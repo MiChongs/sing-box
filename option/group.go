@@ -148,3 +148,8 @@ type SmartOutboundOptions struct {
 	// (every dial re-evaluates from scratch). Recommended 1–5 s.
 	Hysteresis badoption.Duration `json:"hysteresis,omitempty"`
 }
+
+type URLTestFallbackOptions struct {
+	Enabled  bool               `json:"enabled,omitempty"`
+	MaxDelay badoption.Duration `json:"max_delay,omitempty"`
+}
