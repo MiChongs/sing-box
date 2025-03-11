@@ -1,10 +1,5 @@
 # Provider
 
-!!! quote "Changes in sing-box 1.14.0"
-
-    :material-plus: [http_client](#http_client)  
-    :material-delete-clock: [download_detour](#download_detour)
-
 ### Structure
 
 List of subscription providers.
@@ -23,9 +18,7 @@ List of subscription providers.
             "url": "",
             "interval": "",
             "timeout": "",
-          },
-          "override_dialer": {},
-          "override_tls": {}
+          }
         }
       ]
     }
@@ -49,14 +42,8 @@ List of subscription providers.
           "exclude": "",
           "include": "",
           "user_agent": "",
-          "http_client": "", // or {}
-          "update_interval": "",
-          "override_dialer": {},
-          "override_tls": {},
-
-          // Deprecated
-
-          "download_detour": ""
+          "download_detour": "",
+          "update_interval": ""
         }
       ]
     }
@@ -100,14 +87,6 @@ Health check interval. The minimum value is `1m`, the default value is `10m`.
 
 Health check timeout. the default value is `3s`.
 
-##### override_dialer
-
-Override dialer fields of outbounds in provider, see [Dialer Fields Override](/configuration/provider/override_dialer/) for details.
-
-##### override_tls
-
-Override TLS fields of outbounds in provider, see [TLS Fields Override](/configuration/provider/override_tls/) for details.
-
 ### Local Fields
 
 #### path
@@ -140,23 +119,11 @@ Include regular expression to filter nodes.
 
 User agent used to download the provider.
 
-#### http_client
-
-!!! question "Since sing-box 1.14.0"
-
-HTTP Client for downloading provider.
-
-See [HTTP Client Fields](/configuration/shared/http-client/) for details.
-
-Default transport will be used if empty.
-
 #### download_detour
 
-!!! failure "Deprecated in sing-box 1.14.0"
+The tag of the outbound used to download from the provider.
 
-    `download_detour` is deprecated in sing-box 1.14.0 and will be removed in sing-box 1.16.0, use `http_client` instead.
-
-Tag of the outbound used to download from the provider.
+Default outbound will be used if empty.
 
 #### update_interval
 
