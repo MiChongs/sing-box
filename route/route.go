@@ -657,6 +657,14 @@ func (r *Router) actionSniff(
 			} else {
 				r.logger.DebugContext(ctx, "sniffed protocol: ", metadata.Protocol)
 			}
+			//goland:noinspection GoDeprecation
+			if !metadata.Destination.IsDomain() && action.OverrideDestination && M.IsDomainName(metadata.SniffHost) {
+				metadata.Destination = M.Socksaddr{
+					Fqdn: metadata.SniffHost,
+					Port: metadata.Destination.Port,
+				}
+				r.logger.DebugContext(ctx, "connection destination is overridden as ", metadata.SniffHost, ":", metadata.Destination.Port)
+			}
 		}
 		if !sniffBuffer.IsEmpty() {
 			buffer = sniffBuffer
@@ -790,6 +798,16 @@ func (r *Router) actionSniff(
 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", client: ", metadata.Client)
 			} else {
 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol)
+			}
+			//goland:noinspection GoDeprecation
+			if action.OverrideDestination && M.IsDomainName(metadata.SniffHost) {
+				metadata.OriginDestination = metadata.Destination
+				metadata.Destination = M.Socksaddr{
+					Fqdn: metadata.SniffHost,
+					Port: metadata.Destination.Port,
+				}
+				metadata.DestOverride = true
+				r.logger.DebugContext(ctx, "packet connection destination is overridden as ", metadata.SniffHost, ":", metadata.Destination.Port)
 			}
 		}
 	}
