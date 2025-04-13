@@ -153,6 +153,10 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 			r.Mount("/restart", restartRouter(ctx, logFactory))
 		}
 
+		if service.FromContext[adapter.PlatformInterface](ctx) == nil {
+			r.Mount("/restart", restartRouter(ctx, logFactory))
+		}
+
 		s.setupMetaAPI(r)
 	})
 	if options.ExternalUI != "" {
