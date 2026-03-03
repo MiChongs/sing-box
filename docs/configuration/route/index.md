@@ -6,7 +6,6 @@ icon: material/alert-decagram
 
 !!! quote "Changes in sing-box 1.14.0"
 
-    :material-plus: [default_http_client](#default_http_client)  
     :material-plus: [find_neighbor](#find_neighbor)  
     :material-plus: [dhcp_lease_files](#dhcp_lease_files)
 
@@ -41,10 +40,8 @@ icon: material/alert-decagram
     "override_android_vpn": false,
     "default_interface": "",
     "default_mark": 0,
-    "find_process": false,
     "find_neighbor": false,
     "dhcp_lease_files": [],
-    "default_http_client": "",
     "default_domain_resolver": "", // or {}
     "default_network_strategy": "",
     "default_network_type": [],
@@ -117,25 +114,17 @@ Set routing mark by default.
 
 Takes no effect if `outbound.routing_mark` is set.
 
-#### find_process
-
-!!! quote ""
-
-    Only supported on Linux, Windows, and macOS.
-
-Enable process search for logging when no `process_name`, `process_path`, `package_name`, `user` or `user_id` rules exist.
-
 #### find_neighbor
 
 !!! question "Since sing-box 1.14.0"
 
 !!! quote ""
 
-    Only supported on Linux and macOS.
+    Only supported on Linux.
 
-Enable neighbor resolution for logging when no `source_mac_address` or `source_hostname` rules exist.
+Enable neighbor resolution for source MAC address and hostname lookup.
 
-See [Neighbor Resolution](/configuration/shared/neighbor/) for setup.
+Required for `source_mac_address` and `source_hostname` rule items.
 
 #### dhcp_lease_files
 
@@ -143,19 +132,11 @@ See [Neighbor Resolution](/configuration/shared/neighbor/) for setup.
 
 !!! quote ""
 
-    Only supported on Linux and macOS.
+    Only supported on Linux.
 
 Custom DHCP lease file paths for hostname and MAC address resolution.
 
 Automatically detected from common DHCP servers (dnsmasq, odhcpd, ISC dhcpd, Kea) if empty.
-
-#### default_http_client
-
-!!! question "Since sing-box 1.14.0"
-
-Tag of the default [HTTP Client](/configuration/shared/http-client/) used by remote rule-sets.
-
-If empty and `http_clients` is defined, the first HTTP client is used.
 
 #### default_domain_resolver
 
@@ -163,7 +144,7 @@ If empty and `http_clients` is defined, the first HTTP client is used.
 
 See [Dial Fields](/configuration/shared/dial/#domain_resolver) for details.
 
-Can be overridden by `outbound.domain_resolver`.
+Can be overrides by `outbound.domain_resolver`.
 
 #### default_network_strategy
 
@@ -173,7 +154,7 @@ See [Dial Fields](/configuration/shared/dial/#network_strategy) for details.
 
 Takes no effect if `outbound.bind_interface`, `outbound.inet4_bind_address` or `outbound.inet6_bind_address` is set.
 
-Can be overridden by `outbound.network_strategy`.
+Can be overrides by `outbound.network_strategy`.
 
 Conflicts with `default_interface`.
 

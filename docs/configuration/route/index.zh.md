@@ -6,7 +6,6 @@ icon: material/alert-decagram
 
 !!! quote "sing-box 1.14.0 中的更改"
 
-    :material-plus: [default_http_client](#default_http_client)  
     :material-plus: [find_neighbor](#find_neighbor)  
     :material-plus: [dhcp_lease_files](#dhcp_lease_files)
 
@@ -43,10 +42,8 @@ icon: material/alert-decagram
     "override_android_vpn": false,
     "default_interface": "",
     "default_mark": 0,
-    "find_process": false,
     "find_neighbor": false,
     "dhcp_lease_files": [],
-    "default_http_client": "",
     "default_network_strategy": "",
     "default_fallback_delay": ""
   }
@@ -116,25 +113,17 @@ icon: material/alert-decagram
 
 如果设置了 `outbound.routing_mark` 设置，则不生效。
 
-#### find_process
-
-!!! quote ""
-
-    仅支持 Linux、Windows 和 macOS。
-
-在没有 `process_name`、`process_path`、`package_name`、`user` 或 `user_id` 规则时启用进程搜索以输出日志。
-
 #### find_neighbor
 
 !!! question "自 sing-box 1.14.0 起"
 
 !!! quote ""
 
-    仅支持 Linux 和 macOS。
+    仅支持 Linux。
 
-在没有 `source_mac_address` 或 `source_hostname` 规则时启用邻居解析以输出日志。
+启用邻居解析以查找源 MAC 地址和主机名。
 
-参阅 [邻居解析](/configuration/shared/neighbor/) 了解设置方法。
+`source_mac_address` 和 `source_hostname` 规则项需要此选项。
 
 #### dhcp_lease_files
 
@@ -142,19 +131,11 @@ icon: material/alert-decagram
 
 !!! quote ""
 
-    仅支持 Linux 和 macOS。
+    仅支持 Linux。
 
 用于主机名和 MAC 地址解析的自定义 DHCP 租约文件路径。
 
 为空时自动从常见 DHCP 服务器（dnsmasq、odhcpd、ISC dhcpd、Kea）检测。
-
-#### default_http_client
-
-!!! question "自 sing-box 1.14.0 起"
-
-远程规则集使用的默认 [HTTP 客户端](/zh/configuration/shared/http-client/) 的标签。
-
-如果为空且 `http_clients` 已定义，将使用第一个 HTTP 客户端。
 
 #### default_domain_resolver
 

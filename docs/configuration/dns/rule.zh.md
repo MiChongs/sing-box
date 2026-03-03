@@ -5,16 +5,7 @@ icon: material/alert-decagram
 !!! quote "sing-box 1.14.0 中的更改"
 
     :material-plus: [source_mac_address](#source_mac_address)  
-    :material-plus: [source_hostname](#source_hostname)  
-    :material-plus: [match_response](#match_response)  
-    :material-delete-clock: [rule_set_ip_cidr_accept_empty](#rule_set_ip_cidr_accept_empty)  
-    :material-plus: [response_rcode](#response_rcode)  
-    :material-plus: [response_answer](#response_answer)  
-    :material-plus: [response_ns](#response_ns)  
-    :material-plus: [response_extra](#response_extra)  
-    :material-plus: [package_name_regex](#package_name_regex)  
-    :material-alert: [ip_version](#ip_version)  
-    :material-alert: [query_type](#query_type)
+    :material-plus: [source_hostname](#source_hostname)
 
 !!! quote "sing-box 1.13.0 中的更改"
 
@@ -103,6 +94,12 @@ icon: material/alert-decagram
           "192.168.0.1"
         ],
         "source_ip_is_private": false,
+        "ip_cidr": [
+          "10.0.0.0/24",
+          "192.168.0.1"
+        ],
+        "ip_is_private": false,
+        "ip_accept_any": false,
         "source_port": [
           12345
         ],
@@ -132,18 +129,13 @@ icon: material/alert-decagram
         "package_name": [
           "com.termux"
         ],
-        "package_name_regex": [
-          "^com\\.termux.*"
-        ],
         "user": [
           "sekai"
         ],
         "user_id": [
           1000
         ],
-        "clash_mode": [
-          "direct"
-        ],
+        "clash_mode": "direct",
         "network_type": [
           "wifi"
         ],
@@ -179,17 +171,7 @@ icon: material/alert-decagram
           "geosite-cn"
         ],
         "rule_set_ip_cidr_match_source": false,
-        "match_response": false,
-        "ip_cidr": [
-          "10.0.0.0/24",
-          "192.168.0.1"
-        ],
-        "ip_is_private": false,
-        "ip_accept_any": false,
-        "response_rcode": "",
-        "response_answer": [],
-        "response_ns": [],
-        "response_extra": [],
+        "rule_set_ip_cidr_accept_empty": false,
         "invert": false,
         "outbound": [
           "direct"
@@ -198,8 +180,6 @@ icon: material/alert-decagram
         "server": "local",
 
         // 已弃用
-
-        "rule_set_ip_cidr_accept_empty": false,
         "rule_set_ipcidr_match_source": false,
         "geosite": [
           "cn"
@@ -247,37 +227,11 @@ icon: material/alert-decagram
 
 #### ip_version
 
-!!! quote "sing-box 1.14.0 中的更改"
-
-    此字段现在也会在 DNS 规则被未指定具体 DNS 服务器的内部域名解析匹配时生效，
-    例如未设置 `server` 的 [`resolve`](../../route/rule_action/#resolve) 路由规则动作。
-    此前只有来自客户端的 DNS 查询才会评估此字段。完整列表参阅
-    [迁移指南](/zh/migration/#dns-规则中的-ip_version-和-query_type-行为更改)。
-
-    在 DNS 规则中设置此字段后，该 DNS 规则在同一 DNS 配置中不能与
-    旧版地址筛选字段 (DNS 规则)、旧版 DNS 规则动作 `strategy` 选项，
-    或旧版 `rule_set_ip_cidr_accept_empty` DNS 规则项共存。如需与
-    基于地址的筛选组合，请使用 [`evaluate`](../rule_action/#evaluate) 动作和
-    [`match_response`](#match_response)。
-
 4 (A DNS 查询) 或 6 (AAAA DNS 查询)。
 
 默认不限制。
 
 #### query_type
-
-!!! quote "sing-box 1.14.0 中的更改"
-
-    此字段现在也会在 DNS 规则被未指定具体 DNS 服务器的内部域名解析匹配时生效，
-    例如未设置 `server` 的 [`resolve`](../../route/rule_action/#resolve) 路由规则动作。
-    此前只有来自客户端的 DNS 查询才会评估此字段。完整列表参阅
-    [迁移指南](/zh/migration/#dns-规则中的-ip_version-和-query_type-行为更改)。
-
-    在 DNS 规则中设置此字段后，该 DNS 规则在同一 DNS 配置中不能与
-    旧版地址筛选字段 (DNS 规则)、旧版 DNS 规则动作 `strategy` 选项，
-    或旧版 `rule_set_ip_cidr_accept_empty` DNS 规则项共存。如需与
-    基于地址的筛选组合，请使用 [`evaluate`](../rule_action/#evaluate) 动作和
-    [`match_response`](#match_response)。
 
 DNS 查询类型。值可以为整数或者类型名称字符串。
 
@@ -381,12 +335,6 @@ DNS 查询类型。值可以为整数或者类型名称字符串。
 
 匹配 Android 应用包名。
 
-#### package_name_regex
-
-!!! question "自 sing-box 1.14.0 起"
-
-使用正则表达式匹配 Android 应用包名。
-
 #### user
 
 !!! quote ""
@@ -476,7 +424,7 @@ Available values: `wifi`, `cellular`, `ethernet` and `other`.
 
 !!! quote ""
 
-    仅支持 Linux、macOS，或在 Android 和 macOS 图形客户端中支持。参阅 [邻居解析](/configuration/shared/neighbor/) 了解设置方法。
+    仅支持 Linux，且需要 `route.find_neighbor` 已启用。
 
 匹配源设备 MAC 地址。
 
@@ -486,7 +434,7 @@ Available values: `wifi`, `cellular`, `ethernet` and `other`.
 
 !!! quote ""
 
-    仅支持 Linux、macOS，或在 Android 和 macOS 图形客户端中支持。参阅 [邻居解析](/configuration/shared/neighbor/) 了解设置方法。
+    仅支持 Linux，且需要 `route.find_neighbor` 已启用。
 
 匹配源设备从 DHCP 租约获取的主机名。
 
@@ -527,23 +475,6 @@ Available values: `wifi`, `cellular`, `ethernet` and `other`.
 !!! question "自 sing-box 1.10.0 起"
 
 使规则集中的 `ip_cidr` 规则匹配源 IP。
-
-#### match_response
-
-!!! question "自 sing-box 1.14.0 起"
-
-启用响应匹配。启用后，此规则将匹配已评估的响应（由前序 [`evaluate`](/zh/configuration/dns/rule_action/#evaluate) 动作设置），而不仅是匹配原始查询。
-
-该已评估的响应也可以被后续的 [`respond`](/zh/configuration/dns/rule_action/#respond) 动作直接返回。
-
-响应匹配字段（`response_rcode`、`response_answer`、`response_ns`、`response_extra`）需要此选项。
-当与 `evaluate` 或响应匹配字段一起使用时，`ip_cidr`、`ip_is_private` 和 `ip_accept_any` 也需要此选项。
-
-#### ip_accept_any
-
-!!! question "自 sing-box 1.12.0 起"
-
-当 DNS 查询响应包含至少一个地址时匹配。
 
 #### invert
 
@@ -589,12 +520,7 @@ Available values: `wifi`, `cellular`, `ethernet` and `other`.
 
     已移动到 [DNS 规则动作](../rule_action#route).
 
-### 旧版地址筛选字段
-
-!!! failure "已在 sing-box 1.14.0 废弃"
-
-    旧版地址筛选字段已废弃，且将在 sing-box 1.16.0 中被移除，
-    参阅[迁移指南](/zh/migration/#迁移地址筛选字段到响应匹配)。
+### 地址筛选字段
 
 仅对地址请求 (A/AAAA/HTTPS) 生效。 当查询结果与地址筛选规则项不匹配时，将跳过当前规则。
 
@@ -621,61 +547,23 @@ Available values: `wifi`, `cellular`, `ethernet` and `other`.
 
 与查询响应匹配 IP CIDR。
 
-作为旧版地址筛选字段已废弃。请改为配合 `match_response` 使用，
-参阅[迁移指南](/zh/migration/#迁移地址筛选字段到响应匹配)。
-
 #### ip_is_private
 
 !!! question "自 sing-box 1.9.0 起"
 
 与查询响应匹配非公开 IP。
 
-作为旧版地址筛选字段已废弃。请改为配合 `match_response` 使用，
-参阅[迁移指南](/zh/migration/#迁移地址筛选字段到响应匹配)。
+#### ip_accept_any
+
+!!! question "自 sing-box 1.12.0 起"
+
+匹配任意 IP。
 
 #### rule_set_ip_cidr_accept_empty
 
 !!! question "自 sing-box 1.10.0 起"
 
-!!! failure "已在 sing-box 1.14.0 废弃"
-
-    `rule_set_ip_cidr_accept_empty` 已废弃且将在 sing-box 1.16.0 中被移除，
-    参阅[迁移指南](/zh/migration/#迁移地址筛选字段到响应匹配)。
-
 使规则集中的 `ip_cidr` 规则接受空查询响应。
-
-### 响应匹配字段
-
-!!! question "自 sing-box 1.14.0 起"
-
-已评估的响应的匹配字段。需要将 `match_response` 设为 `true`，
-且需要前序规则使用 [`evaluate`](/zh/configuration/dns/rule_action/#evaluate) 动作来填充响应。
-
-该已评估的响应也可以被后续的 [`respond`](/zh/configuration/dns/rule_action/#respond) 动作直接返回。
-
-#### response_rcode
-
-匹配 DNS 响应码。
-
-接受的值与 [predefined 动作 rcode](/zh/configuration/dns/rule_action/#rcode) 中相同。
-
-#### response_answer
-
-匹配 DNS 应答记录。
-
-记录格式与 [predefined 动作 answer](/zh/configuration/dns/rule_action/#answer) 中相同。
-
-#### response_ns
-
-匹配 DNS 名称服务器记录。
-
-记录格式与 [predefined 动作 ns](/zh/configuration/dns/rule_action/#ns) 中相同。
-
-#### response_extra
-
-匹配 DNS 额外记录。
-
-记录格式与 [predefined 动作 extra](/zh/configuration/dns/rule_action/#extra) 中相同。
 
 ### 逻辑字段
 

@@ -5,8 +5,7 @@ icon: material/new-box
 !!! quote "Changes in sing-box 1.14.0"
 
     :material-plus: [source_mac_address](#source_mac_address)  
-    :material-plus: [source_hostname](#source_hostname)  
-    :material-plus: [package_name_regex](#package_name_regex)
+    :material-plus: [source_hostname](#source_hostname)
 
 !!! quote "Changes in sing-box 1.13.0"
 
@@ -130,18 +129,13 @@ icon: material/new-box
         "package_name": [
           "com.termux"
         ],
-        "package_name_regex": [
-          "^com\\.termux.*"
-        ],
         "user": [
           "sekai"
         ],
         "user_id": [
           1000
         ],
-        "clash_mode": [
-          "direct"
-        ],
+        "clash_mode": "direct",
         "network_type": [
           "wifi"
         ],
@@ -360,12 +354,6 @@ Match process path using regular expression.
 
 Match android package name.
 
-#### package_name_regex
-
-!!! question "Since sing-box 1.14.0"
-
-Match android package name using regular expression.
-
 #### user
 
 !!! quote ""
@@ -478,7 +466,7 @@ Match specified outbounds' preferred routes.
 
 !!! quote ""
 
-    Only supported on Linux, macOS, or in graphical clients on Android and macOS. See [Neighbor Resolution](/configuration/shared/neighbor/) for setup.
+    Only supported on Linux with `route.find_neighbor` enabled.
 
 Match source device MAC address.
 
@@ -488,7 +476,7 @@ Match source device MAC address.
 
 !!! quote ""
 
-    Only supported on Linux, macOS, or in graphical clients on Android and macOS. See [Neighbor Resolution](/configuration/shared/neighbor/) for setup.
+    Only supported on Linux with `route.find_neighbor` enabled.
 
 Match source device hostname from DHCP leases.
 
