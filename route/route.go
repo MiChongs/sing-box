@@ -414,10 +414,10 @@ func (r *Router) matchRule(
 	// isLocalSource to avoid a costly ProcFS scan for remote clients
 	// (eg TUN-routed traffic from other hosts on the LAN).
 	r.searchProcessInfo(ctx, metadata)
-	// xiaobaf14g: neighbor-resolver block kept inline — upstream does
-	// not (yet) have an equivalent helper. Looks up the source IP's
-	// MAC + hostname so later rule_item_mac / rule_item_hostname can
-	// match without their own lookup path.
+	// upstream 2cf78e1df: neighbor lookup populates SourceMACAddress /
+	// SourceHostname for the new rule_item_mac / rule_item_hostname
+	// matchers. xiaobaf14g already had this block in place; upstream
+	// commit matches our wording exactly.
 	if r.neighborResolver != nil && metadata.SourceMACAddress == nil && metadata.Source.Addr.IsValid() {
 		mac, macFound := r.neighborResolver.LookupMAC(metadata.Source.Addr)
 		if macFound {

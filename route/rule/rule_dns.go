@@ -334,6 +334,9 @@ func NewDefaultDNSRule(ctx context.Context, logger log.ContextLogger, options op
 		rule.items = append(rule.items, item)
 		rule.allItems = append(rule.allItems, item)
 	}
+	// xiaobaf14g: keep the RuleSetIPCIDRAcceptEmpty deprecation gate
+	// here (upstream doesn't have it yet). When legacyDNSMode is on
+	// we only emit a warning; otherwise it's a hard error.
 	if options.RuleSetIPCIDRAcceptEmpty { //nolint:staticcheck
 		if legacyDNSMode {
 			deprecated.Report(ctx, deprecated.OptionRuleSetIPCIDRAcceptEmpty)
