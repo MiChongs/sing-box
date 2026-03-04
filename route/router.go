@@ -206,6 +206,23 @@ func (r *Router) Start(stage adapter.StartStage) error {
 					}
 				}
 			}
+			if r.neighborResolver == nil {
+				monitor.Start("initialize neighbor resolver")
+				resolver, err := newNeighborResolver(r.logger, r.leaseFiles)
+				monitor.Finish()
+				if err != nil {
+					if err != os.ErrInvalid {
+						r.logger.Error(E.Cause(err, "create neighbor resolver"))
+					}
+				} else {
+					err = resolver.Start()
+					if err != nil {
+						r.logger.Error(E.Cause(err, "start neighbor resolver"))
+					} else {
+						r.neighborResolver = resolver
+					}
+				}
+			}
 		}
 	case adapter.StartStatePostStart:
 		for i, rule := range r.rules {

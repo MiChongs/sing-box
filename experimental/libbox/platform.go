@@ -21,6 +21,7 @@ type PlatformInterface interface {
 	SystemCertificates() StringIterator
 	ClearDNSCache()
 	SendNotification(notification *Notification) error
+<<<<<<< HEAD
 	StartNeighborMonitor(listener NeighborUpdateListener) error
 	CloseNeighborMonitor(listener NeighborUpdateListener) error
 	RegisterMyInterface(name string)
@@ -28,6 +29,15 @@ type PlatformInterface interface {
 
 type NeighborUpdateListener interface {
 	UpdateNeighborTable(entries NeighborEntryIterator)
+||||||| parent of c69d3965f (Add Android support for MAC and hostname rule items)
+=======
+	StartNeighborMonitor(listener NeighborUpdateListener) error
+	CloseNeighborMonitor(listener NeighborUpdateListener) error
+}
+
+type NeighborUpdateListener interface {
+	UpdateNeighborTable(entries NeighborEntryIterator)
+>>>>>>> c69d3965f (Add Android support for MAC and hostname rule items)
 }
 
 type ConnectionOwner struct {
