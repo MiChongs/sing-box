@@ -189,23 +189,14 @@ func (r *Router) Start(stage adapter.StartStage) error {
 				} else {
 					r.neighborResolver = resolver
 				}
-			} else {
-				monitor.Start("initialize neighbor resolver")
-				resolver, err := newNeighborResolver(r.logger, r.leaseFiles)
-				monitor.Finish()
-				if err != nil {
-					if err != os.ErrInvalid {
-						r.logger.Error(E.Cause(err, "create neighbor resolver"))
-					}
-				} else {
-					err = resolver.Start()
-					if err != nil {
-						r.logger.Error(E.Cause(err, "start neighbor resolver"))
-					} else {
-						r.neighborResolver = resolver
-					}
-				}
 			}
+			// Native lease-file-backed resolver as a fallback —
+			// upstream 11783aa54 added the nil-check so macOS falls
+			// through when the platform binding isn't available.
+			// The "else" pre-existing in HEAD was narrower (only ran
+			// when UsePlatformNeighborResolver=false); merging gives
+			// us double-protection: platform-first, else-or-failed
+			// path tries the native resolver.
 			if r.neighborResolver == nil {
 				monitor.Start("initialize neighbor resolver")
 				resolver, err := newNeighborResolver(r.logger, r.leaseFiles)
