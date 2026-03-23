@@ -10,11 +10,9 @@ sing-box 使用 JSON 作为配置文件格式。
   "ntp": {},
   "certificate": {},
   "certificate_providers": [],
-  "http_clients": [],
   "endpoints": [],
   "inbounds": [],
   "outbounds": [],
-  "providers": [],
   "route": {},
   "services": [],
   "experimental": {}
@@ -30,11 +28,9 @@ sing-box 使用 JSON 作为配置文件格式。
 | `ntp`          | [NTP](./ntp/)          |
 | `certificate`  | [证书](./certificate/)   |
 | `certificate_providers` | [证书提供者](./shared/certificate-provider/) |
-| `http_clients` | [HTTP 客户端](./shared/http-client/) |
 | `endpoints`    | [端点](./endpoint/)      |
 | `inbounds`     | [入站](./inbound/)       |
 | `outbounds`    | [出站](./outbound/)      |
-| `providers`    | [提供者](./provider/)         |
 | `route`        | [路由](./route/)         |
 | `services`     | [服务](./service/)       |
 | `experimental` | [实验性](./experimental/) |
