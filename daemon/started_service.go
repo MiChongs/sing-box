@@ -769,6 +769,41 @@ func (s *StartedService) TriggerOOMReport(ctx context.Context, _ *emptypb.Empty)
 	return &emptypb.Empty{}, reporter.WriteReport(memory.Total())
 }
 
+func (s *StartedService) TriggerDebugCrash(ctx context.Context, request *DebugCrashRequest) (*emptypb.Empty, error) {
+	if !s.debug {
+		return nil, status.Error(codes.PermissionDenied, "debug crash trigger unavailable")
+	}
+	if request == nil {
+		return nil, status.Error(codes.InvalidArgument, "missing debug crash request")
+	}
+	switch request.Type {
+	case DebugCrashRequest_GO:
+		time.AfterFunc(200*time.Millisecond, func() {
+			panic("debug go crash")
+		})
+	case DebugCrashRequest_NATIVE:
+		err := s.handler.TriggerNativeCrash()
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, status.Error(codes.InvalidArgument, "unknown debug crash type")
+	}
+	return &emptypb.Empty{}, nil
+}
+
+func (s *StartedService) TriggerOOMReport(ctx context.Context, _ *emptypb.Empty) (*emptypb.Empty, error) {
+	instance := s.Instance()
+	if instance == nil {
+		return nil, status.Error(codes.FailedPrecondition, "service not started")
+	}
+	reporter := service.FromContext[oomkiller.OOMReporter](instance.ctx)
+	if reporter == nil {
+		return nil, status.Error(codes.Unavailable, "OOM reporter not available")
+	}
+	return &emptypb.Empty{}, reporter.WriteReport(memory.Total())
+}
+
 func (s *StartedService) SubscribeConnections(request *SubscribeConnectionsRequest, server grpc.ServerStreamingServer[ConnectionEvents]) error {
 	err := s.waitForStarted(server.Context())
 	if err != nil {
