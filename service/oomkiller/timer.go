@@ -107,7 +107,6 @@ type adaptiveTimer struct {
 	access                  sync.Mutex
 	timer                   *time.Timer
 	state                   pressureState
-	currentInterval         time.Duration
 	forceMinInterval        bool
 	pendingPressureBaseline bool
 	pressureBaseline        memorySample
@@ -161,10 +160,6 @@ func (t *adaptiveTimer) stop() {
 }
 
 func (t *adaptiveTimer) poll() {
-	if t.timerConfig.policyMode == policyModeNetworkExtension {
-		runtimeDebug.FreeOSMemory()
-	}
-
 	var triggered bool
 	var rateTriggered bool
 	sample := readMemorySample(t.policyMode)
@@ -183,9 +178,7 @@ func (t *adaptiveTimer) poll() {
 	t.state = t.nextState(sample)
 	if t.state == pressureStateNormal {
 		t.forceMinInterval = false
-		if !t.pressureBaselineTime.IsZero() && time.Since(t.pressureBaselineTime) > t.maxInterval {
-			t.pressureBaselineTime = time.Time{}
-		}
+		t.pressureBaselineTime = time.Time{}
 	}
 	t.timer.Reset(t.intervalForState())
 	triggered = previousState != pressureStateTriggered && t.state == pressureStateTriggered
@@ -209,7 +202,6 @@ func (t *adaptiveTimer) poll() {
 	if !triggered {
 		return
 	}
-	t.onTriggered(sample.usage)
 	if rateTriggered {
 		if t.killerDisabled {
 			t.logger.Warn("memory growth rate critical (report only), usage: ", byteformats.FormatMemoryBytes(sample.usage), t.logDetails(sample))
@@ -225,6 +217,7 @@ func (t *adaptiveTimer) poll() {
 			t.router.ResetNetwork()
 		}
 	}
+	t.onTriggered(sample.usage)
 	runtimeDebug.FreeOSMemory()
 }
 
@@ -279,19 +272,13 @@ func (t *adaptiveTimer) availableThresholds(sample memorySample) pressureThresho
 }
 
 func (t *adaptiveTimer) intervalForState() time.Duration {
-	switch {
-	case t.forceMinInterval || t.state == pressureStateTriggered:
-		t.currentInterval = t.minInterval
-	case t.state == pressureStateArmed:
-		t.currentInterval = t.armedInterval
-	default:
-		if t.currentInterval == 0 {
-			t.currentInterval = t.maxInterval
-		} else {
-			t.currentInterval = min(t.currentInterval*2, t.maxInterval)
-		}
+	if t.state == pressureStateNormal {
+		return t.maxInterval
 	}
-	return t.currentInterval
+	if t.forceMinInterval || t.state == pressureStateTriggered {
+		return t.minInterval
+	}
+	return t.armedInterval
 }
 
 func (t *adaptiveTimer) logDetails(sample memorySample) string {

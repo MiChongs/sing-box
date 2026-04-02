@@ -1,12 +1,9 @@
 package libbox
 
-import (
-	"time"
-	"unsafe"
-)
+import "time"
 
 func TriggerGoPanic() {
 	time.AfterFunc(200*time.Millisecond, func() {
-		*(*int)(unsafe.Pointer(uintptr(0))) = 0
+		panic("debug go crash")
 	})
 }

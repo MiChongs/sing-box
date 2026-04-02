@@ -95,8 +95,7 @@ func writeAlloc(w io.Writer) error {
 
 func writeHeapInternal(w io.Writer, defaultSampleType string) error {
 	var profile []memProfileRecord
-	n, _ := runtimeMemProfileInternal(nil, true)
-	var ok bool
+	n, ok := runtimeMemProfileInternal(nil, true)
 	for {
 		profile = make([]memProfileRecord, n+50)
 		n, ok = runtimeMemProfileInternal(profile, true)
@@ -122,8 +121,7 @@ func writeRuntimeProfile(w io.Writer, name string, fetch func([]stackRecord, []u
 	var profile []stackRecord
 	var labels []unsafe.Pointer
 
-	n, _ := fetch(nil, nil)
-	var ok bool
+	n, ok := fetch(nil, nil)
 	for {
 		profile = make([]stackRecord, n+10)
 		labels = make([]unsafe.Pointer, n+10)
@@ -148,8 +146,7 @@ func writeMutex(w io.Writer) error {
 
 func writeCycleProfile(w io.Writer, countName string, cycleName string, fetch func([]blockProfileRecord) (int, bool)) error {
 	var profile []blockProfileRecord
-	n, _ := fetch(nil)
-	var ok bool
+	n, ok := fetch(nil)
 	for {
 		profile = make([]blockProfileRecord, n+50)
 		n, ok = fetch(profile)
