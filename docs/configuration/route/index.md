@@ -144,7 +144,7 @@ Automatically detected from common DHCP servers (dnsmasq, odhcpd, ISC dhcpd, Kea
 
 See [Dial Fields](/configuration/shared/dial/#domain_resolver) for details.
 
-Can be overrides by `outbound.domain_resolver`.
+Can be overridden by `outbound.domain_resolver`.
 
 #### default_network_strategy
 
@@ -154,7 +154,7 @@ See [Dial Fields](/configuration/shared/dial/#network_strategy) for details.
 
 Takes no effect if `outbound.bind_interface`, `outbound.inet4_bind_address` or `outbound.inet6_bind_address` is set.
 
-Can be overrides by `outbound.network_strategy`.
+Can be overridden by `outbound.network_strategy`.
 
 Conflicts with `default_interface`.
 

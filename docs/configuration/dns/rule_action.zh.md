@@ -6,8 +6,7 @@ icon: material/new-box
 
     :material-delete-clock: [strategy](#strategy)  
     :material-plus: [evaluate](#evaluate)  
-    :material-plus: [respond](#respond)  
-    :material-plus: [disable_optimistic_cache](#disable_optimistic_cache)
+    :material-plus: [respond](#respond)
 
 !!! quote "sing-box 1.12.0 中的更改"
 
@@ -24,7 +23,6 @@ icon: material/new-box
   "server": "",
   "strategy": "",
   "disable_cache": false,
-  "disable_optimistic_cache": false,
   "rewrite_ttl": null,
   "client_subnet": null
 }
@@ -46,19 +44,13 @@ icon: material/new-box
 
     `strategy` 已在 sing-box 1.14.0 废弃，且将在 sing-box 1.16.0 中被移除。
 
-为此查询设置域名策略。
+为此查询设置域名策略。已废弃，参阅[迁移指南](/zh/migration/#迁移-dns-规则动作-strategy-到规则项)。
 
 可选项：`prefer_ipv4` `prefer_ipv6` `ipv4_only` `ipv6_only`。
 
 #### disable_cache
 
 在此查询中禁用缓存。
-
-#### disable_optimistic_cache
-
-!!! question "自 sing-box 1.14.0 起"
-
-在此查询中禁用乐观 DNS 缓存。
 
 #### rewrite_ttl
 
@@ -81,7 +73,6 @@ icon: material/new-box
   "action": "evaluate",
   "server": "",
   "disable_cache": false,
-  "disable_optimistic_cache": false,
   "rewrite_ttl": null,
   "client_subnet": null
 }
@@ -103,12 +94,6 @@ icon: material/new-box
 #### disable_cache
 
 在此查询中禁用缓存。
-
-#### disable_optimistic_cache
-
-!!! question "自 sing-box 1.14.0 起"
-
-在此查询中禁用乐观 DNS 缓存。
 
 #### rewrite_ttl
 
@@ -144,7 +129,6 @@ icon: material/new-box
 {
   "action": "route-options",
   "disable_cache": false,
-  "disable_optimistic_cache": false,
   "rewrite_ttl": null,
   "client_subnet": null
 }
