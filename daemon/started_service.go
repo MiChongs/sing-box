@@ -1073,9 +1073,12 @@ func (s *StartedService) GetDeprecatedWarnings(ctx context.Context, empty *empty
 			// when bringing upstream's pb back, since the proto lives in
 			// a .pb.go generated file we don't patch by hand.
 			return &DeprecatedWarning{
-				Message:       it.Message(),
-				Impending:     it.Impending(),
-				MigrationLink: it.MigrationLink,
+				Message:           it.Message(),
+				Impending:         it.Impending(),
+				MigrationLink:     it.MigrationLink,
+				Description:       it.Description,
+				DeprecatedVersion: it.DeprecatedVersion,
+				ScheduledVersion:  it.ScheduledVersion,
 			}
 		}),
 	}, nil
