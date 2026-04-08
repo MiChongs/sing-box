@@ -6,14 +6,12 @@ import (
 	"runtime"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/networkquality"
 	"github.com/sagernet/sing-box/common/stun"
 	"github.com/sagernet/sing-box/common/urltest"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/clashapi"
 	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
 	"github.com/sagernet/sing-box/experimental/deprecated"
@@ -655,26 +653,14 @@ func (s *StartedService) SelectOutbound(ctx context.Context, request *SelectOutb
 	s.serviceAccess.RUnlock()
 	outboundGroup, isLoaded := boxService.Outbound().Outbound(request.GroupTag)
 	if !isLoaded {
-		return nil, E.New("group not found: ", request.GroupTag)
+		return nil, E.New("selector not found: ", request.GroupTag)
 	}
-	// Mobile clients (Android / iOS) reach this RPC when the user taps a
-	// node in a group card. Historically only Selector was accepted, so
-	// pinning a node inside a Smart group either errored or the app UI
-	// silently reverted — matching the user report that "the pin is
-	// immediately cleared". Smart exposes the same SelectOutbound API
-	// with mihomo-parity semantics (empty tag releases the pin), so we
-	// route to it the same way the Clash API updateProxy handler does.
-	switch grp := outboundGroup.(type) {
-	case *group.Selector:
-		if !grp.SelectOutbound(request.OutboundTag) {
-			return nil, E.New("outbound not found in selector: ", request.OutboundTag)
-		}
-	case *group.Smart:
-		if !grp.SelectOutbound(request.OutboundTag) {
-			return nil, E.New("outbound not found in smart group: ", request.OutboundTag)
-		}
-	default:
-		return nil, E.New("outbound is not a selectable group: ", request.GroupTag)
+	selector, isSelector := outboundGroup.(*group.Selector)
+	if !isSelector {
+		return nil, E.New("outbound is not a selector: ", request.GroupTag)
+	}
+	if !selector.SelectOutbound(request.OutboundTag) {
+		return nil, E.New("outbound not found in selector: ", request.OutboundTag)
 	}
 	s.urlTestObserver.Emit(struct{}{})
 	return &emptypb.Empty{}, nil
@@ -721,7 +707,7 @@ func (s *StartedService) TriggerDebugCrash(ctx context.Context, request *DebugCr
 	switch request.Type {
 	case DebugCrashRequest_GO:
 		time.AfterFunc(200*time.Millisecond, func() {
-			*(*int)(unsafe.Pointer(uintptr(0))) = 0
+			panic("debug go crash")
 		})
 	case DebugCrashRequest_NATIVE:
 		err := s.handler.TriggerNativeCrash()
@@ -1079,13 +1065,15 @@ func (s *StartedService) GetDeprecatedWarnings(ctx context.Context, empty *empty
 	notes := service.FromContext[deprecated.Manager](boxService.ctx).(*deprecatedManager).Get()
 	return &DeprecatedWarnings{
 		Warnings: common.Map(notes, func(it deprecated.Note) *DeprecatedWarning {
+			// upstream's DeprecatedWarning proto only exposes Message /
+			// Impending / MigrationLink. Description / DeprecatedVersion /
+			// ScheduledVersion were xiaobaf14g-local fields — drop them
+			// when bringing upstream's pb back, since the proto lives in
+			// a .pb.go generated file we don't patch by hand.
 			return &DeprecatedWarning{
-				Message:           it.Message(),
-				Impending:         it.Impending(),
-				MigrationLink:     it.MigrationLink,
-				Description:       it.Description,
-				DeprecatedVersion: it.DeprecatedVersion,
-				ScheduledVersion:  it.ScheduledVersion,
+				Message:       it.Message(),
+				Impending:     it.Impending(),
+				MigrationLink: it.MigrationLink,
 			}
 		}),
 	}, nil
@@ -1095,6 +1083,31 @@ func (s *StartedService) GetStartedAt(ctx context.Context, empty *emptypb.Empty)
 	s.serviceAccess.RLock()
 	defer s.serviceAccess.RUnlock()
 	return &StartedAt{StartedAt: s.startedAt.UnixMilli()}, nil
+}
+
+func (s *StartedService) ListOutbounds(ctx context.Context, _ *emptypb.Empty) (*OutboundList, error) {
+	s.serviceAccess.RLock()
+	if s.serviceStatus.Status != ServiceStatus_STARTED {
+		s.serviceAccess.RUnlock()
+		return nil, os.ErrInvalid
+	}
+	boxService := s.instance
+	s.serviceAccess.RUnlock()
+	historyStorage := boxService.urlTestHistoryStorage
+	outbounds := boxService.instance.Outbound().Outbounds()
+	var list OutboundList
+	for _, ob := range outbounds {
+		item := &GroupItem{
+			Tag:  ob.Tag(),
+			Type: ob.Type(),
+		}
+		if history := historyStorage.LoadURLTestHistory(adapter.OutboundTag(ob)); history != nil {
+			item.UrlTestTime = history.Time.Unix()
+			item.UrlTestDelay = int32(history.Delay)
+		}
+		list.Outbounds = append(list.Outbounds, item)
+	}
+	return &list, nil
 }
 
 func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.ServerStreamingServer[OutboundList]) error {
@@ -1116,24 +1129,14 @@ func (s *StartedService) SubscribeOutbounds(_ *emptypb.Empty, server grpc.Server
 		boxService := s.instance
 		s.serviceAccess.RUnlock()
 		historyStorage := boxService.urlTestHistoryStorage
+		outbounds := boxService.instance.Outbound().Outbounds()
 		var list OutboundList
-		for _, ob := range boxService.instance.Outbound().Outbounds() {
+		for _, ob := range outbounds {
 			item := &GroupItem{
 				Tag:  ob.Tag(),
 				Type: ob.Type(),
 			}
 			if history := historyStorage.LoadURLTestHistory(adapter.OutboundTag(ob)); history != nil {
-				item.UrlTestTime = history.Time.Unix()
-				item.UrlTestDelay = int32(history.Delay)
-			}
-			list.Outbounds = append(list.Outbounds, item)
-		}
-		for _, ep := range boxService.instance.Endpoint().Endpoints() {
-			item := &GroupItem{
-				Tag:  ep.Tag(),
-				Type: ep.Type(),
-			}
-			if history := historyStorage.LoadURLTestHistory(adapter.OutboundTag(ep)); history != nil {
 				item.UrlTestTime = history.Time.Unix()
 				item.UrlTestDelay = int32(history.Delay)
 			}
@@ -1283,197 +1286,6 @@ func (s *StartedService) StartSTUNTest(
 		NatFiltering:     int32(result.NATFiltering),
 		IsFinal:          true,
 		NatTypeSupported: result.NATTypeSupported,
-	})
-}
-
-func (s *StartedService) SubscribeTailscaleStatus(
-	_ *emptypb.Empty,
-	server grpc.ServerStreamingServer[TailscaleStatusUpdate],
-) error {
-	err := s.waitForStarted(server.Context())
-	if err != nil {
-		return err
-	}
-	s.serviceAccess.RLock()
-	boxService := s.instance
-	s.serviceAccess.RUnlock()
-
-	endpointManager := service.FromContext[adapter.EndpointManager](boxService.ctx)
-	if endpointManager == nil {
-		return status.Error(codes.FailedPrecondition, "endpoint manager not available")
-	}
-
-	type tailscaleEndpoint struct {
-		tag      string
-		provider adapter.TailscaleEndpoint
-	}
-	var endpoints []tailscaleEndpoint
-	for _, endpoint := range endpointManager.Endpoints() {
-		if endpoint.Type() != C.TypeTailscale {
-			continue
-		}
-		provider, loaded := endpoint.(adapter.TailscaleEndpoint)
-		if !loaded {
-			continue
-		}
-		endpoints = append(endpoints, tailscaleEndpoint{
-			tag:      endpoint.Tag(),
-			provider: provider,
-		})
-	}
-	if len(endpoints) == 0 {
-		return status.Error(codes.NotFound, "no Tailscale endpoint found")
-	}
-
-	type taggedStatus struct {
-		tag    string
-		status *adapter.TailscaleEndpointStatus
-	}
-	updates := make(chan taggedStatus, len(endpoints))
-	ctx, cancel := context.WithCancel(server.Context())
-	defer cancel()
-
-	var waitGroup sync.WaitGroup
-	for _, endpoint := range endpoints {
-		waitGroup.Add(1)
-		go func(tag string, provider adapter.TailscaleEndpoint) {
-			defer waitGroup.Done()
-			_ = provider.SubscribeTailscaleStatus(ctx, func(endpointStatus *adapter.TailscaleEndpointStatus) {
-				select {
-				case updates <- taggedStatus{tag: tag, status: endpointStatus}:
-				case <-ctx.Done():
-				}
-			})
-		}(endpoint.tag, endpoint.provider)
-	}
-
-	go func() {
-		waitGroup.Wait()
-		close(updates)
-	}()
-
-	var tags []string
-	statuses := make(map[string]*adapter.TailscaleEndpointStatus, len(endpoints))
-	for update := range updates {
-		if _, exists := statuses[update.tag]; !exists {
-			tags = append(tags, update.tag)
-		}
-		statuses[update.tag] = update.status
-		protoEndpoints := make([]*TailscaleEndpointStatus, 0, len(statuses))
-		for _, tag := range tags {
-			protoEndpoints = append(protoEndpoints, tailscaleEndpointStatusToProto(tag, statuses[tag]))
-		}
-		sendErr := server.Send(&TailscaleStatusUpdate{
-			Endpoints: protoEndpoints,
-		})
-		if sendErr != nil {
-			return sendErr
-		}
-	}
-	return nil
-}
-
-func tailscaleEndpointStatusToProto(tag string, s *adapter.TailscaleEndpointStatus) *TailscaleEndpointStatus {
-	userGroups := make([]*TailscaleUserGroup, len(s.UserGroups))
-	for i, group := range s.UserGroups {
-		peers := make([]*TailscalePeer, len(group.Peers))
-		for j, peer := range group.Peers {
-			peers[j] = tailscalePeerToProto(peer)
-		}
-		userGroups[i] = &TailscaleUserGroup{
-			UserID:        group.UserID,
-			LoginName:     group.LoginName,
-			DisplayName:   group.DisplayName,
-			ProfilePicURL: group.ProfilePicURL,
-			Peers:         peers,
-		}
-	}
-	result := &TailscaleEndpointStatus{
-		EndpointTag:    tag,
-		BackendState:   s.BackendState,
-		AuthURL:        s.AuthURL,
-		NetworkName:    s.NetworkName,
-		MagicDNSSuffix: s.MagicDNSSuffix,
-		UserGroups:     userGroups,
-	}
-	if s.Self != nil {
-		result.Self = tailscalePeerToProto(s.Self)
-	}
-	return result
-}
-
-func tailscalePeerToProto(peer *adapter.TailscalePeer) *TailscalePeer {
-	return &TailscalePeer{
-		HostName:       peer.HostName,
-		DnsName:        peer.DNSName,
-		Os:             peer.OS,
-		TailscaleIPs:   peer.TailscaleIPs,
-		Online:         peer.Online,
-		ExitNode:       peer.ExitNode,
-		ExitNodeOption: peer.ExitNodeOption,
-		Active:         peer.Active,
-		RxBytes:        peer.RxBytes,
-		TxBytes:        peer.TxBytes,
-		KeyExpiry:      peer.KeyExpiry,
-	}
-}
-
-func (s *StartedService) StartTailscalePing(
-	request *TailscalePingRequest,
-	server grpc.ServerStreamingServer[TailscalePingResponse],
-) error {
-	err := s.waitForStarted(server.Context())
-	if err != nil {
-		return err
-	}
-	s.serviceAccess.RLock()
-	boxService := s.instance
-	s.serviceAccess.RUnlock()
-
-	endpointManager := service.FromContext[adapter.EndpointManager](boxService.ctx)
-	if endpointManager == nil {
-		return status.Error(codes.FailedPrecondition, "endpoint manager not available")
-	}
-
-	var provider adapter.TailscaleEndpoint
-	if request.EndpointTag != "" {
-		endpoint, loaded := endpointManager.Get(request.EndpointTag)
-		if !loaded {
-			return status.Error(codes.NotFound, "endpoint not found: "+request.EndpointTag)
-		}
-		if endpoint.Type() != C.TypeTailscale {
-			return status.Error(codes.InvalidArgument, "endpoint is not Tailscale: "+request.EndpointTag)
-		}
-		pingProvider, loaded := endpoint.(adapter.TailscaleEndpoint)
-		if !loaded {
-			return status.Error(codes.FailedPrecondition, "endpoint does not support ping")
-		}
-		provider = pingProvider
-	} else {
-		for _, endpoint := range endpointManager.Endpoints() {
-			if endpoint.Type() != C.TypeTailscale {
-				continue
-			}
-			pingProvider, loaded := endpoint.(adapter.TailscaleEndpoint)
-			if loaded {
-				provider = pingProvider
-				break
-			}
-		}
-		if provider == nil {
-			return status.Error(codes.NotFound, "no Tailscale endpoint found")
-		}
-	}
-
-	return provider.StartTailscalePing(server.Context(), request.PeerIP, func(result *adapter.TailscalePingResult) {
-		_ = server.Send(&TailscalePingResponse{
-			LatencyMs:      result.LatencyMs,
-			IsDirect:       result.IsDirect,
-			Endpoint:       result.Endpoint,
-			DerpRegionID:   result.DERPRegionID,
-			DerpRegionCode: result.DERPRegionCode,
-			Error:          result.Error,
-		})
 	})
 }
 
