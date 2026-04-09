@@ -595,11 +595,13 @@ func (c *CommandClient) GetDeprecatedNotes() (DeprecatedNoteIterator, error) {
 		}
 		var notes []*DeprecatedNote
 		for _, warning := range warnings.Warnings {
+			// upstream's DeprecatedWarning proto only has Message /
+			// Impending / MigrationLink; Description / DeprecatedVersion /
+			// ScheduledVersion are xiaobaf14g-local fields not surfaced
+			// across the daemon RPC boundary. Map what we have; UIs
+			// relying on the richer fields will need to parse Message.
 			notes = append(notes, &DeprecatedNote{
-				Description:       warning.Description,
-				DeprecatedVersion: warning.DeprecatedVersion,
-				ScheduledVersion:  warning.ScheduledVersion,
-				MigrationLink:     warning.MigrationLink,
+				MigrationLink: warning.MigrationLink,
 			})
 		}
 		return newIterator(notes), nil
@@ -718,5 +720,27 @@ func (c *CommandClient) StartSTUNTest(server string, outboundTag string, handler
 			return nil
 		}
 		handler.OnProgress(stunTestProgressFromGRPC(event))
+	}
+}
+
+func (c *CommandClient) SubscribeTailscaleStatus(handler TailscaleStatusHandler) error {
+	client, err := c.getClientForCall()
+	if err != nil {
+		return err
+	}
+	if c.standalone {
+		defer c.closeConnection()
+	}
+	stream, err := client.SubscribeTailscaleStatus(context.Background(), &emptypb.Empty{})
+	if err != nil {
+		return err
+	}
+	for {
+		event, recvErr := stream.Recv()
+		if recvErr != nil {
+			handler.OnError(recvErr.Error())
+			return recvErr
+		}
+		handler.OnStatusUpdate(tailscaleStatusUpdateFromGRPC(event))
 	}
 }

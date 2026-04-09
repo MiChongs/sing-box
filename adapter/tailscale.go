@@ -2,18 +2,8 @@ package adapter
 
 import "context"
 
-type TailscaleEndpoint interface {
+type TailscaleStatusProvider interface {
 	SubscribeTailscaleStatus(ctx context.Context, fn func(*TailscaleEndpointStatus)) error
-	StartTailscalePing(ctx context.Context, peerIP string, fn func(*TailscalePingResult)) error
-}
-
-type TailscalePingResult struct {
-	LatencyMs      float64
-	IsDirect       bool
-	Endpoint       string
-	DERPRegionID   int32
-	DERPRegionCode string
-	Error          string
 }
 
 type TailscaleEndpointStatus struct {
@@ -22,15 +12,8 @@ type TailscaleEndpointStatus struct {
 	NetworkName    string
 	MagicDNSSuffix string
 	Self           *TailscalePeer
-	UserGroups     []*TailscaleUserGroup
-}
-
-type TailscaleUserGroup struct {
-	UserID        int64
-	LoginName     string
-	DisplayName   string
-	ProfilePicURL string
-	Peers         []*TailscalePeer
+	Users          map[int64]*TailscaleUser
+	Peers          []*TailscalePeer
 }
 
 type TailscalePeer struct {
@@ -46,4 +29,11 @@ type TailscalePeer struct {
 	TxBytes        int64
 	UserID         int64
 	KeyExpiry      int64
+}
+
+type TailscaleUser struct {
+	ID            int64
+	LoginName     string
+	DisplayName   string
+	ProfilePicURL string
 }
