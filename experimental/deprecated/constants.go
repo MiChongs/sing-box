@@ -109,6 +109,7 @@ var OptionLegacyTailscaleEndpointDialer = Note{
 	EnvName:           "LEGACY_TAILSCALE_ENDPOINT_DIALER",
 }
 
+
 var OptionRuleSetIPCIDRAcceptEmpty = Note{
 	Name:              "dns-rule-rule-set-ip-cidr-accept-empty",
 	Description:       "Legacy `rule_set_ip_cidr_accept_empty` DNS rule item",

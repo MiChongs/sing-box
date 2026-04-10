@@ -1122,7 +1122,9 @@ func validateLegacyDNSModeDisabledDefaultRule(router adapter.Router, rule option
 	}
 	// rule_set entries are only rejected when every referenced set is pure-IP;
 	// mixed sets still fall through because their non-IP branches remain matchable
-	// before a DNS response is available.
+	// before a DNS response is available. (Stricter than upstream's
+	// "never reject rule_set" stance — keeps users from silently accepting a
+	// pure-IP rule-set under match_response=false.)
 	if !rule.MatchResponse && len(rule.RuleSet) > 0 {
 		for _, tag := range rule.RuleSet {
 			metadata, err := lookupDNSRuleSetMetadata(router, tag, metadataOverrides)
@@ -1134,6 +1136,7 @@ func validateLegacyDNSModeDisabledDefaultRule(router adapter.Router, rule option
 			}
 		}
 	}
+	// upstream 523ed6e49: ip_accept_any is no longer deprecated.
 	if rule.RuleSetIPCIDRAcceptEmpty { //nolint:staticcheck
 		return false, E.New(deprecated.OptionRuleSetIPCIDRAcceptEmpty.MessageWithLink())
 	}
