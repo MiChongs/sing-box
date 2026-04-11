@@ -29,10 +29,7 @@ icon: material/alert-decagram
     "disable_cache": false,
     "disable_expire": false,
     "independent_cache": false,
-    "round_robin_cache": false,
     "cache_capacity": 0,
-    "min_cache_ttl": 0,
-    "max_cache_ttl": 0,
     "optimistic": false, // or {}
     "reverse_mapping": false,
     "client_subnet": "",
@@ -82,10 +79,6 @@ Conflict with `optimistic`.
 
 Make each DNS server's cache independent for special purposes. If enabled, will slightly degrade performance.
 
-#### round_robin_cache
-
-Make the order of cached response addresses rotated in round robin manner.
-
 #### cache_capacity
 
 !!! question "Since sing-box 1.11.0"
@@ -93,14 +86,6 @@ Make the order of cached response addresses rotated in round robin manner.
 LRU cache capacity.
 
 Value less than 1024 will be ignored.
-
-#### min_cache_ttl
-
-Extend short TTL values to the time given when caching them.
-
-#### max_cache_ttl
-
-Set a maximum TTL value for entries in the cache.
 
 #### optimistic
 
