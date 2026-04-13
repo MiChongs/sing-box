@@ -193,10 +193,6 @@ func (r *Router) buildRules(startRules bool) ([]adapter.DNSRule, bool, dnsRuleMo
 			return nil, false, dnsRuleModeFlags{}, err
 		}
 	}
-	err = validateEvaluateFakeIPRules(r.rawRules, r.transport)
-	if err != nil {
-		return nil, false, dnsRuleModeFlags{}, err
-	}
 	newRules := make([]adapter.DNSRule, 0, len(r.rawRules))
 	for i, ruleOptions := range r.rawRules {
 		var dnsRule adapter.DNSRule
@@ -429,6 +425,9 @@ func (r *Router) exchangeWithRules(ctx context.Context, rules []adapter.DNSRule,
 				r.logger.ErrorContext(ctx, "transport not found: ", action.Server)
 				evaluatedResponse = nil
 				evaluatedTransport = nil
+				continue
+			}
+			if transport.Type() == C.DNSTypeFakeIP && !allowFakeIP {
 				continue
 			}
 			r.applyDNSRouteOptions(&queryOptions, action.RuleActionDNSRouteOptions)
@@ -1054,27 +1053,6 @@ func validateLegacyDNSModeDisabledRules(rules []option.DNSRule) error {
 		if dnsRuleActionType(rule) == C.RuleActionTypeEvaluate {
 			seenEvaluate = true
 		}
-	}
-	return nil
-}
-
-func validateEvaluateFakeIPRules(rules []option.DNSRule, transportManager adapter.DNSTransportManager) error {
-	if transportManager == nil {
-		return nil
-	}
-	for i, rule := range rules {
-		if dnsRuleActionType(rule) != C.RuleActionTypeEvaluate {
-			continue
-		}
-		server := dnsRuleActionServer(rule)
-		if server == "" {
-			continue
-		}
-		transport, loaded := transportManager.Transport(server)
-		if !loaded || transport.Type() != C.DNSTypeFakeIP {
-			continue
-		}
-		return E.New("dns rule[", i, "]: evaluate action cannot use fakeip server: ", server)
 	}
 	return nil
 }

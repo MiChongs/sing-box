@@ -1995,68 +1995,6 @@ func TestInitializeRejectsDNSRuleStrategyWhenLegacyDNSModeIsDisabledByEvaluate(t
 	require.ErrorContains(t, err, "deprecated")
 }
 
-func TestInitializeRejectsEvaluateFakeIPServerInDefaultRule(t *testing.T) {
-	t.Parallel()
-
-	router := &Router{
-		ctx:                   context.Background(),
-		logger:                log.NewNOPFactory().NewLogger("dns"),
-		transport:             &fakeDNSTransportManager{transports: map[string]adapter.DNSTransport{"fake": &fakeDNSTransport{tag: "fake", transportType: C.DNSTypeFakeIP}}},
-		client:                &fakeDNSClient{},
-		rawRules:              make([]option.DNSRule, 0, 1),
-		defaultDomainStrategy: C.DomainStrategyAsIS,
-	}
-	err := router.Initialize([]option.DNSRule{{
-		Type: C.RuleTypeDefault,
-		DefaultOptions: option.DefaultDNSRule{
-			RawDefaultDNSRule: option.RawDefaultDNSRule{
-				Domain: badoption.Listable[string]{"example.com"},
-			},
-			DNSRuleAction: option.DNSRuleAction{
-				Action:       C.RuleActionTypeEvaluate,
-				RouteOptions: option.DNSRouteActionOptions{Server: "fake"},
-			},
-		},
-	}})
-	require.ErrorContains(t, err, "evaluate action cannot use fakeip server")
-	require.ErrorContains(t, err, "fake")
-}
-
-func TestInitializeRejectsEvaluateFakeIPServerInLogicalRule(t *testing.T) {
-	t.Parallel()
-
-	router := &Router{
-		ctx:                   context.Background(),
-		logger:                log.NewNOPFactory().NewLogger("dns"),
-		transport:             &fakeDNSTransportManager{transports: map[string]adapter.DNSTransport{"fake": &fakeDNSTransport{tag: "fake", transportType: C.DNSTypeFakeIP}}},
-		client:                &fakeDNSClient{},
-		rawRules:              make([]option.DNSRule, 0, 1),
-		defaultDomainStrategy: C.DomainStrategyAsIS,
-	}
-	err := router.Initialize([]option.DNSRule{{
-		Type: C.RuleTypeLogical,
-		LogicalOptions: option.LogicalDNSRule{
-			RawLogicalDNSRule: option.RawLogicalDNSRule{
-				Mode: C.LogicalTypeOr,
-				Rules: []option.DNSRule{{
-					Type: C.RuleTypeDefault,
-					DefaultOptions: option.DefaultDNSRule{
-						RawDefaultDNSRule: option.RawDefaultDNSRule{
-							Domain: badoption.Listable[string]{"example.com"},
-						},
-					},
-				}},
-			},
-			DNSRuleAction: option.DNSRuleAction{
-				Action:       C.RuleActionTypeEvaluate,
-				RouteOptions: option.DNSRouteActionOptions{Server: "fake"},
-			},
-		},
-	}})
-	require.ErrorContains(t, err, "evaluate action cannot use fakeip server")
-	require.ErrorContains(t, err, "fake")
-}
-
 func TestInitializeRejectsDNSRuleStrategyWhenLegacyDNSModeIsDisabledByMatchResponse(t *testing.T) {
 	t.Parallel()
 
