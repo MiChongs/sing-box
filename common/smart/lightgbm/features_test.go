@@ -105,10 +105,11 @@ func TestPredictWeightFallback(t *testing.T) {
 }
 
 func TestCollectorDefaultSize(t *testing.T) {
-	dc, err := NewDataCollector("/tmp/test_collector.csv", 0)
+	dc, err := NewDataCollector("/tmp/test_collector.csv", 0, nil)
 	if err != nil {
 		t.Fatalf("NewDataCollector: %v", err)
 	}
+	defer dc.Close()
 	if dc.sizeLimit != DefaultCollectorSizeMB*1024*1024 {
 		t.Errorf("default size limit mismatch: %d vs %d", dc.sizeLimit, DefaultCollectorSizeMB*1024*1024)
 	}

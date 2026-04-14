@@ -204,12 +204,12 @@ func (s *Service) initCollector() error {
 	}
 	path = filemanager.BasePath(s.ctx, path)
 
-	dc, err := lightgbm.NewDataCollector(path, opts.SizeLimitMB)
+	dc, err := lightgbm.NewDataCollector(path, opts.SizeLimitMB, s.logger)
 	if err != nil {
+		s.logger.Warn("smart collector: init failed: ", err)
 		return err
 	}
 	s.collector = dc
-	s.logger.Info("smart training data collector enabled at ", path)
 	return nil
 }
 

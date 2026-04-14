@@ -351,6 +351,37 @@ func (s *Smart) PostStart() error {
 		s.startTimedTask(t.name, t.initial, t.period, t.fn, t.once)
 	}
 
+	// Startup summary — single info line with all relevant flags.
+	snap := s.state.Load()
+	outboundCount := 0
+	if snap != nil {
+		outboundCount = len(snap.tags)
+	}
+	asnStatus := "off"
+	if s.useASN {
+		if s.asnDB != nil {
+			asnStatus = "on"
+		} else {
+			asnStatus = "on(no-db)"
+		}
+	}
+	mlStatus := "off"
+	if s.useLightGBM {
+		if s.weightModel != nil && s.weightModel.IsLoaded() {
+			mlStatus = "loaded"
+		} else {
+			mlStatus = "pending"
+		}
+	}
+	collectStatus := "off"
+	if s.dataCollector != nil {
+		collectStatus = "on(" + formatFloat(s.sampleRate, 2) + ")"
+	}
+	s.logger.Info("smart[", s.Tag(), "] started: ", outboundCount, " outbounds, ",
+		len(tasks), " background tasks, testURL=", s.testURL,
+		" interval=", s.interval, " asn=", asnStatus,
+		" ml=", mlStatus, " collect=", collectStatus)
+
 	s.started.Store(true)
 	return nil
 }
@@ -533,7 +564,11 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	}
 
 	isUDP := N.NetworkName(network) == N.NetworkUDP
-	selectedOutbounds, isUnwrap := s.selectProxies(meta, snap.outbounds, isUDP)
+	selectedOutbounds, isUnwrap, source := s.selectProxiesTraced(meta, snap.outbounds, isUDP)
+
+	s.logger.DebugContext(ctx, "smart[", s.Tag(), "] select via ", source,
+		": target=", meta.smartTarget, " asn=[", meta.asnCode,
+		"] candidates=", proxyTagsPreview(selectedOutbounds, 5))
 
 	if !isUnwrap && s.store != nil && meta.smartTarget != "" {
 		names := outboundNames(selectedOutbounds)
@@ -542,9 +577,14 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 
 	conn, proxyTag, connectTime, err := s.dialWithRetry(ctx, network, destination, selectedOutbounds, meta)
 	if err != nil {
+		s.logger.WarnContext(ctx, "smart[", s.Tag(), "] dial failed to ", destination,
+			" after retries: ", err)
 		return nil, err
 	}
 	s.setLastSelected(proxyTag)
+	s.logger.InfoContext(ctx, "smart[", s.Tag(), "] ", network, " → ", destination,
+		" via [", proxyTag, "] in ", connectTime, "ms (target=", meta.smartTarget,
+		" asn=[", meta.asnCode, "] source=", source, ")")
 
 	return s.wrapConn(conn, proxyTag, meta, connectTime, isUDP), nil
 }
@@ -565,7 +605,11 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		return nil, E.New("smart: no outbounds available")
 	}
 
-	selectedOutbounds, isUnwrap := s.selectProxies(meta, snap.outbounds, true)
+	selectedOutbounds, isUnwrap, source := s.selectProxiesTraced(meta, snap.outbounds, true)
+
+	s.logger.DebugContext(ctx, "smart[", s.Tag(), "] select via ", source,
+		" (UDP): target=", meta.smartTarget, " asn=[", meta.asnCode,
+		"] candidates=", proxyTagsPreview(selectedOutbounds, 5))
 
 	if !isUnwrap && s.store != nil && meta.smartTarget != "" {
 		names := outboundNames(selectedOutbounds)
@@ -589,37 +633,70 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 
 		if err == nil {
 			s.setLastSelected(ob.Tag())
+			s.logger.InfoContext(ctx, "smart[", s.Tag(), "] UDP → ", destination,
+				" via [", ob.Tag(), "] in ", connectTime, "ms (target=",
+				meta.smartTarget, " asn=[", meta.asnCode, "] source=", source, ")")
 			return s.wrapPacketConn(pc, ob.Tag(), meta, connectTime), nil
 		}
 		finalErr = err
+		s.logger.DebugContext(ctx, "smart[", s.Tag(), "] UDP probe [", ob.Tag(),
+			"] failed in ", connectTime, "ms: ", err)
 		go s.recordStats("failed", meta, ob.Tag(), connectTime, 0, 0, 0, 0, 0, 0)
 	}
 
 	return nil, finalErr
 }
 
-// selectProxies performs 3-tier lookup: unwrap → prefetch → GetBest.
-func (s *Smart) selectProxies(meta *smartDialMeta, all []adapter.Outbound, isUDP bool) ([]adapter.Outbound, bool) {
+// selectProxiesTraced performs the 3-tier selection and returns which tier
+// produced the result. Used for user-visible logging. Tier names:
+//   - "unwrap"   : hot cache of a recently-used node list for this target
+//   - "prefetch" : periodically pre-computed best-node list
+//   - "weight"   : realtime computation from the weight store
+//   - "fallback" : no history; random pick filtered by alive/blocked
+func (s *Smart) selectProxiesTraced(meta *smartDialMeta, all []adapter.Outbound, isUDP bool) ([]adapter.Outbound, bool, string) {
 	if s.store == nil || meta.smartTarget == "" {
-		return s.fillProxies(nil, nil, all, smartMaxSelected, isUDP, false), false
+		return s.fillProxies(nil, nil, all, smartMaxSelected, isUDP, false), false, "fallback"
 	}
 
 	// Tier 1: unwrap cache
 	if names := s.store.GetUnwrapResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP); len(names) > 0 {
-		return s.fillProxies(names, nil, all, smartMaxSelected, isUDP, true), true
+		return s.fillProxies(names, nil, all, smartMaxSelected, isUDP, true), true, "unwrap"
 	}
 
 	// Tier 2: prefetch cache
 	if names, weights := s.store.GetPrefetchResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP); len(names) > 0 {
-		return s.fillProxies(names, weights, all, smartMaxSelected, isUDP, false), false
+		return s.fillProxies(names, weights, all, smartMaxSelected, isUDP, false), false, "prefetch"
 	}
 
 	// Tier 3: real-time computation
 	if names, weights, err := s.store.GetBestProxyForTarget(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP); err == nil && len(names) > 0 {
-		return s.fillProxies(names, weights, all, smartMaxSelected, isUDP, false), false
+		return s.fillProxies(names, weights, all, smartMaxSelected, isUDP, false), false, "weight"
 	}
 
-	return s.fillProxies(nil, nil, all, smartMaxSelected, isUDP, false), false
+	return s.fillProxies(nil, nil, all, smartMaxSelected, isUDP, false), false, "fallback"
+}
+
+// proxyTagsPreview returns a comma-joined preview of up to `limit` tags,
+// with an ellipsis when there are more. Used purely for log output.
+func proxyTagsPreview(outbounds []adapter.Outbound, limit int) string {
+	if len(outbounds) == 0 {
+		return "[]"
+	}
+	n := len(outbounds)
+	if n > limit {
+		n = limit
+	}
+	tags := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		tags = append(tags, outbounds[i].Tag())
+	}
+	s := "[" + strings.Join(tags, ",")
+	if len(outbounds) > limit {
+		s += ",...+" + strconv.Itoa(len(outbounds)-limit) + "]"
+	} else {
+		s += "]"
+	}
+	return s
 }
 
 // fillProxies assembles the final candidate list with alive/blocked checks and fallback.
@@ -756,6 +833,8 @@ func (s *Smart) dialWithRetry(ctx context.Context, network string, dest M.Socksa
 			base := time.Duration(math.Pow(2, float64(i-1))) * 50 * time.Millisecond
 			jitter := 1.0 + (rand.Float64()*2-1)*0.2
 			delay := time.Duration(float64(base) * jitter)
+			s.logger.DebugContext(ctx, "smart[", s.Tag(), "] retry round ", i,
+				" after ", delay, " backoff")
 			select {
 			case <-time.After(delay):
 			case <-ctx.Done():
@@ -767,6 +846,9 @@ func (s *Smart) dialWithRetry(ctx context.Context, network string, dest M.Socksa
 		if len(batch) == 0 {
 			break
 		}
+
+		s.logger.DebugContext(ctx, "smart[", s.Tag(), "] round ", i, " batch=",
+			proxyTagsPreview(batch, 5), " timeout=", timeout)
 
 		ctxDial, cancel := context.WithTimeout(ctx, timeout)
 		conn, proxyTag, connectTime, err := s.parallelDial(ctxDial, network, dest, batch, meta)
@@ -1152,7 +1234,34 @@ func (s *Smart) recordStats(
 		})
 	}
 
-	s.logger.Debug("smart: [", status, "] group=[", s.Tag(), "] node=[", proxyTag, "] target=[", target, "] weight=[", finalWeight, "]")
+	// Verbose per-event log — includes enough context to reconstruct node
+	// quality trajectory without querying the store. Debug level to avoid
+	// noise on info by default.
+	algo := "traditional"
+	if mlPredicted {
+		algo = "lightgbm"
+	}
+	degradedTag := ""
+	if isDegraded {
+		degradedTag = " DEGRADED"
+	}
+	blockedTag := ""
+	if hostBlocked {
+		blockedTag = " HOST_BLOCKED"
+	}
+	s.logger.Debug("smart[", s.Tag(), "] [", status, algo, degradedTag, blockedTag,
+		"] node=[", proxyTag, "] target=[", target, "] asn=[", meta.asnCode,
+		"] weight=", formatFloat(finalWeight, 4), " (was ", formatFloat(oldWeight, 4),
+		") S/F=", input.Success, "/", input.Failure,
+		" connect=", input.ConnectTime, "ms latency=", input.Latency,
+		"ms up=", formatFloat(uploadMB, 3), "MB down=", formatFloat(downloadMB, 3),
+		"MB dur=", durationMS, "ms prio=", formatFloat(priorityFactor, 2),
+		" hostFails=", hostFailCount)
+}
+
+// formatFloat renders a float with fixed precision for log output.
+func formatFloat(v float64, prec int) string {
+	return strconv.FormatFloat(v, 'f', prec, 64)
 }
 
 func (s *Smart) checkNodeQualityDegradation(
@@ -1305,11 +1414,33 @@ func (s *Smart) updateNodeRanking() {
 		return
 	}
 
+	start := time.Now()
 	tags := snap.tags
-	_, err := s.store.GetNodeWeightRanking(s.Tag(), smartConfigName, s.testURL, s.isAlive, tags)
+	ranking, err := s.store.GetNodeWeightRanking(s.Tag(), smartConfigName, s.testURL, s.isAlive, tags)
 	if err != nil {
-		s.logger.Debug("smart: ranking update: ", err)
+		s.logger.Debug("smart[", s.Tag(), "] ranking update failed: ", err)
+		return
 	}
+	most, occ, rare := 0, 0, 0
+	var topName string
+	var topWeight float64
+	for i, r := range ranking {
+		switch r.Rank {
+		case smart.RankMostUsed:
+			most++
+		case smart.RankOccasional:
+			occ++
+		case smart.RankRarelyUsed:
+			rare++
+		}
+		if i == 0 {
+			topName = r.Name
+			topWeight = r.Weight
+		}
+	}
+	s.logger.Info("smart[", s.Tag(), "] ranking updated in ", time.Since(start).Round(time.Millisecond),
+		": ", len(ranking), " nodes (most=", most, " occasional=", occ, " rarely=", rare,
+		") top=[", topName, "] weight=", formatFloat(topWeight, 2))
 }
 
 func (s *Smart) runPrefetch() {
@@ -1320,14 +1451,20 @@ func (s *Smart) runPrefetch() {
 	if snap == nil {
 		return
 	}
+	start := time.Now()
 	proxyMap := make(map[string]string, len(snap.outbounds))
+	alive, skipped := 0, 0
 	for _, ob := range snap.outbounds {
 		if s.isAlive(ob.Tag()) {
 			proxyMap[ob.Tag()] = ob.Tag()
+			alive++
+		} else {
+			skipped++
 		}
 	}
 	count := s.store.RunPrefetch(s.Tag(), smartConfigName, proxyMap)
-	s.logger.Debug("smart: prefetch completed for ", s.Tag(), " targets=", count)
+	s.logger.Info("smart[", s.Tag(), "] prefetch completed in ", time.Since(start).Round(time.Millisecond),
+		": ", count, " targets pre-computed (alive=", alive, " skipped=", skipped, ")")
 }
 
 func (s *Smart) checkAndRecoverDegradedNodes() {
@@ -1341,6 +1478,7 @@ func (s *Smart) checkAndRecoverDegradedNodes() {
 
 	var ops []smart.StoreOperation
 	now := time.Now().Unix()
+	unblocked, recovered, stillDegraded := 0, 0, 0
 
 	for nodeName, data := range stateData {
 		var state smart.NodeState
@@ -1352,7 +1490,9 @@ func (s *Smart) checkAndRecoverDegradedNodes() {
 		if state.BlockedUntil > 0 && state.BlockedUntil <= now {
 			state.BlockedUntil = 0
 			updated = true
-			s.logger.Debug("smart: unblocked node [", nodeName, "]")
+			unblocked++
+			s.logger.Info("smart[", s.Tag(), "] unblocked node [", nodeName,
+				"] (cooldown ended)")
 		}
 
 		if state.Degraded && state.BlockedUntil == 0 {
@@ -1361,8 +1501,11 @@ func (s *Smart) checkAndRecoverDegradedNodes() {
 			if recoveryFactor >= 0.99 {
 				state.Degraded = false
 				state.DegradedFactor = 1.0
+				recovered++
+				s.logger.Info("smart[", s.Tag(), "] node [", nodeName, "] fully recovered")
 			} else {
 				state.DegradedFactor = recoveryFactor
+				stillDegraded++
 			}
 			updated = true
 		}
@@ -1382,12 +1525,17 @@ func (s *Smart) checkAndRecoverDegradedNodes() {
 
 	if len(ops) > 0 {
 		s.store.AppendToGlobalQueue(ops...)
+		s.logger.Debug("smart[", s.Tag(), "] recovery check: unblocked=", unblocked,
+			" recovered=", recovered, " still_degraded=", stillDegraded)
 	}
 }
 
 func (s *Smart) cleanupOldRecords() {
 	if s.store != nil {
+		start := time.Now()
 		_ = s.store.CleanupOldRecords(s.Tag(), smartConfigName)
+		s.logger.Debug("smart[", s.Tag(), "] old-records cleanup in ",
+			time.Since(start).Round(time.Millisecond))
 	}
 }
 
@@ -1418,11 +1566,30 @@ func (s *Smart) cleanupOrphanedNodeCache() {
 	}
 
 	if len(orphaned) > 0 {
-		s.logger.Debug("smart: cleaning ", len(orphaned), " orphaned nodes for [", s.Tag(), "]")
+		s.logger.Info("smart[", s.Tag(), "] cleaning ", len(orphaned),
+			" orphaned node record(s): ", proxyTagsPreviewStrings(orphaned, 5))
 		if err := s.store.RemoveNodesData(s.Tag(), smartConfigName, orphaned); err != nil {
-			s.logger.Warn("smart: failed to clean orphaned nodes: ", err)
+			s.logger.Warn("smart[", s.Tag(), "] failed to clean orphaned nodes: ", err)
 		}
 	}
+}
+
+// proxyTagsPreviewStrings is a variant of proxyTagsPreview that takes raw tag strings.
+func proxyTagsPreviewStrings(tags []string, limit int) string {
+	if len(tags) == 0 {
+		return "[]"
+	}
+	n := len(tags)
+	if n > limit {
+		n = limit
+	}
+	out := "[" + strings.Join(tags[:n], ",")
+	if len(tags) > limit {
+		out += ",...+" + strconv.Itoa(len(tags)-limit) + "]"
+	} else {
+		out += "]"
+	}
+	return out
 }
 
 func (s *Smart) flushQueue() {
