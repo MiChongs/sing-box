@@ -125,6 +125,23 @@ type Smart struct {
 	dialFailAt    atomic.Int64
 	recheckOnce   atomic.Bool
 
+	// knownDead records nodes that failed their most recent probe. It
+	// disambiguates "untested" (history=nil → assume alive during bootstrap)
+	// from "tested and failed" (must-not-select until next success). The
+	// previous implementation called DeleteURLTestHistory on failure, which
+	// isAlive then saw as nil and treated as alive — the node never got
+	// removed from selection even when permanently broken.
+	//
+	// Entries expire after knownDeadTTL so a recovered node isn't
+	// permanently blackholed if the test URL was only briefly unreachable.
+	knownDeadMu sync.RWMutex
+	knownDead   map[string]time.Time
+
+	// countryDBRetryAt throttles re-opening country.mmdb when the GeoX
+	// download finishes after PostStart (first open was a no-op because
+	// the file didn't exist yet).
+	countryDBRetryAt atomic.Int64
+
 	// provider support
 	provider         adapter.ProviderManager
 	providers        map[string]adapter.Provider
@@ -761,6 +778,21 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	isUDP := N.NetworkName(network) == N.NetworkUDP
 	selectedOutbounds, isUnwrap, source := s.selectProxiesTraced(meta, snap.outbounds, isUDP)
 
+	// If everyone in the candidate list is dead, selectProxiesTraced will
+	// have already fallen through to a fallback tier via fillProxies. But if
+	// the unwrap cache returned a single dead node that survived isAlive
+	// (e.g. the health-check goroutine hasn't run yet), proactively drop
+	// the unwrap cache and re-select fresh.
+	if isUnwrap && len(selectedOutbounds) == 1 && !s.isAlive(selectedOutbounds[0].Tag()) {
+		if s.store != nil {
+			s.store.DeleteUnwrapResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP)
+		}
+		s.logger.DebugContext(ctx, "smart[", s.Tag(),
+			"] unwrap cache hit on dead node [", selectedOutbounds[0].Tag(),
+			"]; re-selecting")
+		selectedOutbounds, isUnwrap, source = s.selectProxiesTraced(meta, snap.outbounds, isUDP)
+	}
+
 	s.logger.DebugContext(ctx, "smart[", s.Tag(), "] select via ", source,
 		": target=", meta.smartTarget, " asn=[", meta.asnCode,
 		"] candidates=", proxyTagsPreview(selectedOutbounds, 5))
@@ -777,6 +809,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		return nil, err
 	}
 	s.setLastSelected(proxyTag)
+	s.markAlive(proxyTag) // successful dial = confirmed alive; clears knownDead
 	s.logger.InfoContext(ctx, "smart[", s.Tag(), "] ", network, " → ", destination,
 		" via [", proxyTag, "] in ", connectTime, "ms (target=", meta.smartTarget,
 		" asn=[", meta.asnCode, "] source=", source, ")")
@@ -828,12 +861,14 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 
 		if err == nil {
 			s.setLastSelected(ob.Tag())
+			s.markAlive(ob.Tag())
 			s.logger.InfoContext(ctx, "smart[", s.Tag(), "] UDP → ", destination,
 				" via [", ob.Tag(), "] in ", connectTime, "ms (target=",
 				meta.smartTarget, " asn=[", meta.asnCode, "] source=", source, ")")
 			return s.wrapPacketConn(pc, ob.Tag(), meta, connectTime), nil
 		}
 		finalErr = err
+		s.markDead(ob.Tag())
 		s.logger.DebugContext(ctx, "smart[", s.Tag(), "] UDP probe [", ob.Tag(),
 			"] failed in ", connectTime, "ms: ", err)
 		go s.recordStats("failed", meta, ob.Tag(), connectTime, 0, 0, 0, 0, 0, 0)
@@ -1151,6 +1186,7 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 		// Only record non-cancelled failures — losing race arms get cancelled
 		// via raceCtx after the winner returns, and that's not a real failure.
 		if r.err != context.Canceled && !errors.Is(r.err, context.Canceled) {
+			s.markDead(r.tag)
 			go s.recordFailedDial(r.tag, meta, r.connectTime)
 		}
 	}
@@ -1990,7 +2026,11 @@ func (s *Smart) runHealthCheck() {
 			probeCancel()
 
 			if err != nil || delay == 0 {
+				// Record both the URLTest-null and our own known-dead set so
+				// isAlive has a durable signal. Purely deleting history made
+				// failed nodes look "untested → alive" to downstream callers.
 				s.history.DeleteURLTestHistory(tag)
+				s.markDead(tag)
 				dead.Add(1)
 				return
 			}
@@ -1998,6 +2038,7 @@ func (s *Smart) runHealthCheck() {
 				Time:  time.Now(),
 				Delay: delay,
 			})
+			s.markAlive(tag)
 			alive.Add(1)
 		}()
 	}
@@ -2250,15 +2291,69 @@ func (s *Smart) adjustCache() {
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 
+// knownDeadTTL is the window during which a recently-failed node stays
+// in knownDead. After this elapses, isAlive starts trusting URLTestHistory
+// again — giving the node another chance in case the test URL was briefly
+// unreachable rather than the node itself being broken.
+const knownDeadTTL = 3 * time.Minute
+
+// isAlive returns false iff we have evidence the node is unreachable.
+// Evidence comes from two sources:
+//  1. knownDead — populated by runHealthCheck on probe failure; authoritative
+//     within knownDeadTTL of the last failure.
+//  2. URLTestHistoryStorage — populated by our probe OR by a co-located URLTest
+//     group. An entry with Delay=0 is also treated as dead.
+//
+// When neither source has data (fresh boot), assume alive so the group can
+// bootstrap.
 func (s *Smart) isAlive(tag string) bool {
+	// Source 1: known-dead set
+	s.knownDeadMu.RLock()
+	deadAt, isDead := s.knownDead[tag]
+	s.knownDeadMu.RUnlock()
+	if isDead {
+		if time.Since(deadAt) < knownDeadTTL {
+			return false
+		}
+		// TTL expired — fall through to source 2
+	}
+
 	if s.history == nil {
 		return true
 	}
 	h := s.history.LoadURLTestHistory(tag)
 	if h == nil {
-		return true // no data = assume alive
+		return true // no data = assume alive (bootstrap)
 	}
-	return time.Since(h.Time) < s.interval*2
+	// A Delay of 0 indicates a tested-and-failed entry (URLTest group
+	// occasionally writes these). Treat as dead.
+	if h.Delay == 0 {
+		return false
+	}
+	return time.Since(h.Time) < s.interval*3
+}
+
+// markDead records a probe / dial failure for tag.
+func (s *Smart) markDead(tag string) {
+	if tag == "" {
+		return
+	}
+	s.knownDeadMu.Lock()
+	if s.knownDead == nil {
+		s.knownDead = make(map[string]time.Time)
+	}
+	s.knownDead[tag] = time.Now()
+	s.knownDeadMu.Unlock()
+}
+
+// markAlive clears tag from knownDead. Called on successful probe or dial.
+func (s *Smart) markAlive(tag string) {
+	if tag == "" {
+		return
+	}
+	s.knownDeadMu.Lock()
+	delete(s.knownDead, tag)
+	s.knownDeadMu.Unlock()
 }
 
 func (s *Smart) supportsUDP(ob adapter.Outbound) bool {
@@ -2314,9 +2409,16 @@ func (s *Smart) lookupASN(ips []netip.Addr) string {
 // country mmdb for the first valid non-private destination IP, or nil.
 // Format matches mihomo's ModelInput.DestGeoIP ([]string); LightGBM
 // extractGeoIPFeature + FNV hash bucket consume it.
+//
+// Lazy-retry: if countryDB is nil, attempt to re-open via the GeoX service
+// at most once per 60s. This handles the common case where Smart started
+// before GeoX finished downloading country.mmdb.
 func (s *Smart) lookupCountry(ips []netip.Addr) []string {
 	if s.countryDB == nil {
-		return nil
+		s.maybeOpenCountryDB()
+		if s.countryDB == nil {
+			return nil
+		}
 	}
 	for _, ip := range ips {
 		if !ip.IsValid() || ip.IsPrivate() || ip.IsLoopback() {
@@ -2332,6 +2434,39 @@ func (s *Smart) lookupCountry(ips []netip.Addr) []string {
 		}
 	}
 	return nil
+}
+
+// maybeOpenCountryDB attempts to open the GeoX country mmdb if we don't
+// already have a reader. Rate-limited to once per 60 seconds to avoid
+// hammering Stat() on a path that doesn't exist yet.
+func (s *Smart) maybeOpenCountryDB() {
+	if s.countryDB != nil {
+		return
+	}
+	now := time.Now().Unix()
+	last := s.countryDBRetryAt.Load()
+	if now-last < 60 {
+		return
+	}
+	if !s.countryDBRetryAt.CompareAndSwap(last, now) {
+		return // another goroutine raced us
+	}
+
+	geoSvc := service.FromContext[adapter.GeoXService](s.ctx)
+	if geoSvc == nil {
+		return
+	}
+	mmdbPath := geoSvc.MMDBPath()
+	if mmdbPath == "" {
+		return
+	}
+	db, err := maxminddb.Open(mmdbPath)
+	if err != nil {
+		return // file still not present; try again next time
+	}
+	s.countryDB = db
+	s.logger.Info("smart[", s.Tag(), "] country mmdb lazily opened from ",
+		mmdbPath, " (feeds DestGeoIP feature)")
 }
 
 func (s *Smart) onProviderUpdated(tag string) error {
