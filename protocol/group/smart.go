@@ -169,6 +169,10 @@ type Smart struct {
 
 	started atomic.Bool
 
+	// coldStartLogged guards the once-per-process "no ranking data yet" log
+	// so we don't re-spam it every tick while the pipeline warms up.
+	coldStartLogged atomic.Bool
+
 	// Most recently selected (successfully dialed) node tag. Surfaced via
 	// Now() for ClashAPI / UI display. Updated on every successful dial
 	// from both DialContext and ListenPacket paths.
@@ -428,8 +432,12 @@ func (s *Smart) PostStart() error {
 		// selectFullScan ranking and fillProxies actually see dead nodes.
 		// Without this a standalone Smart group treats every node as alive.
 		{"health-check", 10 * time.Second, s.interval, s.runHealthCheck, false},
-		{"nodes-ranking", 1 * time.Minute, 5 * time.Minute, s.updateNodeRanking, false},
-		{"prefetch", 5 * time.Minute, 10 * time.Minute, s.runPrefetch, false},
+		// Warm the pipeline fast so /proxies/<tag>/weights returns non-empty
+		// within a minute of first traffic. Prefetch runs first (30 s) so the
+		// ranking tick (45 s) has per-target aggregates to score against; the
+		// live-stats fallback in WeightRanking covers the earliest window.
+		{"nodes-ranking", 45 * time.Second, 1 * time.Minute, s.updateNodeRanking, false},
+		{"prefetch", 30 * time.Second, 2 * time.Minute, s.runPrefetch, false},
 		{"recovery-check", 5 * time.Minute, 5 * time.Minute, s.checkAndRecoverDegradedNodes, false},
 		{"cleanup-old", 10 * time.Minute, 120 * time.Minute, s.cleanupOldRecords, false},
 		{"cleanup-orphan", 10 * time.Minute, 10 * time.Minute, s.cleanupOrphanedNodeCache, false},
@@ -601,45 +609,76 @@ func (s *Smart) Selected() string { return s.getManualSelected() }
 // need to address the Smart store per-config.
 func (s *Smart) ConfigName() string { return smartConfigName }
 
-// WeightRanking returns the cached ranked node list (sorted by weight) for
-// this group, used by `GET /proxies/<tag>/weights`. Returns a non-nil empty
-// slice when no ranking has been computed yet; never returns nil.
-// When forceRefresh is true, the ranking is recomputed synchronously before
-// returning — useful for an explicit recompute button in the UI.
+// WeightRanking returns the ranked node list (sorted by weight) for this
+// group, used by `GET /proxies/<tag>/weights`. Three-layer resolution:
+//
+//  1. forceRefresh=true → recompute from prefetch (authoritative).
+//  2. Cached ranking from the store (fast path; populated every ~1 min).
+//  3. Live fallback from raw stats (covers cold-start + empty-prefetch cases
+//     so the API returns data as soon as the first connection closes, not
+//     only after the 5-min prefetch cycle — mihomo parity).
+//
+// Returns a non-nil empty slice when no data exists anywhere; never returns nil.
 func (s *Smart) WeightRanking(forceRefresh bool) ([]smart.NodeRank, error) {
 	if s.store == nil {
 		return []smart.NodeRank{}, nil
 	}
+	snap := s.state.Load()
+	if snap == nil || len(snap.tags) == 0 {
+		return []smart.NodeRank{}, nil
+	}
 	if forceRefresh {
-		snap := s.state.Load()
-		if snap == nil || len(snap.tags) == 0 {
-			return []smart.NodeRank{}, nil
-		}
 		ranking, err := s.store.GetNodeWeightRanking(s.Tag(), smartConfigName, s.testURL, s.isAlive, snap.tags)
 		if err != nil {
 			return []smart.NodeRank{}, err
 		}
-		if ranking == nil {
-			return []smart.NodeRank{}, nil
+		if len(ranking) > 0 {
+			return ranking, nil
 		}
-		return ranking, nil
+		// Authoritative recompute came up empty — fall through to live.
+	} else if cached, err := s.store.GetNodeWeightRankingCache(s.Tag(), smartConfigName); err == nil && len(cached) > 0 {
+		return cached, nil
 	}
-	ranking, err := s.store.GetNodeWeightRankingCache(s.Tag(), smartConfigName)
-	if err != nil {
-		return []smart.NodeRank{}, err
+	if live := s.store.GetLiveNodeRanking(s.Tag(), smartConfigName, s.isAlive, snap.tags); len(live) > 0 {
+		return live, nil
 	}
-	if ranking == nil {
-		return []smart.NodeRank{}, nil
-	}
-	return ranking, nil
+	return []smart.NodeRank{}, nil
 }
 
-// FlushStore wipes all Smart persistent data for this specific group.
-func (s *Smart) FlushStore() error {
+// FlushStore wipes all Smart persistent data for this specific group AND
+// resets every piece of in-process runtime state that could otherwise
+// make a flushed group still "feel" populated: manual pin, cold-start
+// log latch, knownDead map, short-life counters, and the last-selected
+// tag. Without this, /proxies/<tag>/weights would go empty-then-reappear
+// because live stats from existing connections keep feeding in, and the
+// operator would see "the flush didn't work".
+//
+// Returns flush statistics (deleted key counts per bucket) so operators
+// hitting /cache/smart/flush/{name} can verify the operation was effective.
+func (s *Smart) FlushStore() (smart.FlushStats, error) {
 	if s.store == nil {
-		return nil
+		return smart.FlushStats{}, nil
 	}
+	// In-process runtime reset
 	s.manualSelected.Store("")
+	s.lastSelectedTag.Store("")
+	s.coldStartLogged.Store(false)
+
+	s.knownDeadMu.Lock()
+	s.knownDead = make(map[string]time.Time)
+	s.knownDeadMu.Unlock()
+
+	s.shortLifeMu.Lock()
+	s.shortLife = make(map[string][]time.Time)
+	s.shortLifeMu.Unlock()
+
+	// Drop per-target registry so a subsequent mass-close doesn't chase
+	// pointers to conns that were relevant only to the pre-flush state.
+	s.targetConnsMu.Lock()
+	s.targetConns = make(map[string]map[*smartTrackedConn]struct{})
+	s.targetConnsMu.Unlock()
+
+	smart.ClearBlockedNodesCache(s.Tag(), smartConfigName)
 	return s.store.FlushByGroup(s.Tag(), smartConfigName)
 }
 
@@ -647,42 +686,20 @@ func (s *Smart) FlushStore() error {
 // Returns nil if the cache file was not configured.
 func (s *Smart) SmartStore() *smart.Store { return s.store }
 
-// NotifyUserDisconnect records an unambiguous user-initiated disconnect
-// against (target, node). The Clash API connection-close handlers call
-// this so manual "close connection" clicks / API DELETEs participate in
-// the same short-life → markDead escalation path as in-process
-// smartTrackedConn.Close. Without this, disconnects routed exclusively
-// through the API bypassed the detection logic.
-//
-// target may be empty (derived from tracker metadata) — in that case we
-// still drop any unwrap cache that references the node across all
-// targets, so the next dial re-evaluates candidates.
-func (s *Smart) NotifyUserDisconnect(target, node string, isUDP bool, asnCode string) {
-	if node == "" {
+// RecomputeWeights kicks off an async refresh of the group's ranking pipeline:
+// runPrefetch (aggregates per-target history) followed by updateNodeRanking
+// (derives the overall node ranking from prefetch output). Used right after
+// a flush so /proxies/<tag>/weights reflects post-flush state within seconds
+// instead of waiting for the next scheduled tick. Safe to call concurrently;
+// the background task loop tolerates overlapping invocations.
+func (s *Smart) RecomputeWeights() {
+	if s.store == nil {
 		return
 	}
-	if target == "" {
-		// Best-effort: we don't know which target to blame, so at minimum
-		// ensure the node re-enters short-life aggregation via a synthetic
-		// key. Uses node tag as the sole key so repeated API closes on the
-		// same node still accumulate.
-		target = "__clashapi__"
-	}
-	if s.recordShortLife(target, node) {
-		s.markDead(node)
-		if s.store != nil && target != "__clashapi__" {
-			s.store.DeleteUnwrapResult(s.Tag(), smartConfigName, target, asnCode, isUDP)
-		}
-		s.logger.Info("smart[", s.Tag(), "] node [", node,
-			"] marked dead after ", shortLifeThreshold,
-			" user-initiated disconnects (target=", target, ")")
-		return
-	}
-	// Below threshold: still clear unwrap for this target so the next dial
-	// re-selects rather than pinning back to the same node.
-	if s.store != nil && target != "__clashapi__" {
-		s.store.DeleteUnwrapResult(s.Tag(), smartConfigName, target, asnCode, isUDP)
-	}
+	go func() {
+		s.runPrefetch()
+		s.updateNodeRanking()
+	}()
 }
 
 // DefaultBlockDuration applied by MarkBlocked when caller doesn't specify one.
@@ -2254,7 +2271,7 @@ func (s *Smart) cleanupOrphanedGroups() {
 		return
 	}
 	for _, g := range orphaned {
-		if err := s.store.FlushByGroup(g, smartConfigName); err != nil {
+		if _, err := s.store.FlushByGroup(g, smartConfigName); err != nil {
 			s.logger.Warn("smart: orphan-groups cleanup failed for [", g, "]: ", err)
 			continue
 		}
@@ -2315,16 +2332,17 @@ func (s *Smart) updateNodeRanking() {
 		return
 	}
 
-	// Empty ranking during cold-start is EXPECTED behaviour (mihomo parity):
-	// GetNodeWeightRanking derives scores from prefetch-aggregated history,
-	// which is empty until the "prefetch" task has fired at least once (5+
-	// minutes after PostStart). Do NOT synthesize a fake ranking from
-	// URLTest delays — that conflates two orthogonal signals and would
-	// persist bogus weights into the store that future real data has to
-	// fight against.
+	// Empty ranking during cold-start is EXPECTED (mihomo parity): the
+	// prefetch chain needs per-target history, which accumulates only as
+	// traffic flows. WeightRanking() handles the API surface with a live
+	// stats-based fallback, so this path just skips the persisted ranking
+	// write until we have real aggregated data. Log once per process so
+	// operators see the state without spam.
 	if len(ranking) == 0 {
-		s.logger.Debug("smart[", s.Tag(),
-			"] not enough data to generate node ranking yet (prefetch has not accumulated target history)")
+		if s.coldStartLogged.CompareAndSwap(false, true) {
+			s.logger.Debug("smart[", s.Tag(),
+				"] no prefetch-derived ranking yet; /weights serving live stats fallback until the first prefetch cycle completes")
+		}
 		return
 	}
 	most, occ, rare := 0, 0, 0

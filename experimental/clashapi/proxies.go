@@ -33,6 +33,11 @@ func proxyRouter(server *Server, router adapter.Router) http.Handler {
 		// Smart-specific: per-group weight ranking (mihomo parity).
 		// `?refresh=true` recomputes synchronously instead of returning cache.
 		r.Get("/weights", getSmartGroupWeights)
+		// DELETE drops the group's persisted Smart data (stats, node states,
+		// rankings, prefetch, host-failure counters). Equivalent to
+		// POST /cache/smart/flush/{name} but exposed on the proxy resource
+		// so UI "clear weights" buttons can use the natural REST verb.
+		r.Delete("/weights", deleteSmartGroupWeights)
 	})
 	return r
 }
@@ -68,6 +73,38 @@ func getSmartGroupWeights(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	render.JSON(w, r, render.M{"weights": weights})
+}
+
+// deleteSmartGroupWeights clears the Smart group's persisted weight / ranking /
+// prefetch / node-state data and kicks off an immediate async recompute. The
+// response reports per-bucket deletion counts so UIs can surface "N keys
+// cleared" instead of a bare 204 that leaves operators wondering whether
+// anything happened.
+func deleteSmartGroupWeights(w http.ResponseWriter, r *http.Request) {
+	proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
+	sg, ok := proxy.(*group.Smart)
+	if !ok {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, render.M{"error": "not a Smart group"})
+		return
+	}
+	stats, err := sg.FlushStore()
+	if err != nil {
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, render.M{
+			"group":   sg.Tag(),
+			"deleted": stats,
+			"error":   err.Error(),
+		})
+		return
+	}
+	sg.RecomputeWeights()
+	render.JSON(w, r, render.M{
+		"group":      sg.Tag(),
+		"deleted":    stats,
+		"total":      stats.Total(),
+		"recomputed": true,
+	})
 }
 
 func parseProxyName(next http.Handler) http.Handler {

@@ -1014,6 +1014,128 @@ func (s *Store) UpdateHostStatus(group, config, host string, failure, needLastUs
 	})
 }
 
+// GetLiveNodeRanking aggregates NODE-level weights directly from raw stats —
+// bypassing the prefetch→ranking pipeline that takes minutes to warm up on a
+// fresh config. Sums each node's per-target WeightTypeTCP + WeightTypeUDP
+// scores, then normalises to percentages and assigns rank categories.
+//
+// Used as a fallback in WeightRanking when the precomputed ranking cache is
+// empty — mihomo-style "live weights" behaviour so /proxies/<tag>/weights
+// returns data the moment the first connection stats land in bbolt, without
+// waiting for the (intentionally slow) prefetch cycle.
+func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string) bool, allTags []string) []NodeRank {
+	if len(allTags) == 0 {
+		return nil
+	}
+	allStats, err := s.GetAllStats(group, config)
+	if err != nil || len(allStats) == 0 {
+		return nil
+	}
+
+	nodeScores := make(map[string]float64, len(allTags))
+	nodeLastUsed := make(map[string]int64, len(allTags))
+	for _, nodeStats := range allStats {
+		for nodeName, data := range nodeStats {
+			if !contains(allTags, nodeName) {
+				continue
+			}
+			var record StatsRecord
+			if json.Unmarshal(data, &record) != nil || record.Weights == nil {
+				continue
+			}
+			tcp := record.Weights[WeightTypeTCP]
+			udp := record.Weights[WeightTypeUDP]
+			w := tcp + udp
+			if w <= 0 {
+				continue
+			}
+			nodeScores[nodeName] += w
+			if record.LastUsed > nodeLastUsed[nodeName] {
+				nodeLastUsed[nodeName] = record.LastUsed
+			}
+		}
+	}
+
+	maxScore := 0.0
+	for _, w := range nodeScores {
+		if w > maxScore {
+			maxScore = w
+		}
+	}
+	if maxScore == 0 {
+		return nil
+	}
+
+	now := time.Now().Unix()
+	result := make([]NodeRank, 0, len(allTags))
+	for _, tag := range allTags {
+		w := nodeScores[tag]
+		pct := math.Round(w/maxScore*100*100) / 100
+		result = append(result, NodeRank{
+			Name:        tag,
+			Weight:      pct,
+			LastUpdated: now,
+		})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		ai := isAlive(result[i].Name)
+		aj := isAlive(result[j].Name)
+		if ai != aj {
+			return ai
+		}
+		return result[i].Weight > result[j].Weight
+	})
+
+	aliveCount := 0
+	for _, r := range result {
+		if isAlive(r.Name) {
+			aliveCount++
+		}
+	}
+	if aliveCount > 0 {
+		result[0].Rank = RankMostUsed
+		if aliveCount == 2 {
+			if result[1].Weight > 0 {
+				result[1].Rank = RankOccasional
+			} else {
+				result[1].Rank = RankRarelyUsed
+			}
+		} else if aliveCount >= 3 {
+			mostUsedBound := int(float64(aliveCount) * 0.2)
+			if mostUsedBound < 1 {
+				mostUsedBound = 1
+			}
+			occasionalBound := mostUsedBound + int(float64(aliveCount)*0.5)
+			for i := 1; i < mostUsedBound && i < aliveCount; i++ {
+				if result[i].Weight > 0 {
+					result[i].Rank = RankMostUsed
+				} else {
+					result[i].Rank = RankRarelyUsed
+				}
+			}
+			for i := mostUsedBound; i < occasionalBound && i < aliveCount; i++ {
+				if result[i].Weight > 0 {
+					result[i].Rank = RankOccasional
+				} else {
+					result[i].Rank = RankRarelyUsed
+				}
+			}
+			for i := occasionalBound; i < aliveCount; i++ {
+				result[i].Rank = RankRarelyUsed
+			}
+		}
+		for i := 0; i < aliveCount; i++ {
+			if result[i].Rank == "" {
+				result[i].Rank = RankRarelyUsed
+			}
+		}
+	}
+	for i := aliveCount; i < len(result); i++ {
+		result[i].Rank = RankRarelyUsed
+	}
+	return result
+}
+
 // GetNodeWeightRankingCache returns cached ranking without recomputing.
 func (s *Store) GetNodeWeightRankingCache(group, config string) ([]NodeRank, error) {
 	pathPrefix := FormatDBKey(KeyTypeRanking, config, group)
@@ -1748,8 +1870,32 @@ func getSystemMemoryUsage() float64 {
 	return 0.5
 }
 
-// FlushByLevel clears queue and DB data at the given level.
-func (s *Store) FlushByLevel(level, config, group string) error {
+// FlushStats holds per-key-type deletion counts returned by FlushByLevel.
+// Zero values mean "nothing matched" — NOT "skipped". Callers surface this
+// to operators so `POST /cache/smart/flush/{name}` is visibly effective.
+type FlushStats struct {
+	Stats    int `json:"stats"`
+	Nodes    int `json:"nodes"`
+	Ranking  int `json:"ranking"`
+	Prefetch int `json:"prefetch"`
+	Failures int `json:"failures"`
+	Queue    int `json:"queue"`
+}
+
+// Total sums every deletion bucket — convenient for "nothing happened" checks.
+func (f FlushStats) Total() int {
+	return f.Stats + f.Nodes + f.Ranking + f.Prefetch + f.Failures + f.Queue
+}
+
+// FlushByLevel clears queue and DB data at the given level and returns the
+// per-bucket deletion counts + the first error (if any). Previous versions
+// silently swallowed errors via `_ = ...` which masked failures in logs.
+// Group-level deletes now use strict=true so "HK" doesn't accidentally
+// purge "HK-Backup" (prefix-collision bug with non-strict matching).
+func (s *Store) FlushByLevel(level, config, group string) (FlushStats, error) {
+	var stats FlushStats
+	stats.Queue = snapshotQueueDepth(level, config, group)
+
 	switch level {
 	case "all":
 		globalQueueMu.Lock()
@@ -1761,35 +1907,133 @@ func (s *Store) FlushByLevel(level, config, group string) error {
 		filterQueueByGroup(group, config)
 	}
 
-	// Clear in-memory caches
+	// Clear in-memory caches (process-wide — cheap to rebuild lazily).
 	targetCache.Clear()
 	unwrapCache.Clear()
 	recordCache.Clear()
 	dbResultCache.Clear()
 	blockedNodesCache.Clear()
 
+	var firstErr error
+	deletePrefix := func(prefix string, strict bool) int {
+		n, err := s.dbDeletePrefixCount(prefix, strict)
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+		return n
+	}
 	switch level {
 	case "all":
-		return s.DBBatchDeletePrefix("smart", false)
+		stats.Stats = deletePrefix(FormatDBKey(KeyTypeStats), false)
+		stats.Nodes = deletePrefix(FormatDBKey(KeyTypeNode), false)
+		stats.Ranking = deletePrefix(FormatDBKey(KeyTypeRanking), false)
+		stats.Prefetch = deletePrefix(FormatDBKey(KeyTypePrefetch), false)
+		stats.Failures = deletePrefix(FormatDBKey(KeyTypeHostFailures), false)
 	case "config":
-		_ = s.DBBatchDeletePrefix(FormatDBKey(KeyTypeStats, config), false)
-		_ = s.DBBatchDeletePrefix(FormatDBKey(KeyTypeNode, config), false)
-		_ = s.DBBatchDeletePrefix(FormatDBKey(KeyTypeRanking, config), false)
-		_ = s.DBBatchDeletePrefix(FormatDBKey(KeyTypePrefetch, config), false)
-		return s.DBBatchDeletePrefix(FormatDBKey(KeyTypeHostFailures, config), false)
+		stats.Stats = deletePrefix(FormatDBKey(KeyTypeStats, config), true)
+		stats.Nodes = deletePrefix(FormatDBKey(KeyTypeNode, config), true)
+		stats.Ranking = deletePrefix(FormatDBKey(KeyTypeRanking, config), true)
+		stats.Prefetch = deletePrefix(FormatDBKey(KeyTypePrefetch, config), true)
+		stats.Failures = deletePrefix(FormatDBKey(KeyTypeHostFailures, config), true)
 	case "group":
-		_ = s.DBBatchDeletePrefix(FormatDBKey(KeyTypeStats, config, group), false)
-		_ = s.DBBatchDeletePrefix(FormatDBKey(KeyTypeNode, config, group), false)
-		_ = s.DBBatchDeletePrefix(FormatDBKey(KeyTypeRanking, config, group), false)
-		_ = s.DBBatchDeletePrefix(FormatDBKey(KeyTypePrefetch, config, group), false)
-		return s.DBBatchDeletePrefix(FormatDBKey(KeyTypeHostFailures, config, group), false)
+		stats.Stats = deletePrefix(FormatDBKey(KeyTypeStats, config, group), true)
+		stats.Nodes = deletePrefix(FormatDBKey(KeyTypeNode, config, group), true)
+		stats.Ranking = deletePrefix(FormatDBKey(KeyTypeRanking, config, group), true)
+		stats.Prefetch = deletePrefix(FormatDBKey(KeyTypePrefetch, config, group), true)
+		stats.Failures = deletePrefix(FormatDBKey(KeyTypeHostFailures, config, group), true)
 	}
-	return nil
+	return stats, firstErr
 }
 
-func (s *Store) FlushAll() error        { return s.FlushByLevel("all", "", "") }
-func (s *Store) FlushByConfig(c string) error { return s.FlushByLevel("config", c, "") }
-func (s *Store) FlushByGroup(g, c string) error { return s.FlushByLevel("group", c, g) }
+// snapshotQueueDepth counts pending queue items that match a flush scope,
+// captured BEFORE the queue is filtered so the stats output reflects what
+// was actually purged (not the residual).
+func snapshotQueueDepth(level, config, group string) int {
+	ops, _ := globalQueue.Load().([]StoreOperation)
+	if len(ops) == 0 {
+		return 0
+	}
+	n := 0
+	for _, op := range ops {
+		switch level {
+		case "all":
+			n++
+		case "config":
+			if op.Config == config {
+				n++
+			}
+		case "group":
+			if op.Config == config && op.Group == group {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// dbDeletePrefixCount deletes by prefix and returns how many keys matched.
+// Mirrors DBBatchDeletePrefix but preserves the deletion count so callers
+// (notably FlushByLevel) can surface "how much did we actually wipe" to
+// operators hitting /cache/smart/flush/*.
+func (s *Store) dbDeletePrefixCount(prefix string, strict bool) (int, error) {
+	var keysToDelete [][]byte
+	err := globalDB.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(bucketSmartStats)
+		if bucket == nil {
+			return nil
+		}
+		cursor := bucket.Cursor()
+		prefixBytes := []byte(prefix)
+		for k, _ := cursor.Seek(prefixBytes); k != nil && bytes.HasPrefix(k, prefixBytes); k, _ = cursor.Next() {
+			if strict && len(k) > len(prefixBytes) && k[len(prefixBytes)] != '/' {
+				continue
+			}
+			keyCopy := make([]byte, len(k))
+			copy(keyCopy, k)
+			keysToDelete = append(keysToDelete, keyCopy)
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if len(keysToDelete) == 0 {
+		return 0, nil
+	}
+	const batchSize = 200
+	for i := 0; i < len(keysToDelete); i += batchSize {
+		end := i + batchSize
+		if end > len(keysToDelete) {
+			end = len(keysToDelete)
+		}
+		batch := keysToDelete[i:end]
+		if err := globalDB.Batch(func(tx *bbolt.Tx) error {
+			bucket := tx.Bucket(bucketSmartStats)
+			if bucket == nil {
+				return nil
+			}
+			for _, k := range batch {
+				if err := bucket.Delete(k); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			return 0, err
+		}
+	}
+	return len(keysToDelete), nil
+}
+
+func (s *Store) FlushAll() (FlushStats, error) {
+	return s.FlushByLevel("all", "", "")
+}
+func (s *Store) FlushByConfig(c string) (FlushStats, error) {
+	return s.FlushByLevel("config", c, "")
+}
+func (s *Store) FlushByGroup(g, c string) (FlushStats, error) {
+	return s.FlushByLevel("group", c, g)
+}
 
 func contains(slice []string, s string) bool {
 	for _, v := range slice {

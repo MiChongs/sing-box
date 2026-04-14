@@ -23,63 +23,13 @@ import (
 func connectionRouter(ctx context.Context, router adapter.Router, trafficManager *trafficontrol.Manager) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getConnections(ctx, trafficManager))
-	r.Delete("/", closeAllConnections(ctx, router, trafficManager))
-	r.Delete("/{id}", closeConnection(ctx, trafficManager))
+	r.Delete("/", closeAllConnections(router, trafficManager))
+	r.Delete("/{id}", closeConnection(trafficManager))
 	// Smart-block: close the connection AND mark its upstream Smart-selected
 	// node as blocked so the group stops selecting it for a cooldown window.
 	// Mirrors mihomo's `DELETE /connections/smart/{id}`.
 	r.Delete("/smart/{id}", smartBlockConnection(ctx, trafficManager))
 	return r
-}
-
-// notifySmartUserDisconnect walks the tracker's real-outbound chain to find
-// a Smart group; if one is found, calls Smart.NotifyUserDisconnect with the
-// downstream node + target so manual close-via-API events participate in
-// short-life → markDead escalation identically to direct smartTrackedConn.Close.
-//
-// Called IMMEDIATELY BEFORE tracker.Close() so the Smart state updates
-// before the async recordStats goroutine in smartTrackedConn.Close fires.
-// That race used to let the user's next DialContext hit the same stale
-// unwrap cache even when closing explicitly through the API.
-func notifySmartUserDisconnect(ctx context.Context, meta *trafficontrol.TrackerMetadata) {
-	if meta == nil {
-		return
-	}
-	outboundMgr := service.FromContext[adapter.OutboundManager](ctx)
-	if outboundMgr == nil {
-		return
-	}
-	chain := meta.Metadata.GetRealOutboundChain()
-	for i, tag := range chain {
-		ob, ok := outboundMgr.Outbound(tag)
-		if !ok {
-			continue
-		}
-		sg, ok := ob.(*group.Smart)
-		if !ok {
-			continue
-		}
-		nodeTag := ""
-		if i+1 < len(chain) {
-			nodeTag = chain[i+1]
-		}
-		if nodeTag == "" {
-			nodeTag = sg.Now()
-		}
-		if nodeTag == "" {
-			return
-		}
-		// Extract target + isUDP from metadata for the short-life key.
-		target := ""
-		if meta.Metadata.Destination.Fqdn != "" {
-			target = meta.Metadata.Destination.Fqdn
-		} else if meta.Metadata.SniffHost != "" {
-			target = meta.Metadata.SniffHost
-		}
-		isUDP := meta.Metadata.Network == "udp"
-		sg.NotifyUserDisconnect(target, nodeTag, isUDP, "")
-		return
-	}
 }
 
 func getConnections(ctx context.Context, trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
@@ -138,18 +88,12 @@ func getConnections(ctx context.Context, trafficManager *trafficontrol.Manager) 
 	}
 }
 
-func closeConnection(ctx context.Context, trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
+func closeConnection(trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := uuid.FromStringOrNil(chi.URLParam(r, "id"))
 		snapshot := trafficManager.Snapshot()
 		for _, c := range snapshot.Connections {
-			meta := c.Metadata()
-			if meta != nil && id == meta.ID {
-				// Notify any Smart group in the chain BEFORE closing so the
-				// short-life aggregator receives an explicit user-initiated
-				// disconnect signal. Without this, an API-only close was
-				// indistinguishable from a normal server FIN.
-				notifySmartUserDisconnect(ctx, meta)
+			if id == c.Metadata().ID {
 				c.Close()
 				break
 			}
@@ -158,13 +102,10 @@ func closeConnection(ctx context.Context, trafficManager *trafficontrol.Manager)
 	}
 }
 
-func closeAllConnections(ctx context.Context, router adapter.Router, trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
+func closeAllConnections(router adapter.Router, trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		snapshot := trafficManager.Snapshot()
 		for _, c := range snapshot.Connections {
-			// Every conn in the bulk close is user-initiated; feed Smart so
-			// a "close all" click also contributes to short-life counters.
-			notifySmartUserDisconnect(ctx, c.Metadata())
 			c.Close()
 		}
 		router.ResetNetwork()
