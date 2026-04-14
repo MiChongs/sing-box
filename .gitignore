@@ -2,6 +2,7 @@
 /.vscode/
 /vendor/
 /*.json
+!/example-config.json
 /*.srs
 /*.db
 /site/
@@ -9,7 +10,11 @@
 /dist/
 /sing-box
 /sing-box.exe
+/sing-box-android-*
 /build/
+/build-all/
+/build_libbox.exe
+/*.7z
 /*.jar
 /*.aar
 /*.xcframework/
@@ -19,6 +24,8 @@
 .DS_Store
 /config.d/
 /venv/
+/data/
+/.spec-workflow/
 CLAUDE.md
 AGENTS.md
 /.claude/

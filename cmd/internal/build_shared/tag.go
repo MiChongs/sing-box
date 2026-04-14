@@ -26,9 +26,11 @@ func ReadTag() (string, error) {
 	if currentTagRev == currentTag {
 		return currentTag[1:], nil
 	}
+	// Past the latest annotated tag: preserve the full base tag (including
+	// our custom "-xiaobaf14g" suffix — badversion.Parse+String would drop
+	// that pre-release identifier segment) and append the short commit hash.
 	shortCommit, _ := shell.Exec("git", "rev-parse", "--short", "HEAD").ReadOutput()
-	version := badversion.Parse(currentTagRev[1:])
-	return version.String() + "-" + shortCommit, nil
+	return currentTagRev[1:] + "-" + shortCommit, nil
 }
 
 func ReadTagVersionRev() (badversion.Version, error) {
