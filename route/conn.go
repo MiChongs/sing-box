@@ -28,6 +28,27 @@ import (
 
 var _ adapter.ConnectionManager = (*ConnectionManager)(nil)
 
+// joinDestinationAddresses 将目的地址切片格式化为 "[a,b,c]" 形式。
+// 相比 strings.Join(common.Map(addrs, netip.Addr.String), ",") 省去一次
+// 中间 []string 分配 + strings.Join 内部拼接缓冲，错误路径分配量显著降低。
+func joinDestinationAddresses(addrs []netip.Addr) string {
+	if len(addrs) == 0 {
+		return "[]"
+	}
+	var sb strings.Builder
+	// IPv4 ~15 字符、IPv6 ~40 字符，平均 20 足够，再加 "[]" 与分隔符
+	sb.Grow(len(addrs)*22 + 2)
+	sb.WriteByte('[')
+	for i, a := range addrs {
+		if i > 0 {
+			sb.WriteByte(',')
+		}
+		sb.WriteString(a.String())
+	}
+	sb.WriteByte(']')
+	return sb.String()
+}
+
 type ConnectionManager struct {
 	logger      logger.ContextLogger
 	access      sync.Mutex
@@ -104,7 +125,7 @@ func (m *ConnectionManager) NewConnection(ctx context.Context, this N.Dialer, co
 	if err != nil {
 		var remoteString string
 		if len(metadata.DestinationAddresses) > 0 {
-			remoteString = "[" + strings.Join(common.Map(metadata.DestinationAddresses, netip.Addr.String), ",") + "]"
+			remoteString = joinDestinationAddresses(metadata.DestinationAddresses)
 		} else {
 			remoteString = metadata.Destination.String()
 		}
@@ -170,7 +191,7 @@ func (m *ConnectionManager) NewPacketConnection(ctx context.Context, this N.Dial
 		if err != nil {
 			var remoteString string
 			if len(metadata.DestinationAddresses) > 0 {
-				remoteString = "[" + strings.Join(common.Map(metadata.DestinationAddresses, netip.Addr.String), ",") + "]"
+				remoteString = joinDestinationAddresses(metadata.DestinationAddresses)
 			} else {
 				remoteString = metadata.Destination.String()
 			}

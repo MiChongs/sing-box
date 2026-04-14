@@ -3,8 +3,9 @@ package group
 import (
 	"context"
 	"net"
-	"time"
 	"regexp"
+	"sync"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -40,9 +41,10 @@ type Selector struct {
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 
-	provider       adapter.ProviderManager
-	providers      map[string]adapter.Provider
-	outboundsCache map[string][]adapter.Outbound
+	provider         adapter.ProviderManager
+	providers        map[string]adapter.Provider
+	outboundsCacheMu sync.Mutex
+	outboundsCache   map[string][]adapter.Outbound
 
 	providerTags    []string
 	exclude         *regexp.Regexp
@@ -218,6 +220,7 @@ func (s *Selector) onProviderUpdated(tag string) error {
 	for _, tag := range tags {
 		outboundByTag[tag] = s.outbounds[tag]
 	}
+	s.outboundsCacheMu.Lock()
 	for _, providerTag := range s.providerTags {
 		if providerTag != tag && s.outboundsCache[providerTag] != nil {
 			for _, detour := range s.outboundsCache[providerTag] {
@@ -242,6 +245,7 @@ func (s *Selector) onProviderUpdated(tag string) error {
 		}
 		s.outboundsCache[providerTag] = cache
 	}
+	s.outboundsCacheMu.Unlock()
 	if len(tags) == 0 {
 		detour, _ := s.outbound.Outbound("Compatible")
 		tags = append(tags, detour.Tag())

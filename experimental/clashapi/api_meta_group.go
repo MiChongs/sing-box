@@ -87,44 +87,8 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		} else if loadBalanceGroup, isLoadBalanceGroup := outboundGroup.(adapter.LoadBalanceGroup); isLoadBalanceGroup {
 			result, err = loadBalanceGroup.URLTest(ctx)
 		} else {
-			outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
-				itOutbound, _ := server.outbound.Outbound(it)
-				return itOutbound
-			}))
-			b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
-			checked := make(map[string]bool)
-			result = make(map[string]uint16)
-			var resultAccess sync.Mutex
-			for _, detour := range outbounds {
-				tag := detour.Tag()
-				realTag := group.RealTag(detour)
-				if checked[realTag] {
-					continue
-				}
-				checked[realTag] = true
-				p, loaded := server.outbound.Outbound(realTag)
-				if !loaded {
-					continue
-				}
-				b.Go(realTag, func() (any, error) {
-					t, err := urltest.URLTest(ctx, url, p)
-					if err != nil {
-						server.logger.Debug("outbound ", tag, " unavailable: ", err)
-						server.urlTestHistory.DeleteURLTestHistory(realTag)
-					} else {
-						server.logger.Debug("outbound ", tag, " available: ", t, "ms")
-						server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
-							Time:  time.Now(),
-							Delay: t,
-						})
-						resultAccess.Lock()
-						result[tag] = t
-						resultAccess.Unlock()
-					}
-					return nil, nil
-				})
-			}
-			b.Wait()
+			// Selector or other groups: test members with controlled concurrency
+			result = testGroupMembers(ctx, server, outboundGroup, url)
 		}
 
 		if err != nil {
@@ -135,4 +99,58 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 
 		render.JSON(w, r, result)
 	}
+}
+
+// testGroupMembers tests all members of a non-URLTest/LoadBalance group (e.g. Selector)
+// with controlled concurrency for accurate results.
+func testGroupMembers(ctx context.Context, server *Server, outboundGroup adapter.OutboundGroup, url string) map[string]uint16 {
+	outbounds := common.FilterNotNil(common.Map(outboundGroup.All(), func(it string) adapter.Outbound {
+		itOutbound, _ := server.outbound.Outbound(it)
+		return itOutbound
+	}))
+
+	// Use concurrency 4 for accuracy — avoids bandwidth competition
+	concurrency := 4
+	if len(outbounds) < concurrency {
+		concurrency = len(outbounds)
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](concurrency))
+	checked := make(map[string]bool, len(outbounds))
+	result := make(map[string]uint16, len(outbounds))
+	var resultAccess sync.Mutex
+
+	for _, detour := range outbounds {
+		tag := detour.Tag()
+		realTag := group.RealTag(detour)
+		if checked[realTag] {
+			continue
+		}
+		checked[realTag] = true
+		p, loaded := server.outbound.Outbound(realTag)
+		if !loaded {
+			continue
+		}
+		b.Go(realTag, func() (any, error) {
+			t, testErr := urltest.URLTest(ctx, url, p)
+			if testErr != nil {
+				server.logger.Debug("outbound ", tag, " unavailable: ", testErr)
+				// Don't delete history on single API test failure — let periodic checks handle it
+			} else {
+				server.logger.Debug("outbound ", tag, " available: ", t, "ms")
+				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
+					Time:  time.Now(),
+					Delay: t,
+				})
+				resultAccess.Lock()
+				result[tag] = t
+				resultAccess.Unlock()
+			}
+			return nil, nil
+		})
+	}
+	b.Wait()
+	return result
 }

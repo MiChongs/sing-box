@@ -100,72 +100,106 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
 	monitor := taskmonitor.New(m.logger, C.StartTimeout)
 	started := make(map[string]bool)
 	for {
-		canContinue := false
-	startOne:
+		// Collect all outbounds whose dependencies are satisfied
+		var ready []adapter.Outbound
+	collectReady:
 		for _, outboundToStart := range outbounds {
 			outboundTag := outboundToStart.Tag()
 			if started[outboundTag] {
 				continue
 			}
-			dependencies := outboundToStart.Dependencies()
-			for _, dependency := range dependencies {
+			for _, dependency := range outboundToStart.Dependencies() {
 				if !started[dependency] {
-					continue startOne
+					continue collectReady
 				}
 			}
-			started[outboundTag] = true
-			canContinue = true
-			name := "outbound/" + outboundToStart.Type() + "[" + outboundTag + "]"
-			if starter, isStarter := outboundToStart.(adapter.Lifecycle); isStarter {
-				m.logger.Trace("start ", name)
-				startTime := time.Now()
-				monitor.Start("start ", name)
-				err := starter.Start(adapter.StartStateStart)
-				monitor.Finish()
-				if err != nil {
-					return E.Cause(err, "start ", name)
+			ready = append(ready, outboundToStart)
+		}
+		if len(ready) == 0 {
+			if len(started) == len(outbounds) {
+				break
+			}
+			// Circular dependency detection
+			currentOutbound := common.Find(outbounds, func(it adapter.Outbound) bool {
+				return !started[it.Tag()]
+			})
+			var lintOutbound func(oTree []string, oCurrent adapter.Outbound) error
+			lintOutbound = func(oTree []string, oCurrent adapter.Outbound) error {
+				problemOutboundTag := common.Find(oCurrent.Dependencies(), func(it string) bool {
+					return !started[it]
+				})
+				if common.Contains(oTree, problemOutboundTag) {
+					return E.New("circular outbound dependency: ", strings.Join(oTree, " -> "), " -> ", problemOutboundTag)
 				}
-				m.logger.Trace("start ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
-			} else if starter, isStarter := outboundToStart.(interface {
-				Start() error
-			}); isStarter {
-				m.logger.Trace("start ", name)
-				startTime := time.Now()
-				monitor.Start("start ", name)
-				err := starter.Start()
-				monitor.Finish()
-				if err != nil {
-					return E.Cause(err, "start ", name)
+				m.access.Lock()
+				problemOutbound := m.outboundByTag[problemOutboundTag]
+				m.access.Unlock()
+				if problemOutbound == nil {
+					return E.New("dependency[", problemOutboundTag, "] not found for outbound[", oCurrent.Tag(), "]")
 				}
-				m.logger.Trace("start ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
+				return lintOutbound(append(oTree, problemOutboundTag), problemOutbound)
+			}
+			return lintOutbound([]string{currentOutbound.Tag()}, currentOutbound)
+		}
+		// Start all ready outbounds in parallel
+		if len(ready) == 1 {
+			// Single outbound — no goroutine overhead
+			ob := ready[0]
+			started[ob.Tag()] = true
+			if err := m.startSingleOutbound(monitor, ob); err != nil {
+				return err
+			}
+		} else {
+			var wg sync.WaitGroup
+			var startErr error
+			var errOnce sync.Once
+			for _, ob := range ready {
+				started[ob.Tag()] = true
+				wg.Add(1)
+				go func(outbound adapter.Outbound) {
+					defer wg.Done()
+					if err := m.startSingleOutbound(monitor, outbound); err != nil {
+						errOnce.Do(func() { startErr = err })
+					}
+				}(ob)
+			}
+			wg.Wait()
+			if startErr != nil {
+				return startErr
 			}
 		}
+		ready = ready[:0]
 		if len(started) == len(outbounds) {
 			break
 		}
-		if canContinue {
-			continue
+	}
+	return nil
+}
+
+func (m *Manager) startSingleOutbound(monitor *taskmonitor.Monitor, outbound adapter.Outbound) error {
+	name := "outbound/" + outbound.Type() + "[" + outbound.Tag() + "]"
+	if starter, isStarter := outbound.(adapter.Lifecycle); isStarter {
+		m.logger.Trace("start ", name)
+		startTime := time.Now()
+		monitor.Start("start ", name)
+		err := starter.Start(adapter.StartStateStart)
+		monitor.Finish()
+		if err != nil {
+			return E.Cause(err, "start ", name)
 		}
-		currentOutbound := common.Find(outbounds, func(it adapter.Outbound) bool {
-			return !started[it.Tag()]
-		})
-		var lintOutbound func(oTree []string, oCurrent adapter.Outbound) error
-		lintOutbound = func(oTree []string, oCurrent adapter.Outbound) error {
-			problemOutboundTag := common.Find(oCurrent.Dependencies(), func(it string) bool {
-				return !started[it]
-			})
-			if common.Contains(oTree, problemOutboundTag) {
-				return E.New("circular outbound dependency: ", strings.Join(oTree, " -> "), " -> ", problemOutboundTag)
-			}
-			m.access.Lock()
-			problemOutbound := m.outboundByTag[problemOutboundTag]
-			m.access.Unlock()
-			if problemOutbound == nil {
-				return E.New("dependency[", problemOutboundTag, "] not found for outbound[", oCurrent.Tag(), "]")
-			}
-			return lintOutbound(append(oTree, problemOutboundTag), problemOutbound)
+		m.logger.Trace("start ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
+	} else if starter, isStarter := outbound.(interface {
+		Start() error
+	}); isStarter {
+		m.logger.Trace("start ", name)
+		startTime := time.Now()
+		monitor.Start("start ", name)
+		err := starter.Start()
+		monitor.Finish()
+		if err != nil {
+			return E.Cause(err, "start ", name)
 		}
-		return lintOutbound([]string{currentOutbound.Tag()}, currentOutbound)
+		m.logger.Trace("start ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 	}
 	return nil
 }

@@ -70,15 +70,24 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	info.Put("type", clashType)
 	info.Put("name", detour.Tag())
 	info.Put("udp", common.Contains(detour.Network(), N.NetworkUDP))
-	delayHistory := server.urlTestHistory.LoadURLTestHistory(adapter.OutboundTag(detour))
+
+	realTag := adapter.OutboundTag(detour)
+	delayHistory := server.urlTestHistory.LoadURLTestHistory(realTag)
 	if delayHistory != nil {
 		info.Put("history", []*adapter.URLTestHistory{delayHistory})
+		// Alive: history exists and is fresh (within 10 minutes)
+		info.Put("alive", time.Since(delayHistory.Time) < 10*time.Minute)
+		info.Put("delay", delayHistory.Delay)
 	} else {
 		info.Put("history", []*adapter.URLTestHistory{})
+		info.Put("alive", false)
+		info.Put("delay", 0)
 	}
-	if group, isGroup := detour.(adapter.OutboundGroup); isGroup {
-		info.Put("now", group.Now())
-		info.Put("all", group.All())
+
+	if groupOutbound, isGroup := detour.(adapter.OutboundGroup); isGroup {
+		info.Put("now", groupOutbound.Now())
+		allTags := groupOutbound.All()
+		info.Put("all", allTags)
 	}
 	return &info
 }
@@ -117,6 +126,8 @@ func getProxies(server *Server) func(w http.ResponseWriter, r *http.Request) {
 			"name":    "GLOBAL",
 			"udp":     true,
 			"history": []*adapter.URLTestHistory{},
+			"alive":   true,
+			"delay":   0,
 			"all":     allProxies,
 			"now":     defaultTag,
 		})
@@ -184,6 +195,8 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 	render.NoContent(w, r)
 }
 
+// getProxyDelay performs multi-sample delay testing for accuracy.
+// Tests up to 3 times and returns the median for stable results.
 func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
@@ -191,7 +204,7 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		if strings.HasPrefix(url, "http://") {
 			url = ""
 		}
-		timeout, err := strconv.ParseInt(query.Get("timeout"), 10, 16)
+		timeout, err := strconv.ParseInt(query.Get("timeout"), 10, 32)
 		if err != nil {
 			render.Status(r, http.StatusBadRequest)
 			render.JSON(w, r, ErrBadRequest)
@@ -199,33 +212,51 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		}
 
 		proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
-		ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*time.Duration(timeout))
-		defer cancel()
+		realTag := group.RealTag(proxy)
+		timeoutDuration := time.Millisecond * time.Duration(timeout)
 
-		delay, err := urltest.URLTest(ctx, url, proxy)
-		defer func() {
-			realTag := group.RealTag(proxy)
-			if err != nil {
-				server.urlTestHistory.DeleteURLTestHistory(realTag)
-			} else {
-				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
-					Time:  time.Now(),
-					Delay: delay,
-				})
+		// Multi-sample: test up to 3 times, collect valid results
+		const maxSamples = 3
+		var samples []uint16
+		for i := 0; i < maxSamples; i++ {
+			ctx, cancel := context.WithTimeout(r.Context(), timeoutDuration)
+			t, testErr := urltest.URLTest(ctx, url, proxy)
+			cancel()
+			if testErr != nil || t == 0 {
+				continue
 			}
-		}()
+			samples = append(samples, t)
+			// If first sample is very fast (<50ms), result is already reliable
+			if i == 0 && t < 50 {
+				break
+			}
+		}
 
-		if ctx.Err() != nil {
-			render.Status(r, http.StatusGatewayTimeout)
-			render.JSON(w, r, ErrRequestTimeout)
+		if len(samples) == 0 {
+			// All attempts failed — check if it was a timeout
+			ctx, cancel := context.WithTimeout(r.Context(), timeoutDuration)
+			_, _ = urltest.URLTest(ctx, url, proxy)
+			timedOut := ctx.Err() != nil
+			cancel()
+
+			if timedOut {
+				render.Status(r, http.StatusGatewayTimeout)
+				render.JSON(w, r, ErrRequestTimeout)
+			} else {
+				render.Status(r, http.StatusServiceUnavailable)
+				render.JSON(w, r, newError("An error occurred in the delay test"))
+			}
 			return
 		}
 
-		if err != nil || delay == 0 {
-			render.Status(r, http.StatusServiceUnavailable)
-			render.JSON(w, r, newError("An error occurred in the delay test"))
-			return
-		}
+		// Take median for stability
+		sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
+		delay := samples[len(samples)/2]
+
+		server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
+			Time:  time.Now(),
+			Delay: delay,
+		})
 
 		render.JSON(w, r, render.M{
 			"delay": delay,

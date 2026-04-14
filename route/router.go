@@ -126,7 +126,7 @@ func (r *Router) Start(stage adapter.StartStage) error {
 					return nil
 				})
 			}
-			ruleSetStartGroup.Concurrency(5)
+			ruleSetStartGroup.Concurrency(20)
 			ruleSetStartGroup.FastFail()
 			err := ruleSetStartGroup.Run(r.ctx)
 			monitor.Finish()
@@ -206,12 +206,26 @@ func (r *Router) Start(stage adapter.StartStage) error {
 			}
 		}
 	case adapter.StartStatePostStart:
-		for i, rule := range r.rules {
-			monitor.Start("initialize rule[", i, "]")
-			err := rule.Start()
+		if len(r.rules) > 0 {
+			var ruleStartGroup task.Group
+			for i, rule := range r.rules {
+				ruleInPlace := rule
+				ruleIndex := i
+				ruleStartGroup.Append0(func(ctx context.Context) error {
+					err := ruleInPlace.Start()
+					if err != nil {
+						return E.Cause(err, "initialize rule[", ruleIndex, "]")
+					}
+					return nil
+				})
+			}
+			ruleStartGroup.Concurrency(20)
+			ruleStartGroup.FastFail()
+			monitor.Start("initialize rules")
+			err := ruleStartGroup.Run(r.ctx)
 			monitor.Finish()
 			if err != nil {
-				return E.Cause(err, "initialize rule[", i, "]")
+				return err
 			}
 		}
 		for _, ruleSet := range r.ruleSets {

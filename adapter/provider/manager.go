@@ -51,15 +51,31 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	if stage == adapter.StartStateStart && len(providers) > 0 {
 		startContext := adapter.NewHTTPStartContext(context.Background())
 		defer startContext.Close()
+		var wg sync.WaitGroup
+		var startErr error
+		var errOnce sync.Once
 		for _, provider := range providers {
-			if contextStarter, ok := provider.(interface {
+			contextStarter, ok := provider.(interface {
 				StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
-			}); ok {
-				err := contextStarter.StartContext(context.Background(), startContext)
-				if err != nil {
-					return E.Cause(err, stage, " provider/", provider.Type(), "[", provider.Tag(), "]")
-				}
+			})
+			if !ok {
+				continue
 			}
+			wg.Add(1)
+			go func(p adapter.Provider, starter interface {
+				StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
+			}) {
+				defer wg.Done()
+				if err := starter.StartContext(context.Background(), startContext); err != nil {
+					errOnce.Do(func() {
+						startErr = E.Cause(err, stage, " provider/", p.Type(), "[", p.Tag(), "]")
+					})
+				}
+			}(provider, contextStarter)
+		}
+		wg.Wait()
+		if startErr != nil {
+			return startErr
 		}
 		return nil
 	}

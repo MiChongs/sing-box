@@ -665,7 +665,10 @@ func (r *Router) actionSniff(
 			action.Timeout,
 			streamSniffers...,
 		)
-		metadata.SnifferNames = action.SnifferNames
+		// 仅在 slice 真实变化时改写 SnifferNames，避免 header 拷贝污染缓存
+		if !slices.Equal(metadata.SnifferNames, action.SnifferNames) {
+			metadata.SnifferNames = action.SnifferNames
+		}
 		metadata.SniffError = err
 		if err == nil {
 			if metadata.SniffHost != "" && metadata.Client != "" {
@@ -687,6 +690,13 @@ func (r *Router) actionSniff(
 		} else if slices.Equal(metadata.SnifferNames, action.SnifferNames) && metadata.SniffError != nil && !errors.Is(metadata.SniffError, sniff.ErrNeedMoreData) {
 			r.logger.DebugContext(ctx, "packet sniff skipped due to previous error: ", metadata.SniffError)
 			return
+		}
+		// 一次性同步 SnifferNames，使后续两个循环内仅需更新 SniffError，
+		// 避免千次级分片循环中重复执行 slice header 拷贝。
+		// quicMoreData 闭包依赖的 slices.Equal 语义与原实现一致：
+		// 同步后相等性不变，只依赖 SniffError 是否为 ErrNeedMoreData。
+		if !slices.Equal(metadata.SnifferNames, action.SnifferNames) {
+			metadata.SnifferNames = action.SnifferNames
 		}
 		quicMoreData := func() bool {
 			return slices.Equal(metadata.SnifferNames, action.SnifferNames) && errors.Is(metadata.SniffError, sniff.ErrNeedMoreData)
@@ -721,7 +731,7 @@ func (r *Router) actionSniff(
 					packetSniffers...,
 				)
 			}
-			metadata.SnifferNames = action.SnifferNames
+			// SnifferNames 已在循环外同步，此处仅需更新 SniffError
 			metadata.SniffError = err
 			if errors.Is(err, sniff.ErrNeedMoreData) {
 				// TODO: replace with generic message when there are more multi-packet protocols
@@ -781,7 +791,7 @@ func (r *Router) actionSniff(
 					Destination: destination,
 				}
 				packetBuffers = append(packetBuffers, packetBuffer)
-				metadata.SnifferNames = action.SnifferNames
+				// SnifferNames 已在循环外同步，此处仅需更新 SniffError
 				metadata.SniffError = err
 				if errors.Is(err, sniff.ErrNeedMoreData) {
 					// TODO: replace with generic message when there are more multi-packet protocols

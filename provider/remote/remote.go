@@ -11,7 +11,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -403,7 +402,6 @@ func (s *ProviderRemote) loopUpdate() {
 	}
 	s.ticker = time.NewTicker(s.updateInterval)
 	for {
-		runtime.GC()
 		select {
 		case <-s.ctx.Done():
 			return

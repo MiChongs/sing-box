@@ -237,6 +237,9 @@ test_stdio:
 lib_android:
 	go run ./cmd/internal/build_libbox -target android
 
+lib_android_bin:
+	go run ./cmd/internal/build_libbox -target android-bin
+
 lib_apple:
 	go run ./cmd/internal/build_libbox -target apple
 

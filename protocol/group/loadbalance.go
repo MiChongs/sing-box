@@ -2,10 +2,11 @@ package group
 
 import (
 	"context"
-	"fmt"
 	"net"
 	"net/netip"
 	"regexp"
+	"runtime/debug"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -42,6 +43,9 @@ const (
 	StrategyRoundRobin        = "round-robin"
 	StrategyConsistentHashing = "consistent-hashing"
 	StrategyStickySessions    = "sticky-sessions"
+
+	lbMaxBatchConcurrency   = 16
+	lbMaxFailoverCandidates = 10
 )
 
 type LoadBalance struct {
@@ -51,7 +55,6 @@ type LoadBalance struct {
 	outbound                     adapter.OutboundManager
 	connection                   adapter.ConnectionManager
 	logger                       log.ContextLogger
-	tags                         []string
 	link                         string
 	interval                     time.Duration
 	idleTimeout                  time.Duration
@@ -60,10 +63,12 @@ type LoadBalance struct {
 	interruptExternalConnections bool
 	strategy                     string
 
-	provider       adapter.ProviderManager
-	providers      map[string]adapter.Provider
-	outboundsCache map[string][]adapter.Outbound
-	cancel         context.CancelFunc
+	provider         adapter.ProviderManager
+	providers        map[string]adapter.Provider
+	outboundsCacheMu sync.Mutex
+	outboundsCache   map[string][]adapter.Outbound
+	cancelAccess     sync.Mutex
+	cancel           context.CancelFunc
 
 	providerTags    []string
 	exclude         *regexp.Regexp
@@ -88,7 +93,6 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		outbound:                     service.FromContext[adapter.OutboundManager](ctx),
 		connection:                   service.FromContext[adapter.ConnectionManager](ctx),
 		logger:                       logger,
-		tags:                         options.Outbounds,
 		link:                         options.URL,
 		interval:                     time.Duration(options.Interval),
 		ttl:                          time.Duration(options.TTL),
@@ -127,24 +131,25 @@ func (s *LoadBalance) Start() error {
 			provider.RegisterCallback(s.onProviderUpdated)
 		}
 	}
-	if len(s.tags)+len(s.providerTags) == 0 {
+	tags := s.Dependencies()
+	if len(tags)+len(s.providerTags) == 0 {
 		return E.New("missing outbound and provider tags")
 	}
 
-	outbounds := make([]adapter.Outbound, 0, len(s.tags))
-	for i, tag := range s.tags {
+	outbounds := make([]adapter.Outbound, 0, len(tags))
+	for i, tag := range tags {
 		detour, loaded := s.outbound.Outbound(tag)
 		if !loaded {
 			return E.New("outbound ", i, " not found: ", tag)
 		}
 		outbounds = append(outbounds, detour)
 	}
-	if len(s.tags) == 0 {
+	if len(tags) == 0 {
 		detour, _ := s.outbound.Outbound("Compatible")
-		s.tags = append(s.tags, detour.Tag())
+		tags = append(tags, detour.Tag())
 		outbounds = append(outbounds, detour)
 	}
-	group, err := NewLoadBalanceGroup(s.ctx, s.outbound, s.logger, outbounds, s.link, s.interval, s.idleTimeout, s.ttl, s.interruptExternalConnections, s.strategy)
+	group, err := NewLoadBalanceGroup(s.ctx, s.outbound, s.logger, outbounds, tags, s.link, s.interval, s.idleTimeout, s.ttl, s.interruptExternalConnections, s.strategy)
 	if err != nil {
 		return err
 	}
@@ -168,11 +173,13 @@ func (s *LoadBalance) Now() string {
 }
 
 func (s *LoadBalance) All() []string {
-	var all []string
-	for _, outbound := range s.group.outbounds {
-		all = append(all, outbound.Tag())
+	snap := s.group.state.Load()
+	if snap == nil {
+		return nil
 	}
-	return all
+	result := make([]string, len(snap.tags))
+	copy(result, snap.tags)
+	return result
 }
 
 func (s *LoadBalance) URLTest(ctx context.Context) (map[string]uint16, error) {
@@ -184,7 +191,7 @@ func (s *LoadBalance) CheckOutbounds() {
 }
 
 func (s *LoadBalance) isGroupActive() bool {
-	if !s.group.started {
+	if !s.group.started.Load() {
 		return false
 	}
 	return time.Since(s.group.lastActive.Load()) <= s.group.idleTimeout
@@ -204,9 +211,24 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 	if err == nil {
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
-	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	return nil, err
+	s.logger.ErrorContext(ctx, "primary outbound ", outbound.Tag(), " failed: ", err)
+	// Failover from alive list
+	failedTag := outbound.Tag()
+	candidates := s.group.getFailoverCandidates(failedTag)
+	for _, detour := range candidates {
+		if !common.Contains(detour.Network(), network) {
+			continue
+		}
+		conn, err = detour.DialContext(ctx, network, destination)
+		if err == nil {
+			s.logger.InfoContext(ctx, "failover to ", detour.Tag())
+			if metadata != nil {
+				metadata.AppendRealOutbound(detour.Tag())
+			}
+			return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
+		}
+	}
+	return nil, E.New("all outbounds failed for ", network, " to ", destination)
 }
 
 func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
@@ -223,9 +245,23 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	if err == nil {
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
-	s.logger.ErrorContext(ctx, err)
-	s.group.history.DeleteURLTestHistory(outbound.Tag())
-	return nil, err
+	s.logger.ErrorContext(ctx, "primary outbound ", outbound.Tag(), " failed: ", err)
+	failedTag := outbound.Tag()
+	candidates := s.group.getFailoverCandidates(failedTag)
+	for _, detour := range candidates {
+		if !common.Contains(detour.Network(), N.NetworkUDP) {
+			continue
+		}
+		conn, err = detour.ListenPacket(ctx, destination)
+		if err == nil {
+			s.logger.InfoContext(ctx, "failover to ", detour.Tag())
+			if metadata != nil {
+				metadata.AppendRealOutbound(detour.Tag())
+			}
+			return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
+		}
+	}
+	return nil, E.New("all outbounds failed for UDP to ", destination)
 }
 
 func (s *LoadBalance) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
@@ -263,6 +299,7 @@ func (s *LoadBalance) onProviderUpdated(tag string) error {
 		detour, _ := s.outbound.Outbound(tag)
 		outbounds = append(outbounds, detour)
 	}
+	s.outboundsCacheMu.Lock()
 	for _, providerTag := range s.providerTags {
 		if providerTag != tag && s.outboundsCache[providerTag] != nil {
 			for _, detour := range s.outboundsCache[providerTag] {
@@ -287,29 +324,55 @@ func (s *LoadBalance) onProviderUpdated(tag string) error {
 		outbounds = append(outbounds, cache...)
 		s.outboundsCache[providerTag] = cache
 	}
+	s.outboundsCacheMu.Unlock()
 	if len(tags) == 0 {
 		detour, _ := s.outbound.Outbound("Compatible")
 		tags = append(tags, detour.Tag())
 		outbounds = append(outbounds, detour)
 	}
-	s.tags, s.group.outbounds = tags, outbounds
+	// Atomic snapshot swap
+	s.group.state.Store(&lbState{outbounds: outbounds, tags: tags, outboundByTag: make(map[string]adapter.Outbound)})
+	// Build tag→outbound index for strategies
+	s.group.rebuildOutboundIndex()
+	// Clean stale failure counters
+	activeTagSet := make(map[string]struct{}, len(tags))
+	for _, t := range tags {
+		activeTagSet[t] = struct{}{}
+	}
+	s.group.failureMu.Lock()
+	for k := range s.group.failureCount {
+		if _, exists := activeTagSet[k]; !exists {
+			delete(s.group.failureCount, k)
+		}
+	}
+	s.group.failureMu.Unlock()
 	if s.isGroupActive() {
 		s.group.access.Lock()
 		if s.group.ticker != nil {
 			s.group.ticker.Reset(s.group.interval)
 		}
 		s.group.access.Unlock()
+		s.cancelAccess.Lock()
 		ctx, cancel := context.WithCancel(s.ctx)
 		if s.cancel != nil {
 			s.cancel()
 		}
 		s.cancel = cancel
+		s.cancelAccess.Unlock()
 		s.URLTest(ctx)
 	}
 	return nil
 }
 
 type strategyFn = func(metadata *adapter.InboundContext, touch bool) adapter.Outbound
+
+// lbState is a single immutable snapshot containing ALL LoadBalance group data.
+type lbState struct {
+	outbounds     []adapter.Outbound
+	tags          []string
+	alive         []adapter.Outbound          // sorted by delay
+	outboundByTag map[string]adapter.Outbound // for sticky-sessions tag lookup
+}
 
 type LoadBalanceGroup struct {
 	ctx                          context.Context
@@ -318,7 +381,6 @@ type LoadBalanceGroup struct {
 	pause                        pause.Manager
 	pauseCallback                *list.Element[pause.Callback]
 	logger                       log.Logger
-	outbounds                    []adapter.Outbound
 	link                         string
 	interval                     time.Duration
 	idleTimeout                  time.Duration
@@ -327,15 +389,21 @@ type LoadBalanceGroup struct {
 	checking                     atomic.Bool
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
-	access                       sync.Mutex
-	ticker                       *time.Ticker
-	close                        chan struct{}
-	started                      bool
-	lastActive                   common.TypedValue[time.Time]
-	strategyFn                   strategyFn
+
+	// Single atomic state — all group data in one pointer
+	state atomic.Pointer[lbState]
+
+	access       sync.Mutex
+	ticker       *time.Ticker
+	close        chan struct{}
+	started      atomic.Bool
+	lastActive   common.TypedValue[time.Time]
+	failureMu    sync.Mutex
+	failureCount map[string]int32
+	strategyFn   strategyFn
 }
 
-func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, interruptExternalConnections bool, strategy string) (*LoadBalanceGroup, error) {
+func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, tags []string, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, interruptExternalConnections bool, strategy string) (*LoadBalanceGroup, error) {
 	if interval == 0 {
 		interval = C.DefaultURLTestInterval
 	}
@@ -359,11 +427,10 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
 	}
-	loadBalanceGroup := &LoadBalanceGroup{
+	g := &LoadBalanceGroup{
 		ctx:                          ctx,
 		outbound:                     outboundManager,
 		logger:                       logger,
-		outbounds:                    outbounds,
 		link:                         link,
 		interval:                     interval,
 		idleTimeout:                  idleTimeout,
@@ -373,28 +440,127 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 		pause:                        service.FromContext[pause.Manager](ctx),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
+		failureCount:                 make(map[string]int32),
 	}
+	index := make(map[string]adapter.Outbound, len(outbounds))
+	for _, o := range outbounds {
+		index[o.Tag()] = o
+	}
+	g.state.Store(&lbState{outbounds: outbounds, tags: tags, outboundByTag: index})
 	switch strategy {
 	case StrategyRoundRobin:
-		loadBalanceGroup.strategyFn = strategyRoundRobin(loadBalanceGroup, link)
+		g.strategyFn = strategyRoundRobin(g)
 	case StrategyConsistentHashing:
-		loadBalanceGroup.strategyFn = strategyConsistentHashing(loadBalanceGroup, link)
+		g.strategyFn = strategyConsistentHashing(g)
 	case StrategyStickySessions:
-		loadBalanceGroup.strategyFn = strategyStickySessions(loadBalanceGroup, link)
+		lruSize := uint32(len(outbounds) * 2)
+		if lruSize < 4096 {
+			lruSize = 4096
+		}
+		g.strategyFn = strategyStickySessions(g, lruSize)
 	}
-	return loadBalanceGroup, nil
+	return g, nil
+}
+
+func (g *LoadBalanceGroup) rebuildOutboundIndex() {
+	st := g.state.Load()
+	if st == nil {
+		return
+	}
+	index := make(map[string]adapter.Outbound, len(st.outbounds))
+	for _, o := range st.outbounds {
+		index[o.Tag()] = o
+	}
+	g.state.Store(&lbState{
+		outbounds:     st.outbounds,
+		tags:          st.tags,
+		alive:         st.alive,
+		outboundByTag: index,
+	})
+}
+
+// IsAlive checks if an outbound has a recent successful health check.
+func (g *LoadBalanceGroup) IsAlive(proxy adapter.Outbound) bool {
+	history := g.history.LoadURLTestHistory(RealTag(proxy))
+	if history == nil {
+		return false
+	}
+	return time.Since(history.Time) < 2*g.interval
+}
+
+// rebuildAliveList filters alive outbounds and stores in a single atomic state swap.
+func (g *LoadBalanceGroup) rebuildAliveList() {
+	st := g.state.Load()
+	if st == nil {
+		return
+	}
+	alive := make([]adapter.Outbound, 0, len(st.outbounds))
+	for _, o := range st.outbounds {
+		if g.IsAlive(o) {
+			alive = append(alive, o)
+		}
+	}
+	sort.Slice(alive, func(i, j int) bool {
+		hi := g.history.LoadURLTestHistory(RealTag(alive[i]))
+		hj := g.history.LoadURLTestHistory(RealTag(alive[j]))
+		if hi == nil {
+			return false
+		}
+		if hj == nil {
+			return true
+		}
+		return hi.Delay < hj.Delay
+	})
+	g.state.Store(&lbState{
+		outbounds:     st.outbounds,
+		tags:          st.tags,
+		alive:         alive,
+		outboundByTag: st.outboundByTag,
+	})
+}
+
+// getAlive returns the current alive outbound list (lock-free).
+func (g *LoadBalanceGroup) getAlive() []adapter.Outbound {
+	st := g.state.Load()
+	if st == nil {
+		return nil
+	}
+	return st.alive
+}
+
+// getFailoverCandidates returns up to lbMaxFailoverCandidates alive outbounds excluding the failed one.
+func (g *LoadBalanceGroup) getFailoverCandidates(excludeTag string) []adapter.Outbound {
+	alive := g.getAlive()
+	if len(alive) == 0 {
+		return nil
+	}
+	cap := lbMaxFailoverCandidates
+	if len(alive) < cap {
+		cap = len(alive)
+	}
+	result := make([]adapter.Outbound, 0, cap)
+	for _, o := range alive {
+		if o.Tag() == excludeTag {
+			continue
+		}
+		result = append(result, o)
+		if len(result) >= lbMaxFailoverCandidates {
+			break
+		}
+	}
+	return result
 }
 
 func (g *LoadBalanceGroup) PostStart() {
 	g.access.Lock()
 	defer g.access.Unlock()
-	g.started = true
+	g.started.Store(true)
 	g.lastActive.Store(time.Now())
 	go g.CheckOutbounds(false)
 }
 
 func (g *LoadBalanceGroup) Touch() {
-	if !g.started {
+	if !g.started.Load() {
 		return
 	}
 	g.access.Lock()
@@ -406,6 +572,7 @@ func (g *LoadBalanceGroup) Touch() {
 	g.ticker = time.NewTicker(g.interval)
 	go g.loopCheck()
 	g.pauseCallback = pause.RegisterTicker(g.pause, g.ticker, g.interval, nil)
+	g.logger.Info("health check resumed")
 }
 
 func (g *LoadBalanceGroup) Close() error {
@@ -426,10 +593,14 @@ func (g *LoadBalanceGroup) loopCheck() {
 		g.CheckOutbounds(false)
 	}
 	for {
+		g.access.Lock()
+		tickerChan := g.ticker.C
+		g.access.Unlock()
+
 		select {
 		case <-g.close:
 			return
-		case <-g.ticker.C:
+		case <-tickerChan:
 		}
 		if time.Since(g.lastActive.Load()) > g.idleTimeout {
 			g.access.Lock()
@@ -438,6 +609,7 @@ func (g *LoadBalanceGroup) loopCheck() {
 			g.pause.UnregisterCallback(g.pauseCallback)
 			g.pauseCallback = nil
 			g.access.Unlock()
+			g.logger.Info("health check paused due to idle timeout")
 			return
 		}
 		g.CheckOutbounds(false)
@@ -453,15 +625,44 @@ func (g *LoadBalanceGroup) URLTest(ctx context.Context) (map[string]uint16, erro
 }
 
 func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]uint16, error) {
-	result := make(map[string]uint16)
 	if g.checking.Swap(true) {
-		return result, nil
+		return nil, nil
 	}
 	defer g.checking.Store(false)
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
-	checked := make(map[string]bool)
+
+	snap := g.state.Load()
+	if snap == nil {
+		return nil, nil
+	}
+	outbounds := snap.outbounds
+	outboundCount := len(outbounds)
+	result := make(map[string]uint16, outboundCount)
+
+	// Scale batch timeout with outbound count
+	batchTimeout := g.interval
+	if scaled := time.Duration(outboundCount/lbMaxBatchConcurrency+1) * C.TCPTimeout * 2; scaled > batchTimeout {
+		batchTimeout = scaled
+	}
+	if batchTimeout > 10*time.Minute {
+		batchTimeout = 10 * time.Minute
+	}
+	if batchTimeout < 2*C.TCPTimeout {
+		batchTimeout = 2 * C.TCPTimeout
+	}
+	batchCtx, batchCancel := context.WithTimeout(g.ctx, batchTimeout)
+	defer batchCancel()
+
+	concurrency := outboundCount
+	if concurrency > lbMaxBatchConcurrency {
+		concurrency = lbMaxBatchConcurrency
+	}
+	if concurrency < 1 {
+		concurrency = 1
+	}
+	b, _ := batch.New(batchCtx, batch.WithConcurrencyNum[any](concurrency))
+	checked := make(map[string]bool, outboundCount)
 	var resultAccess sync.Mutex
-	for _, detour := range g.outbounds {
+	for _, detour := range outbounds {
 		tag := detour.Tag()
 		realTag := RealTag(detour)
 		if checked[realTag] {
@@ -477,14 +678,18 @@ func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]
 			continue
 		}
 		b.Go(realTag, func() (any, error) {
-			testCtx, cancel := context.WithTimeout(g.ctx, C.TCPTimeout)
+			testCtx, cancel := context.WithTimeout(batchCtx, C.TCPTimeout)
 			defer cancel()
 			t, err := urltest.URLTest(testCtx, g.link, p)
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
-				g.history.DeleteURLTestHistory(realTag)
+				if g.incrementFailure(realTag) >= 3 {
+					g.history.DeleteURLTestHistory(realTag)
+					g.logger.Info("outbound ", tag, " marked unavailable after consecutive failures")
+				}
 			} else {
 				g.logger.Debug("outbound ", tag, " available: ", t, "ms")
+				g.resetFailure(realTag)
 				g.history.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
 					Time:  time.Now(),
 					Delay: t,
@@ -497,25 +702,38 @@ func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]
 		})
 	}
 	b.Wait()
+	g.rebuildAliveList()
+	g.logger.Info("health check completed: ", len(result), "/", outboundCount, " outbounds available")
+	if outboundCount > 100 {
+		debug.FreeOSMemory()
+	}
 	return result, nil
+}
+
+func (g *LoadBalanceGroup) incrementFailure(tag string) int32 {
+	g.failureMu.Lock()
+	g.failureCount[tag]++
+	count := g.failureCount[tag]
+	g.failureMu.Unlock()
+	return count
+}
+
+func (g *LoadBalanceGroup) resetFailure(tag string) {
+	g.failureMu.Lock()
+	delete(g.failureCount, tag)
+	g.failureMu.Unlock()
 }
 
 func (g *LoadBalanceGroup) Unwrap(metadata *adapter.InboundContext, touch bool) adapter.Outbound {
 	return g.strategyFn(metadata, touch)
 }
 
-func (g *LoadBalanceGroup) AliveForTestUrl(proxy adapter.Outbound) bool {
-	if history := g.history.LoadURLTestHistory(RealTag(proxy)); history != nil {
-		return true
-	}
-	return false
-}
+// --- Utility functions ---
 
 func getKey(metadata *adapter.InboundContext) string {
 	if metadata == nil {
 		return ""
 	}
-
 	var metadataHost string
 	if metadata.Destination.IsDomain() {
 		metadataHost = metadata.Destination.Fqdn
@@ -524,136 +742,138 @@ func getKey(metadata *adapter.InboundContext) string {
 	} else {
 		metadataHost = metadata.Domain
 	}
-
 	if metadataHost != "" {
-		// ip host
 		if ip := net.ParseIP(metadataHost); ip != nil {
 			return metadataHost
 		}
-
 		if etld, err := publicsuffix.EffectiveTLDPlusOne(metadataHost); err == nil {
 			return etld
 		}
 	}
-
 	var destinationAddr netip.Addr
 	if len(metadata.DestinationAddresses) > 0 {
 		destinationAddr = metadata.DestinationAddresses[0]
 	} else {
 		destinationAddr = metadata.Destination.Addr
 	}
-
 	if !destinationAddr.IsValid() {
 		return ""
 	}
-
 	return destinationAddr.String()
 }
 
 func getKeyWithSrcAndDst(metadata *adapter.InboundContext) string {
 	dst := getKey(metadata)
-	src := ""
-	if metadata != nil {
-		src = metadata.Source.Addr.String()
+	if metadata == nil {
+		return dst
 	}
-
-	return fmt.Sprintf("%s%s", src, dst)
+	src := metadata.Source.Addr.String()
+	return src + dst
 }
 
 func jumpHash(key uint64, buckets int32) int32 {
 	var b, j int64
-
 	for j < int64(buckets) {
 		b = j
 		key = key*2862933555777941757 + 1
 		j = int64(float64(b+1) * (float64(int64(1)<<31) / float64((key>>33)+1)))
 	}
-
 	return int32(b)
 }
 
-func strategyRoundRobin(g *LoadBalanceGroup, url string) strategyFn {
-	idx := 0
-	idxMutex := sync.Mutex{}
+// --- Strategies: all operate on alive list, not full outbound list ---
+
+func strategyRoundRobin(g *LoadBalanceGroup) strategyFn {
+	var idx atomic.Uint64
 	return func(metadata *adapter.InboundContext, touch bool) adapter.Outbound {
-		idxMutex.Lock()
-		defer idxMutex.Unlock()
-
-		i := 0
-		length := len(g.outbounds)
-
-		if touch {
-			defer func() {
-				idx = (idx + i) % length
-			}()
-		}
-
-		for ; i < length; i++ {
-			id := (idx + i) % length
-			proxy := g.outbounds[id]
-			if g.AliveForTestUrl(proxy) {
-				i++
-				return proxy
+		alive := g.getAlive()
+		length := len(alive)
+		if length == 0 {
+			// No alive nodes — fallback to first from snapshot
+			snap := g.state.Load()
+			if snap != nil && len(snap.outbounds) > 0 {
+				return snap.outbounds[0]
 			}
+			return nil
 		}
-
-		return g.outbounds[0]
+		if touch {
+			current := idx.Add(1)
+			return alive[int(current-1)%length]
+		}
+		current := idx.Load()
+		return alive[int(current)%length]
 	}
 }
 
-func strategyConsistentHashing(g *LoadBalanceGroup, url string) strategyFn {
-	maxRetry := 5
+func strategyConsistentHashing(g *LoadBalanceGroup) strategyFn {
 	hash := maphash.NewHasher[string]()
 	return func(metadata *adapter.InboundContext, touch bool) adapter.Outbound {
+		alive := g.getAlive()
+		if len(alive) == 0 {
+			snap := g.state.Load()
+			if snap != nil && len(snap.outbounds) > 0 {
+				return snap.outbounds[0]
+			}
+			return nil
+		}
 		key := hash.Hash(getKey(metadata))
-		buckets := int32(len(g.outbounds))
-		for i := 0; i < maxRetry; i, key = i+1, key+1 {
-			idx := jumpHash(key, buckets)
-			proxy := g.outbounds[idx]
-			if g.AliveForTestUrl(proxy) {
-				return proxy
-			}
+		buckets := int32(len(alive))
+		// Adaptive retry: min(alive count, 32)
+		maxRetry := len(alive)
+		if maxRetry > 32 {
+			maxRetry = 32
 		}
-
-		// when availability is poor, traverse the entire list to get the available nodes
-		for _, proxy := range g.outbounds {
-			if g.AliveForTestUrl(proxy) {
-				return proxy
-			}
+		for i := 0; i < maxRetry; i++ {
+			idx := jumpHash(key+uint64(i), buckets)
+			return alive[idx]
 		}
-
-		return g.outbounds[0]
+		return alive[0]
 	}
 }
 
-func strategyStickySessions(g *LoadBalanceGroup, url string) strategyFn {
-	maxRetry := 5
-	lruCache := common.Must1(freelru.NewSharded[uint64, int](1000, maphash.NewHasher[uint64]().Hash32))
+func strategyStickySessions(g *LoadBalanceGroup, lruSize uint32) strategyFn {
+	// LRU stores outbound TAG (string), not index — survives provider updates
+	lruCache := common.Must1(freelru.NewSharded[uint64, string](lruSize, maphash.NewHasher[uint64]().Hash32))
 	lruCache.SetLifetime(g.ttl)
 	hash := maphash.NewHasher[string]()
+
 	return func(metadata *adapter.InboundContext, touch bool) adapter.Outbound {
-		key := hash.Hash(getKeyWithSrcAndDst(metadata))
-		length := len(g.outbounds)
-		idx, has := lruCache.Get(key)
-		if !has || idx >= length {
-			idx = int(jumpHash(key+uint64(time.Now().UnixNano()), int32(length)))
+		alive := g.getAlive()
+		if len(alive) == 0 {
+			snap := g.state.Load()
+			if snap != nil && len(snap.outbounds) > 0 {
+				return snap.outbounds[0]
+			}
+			return nil
 		}
 
-		nowIdx := idx
-		for i := 1; i < maxRetry; i++ {
-			proxy := g.outbounds[nowIdx]
-			if g.AliveForTestUrl(proxy) {
-				if !has || nowIdx != idx {
-					lruCache.Add(key, nowIdx)
-				}
+		key := hash.Hash(getKeyWithSrcAndDst(metadata))
 
-				return proxy
-			} else {
-				nowIdx = int(jumpHash(key+uint64(time.Now().UnixNano()), int32(length)))
+		// Check LRU: if cached tag still alive, use it
+		if cachedTag, has := lruCache.Get(key); has {
+			st := g.state.Load()
+			if st != nil && st.outboundByTag != nil {
+				if outbound, ok := st.outboundByTag[cachedTag]; ok && g.IsAlive(outbound) {
+					return outbound
+				}
 			}
 		}
 
-		lruCache.Add(key, 0)
-		return g.outbounds[0]
+		// Deterministic probing on alive list
+		buckets := int32(len(alive))
+		maxRetry := len(alive)
+		if maxRetry > 32 {
+			maxRetry = 32
+		}
+		for i := 0; i < maxRetry; i++ {
+			idx := jumpHash(key+uint64(i), buckets)
+			proxy := alive[idx]
+			lruCache.Add(key, proxy.Tag())
+			return proxy
+		}
+
+		selected := alive[0]
+		lruCache.Add(key, selected.Tag())
+		return selected
 	}
 }

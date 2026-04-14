@@ -8,6 +8,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -52,6 +53,7 @@ type Inbound struct {
 	routeRuleSetCallback        []*list.Element[adapter.RuleSetUpdateCallback]
 	routeExcludeRuleSet         []adapter.RuleSet
 	routeExcludeRuleSetCallback []*list.Element[adapter.RuleSetUpdateCallback]
+	routeAddressMu              sync.Mutex
 	routeAddressSet             []*netipx.IPSet
 	routeExcludeAddressSet      []*netipx.IPSet
 }
@@ -434,13 +436,17 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 				return E.Cause(err, "auto-redirect")
 			}
 		}
+		t.routeAddressMu.Lock()
 		t.routeAddressSet = nil
 		t.routeExcludeAddressSet = nil
+		t.routeAddressMu.Unlock()
 	}
 	return nil
 }
 
 func (t *Inbound) updateRouteAddressSet(it adapter.RuleSet) {
+	t.routeAddressMu.Lock()
+	defer t.routeAddressMu.Unlock()
 	t.routeAddressSet = common.FlatMap(t.routeRuleSet, adapter.RuleSet.ExtractIPSet)
 	t.routeExcludeAddressSet = common.FlatMap(t.routeExcludeRuleSet, adapter.RuleSet.ExtractIPSet)
 	t.autoRedirect.UpdateRouteAddressSet()
@@ -449,6 +455,22 @@ func (t *Inbound) updateRouteAddressSet(it adapter.RuleSet) {
 }
 
 func (t *Inbound) Close() error {
+	for i, callback := range t.routeRuleSetCallback {
+		t.routeRuleSet[i].UnregisterCallback(callback)
+	}
+	t.routeRuleSetCallback = nil
+	for i, callback := range t.routeExcludeRuleSetCallback {
+		t.routeExcludeRuleSet[i].UnregisterCallback(callback)
+	}
+	t.routeExcludeRuleSetCallback = nil
+	for _, ruleSet := range t.routeRuleSet {
+		ruleSet.DecRef()
+	}
+	t.routeRuleSet = nil
+	for _, ruleSet := range t.routeExcludeRuleSet {
+		ruleSet.DecRef()
+	}
+	t.routeExcludeRuleSet = nil
 	return common.Close(
 		t.tunStack,
 		t.tunIf,
@@ -558,5 +580,6 @@ func (t *autoRedirectHandler) NewConnectionEx(ctx context.Context, conn net.Conn
 }
 
 func (t *autoRedirectHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	panic("unexcepted")
+	t.logger.Error("unexpected packet connection in auto-redirect handler from ", source)
+	N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 }
