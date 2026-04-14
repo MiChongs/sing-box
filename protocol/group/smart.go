@@ -98,15 +98,30 @@ type Smart struct {
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 
-	testURL        string
-	interval       time.Duration
-	disableUDP     bool
-	policyPriority []priorityRule
-	useASN         bool
-	asnDBPath      string // configured path; "" means "fall back to geox service"
-	asnDB          *maxminddb.Reader
+	testURL            string
+	interval           time.Duration
+	disableUDP         bool
+	policyPriority     []priorityRule
+	useASN             bool
+	asnDBPath          string // configured path; "" means "fall back to geox service"
+	asnDB              *maxminddb.Reader
+	maxHostFailedTimes int    // mihomo parity; 0 = default 10
 
 	store *smart.Store
+
+	// Active connections registry keyed by target. Used by markTargetDegraded
+	// to proactively close in-flight connections to a target after a node was
+	// degraded so the user's client re-issues and Smart re-selects.
+	// Mirrors mihomo's findSameConnection behaviour.
+	targetConnsMu sync.Mutex
+	targetConns   map[string]map[*smartTrackedConn]struct{}
+
+	// Dial-failure tracking at the group level. Same idea as URLTest's
+	// reportDialFailure — accumulated failures across the group trigger an
+	// immediate async health re-evaluation (mihomo onDialFailed/Success).
+	dialFailCount atomic.Int32
+	dialFailAt    atomic.Int64
+	recheckOnce   atomic.Bool
 
 	// provider support
 	provider         adapter.ProviderManager
@@ -175,9 +190,14 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		include:         (*regexp.Regexp)(options.Include),
 		useAllProviders: options.UseAllProviders,
 
-		useLightGBM: options.UseLightGBM,
-		collectData: options.CollectData,
-		sampleRate:  options.SampleRate,
+		useLightGBM:        options.UseLightGBM,
+		collectData:        options.CollectData,
+		sampleRate:         options.SampleRate,
+		maxHostFailedTimes: options.MaxHostFailedTimes,
+		targetConns:        make(map[string]map[*smartTrackedConn]struct{}),
+	}
+	if s.maxHostFailedTimes <= 0 {
+		s.maxHostFailedTimes = 10
 	}
 
 	if s.testURL == "" {
@@ -1247,6 +1267,12 @@ func (c *smartTrackedConn) classifyStatus() (string, error) {
 
 func (c *smartTrackedConn) Close() error {
 	c.closeOnce.Do(func() {
+		// Remove from per-target registry so a subsequent mass-close doesn't
+		// try to close this already-closed connection.
+		if c.meta != nil {
+			c.s.deregisterTargetConn(c.meta.smartTarget, c)
+		}
+
 		durMS := time.Since(c.startTime).Milliseconds()
 		up := c.upload.Load()
 		down := c.download.Load()
@@ -1380,12 +1406,102 @@ func (s *Smart) wrapConn(conn net.Conn, tag string, meta *smartDialMeta, connect
 		connectTime: connectTime,
 		startTime:   time.Now(),
 	}
+	s.registerTargetConn(meta.smartTarget, tracked)
 	if s.interruptExternalConnections {
 		return s.interruptGroup.NewConn(tracked,
 			interrupt.IsExternalConnectionFromContext(context.Background()),
 			false)
 	}
 	return tracked
+}
+
+// registerTargetConn adds a tracked conn to the per-target registry used by
+// closeTargetConnections for mihomo-style findSameConnection cleanup.
+func (s *Smart) registerTargetConn(target string, c *smartTrackedConn) {
+	if target == "" {
+		return
+	}
+	s.targetConnsMu.Lock()
+	defer s.targetConnsMu.Unlock()
+	set := s.targetConns[target]
+	if set == nil {
+		set = make(map[*smartTrackedConn]struct{})
+		s.targetConns[target] = set
+	}
+	set[c] = struct{}{}
+}
+
+// deregisterTargetConn removes a tracked conn from the registry at Close time.
+func (s *Smart) deregisterTargetConn(target string, c *smartTrackedConn) {
+	if target == "" {
+		return
+	}
+	s.targetConnsMu.Lock()
+	defer s.targetConnsMu.Unlock()
+	if set := s.targetConns[target]; set != nil {
+		delete(set, c)
+		if len(set) == 0 {
+			delete(s.targetConns, target)
+		}
+	}
+}
+
+// closeTargetConnections force-closes every in-flight connection whose
+// selected node matches the given node tag and whose target matches. Called
+// when a node was just degraded so active connections through it drop and
+// the user's client re-establishes against the updated selection.
+//
+// We intentionally skip the triggering connection itself — the caller was
+// already about to close it (the close path is what invoked recordStats).
+func (s *Smart) closeTargetConnections(target, nodeTag string) {
+	if target == "" {
+		return
+	}
+	s.targetConnsMu.Lock()
+	set := s.targetConns[target]
+	victims := make([]*smartTrackedConn, 0, len(set))
+	for c := range set {
+		if c.proxyTag == nodeTag {
+			victims = append(victims, c)
+		}
+	}
+	s.targetConnsMu.Unlock()
+
+	if len(victims) == 0 {
+		return
+	}
+	s.logger.Debug("smart[", s.Tag(), "] target [", target, "] degraded via [",
+		nodeTag, "]: closing ", len(victims), " active connection(s)")
+	for _, c := range victims {
+		_ = c.Conn.Close() // raw close; our Close() wrapper will de-register
+	}
+}
+
+// onDialOutcome feeds dial success/failure into group-level counters.
+// After 5 consecutive (within the last interval) failures, triggers an
+// async prefetch re-run so the Smart store catches up without waiting
+// for the 10-minute scheduled tick. Mirrors mihomo GroupBase.onDialFailed.
+func (s *Smart) onDialOutcome(success bool) {
+	if success {
+		s.dialFailCount.Store(0)
+		return
+	}
+	now := time.Now().Unix()
+	last := s.dialFailAt.Swap(now)
+	if now-last > 60 {
+		// >1 minute since last failure — reset counter
+		s.dialFailCount.Store(1)
+		return
+	}
+	cnt := s.dialFailCount.Add(1)
+	if cnt >= 5 && s.recheckOnce.CompareAndSwap(false, true) {
+		go func() {
+			defer s.recheckOnce.Store(false)
+			s.logger.Info("smart[", s.Tag(), "] accumulated ", cnt,
+				" dial failures in short window; triggering emergency prefetch refresh")
+			s.runPrefetch()
+		}()
+	}
 }
 
 func (s *Smart) wrapPacketConn(pc net.PacketConn, tag string, meta *smartDialMeta, connectTime int64) net.PacketConn {
@@ -1401,10 +1517,38 @@ func (s *Smart) wrapPacketConn(pc net.PacketConn, tag string, meta *smartDialMet
 
 // ─── connection statistics ────────────────────────────────────────────────────
 
+// smartSkipTypes is the set of outbound types that should never contribute to
+// the weight store — dialing through them is not a "real" route measurement.
+// Mihomo uses proxy.Type() against C.Compatible/C.Reject/C.Pass/C.RejectDrop;
+// sing-box equivalents live in constant.Type*.
+func smartSkipType(t string) bool {
+	switch t {
+	case C.TypeDirect, C.TypeBlock, C.TypeDNS:
+		return true
+	}
+	return false
+}
+
 func (s *Smart) recordStats(
 	status string, meta *smartDialMeta, proxyTag string,
 	connectTime, latency, uploadBytes, downloadBytes, maxUploadRate, maxDownloadRate, durationMS int64,
 ) {
+	// Skip special types — prevents polluting the weight store with results
+	// from direct / block / dns outbounds (mihomo parity).
+	if ob, loaded := s.outboundMgr.Outbound(proxyTag); loaded && smartSkipType(ob.Type()) {
+		return
+	}
+
+	// Feed dial outcome into group-level failure tracking (mihomo's
+	// onDialFailed / onDialSuccess). Accumulated failures trigger an async
+	// prefetch refresh so the group catches new breakage faster than the
+	// scheduled 10-minute tick.
+	if status == "failed" {
+		s.onDialOutcome(false)
+	} else {
+		s.onDialOutcome(true)
+	}
+
 	if s.store == nil {
 		return
 	}
@@ -1520,11 +1664,31 @@ func (s *Smart) recordStats(
 		calculatedWeight, _ = smart.CalculateWeight(input, priorityFactor)
 	}
 
-	// Training-sample collection (sample rate applied).
+	// Host-level failure tracking (mihomo parity): a wildcard target that has
+	// failed many times should NOT further penalize the node — the problem is
+	// the target, not the route. Threshold is configurable per group via
+	// max_host_failed_times (default 10).
+	hostFailCount, hostLastUsed := s.store.GetHostStatus(s.Tag(), smartConfigName, target)
+	hostBlocked := hostFailCount >= s.maxHostFailedTimes
+
+	finalWeight, isDegraded := s.checkNodeQualityDegradation(
+		status, meta, proxyTag, calculatedWeight, oldWeight,
+		durationMS, uploadMB, downloadMB, hostBlocked,
+	)
+
+	// Training-sample collection: record the NORMALISED post-degradation score
+	// (finalWeight / priorityFactor) as the model target — mihomo parity.
+	// Pre-priority / pre-degradation calculatedWeight was the training-target
+	// value prior to this fix, which caused the model to learn priority-biased
+	// scores rather than the raw algorithmic signal.
 	if s.dataCollector != nil && (s.sampleRate >= 1 || rand.Float64() < s.sampleRate) {
 		source := "traditional"
 		if mlPredicted {
 			source = "lightgbm"
+		}
+		baseWeight := finalWeight
+		if priorityFactor > 0 {
+			baseWeight = finalWeight / priorityFactor
 		}
 		cmeta := &lightgbm.CollectorMeta{
 			DestASN:  meta.asnCode,
@@ -1537,30 +1701,18 @@ func (s *Smart) recordStats(
 				break
 			}
 		}
-		go s.dataCollector.AddSample(input, cmeta, calculatedWeight, source)
+		go s.dataCollector.AddSample(input, cmeta, baseWeight, source)
 	}
-
-	// Host-level failure tracking (mihomo parity): a wildcard target that has
-	// failed many times should NOT further penalize the node — the problem is
-	// the target, not the route. Default threshold 10; beyond that the host
-	// is considered "blocked" and node weight stays put.
-	const hostMaxFailedTimes = 10
-	hostFailCount, hostLastUsed := s.store.GetHostStatus(s.Tag(), smartConfigName, target)
-	hostBlocked := hostFailCount >= hostMaxFailedTimes
-
-	finalWeight, isDegraded := s.checkNodeQualityDegradation(
-		status, meta, proxyTag, calculatedWeight, oldWeight,
-		durationMS, uploadMB, downloadMB, hostBlocked,
-	)
 
 	if isDegraded {
 		s.updatePrefetchCache(meta, target, proxyTag, finalWeight)
-		// Drop the unwrap cache so the next connection to this target
-		// re-evaluates node selection (mihomo's findSameConnection equivalent;
-		// sing-box has no global statistic manager so we do the simple thing).
+		// mihomo's findSameConnection equivalent: force-close in-flight
+		// connections to the same target so the user's client re-issues
+		// against the refreshed node selection.
 		if s.store != nil {
 			s.store.DeleteUnwrapResult(s.Tag(), smartConfigName, target, meta.asnCode, meta.isUDP)
 		}
+		s.closeTargetConnections(target, proxyTag)
 	}
 
 	// Update host failure/success counter. Only update lastUsed on zero-traffic

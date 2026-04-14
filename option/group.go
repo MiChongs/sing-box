@@ -51,6 +51,12 @@ type SmartOutboundOptions struct {
 	DisableUDP                bool               `json:"disable_udp,omitempty"`
 	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
 
+	// Host-level blocking threshold (mihomo: maxFailedTimes). When the
+	// failure counter for a wildcard target reaches this value, Smart will
+	// stop further node degradation on the theory that the target itself is
+	// broken (not the node). Zero uses the default 10.
+	MaxHostFailedTimes int `json:"max_host_failed_times,omitempty"`
+
 	// Per-group opt-in flags. Infrastructure (model URL, update interval,
 	// collector path, etc.) lives in experimental.smart at the top level and
 	// is shared across all Smart groups.
