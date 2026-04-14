@@ -33,6 +33,18 @@ const (
 	maxPrecisionConcurrency = 2  // Phase 2: precision retest — minimal concurrency for accuracy
 	maxPrecisionCandidates  = 8  // Number of top candidates to retest
 	maxFailoverCandidates   = 10
+
+	// Consecutive health-check failures before we stop trusting a node.
+	// Unlike mihomo, we don't delete history — we mark it stale by zeroing delay.
+	// This keeps the node in the ranked list for failover but deprioritizes it.
+	healthCheckFailThreshold = 3
+
+	// Dial failures that trigger a proactive re-check (mihomo parity).
+	dialFailureThreshold = 5
+
+	// When current selection's history is missing, how long to trust it anyway
+	// before considering a switch. Prevents flapping on transient test-URL blockage.
+	staleHistoryGrace = 2 * time.Minute
 )
 
 func RegisterURLTest(registry *outbound.Registry) {
@@ -230,17 +242,21 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	}
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
+		s.group.reportDialSuccess(outbound.Tag())
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
+	s.group.reportDialFailure(outbound.Tag())
 	s.logger.ErrorContext(ctx, "primary outbound ", outbound.Tag(), " failed: ", err)
 	// Failover: try top-N ranked healthy outbounds (not all 3000+)
 	candidates := s.group.getFailoverCandidates(N.NetworkName(network), outbound.Tag())
 	for _, detour := range candidates {
 		conn, err = detour.DialContext(ctx, network, destination)
 		if err == nil {
+			s.group.reportDialSuccess(detour.Tag())
 			s.logger.InfoContext(ctx, "failover to ", detour.Tag())
 			return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 		}
+		s.group.reportDialFailure(detour.Tag())
 	}
 	return nil, E.New("all outbounds failed for ", network, " to ", destination)
 }
@@ -256,17 +272,21 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
+		s.group.reportDialSuccess(outbound.Tag())
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
+	s.group.reportDialFailure(outbound.Tag())
 	s.logger.ErrorContext(ctx, "primary outbound ", outbound.Tag(), " failed: ", err)
 	// Failover: try top-N ranked healthy outbounds
 	candidates := s.group.getFailoverCandidates(N.NetworkUDP, outbound.Tag())
 	for _, detour := range candidates {
 		conn, err = detour.ListenPacket(ctx, destination)
 		if err == nil {
+			s.group.reportDialSuccess(detour.Tag())
 			s.logger.InfoContext(ctx, "failover to ", detour.Tag())
 			return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 		}
+		s.group.reportDialFailure(detour.Tag())
 	}
 	return nil, E.New("all outbounds failed for UDP to ", destination)
 }
@@ -354,6 +374,13 @@ func (s *URLTest) onProviderUpdated(tag string) error {
 		}
 	}
 	s.group.failureMu.Unlock()
+	s.group.dialFailureMu.Lock()
+	for k := range s.group.dialFailureCount {
+		if _, exists := activeTagSet[k]; !exists {
+			delete(s.group.dialFailureCount, k)
+		}
+	}
+	s.group.dialFailureMu.Unlock()
 	if s.isGroupActive() {
 		s.group.access.Lock()
 		if s.group.ticker != nil {
@@ -403,6 +430,13 @@ type URLTestGroup struct {
 	failureMu    sync.Mutex
 	failureCount map[string]int32
 
+	// Dial-failure tracking: counts user-facing dial failures per tag.
+	// When threshold exceeded, triggers async health re-check (mihomo onDialFailed parity).
+	dialFailureMu    sync.Mutex
+	dialFailureCount map[string]int32
+	dialFailureAt    time.Time // last time we bumped failures; clears periodically
+	dialRecheckOnce  atomic.Bool
+
 	// Reusable maps — allocated once, cleared each cycle (avoid per-check allocation)
 	reusableChecked map[string]bool
 	reusableResult  map[string]uint16
@@ -446,6 +480,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
 		failureCount:                 make(map[string]int32),
+		dialFailureCount:             make(map[string]int32),
 		reusableChecked:              make(map[string]bool, len(outbounds)),
 		reusableResult:               make(map[string]uint16, len(outbounds)),
 	}
@@ -495,8 +530,14 @@ func (g *URLTestGroup) Close() error {
 
 // Select picks the best outbound from the pre-sorted ranked list — O(1) for the common case.
 // Falls back to full scan only when ranked list is empty (before first health check).
+//
+// Disconnect-prevention rules (mihomo-parity):
+//  1. If current selection still has valid (fresh) history within tolerance, keep it.
+//  2. If current has stale/missing history but is still in the outbound set AND we
+//     haven't seen too many dial failures on it, give it a grace period. Avoids
+//     thrash when the test URL is temporarily blocked while traffic still works.
+//  3. Only switch when current is truly unusable (dropped from set, or marked bad).
 func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
-	// Fast path: use pre-sorted ranked candidates from state
 	st := g.getState()
 	var candidates []rankedOutbound
 	if st != nil {
@@ -507,52 +548,133 @@ func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
 			candidates = st.rankedUDP
 		}
 	}
+
+	var current adapter.Outbound
+	switch network {
+	case N.NetworkTCP:
+		current = g.selectedOutboundTCP.Load()
+	case N.NetworkUDP:
+		current = g.selectedOutboundUDP.Load()
+	}
+
 	if len(candidates) > 0 {
 		best := candidates[0]
-		// Check if current selection is still within tolerance
-		var current adapter.Outbound
-		switch network {
-		case N.NetworkTCP:
-			current = g.selectedOutboundTCP.Load()
-		case N.NetworkUDP:
-			current = g.selectedOutboundUDP.Load()
-		}
+
+		// Rule 1: current still within tolerance → stick with it (prevents delay-jitter flapping).
 		if current != nil {
 			if currentHistory := g.history.LoadURLTestHistory(RealTag(current)); currentHistory != nil {
 				if currentHistory.Delay <= best.delay+g.tolerance {
 					return current, true
 				}
+			} else {
+				// Rule 2: current has no history (either first run or failed-stripped).
+				// If current is still in the snapshot and hasn't accumulated dial failures,
+				// give it a grace period instead of hard-switching.
+				if st != nil && g.outboundStillPresent(st, current) && !g.hasExcessiveDialFailures(current.Tag()) {
+					return current, true
+				}
 			}
 		}
-		// Apply fallback filtering
+
+		// Rule 3: apply fallback filtering
 		if g.fallback.enabled && g.fallback.maxDelay > 0 {
 			for _, c := range candidates {
 				if c.delay <= g.fallback.maxDelay {
 					return c.outbound, true
 				}
 			}
-			// All exceed maxDelay — return best anyway
 		}
 		return best.outbound, true
 	}
-	// Slow path: no ranked data yet — full scan (only on startup before first check)
+
+	// No ranked data yet — try to hold current if it's still in the snapshot.
+	if current != nil && st != nil && g.outboundStillPresent(st, current) {
+		return current, true
+	}
+
 	return g.selectFullScan(network)
 }
 
+// outboundStillPresent reports whether `ob` is part of the current snapshot.
+func (g *URLTestGroup) outboundStillPresent(st *groupState, ob adapter.Outbound) bool {
+	for _, o := range st.outbounds {
+		if o == ob || o.Tag() == ob.Tag() {
+			return true
+		}
+	}
+	return false
+}
+
+// hasExcessiveDialFailures reports whether tag has exceeded dial-failure threshold.
+func (g *URLTestGroup) hasExcessiveDialFailures(tag string) bool {
+	g.dialFailureMu.Lock()
+	defer g.dialFailureMu.Unlock()
+	return g.dialFailureCount[tag] >= dialFailureThreshold
+}
+
+// reportDialFailure is called by DialContext/ListenPacket on a failed dial.
+// Mihomo-parity: bumps failure counter and triggers async health-check when excessive.
+func (g *URLTestGroup) reportDialFailure(tag string) {
+	g.dialFailureMu.Lock()
+	// Decay stale counters if last bump was long ago
+	if !g.dialFailureAt.IsZero() && time.Since(g.dialFailureAt) > g.interval {
+		for k := range g.dialFailureCount {
+			delete(g.dialFailureCount, k)
+		}
+	}
+	g.dialFailureCount[tag]++
+	count := g.dialFailureCount[tag]
+	g.dialFailureAt = time.Now()
+	g.dialFailureMu.Unlock()
+
+	if count >= dialFailureThreshold {
+		// Rate-limit: only one async re-check in flight at a time
+		if g.dialRecheckOnce.CompareAndSwap(false, true) {
+			go func() {
+				defer g.dialRecheckOnce.Store(false)
+				g.CheckOutbounds(true)
+			}()
+		}
+	}
+}
+
+// reportDialSuccess is called when a dial succeeds — clears the failure counter.
+func (g *URLTestGroup) reportDialSuccess(tag string) {
+	g.dialFailureMu.Lock()
+	delete(g.dialFailureCount, tag)
+	g.dialFailureMu.Unlock()
+}
+
 // selectFullScan is the original O(N) selection, used only before the first health check completes.
+// Prefers outbounds with recent history; falls back to any with any history; finally to any at all.
 func (g *URLTestGroup) selectFullScan(network string) (adapter.Outbound, bool) {
 	snap := g.getState()
 	if snap == nil {
 		return nil, false
 	}
-	var minDelay uint16
-	var minOutbound adapter.Outbound
+	var (
+		minDelay     uint16
+		minOutbound  adapter.Outbound
+		anyWithHist  adapter.Outbound
+		anyAvailable adapter.Outbound
+	)
+	now := time.Now()
 	for _, detour := range snap.outbounds {
 		if !common.Contains(detour.Network(), network) {
 			continue
 		}
+		if anyAvailable == nil {
+			anyAvailable = detour
+		}
 		history := g.history.LoadURLTestHistory(RealTag(detour))
 		if history == nil {
+			continue
+		}
+		if anyWithHist == nil {
+			anyWithHist = detour
+		}
+		// Only consider "fresh" history for ranking
+		if now.Sub(history.Time) > 2*g.interval+staleHistoryGrace {
 			continue
 		}
 		if minDelay == 0 || minDelay > history.Delay+g.tolerance {
@@ -560,16 +682,13 @@ func (g *URLTestGroup) selectFullScan(network string) (adapter.Outbound, bool) {
 			minOutbound = detour
 		}
 	}
-	if minOutbound == nil {
-		for _, detour := range snap.outbounds {
-			if !common.Contains(detour.Network(), network) {
-				continue
-			}
-			return detour, false
-		}
-		return nil, false
+	if minOutbound != nil {
+		return minOutbound, true
 	}
-	return minOutbound, true
+	if anyWithHist != nil {
+		return anyWithHist, true
+	}
+	return anyAvailable, anyAvailable != nil
 }
 
 // getFailoverCandidates returns up to maxFailoverCandidates from the ranked list, excluding the failed one.
@@ -737,9 +856,13 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 			t, err := urltest.URLTest(testCtx, g.link, p)
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
-				if g.incrementFailure(realTag) >= 3 {
-					g.history.DeleteURLTestHistory(realTag)
-					g.logger.Info("outbound ", tag, " marked unavailable after consecutive failures")
+				// DO NOT delete history on failure — mihomo never does this, and deleting
+				// it causes the group to aggressively switch away from the current
+				// selection, killing all active user connections via Interrupt.
+				// Just track the failure count for logging; the stale-but-present
+				// history will let Select() keep the current choice under Rule 2.
+				if cnt := g.incrementFailure(realTag); cnt == healthCheckFailThreshold {
+					g.logger.Info("outbound ", tag, " test failed ", cnt, " times (keeping history stale-valid)")
 				}
 			} else {
 				g.logger.Debug("outbound ", tag, " available: ", t, "ms (screening)")
@@ -864,6 +987,13 @@ func (g *URLTestGroup) performUpdateCheck() {
 			udpTag = udp.Tag()
 		}
 		g.logger.Info("selected outbound updated, TCP: ", tcpTag, ", UDP: ", udpTag)
-		g.interruptGroup.Interrupt(g.interruptExternalConnections)
+		// Only interrupt existing connections when the user opts in.
+		// Mihomo's urltest never interrupts active connections on selection change —
+		// new connections use the new choice, in-flight ones finish naturally.
+		// Unconditional Interrupt here was the primary cause of "connection drops
+		// every few minutes" reported by users.
+		if g.interruptExternalConnections {
+			g.interruptGroup.Interrupt(true)
+		}
 	}
 }

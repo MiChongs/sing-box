@@ -46,6 +46,14 @@ const (
 
 	lbMaxBatchConcurrency   = 16
 	lbMaxFailoverCandidates = 10
+
+	// Dial failures that trigger a proactive re-check (mihomo parity).
+	lbDialFailureThreshold = 5
+
+	// Lenient alive window: mihomo doesn't hard-expire history; we use
+	// a wider window than the original 2*interval to prevent flapping
+	// when the test URL is temporarily blocked.
+	lbAliveGraceMultiplier = 4
 )
 
 type LoadBalance struct {
@@ -209,8 +217,10 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 	}
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
+		s.group.reportDialSuccess(outbound.Tag())
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
+	s.group.reportDialFailure(outbound.Tag())
 	s.logger.ErrorContext(ctx, "primary outbound ", outbound.Tag(), " failed: ", err)
 	// Failover from alive list
 	failedTag := outbound.Tag()
@@ -221,12 +231,14 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 		}
 		conn, err = detour.DialContext(ctx, network, destination)
 		if err == nil {
+			s.group.reportDialSuccess(detour.Tag())
 			s.logger.InfoContext(ctx, "failover to ", detour.Tag())
 			if metadata != nil {
 				metadata.AppendRealOutbound(detour.Tag())
 			}
 			return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 		}
+		s.group.reportDialFailure(detour.Tag())
 	}
 	return nil, E.New("all outbounds failed for ", network, " to ", destination)
 }
@@ -243,8 +255,10 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	}
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
+		s.group.reportDialSuccess(outbound.Tag())
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 	}
+	s.group.reportDialFailure(outbound.Tag())
 	s.logger.ErrorContext(ctx, "primary outbound ", outbound.Tag(), " failed: ", err)
 	failedTag := outbound.Tag()
 	candidates := s.group.getFailoverCandidates(failedTag)
@@ -254,12 +268,14 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 		}
 		conn, err = detour.ListenPacket(ctx, destination)
 		if err == nil {
+			s.group.reportDialSuccess(detour.Tag())
 			s.logger.InfoContext(ctx, "failover to ", detour.Tag())
 			if metadata != nil {
 				metadata.AppendRealOutbound(detour.Tag())
 			}
 			return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsProviderConnectionFromContext(ctx)), nil
 		}
+		s.group.reportDialFailure(detour.Tag())
 	}
 	return nil, E.New("all outbounds failed for UDP to ", destination)
 }
@@ -346,6 +362,13 @@ func (s *LoadBalance) onProviderUpdated(tag string) error {
 		}
 	}
 	s.group.failureMu.Unlock()
+	s.group.dialFailureMu.Lock()
+	for k := range s.group.dialFailureCount {
+		if _, exists := activeTagSet[k]; !exists {
+			delete(s.group.dialFailureCount, k)
+		}
+	}
+	s.group.dialFailureMu.Unlock()
 	if s.isGroupActive() {
 		s.group.access.Lock()
 		if s.group.ticker != nil {
@@ -400,7 +423,14 @@ type LoadBalanceGroup struct {
 	lastActive   common.TypedValue[time.Time]
 	failureMu    sync.Mutex
 	failureCount map[string]int32
-	strategyFn   strategyFn
+
+	// Dial-failure tracking for proactive health re-check (mihomo parity).
+	dialFailureMu    sync.Mutex
+	dialFailureCount map[string]int32
+	dialFailureAt    time.Time
+	dialRecheckOnce  atomic.Bool
+
+	strategyFn strategyFn
 }
 
 func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, tags []string, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, interruptExternalConnections bool, strategy string) (*LoadBalanceGroup, error) {
@@ -441,6 +471,7 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: interruptExternalConnections,
 		failureCount:                 make(map[string]int32),
+		dialFailureCount:             make(map[string]int32),
 	}
 	index := make(map[string]adapter.Outbound, len(outbounds))
 	for _, o := range outbounds {
@@ -480,26 +511,85 @@ func (g *LoadBalanceGroup) rebuildOutboundIndex() {
 }
 
 // IsAlive checks if an outbound has a recent successful health check.
+// Uses a lenient window (lbAliveGraceMultiplier * interval) to match mihomo's
+// resilience: a single test-URL blockage shouldn't make all nodes look dead.
+// Dial-failure tracking (see reportDialFailure) provides a faster feedback loop
+// for nodes that are actually broken.
 func (g *LoadBalanceGroup) IsAlive(proxy adapter.Outbound) bool {
 	history := g.history.LoadURLTestHistory(RealTag(proxy))
 	if history == nil {
+		// No history at all — for a node that's never been tested, assume it might
+		// work (mihomo behaviour). The alive-list rebuild will eventually refine.
 		return false
 	}
-	return time.Since(history.Time) < 2*g.interval
+	// Also exclude nodes with excessive dial failures.
+	if g.hasExcessiveDialFailures(proxy.Tag()) {
+		return false
+	}
+	return time.Since(history.Time) < time.Duration(lbAliveGraceMultiplier)*g.interval
+}
+
+func (g *LoadBalanceGroup) hasExcessiveDialFailures(tag string) bool {
+	g.dialFailureMu.Lock()
+	defer g.dialFailureMu.Unlock()
+	return g.dialFailureCount[tag] >= lbDialFailureThreshold
+}
+
+// reportDialFailure is called by DialContext/ListenPacket on a failed dial.
+func (g *LoadBalanceGroup) reportDialFailure(tag string) {
+	g.dialFailureMu.Lock()
+	if !g.dialFailureAt.IsZero() && time.Since(g.dialFailureAt) > g.interval {
+		for k := range g.dialFailureCount {
+			delete(g.dialFailureCount, k)
+		}
+	}
+	g.dialFailureCount[tag]++
+	count := g.dialFailureCount[tag]
+	g.dialFailureAt = time.Now()
+	g.dialFailureMu.Unlock()
+
+	if count >= lbDialFailureThreshold {
+		if g.dialRecheckOnce.CompareAndSwap(false, true) {
+			go func() {
+				defer g.dialRecheckOnce.Store(false)
+				g.CheckOutbounds(true)
+			}()
+		}
+	}
+}
+
+// reportDialSuccess clears the dial-failure counter for tag.
+func (g *LoadBalanceGroup) reportDialSuccess(tag string) {
+	g.dialFailureMu.Lock()
+	delete(g.dialFailureCount, tag)
+	g.dialFailureMu.Unlock()
 }
 
 // rebuildAliveList filters alive outbounds and stores in a single atomic state swap.
+// Fallback tier: if no outbound passes IsAlive, include those with any history at all —
+// better to route through a questionable node than to drop the connection entirely.
 func (g *LoadBalanceGroup) rebuildAliveList() {
 	st := g.state.Load()
 	if st == nil {
 		return
 	}
 	alive := make([]adapter.Outbound, 0, len(st.outbounds))
+	var stale []adapter.Outbound // has history but past the alive window
+
 	for _, o := range st.outbounds {
 		if g.IsAlive(o) {
 			alive = append(alive, o)
+		} else if h := g.history.LoadURLTestHistory(RealTag(o)); h != nil && !g.hasExcessiveDialFailures(o.Tag()) {
+			stale = append(stale, o)
 		}
 	}
+
+	// If no alive nodes, fall back to stale-but-present nodes.
+	if len(alive) == 0 && len(stale) > 0 {
+		alive = stale
+		g.logger.Debug("no fresh alive nodes, using ", len(stale), " stale-history nodes")
+	}
+
 	sort.Slice(alive, func(i, j int) bool {
 		hi := g.history.LoadURLTestHistory(RealTag(alive[i]))
 		hj := g.history.LoadURLTestHistory(RealTag(alive[j]))
@@ -683,9 +773,11 @@ func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]
 			t, err := urltest.URLTest(testCtx, g.link, p)
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
-				if g.incrementFailure(realTag) >= 3 {
-					g.history.DeleteURLTestHistory(realTag)
-					g.logger.Info("outbound ", tag, " marked unavailable after consecutive failures")
+				// DO NOT delete history — preserve mihomo-parity resilience.
+				// The alive-list rebuild uses a wide time window; a single test-URL
+				// blockage won't make otherwise-working nodes look dead.
+				if cnt := g.incrementFailure(realTag); cnt == 3 {
+					g.logger.Info("outbound ", tag, " test failed ", cnt, " times (history retained)")
 				}
 			} else {
 				g.logger.Debug("outbound ", tag, " available: ", t, "ms")
