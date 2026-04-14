@@ -825,19 +825,80 @@ func (s *Smart) buildMeta(metadata adapter.InboundContext, isUDP bool) *smartDia
 	}
 }
 
+// metaFromDestination synthesizes a smartDialMeta directly from the
+// socksaddr argument when the per-conn meta wasn't populated by
+// NewConnectionEx — typical when an upper-level group (Selector / URLTest /
+// LoadBalance) routes through this Smart group via a direct DialContext
+// call. Without this, smartTarget would be empty, every selectProxies hit
+// the "fallback" tier, and recordStats dropped all events.
+//
+// existing != nil means we have a partial meta from ctx — reuse its host /
+// destGeoIP / asnCode if present so we don't lose data the upstream layer
+// might have populated.
+func (s *Smart) metaFromDestination(existing *smartDialMeta, destination M.Socksaddr, isUDP bool) *smartDialMeta {
+	host := ""
+	if destination.IsFqdn() {
+		host = destination.Fqdn
+	}
+	if existing != nil && existing.host != "" {
+		host = existing.host
+	}
+
+	var ips []netip.Addr
+	if existing != nil && len(existing.resolvedIPs) > 0 {
+		ips = existing.resolvedIPs
+	} else if destination.Addr.IsValid() {
+		ips = []netip.Addr{destination.Addr}
+	}
+	firstIP := ""
+	if len(ips) > 0 {
+		firstIP = ips[0].String()
+	}
+
+	target := smart.GetEffectiveTarget(host, firstIP)
+	asnCode := ""
+	if existing != nil && existing.asnCode != "" {
+		asnCode = existing.asnCode
+	} else {
+		asnCode = s.lookupASN(ips)
+	}
+	geoIP := []string(nil)
+	if existing != nil && len(existing.destGeoIP) > 0 {
+		geoIP = existing.destGeoIP
+	} else {
+		geoIP = s.lookupCountry(ips)
+	}
+
+	return &smartDialMeta{
+		host:        host,
+		smartTarget: target,
+		asnCode:     asnCode,
+		destGeoIP:   geoIP,
+		resolvedIPs: ips,
+		isUDP:       isUDP,
+		destPort:    destination.Port,
+	}
+}
+
 // DialContext implements the race-dial with retry logic.
 func (s *Smart) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	isUDP := N.NetworkName(network) == N.NetworkUDP
+
+	// Recover meta from ctx (set by NewConnectionEx) OR synthesize from
+	// the raw destination when this Smart group is dialed directly by an
+	// upper-level group (Selector / URLTest / LoadBalance). The previous
+	// code left meta empty in that case, breaking selectProxiesTraced
+	// (always fell through to "fallback") and recordStats (early-return
+	// on empty target swallowed all stats).
 	meta, _ := ctx.Value(smartMetaCtxKey{}).(*smartDialMeta)
-	if meta == nil {
-		meta = &smartDialMeta{}
+	if meta == nil || meta.smartTarget == "" {
+		meta = s.metaFromDestination(meta, destination, isUDP)
 	}
 
 	snap := s.state.Load()
 	if snap == nil || len(snap.outbounds) == 0 {
 		return nil, E.New("smart: no outbounds available")
 	}
-
-	isUDP := N.NetworkName(network) == N.NetworkUDP
 	selectedOutbounds, isUnwrap, source := s.selectProxiesTraced(meta, snap.outbounds, isUDP)
 
 	// If everyone in the candidate list is dead, selectProxiesTraced will
@@ -886,8 +947,8 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	}
 
 	meta, _ := ctx.Value(smartMetaCtxKey{}).(*smartDialMeta)
-	if meta == nil {
-		meta = &smartDialMeta{isUDP: true}
+	if meta == nil || meta.smartTarget == "" {
+		meta = s.metaFromDestination(meta, destination, true)
 	}
 
 	snap := s.state.Load()
