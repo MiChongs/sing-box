@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"math"
 	"math/rand"
 	"net"
@@ -129,6 +130,11 @@ type Smart struct {
 	// Now() for ClashAPI / UI display. Updated on every successful dial
 	// from both DialContext and ListenPacket paths.
 	lastSelectedTag atomic.Value // string
+
+	// Manually pinned node tag (ClashAPI PUT /proxies/<tag> with {"name": X}).
+	// When non-empty, selectProxies short-circuits to only this node — the
+	// Smart algorithm is bypassed entirely (mihomo parity: Set/ForceSet).
+	manualSelected atomic.Value // string
 
 	// Per-group ML/collector opt-in flags. The actual model, downloader and
 	// collector are owned by the shared SmartService (experimental.smart);
@@ -455,6 +461,45 @@ func (s *Smart) LGBMModelAge() time.Duration {
 	return time.Since(last)
 }
 
+// getManualSelected returns the currently pinned node tag, or "" if none.
+func (s *Smart) getManualSelected() string {
+	if v, ok := s.manualSelected.Load().(string); ok {
+		return v
+	}
+	return ""
+}
+
+// SelectOutbound pins a specific node as the only one Smart will use. Pass
+// empty name to clear the pin and resume automatic selection. Returns false
+// only if the name is non-empty and does not match any current outbound.
+//
+// ClashAPI exposes this via `PUT /proxies/<tag>` with JSON `{"name": "..."}`,
+// mirroring the Selector behaviour and mihomo's Set/ForceSet.
+func (s *Smart) SelectOutbound(tag string) bool {
+	if tag == "" {
+		s.manualSelected.Store("")
+		s.logger.Info("smart[", s.Tag(), "] manual pin cleared, automatic selection resumed")
+		return true
+	}
+	snap := s.state.Load()
+	if snap == nil {
+		return false
+	}
+	for _, ob := range snap.outbounds {
+		if ob.Tag() == tag {
+			s.manualSelected.Store(tag)
+			s.setLastSelected(tag)
+			s.logger.Info("smart[", s.Tag(), "] manually pinned to [", tag, "]")
+			return true
+		}
+	}
+	return false
+}
+
+// Selected returns the pinned node tag, or "" when Smart is in automatic mode.
+// Surfaced in Clash API output as the `fixed` field.
+func (s *Smart) Selected() string { return s.getManualSelected() }
+
 // Now returns the most recently successfully dialed node tag.
 //
 // Smart has no single "current" outbound like Selector — it races and chooses
@@ -649,11 +694,25 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 
 // selectProxiesTraced performs the 3-tier selection and returns which tier
 // produced the result. Used for user-visible logging. Tier names:
+//   - "manual"   : user-pinned via SetSelected (ClashAPI)
 //   - "unwrap"   : hot cache of a recently-used node list for this target
 //   - "prefetch" : periodically pre-computed best-node list
 //   - "weight"   : realtime computation from the weight store
 //   - "fallback" : no history; random pick filtered by alive/blocked
 func (s *Smart) selectProxiesTraced(meta *smartDialMeta, all []adapter.Outbound, isUDP bool) ([]adapter.Outbound, bool, string) {
+	// Manual selection short-circuit: if user pinned a node, use ONLY that node
+	// (matches mihomo's Set/ForceSet semantics).
+	if selected := s.getManualSelected(); selected != "" {
+		for _, ob := range all {
+			if ob.Tag() == selected {
+				return []adapter.Outbound{ob}, true, "manual"
+			}
+		}
+		// Pinned tag no longer in provider set — clear pin and fall through.
+		s.manualSelected.Store("")
+		s.logger.Warn("smart[", s.Tag(), "] pinned node [", selected, "] no longer exists, clearing pin")
+	}
+
 	if s.store == nil || meta.smartTarget == "" {
 		return s.fillProxies(nil, nil, all, smartMaxSelected, isUDP, false), false, "fallback"
 	}
@@ -961,6 +1020,16 @@ func (s *Smart) recordFailedDial(tag string, meta *smartDialMeta, connectTime in
 
 // ─── tracked connection wrappers ──────────────────────────────────────────────
 
+// smartTrackedConn wraps a dialed connection to feed per-connection telemetry
+// into recordStats on Close. Tracks (mihomo parity):
+//   - first-read latency: wall-clock ms from dial-success until the first byte
+//     is read. Approximates TLS handshake + upstream round-trip; a critical
+//     signal separate from connectTime (TCP handshake only).
+//   - first-read / first-write errors: used to classify the connection outcome
+//     as "closed" (success) vs "failed". Without this every connection looked
+//     like a success to the weight algorithm, neutering the failure counter.
+//   - peak byte rate: sampled at 1-second granularity on each Read/Write call;
+//     substitutes for mihomo's statistic.DefaultManager peak tracking.
 type smartTrackedConn struct {
 	net.Conn
 	s           *Smart
@@ -968,9 +1037,26 @@ type smartTrackedConn struct {
 	meta        *smartDialMeta
 	connectTime int64
 	startTime   time.Time
-	upload      atomic.Int64
-	download    atomic.Int64
-	closeOnce   sync.Once
+
+	upload   atomic.Int64
+	download atomic.Int64
+
+	// first-byte tracking
+	firstReadOnce  atomic.Bool
+	firstReadMs    atomic.Int64   // latency in ms from dial-success
+	firstReadErr   atomic.Pointer[error]
+	firstWriteOnce atomic.Bool
+	firstWriteErr  atomic.Pointer[error]
+
+	// peak byte-rate tracking (sampled on each IO call)
+	rateMu        sync.Mutex
+	rateLastTime  time.Time
+	rateLastUp    int64
+	rateLastDown  int64
+	maxUpBps      atomic.Int64
+	maxDownBps    atomic.Int64
+
+	closeOnce sync.Once
 }
 
 func (c *smartTrackedConn) Read(b []byte) (int, error) {
@@ -978,6 +1064,14 @@ func (c *smartTrackedConn) Read(b []byte) (int, error) {
 	if n > 0 {
 		c.download.Add(int64(n))
 	}
+	if c.firstReadOnce.CompareAndSwap(false, true) {
+		c.firstReadMs.Store(time.Since(c.startTime).Milliseconds())
+		if err != nil {
+			e := err // copy to heap before pointer-atomic Store
+			c.firstReadErr.Store(&e)
+		}
+	}
+	c.sampleRate()
 	return n, err
 }
 
@@ -986,14 +1080,97 @@ func (c *smartTrackedConn) Write(b []byte) (int, error) {
 	if n > 0 {
 		c.upload.Add(int64(n))
 	}
+	if c.firstWriteOnce.CompareAndSwap(false, true) {
+		if err != nil {
+			e := err
+			c.firstWriteErr.Store(&e)
+		}
+	}
+	c.sampleRate()
 	return n, err
+}
+
+// sampleRate updates maxUpBps / maxDownBps when at least 1 second has elapsed
+// since the last sample. Cheap — a single mutex + Time.Since comparison per IO.
+func (c *smartTrackedConn) sampleRate() {
+	c.rateMu.Lock()
+	now := time.Now()
+	if c.rateLastTime.IsZero() {
+		c.rateLastTime = c.startTime
+	}
+	dt := now.Sub(c.rateLastTime).Seconds()
+	if dt < 1.0 {
+		c.rateMu.Unlock()
+		return
+	}
+	upNow := c.upload.Load()
+	downNow := c.download.Load()
+	upBps := int64(float64(upNow-c.rateLastUp) / dt)
+	downBps := int64(float64(downNow-c.rateLastDown) / dt)
+	c.rateLastTime = now
+	c.rateLastUp = upNow
+	c.rateLastDown = downNow
+	c.rateMu.Unlock()
+
+	if upBps > c.maxUpBps.Load() {
+		c.maxUpBps.Store(upBps)
+	}
+	if downBps > c.maxDownBps.Load() {
+		c.maxDownBps.Store(downBps)
+	}
+}
+
+// classifyStatus returns ("closed", nil) for a clean completion or
+// ("failed", <reason>) for an abnormal one. Mirrors mihomo's logic in
+// registerClosureMetricsCallback — EOF with no write error is a clean
+// server-initiated close; any other read error, or EOF-with-write-error,
+// signals a broken node.
+func (c *smartTrackedConn) classifyStatus() (string, error) {
+	var rErr, wErr error
+	if p := c.firstReadErr.Load(); p != nil {
+		rErr = *p
+	}
+	if p := c.firstWriteErr.Load(); p != nil {
+		wErr = *p
+	}
+	if rErr == nil {
+		return "closed", nil
+	}
+	if errors.Is(rErr, io.EOF) {
+		if wErr != nil && !errors.Is(wErr, io.EOF) {
+			return "failed", wErr
+		}
+		return "closed", nil
+	}
+	return "failed", rErr
 }
 
 func (c *smartTrackedConn) Close() error {
 	c.closeOnce.Do(func() {
-		dur := time.Since(c.startTime).Milliseconds()
-		go c.s.recordStats("closed", c.meta, c.proxyTag, c.connectTime,
-			0, c.upload.Load(), c.download.Load(), 0, 0, dur)
+		durMS := time.Since(c.startTime).Milliseconds()
+		up := c.upload.Load()
+		down := c.download.Load()
+		latency := c.firstReadMs.Load() // 0 if no reads ever happened
+
+		// Peak rates (bytes/sec); avg-as-fallback when no 1s sample window fired
+		maxUpBps := c.maxUpBps.Load()
+		maxDownBps := c.maxDownBps.Load()
+		durSec := float64(durMS) / 1000.0
+		if maxUpBps == 0 && durSec > 0 && up > 0 {
+			maxUpBps = int64(float64(up) / durSec)
+		}
+		if maxDownBps == 0 && durSec > 0 && down > 0 {
+			maxDownBps = int64(float64(down) / durSec)
+		}
+
+		status, reason := c.classifyStatus()
+		if status == "failed" && reason != nil {
+			c.s.logger.Debug("smart[", c.s.Tag(), "] conn [", c.proxyTag,
+				"] classified as failed: ", reason)
+		}
+
+		go c.s.recordStats(status, c.meta, c.proxyTag, c.connectTime,
+			latency, up, down, maxUpBps, maxDownBps, durMS)
 	})
 	return c.Conn.Close()
 }
@@ -1007,16 +1184,89 @@ type smartTrackedPacketConn struct {
 	meta        *smartDialMeta
 	connectTime int64
 	startTime   time.Time
-	upload      atomic.Int64
-	download    atomic.Int64
-	closeOnce   sync.Once
+
+	upload   atomic.Int64
+	download atomic.Int64
+
+	firstReadOnce atomic.Bool
+	firstReadMs   atomic.Int64
+
+	rateMu       sync.Mutex
+	rateLastTime time.Time
+	rateLastUp   int64
+	rateLastDown int64
+	maxUpBps     atomic.Int64
+	maxDownBps   atomic.Int64
+
+	closeOnce sync.Once
+}
+
+func (c *smartTrackedPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(p)
+	if n > 0 {
+		c.download.Add(int64(n))
+	}
+	if c.firstReadOnce.CompareAndSwap(false, true) && err == nil {
+		c.firstReadMs.Store(time.Since(c.startTime).Milliseconds())
+	}
+	c.samplePktRate()
+	return n, addr, err
+}
+
+func (c *smartTrackedPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
+	n, err := c.PacketConn.WriteTo(p, addr)
+	if n > 0 {
+		c.upload.Add(int64(n))
+	}
+	c.samplePktRate()
+	return n, err
+}
+
+func (c *smartTrackedPacketConn) samplePktRate() {
+	c.rateMu.Lock()
+	now := time.Now()
+	if c.rateLastTime.IsZero() {
+		c.rateLastTime = c.startTime
+	}
+	dt := now.Sub(c.rateLastTime).Seconds()
+	if dt < 1.0 {
+		c.rateMu.Unlock()
+		return
+	}
+	upNow := c.upload.Load()
+	downNow := c.download.Load()
+	upBps := int64(float64(upNow-c.rateLastUp) / dt)
+	downBps := int64(float64(downNow-c.rateLastDown) / dt)
+	c.rateLastTime = now
+	c.rateLastUp = upNow
+	c.rateLastDown = downNow
+	c.rateMu.Unlock()
+
+	if upBps > c.maxUpBps.Load() {
+		c.maxUpBps.Store(upBps)
+	}
+	if downBps > c.maxDownBps.Load() {
+		c.maxDownBps.Store(downBps)
+	}
 }
 
 func (c *smartTrackedPacketConn) Close() error {
 	c.closeOnce.Do(func() {
-		dur := time.Since(c.startTime).Milliseconds()
+		durMS := time.Since(c.startTime).Milliseconds()
+		up := c.upload.Load()
+		down := c.download.Load()
+		latency := c.firstReadMs.Load()
+		maxUpBps := c.maxUpBps.Load()
+		maxDownBps := c.maxDownBps.Load()
+		durSec := float64(durMS) / 1000.0
+		if maxUpBps == 0 && durSec > 0 && up > 0 {
+			maxUpBps = int64(float64(up) / durSec)
+		}
+		if maxDownBps == 0 && durSec > 0 && down > 0 {
+			maxDownBps = int64(float64(down) / durSec)
+		}
 		go c.s.recordStats("closed", c.meta, c.proxyTag, c.connectTime,
-			0, c.upload.Load(), c.download.Load(), 0, 0, dur)
+			latency, up, down, maxUpBps, maxDownBps, durMS)
 	})
 	return c.PacketConn.Close()
 }

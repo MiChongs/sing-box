@@ -94,6 +94,7 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 			info.Put("useASN", sg.UseASN())
 			info.Put("useLightGBM", sg.UseLightGBM())
 			info.Put("collectData", sg.CollectData())
+			info.Put("fixed", sg.Selected())
 			if age := sg.LGBMModelAge(); age > 0 {
 				info.Put("lgbmModelAge", age.Truncate(time.Second).String())
 			}
@@ -189,16 +190,23 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
-	selector, ok := proxy.(*group.Selector)
-	if !ok {
+	switch p := proxy.(type) {
+	case *group.Selector:
+		if !p.SelectOutbound(req.Name) {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("Selector update error: not found"))
+			return
+		}
+	case *group.Smart:
+		// Empty name clears manual pinning; non-empty pins a node (mihomo parity).
+		if !p.SelectOutbound(req.Name) {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("Smart update error: not found"))
+			return
+		}
+	default:
 		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError("Must be a Selector"))
-		return
-	}
-
-	if !selector.SelectOutbound(req.Name) {
-		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError("Selector update error: not found"))
+		render.JSON(w, r, newError("Must be a Selector or Smart"))
 		return
 	}
 
