@@ -30,6 +30,17 @@ func proxyRouter(server *Server, router adapter.Router) http.Handler {
 		r.Get("/", getProxy(server))
 		r.Get("/delay", getProxyDelay(server))
 		r.Put("/", updateProxy)
+		// DELETE /proxies/{name} clears the manual pin on Selector / Smart
+		// groups (mihomo parity — metacubexd / Yacd dashboards bind their
+		// "取消固定 / release fixed" button to this verb). Equivalent to
+		// PUT with {"name": ""} but idiomatic REST so UIs don't need to
+		// fabricate a dummy JSON body.
+		r.Delete("/", clearProxySelection)
+		// PATCH is accepted as an alias for PUT — a small handful of
+		// dashboards (zashboard fork variants) use PATCH for selection
+		// updates, and returning 405 on them reads as "sing-box broke the
+		// endpoint" even though the verb is just non-standard.
+		r.Patch("/", updateProxy)
 		// Smart-specific: per-group weight ranking (mihomo parity).
 		// `?refresh=true` recomputes synchronously instead of returning cache.
 		r.Get("/weights", getSmartGroupWeights)
@@ -42,8 +53,48 @@ func proxyRouter(server *Server, router adapter.Router) http.Handler {
 	return r
 }
 
+// clearProxySelection releases the manual pin on a Smart group and performs
+// the full side-effect cascade (unwrap cache drop, active-connection
+// interrupt, async ranking refresh). Mirrors mihomo's DELETE /proxies/{name}
+// semantic — metacubexd / Yacd dashboards bind this to "取消固定 / clear
+// fixed". Non-Smart groups can't meaningfully "clear" a selection (a
+// Selector must always have some chosen node), so those respond 400 with
+// JSON instead of 405 which reads like a broken endpoint.
+//
+// The response body mirrors mihomo's verbose unpinning reply:
+//
+//	{
+//	  "group":            "🇸🇬 狮城智能",
+//	  "previous_pin":     "HK-01",      // omitted when no pin was active
+//	  "now":              "HK-07",      // best current guess for next dial
+//	  "interrupted_mux":  true,
+//	  "unwrap_cleared":   true
+//	}
+//
+// so the UI can render a toast like "已解除对 HK-01 的固定，当前推荐 HK-07".
+func clearProxySelection(w http.ResponseWriter, r *http.Request) {
+	proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
+	sg, ok := proxy.(*group.Smart)
+	if !ok {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("only Smart groups support clearing the manual pin; Selector requires PUT with a node name"))
+		return
+	}
+	res := sg.ClearSelection()
+	render.JSON(w, r, res)
+}
+
 // getSmartGroupWeights returns the Smart group's weight ranking.
 // Non-Smart groups get 400. Mirrors mihomo's GET /groups/{name}/weights.
+//
+// Query parameters:
+//
+//	?refresh=true  — force recompute from prefetch (bypass cache).
+//	?full=1        — include the per-(target, node) raw weight table in
+//	                 addition to the per-node aggregate. Use this to
+//	                 audit API output against the internal selection
+//	                 pipeline — the table matches exactly what
+//	                 GetBestProxyForTarget sees at dial time.
 func getSmartGroupWeights(w http.ResponseWriter, r *http.Request) {
 	proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
 	sg, ok := proxy.(*group.Smart)
@@ -56,6 +107,8 @@ func getSmartGroupWeights(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	refresh := r.URL.Query().Get("refresh") == "true"
+	full := r.URL.Query().Get("full") == "1" || r.URL.Query().Get("full") == "true"
+
 	weights, err := sg.WeightRanking(refresh)
 	if err != nil {
 		render.Status(r, http.StatusInternalServerError)
@@ -65,14 +118,16 @@ func getSmartGroupWeights(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	payload := render.M{"weights": weights}
 	if len(weights) == 0 {
-		render.JSON(w, r, render.M{
-			"weights": []any{},
-			"message": "no weight data available for this group",
-		})
-		return
+		payload["message"] = "no weight data available for this group"
 	}
-	render.JSON(w, r, render.M{"weights": weights})
+	if full {
+		if store := sg.SmartStore(); store != nil {
+			payload["per_target"] = store.GetPerTargetWeights(sg.Tag(), sg.ConfigName())
+		}
+	}
+	render.JSON(w, r, payload)
 }
 
 // deleteSmartGroupWeights clears the Smart group's persisted weight / ranking /

@@ -3,7 +3,6 @@ package smart
 import (
 	"bytes"
 	"container/heap"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -19,15 +18,41 @@ import (
 	"github.com/sagernet/bbolt"
 )
 
+// json marshal/unmarshal swapped to goccy/go-json — see fastjson.go for
+// the rationale. Kept as package-level aliases so call sites look
+// identical to before (`json.Marshal(x)` / `json.Unmarshal(b, &x)`).
+var json = struct {
+	Marshal   func(any) ([]byte, error)
+	Unmarshal func([]byte, any) error
+}{
+	Marshal:   jsonMarshal,
+	Unmarshal: jsonUnmarshal,
+}
+
 var (
-	globalDB             *bbolt.DB
-	bucketSmartStats     = []byte("smart_stats")
+	globalDB         *bbolt.DB
+	bucketSmartStats = []byte("smart_stats")
 
 	globalStoreOnce sync.Once
 	globalStore     *Store
 
-	globalQueue   atomic.Value // holds []StoreOperation
-	globalQueueMu sync.Mutex
+	// Global write queue for bbolt batch flushing. The queue is a (slice,
+	// index map) tandem protected by globalQueueMu:
+	//
+	//   globalQueueOps    — ordered list of pending StoreOperations
+	//   globalQueueIdx    — map[key] → position in globalQueueOps
+	//   globalQueueDirty  — set when the publicly-visible snapshot is stale
+	//
+	// The index keeps AppendToGlobalQueue at O(1) amortised per insert.
+	// The dirty flag keeps snapshot publishing O(1) on reads too — we
+	// only refresh the atomic.Value snapshot when a reader actually needs
+	// it (in getGlobalQueueSnapshot), not on every write. Writes just
+	// flip the dirty bit.
+	globalQueue      atomic.Value // holds []StoreOperation (read-only)
+	globalQueueOps   []StoreOperation
+	globalQueueIdx   map[string]int
+	globalQueueDirty atomic.Bool
+	globalQueueMu    sync.Mutex
 
 	globalCacheParams struct {
 		BatchSaveThreshold int
@@ -36,10 +61,10 @@ var (
 		mu                 sync.RWMutex
 	}
 
-	targetCache      *lruCache[string, string]
-	unwrapCache      *lruCache[string, UnwrapMap]
-	recordCache      *lruCache[string, *AtomicStatsRecord]
-	dbResultCache    *lruCache[string, map[string][]byte]
+	targetCache       *lruCache[string, string]
+	unwrapCache       *lruCache[string, UnwrapMap]
+	recordCache       *lruCache[string, *AtomicStatsRecord]
+	dbResultCache     *lruCache[string, map[string][]byte]
 	blockedNodesCache *lruCache[string, map[string]bool]
 )
 
@@ -73,6 +98,8 @@ func initCaches() {
 }
 
 func initQueue() {
+	globalQueueOps = make([]StoreOperation, 0, 128)
+	globalQueueIdx = make(map[string]int, 128)
 	globalQueue.Store([]StoreOperation{})
 }
 
@@ -85,7 +112,13 @@ func getBatchSaveThreshold() int {
 	return globalCacheParams.BatchSaveThreshold
 }
 
-// AppendToGlobalQueue deduplicates by operation key and auto-flushes when over threshold.
+// AppendToGlobalQueue deduplicates by operation key and auto-flushes when
+// over threshold. O(1) amortised per insert — we maintain a persistent
+// `key → index` map alongside the queue slice, so dedup doesn't require
+// rebuilding the map from the whole queue on every call.
+//
+// The exported snapshot (via globalQueue atomic.Value) is republished
+// lazily only when callers need it — see getGlobalQueueSnapshot.
 func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 	if len(operations) == 0 {
 		return
@@ -95,36 +128,42 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 	var snapshot []StoreOperation
 
 	globalQueueMu.Lock()
-	old, _ := globalQueue.Load().([]StoreOperation)
-
-	opMap := make(map[string]*StoreOperation, len(old)+len(operations))
-	for i := range old {
-		key := FormatOperationKey(&old[i])
-		if key != "" {
-			opMap[key] = &old[i]
-		}
+	if globalQueueIdx == nil {
+		globalQueueIdx = make(map[string]int, 64)
 	}
 	for i := range operations {
 		key := FormatOperationKey(&operations[i])
-		if key != "" {
-			opMap[key] = &operations[i]
+		if key == "" {
+			continue
 		}
-	}
-
-	newQueue := make([]StoreOperation, 0, len(opMap))
-	for _, op := range opMap {
-		newQueue = append(newQueue, *op)
+		if pos, ok := globalQueueIdx[key]; ok {
+			// Overwrite in place — preserves slot, no slice growth.
+			globalQueueOps[pos] = operations[i]
+			continue
+		}
+		globalQueueIdx[key] = len(globalQueueOps)
+		globalQueueOps = append(globalQueueOps, operations[i])
 	}
 
 	threshold := getBatchSaveThreshold()
-	if len(newQueue) >= threshold {
+	if len(globalQueueOps) >= threshold {
 		shouldFlush = true
-		snapshot = make([]StoreOperation, len(newQueue))
-		copy(snapshot, newQueue)
-		newQueue = make([]StoreOperation, 0, threshold)
+		// Hand the accumulated ops to the flusher; reset the queue. We
+		// copy into a fresh slice so the flusher can work in parallel
+		// with new inserts without holding globalQueueMu.
+		snapshot = make([]StoreOperation, len(globalQueueOps))
+		copy(snapshot, globalQueueOps)
+		globalQueueOps = globalQueueOps[:0]
+		// Clear map keys instead of reallocating — preserves capacity.
+		for k := range globalQueueIdx {
+			delete(globalQueueIdx, k)
+		}
 	}
 
-	globalQueue.Store(newQueue)
+	// Mark the snapshot dirty — actual publish deferred until a reader
+	// calls getGlobalQueueSnapshot. Keeps the append hot path allocation-
+	// free for the steady-state (non-threshold) case.
+	globalQueueDirty.Store(true)
 	globalQueueMu.Unlock()
 
 	if shouldFlush && len(snapshot) > 0 {
@@ -134,21 +173,59 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 	}
 }
 
+// publishQueueSnapshotLocked copies globalQueueOps into the atomic.Value
+// so lock-free readers (GetSubBytesByPath) see a consistent view without
+// contending on globalQueueMu. Must be called with globalQueueMu held.
+func publishQueueSnapshotLocked() {
+	snap := make([]StoreOperation, len(globalQueueOps))
+	copy(snap, globalQueueOps)
+	globalQueue.Store(snap)
+	globalQueueDirty.Store(false)
+}
+
+// getGlobalQueueSnapshot returns the most recent view of the queue.
+// Republishes the snapshot if the append path has flagged it dirty —
+// this defers the O(n) copy until a reader actually needs the data,
+// keeping AppendToGlobalQueue O(1) in the common case.
 func getGlobalQueueSnapshot() []StoreOperation {
+	if globalQueueDirty.Load() {
+		globalQueueMu.Lock()
+		if globalQueueDirty.Load() {
+			publishQueueSnapshotLocked()
+		}
+		globalQueueMu.Unlock()
+	}
 	v, _ := globalQueue.Load().([]StoreOperation)
 	return v
 }
 
+// removeFromQueue filters the queue in-place and rebuilds the index. Used
+// by FlushByLevel → filterQueueByGroup / filterQueueByConfig which run on
+// cache-maintenance operations (infrequent, so the O(n) cost is fine).
 func removeFromQueue(shouldRemove func(StoreOperation) bool) {
 	globalQueueMu.Lock()
-	old, _ := globalQueue.Load().([]StoreOperation)
-	newQ := old[:0]
-	for _, op := range old {
+	kept := globalQueueOps[:0]
+	for _, op := range globalQueueOps {
 		if !shouldRemove(op) {
-			newQ = append(newQ, op)
+			kept = append(kept, op)
 		}
 	}
-	globalQueue.Store(newQ)
+	globalQueueOps = kept
+	// Rebuild the index — cheaper than incremental delete because filter
+	// operations are bulk and we'd do O(n) deletes anyway.
+	if globalQueueIdx == nil {
+		globalQueueIdx = make(map[string]int, len(kept))
+	} else {
+		for k := range globalQueueIdx {
+			delete(globalQueueIdx, k)
+		}
+	}
+	for i := range globalQueueOps {
+		if key := FormatOperationKey(&globalQueueOps[i]); key != "" {
+			globalQueueIdx[key] = i
+		}
+	}
+	publishQueueSnapshotLocked()
 	globalQueueMu.Unlock()
 }
 
@@ -174,17 +251,27 @@ func filterQueueByConfig(config string) {
 	})
 }
 
-// FlushQueue writes buffered operations to bbolt.
+// FlushQueue writes buffered operations to bbolt. Swaps the in-memory
+// queue atomically with globalQueueMu so concurrent Append calls don't
+// race against the flusher — the caller gets a consistent snapshot to
+// BatchSave while new inserts start on a fresh slice.
 func (s *Store) FlushQueue(force bool) {
-	ops := getGlobalQueueSnapshot()
-	if len(ops) == 0 {
-		return
-	}
-	if !force && len(ops) < getBatchSaveThreshold() {
-		return
-	}
 	globalQueueMu.Lock()
-	globalQueue.Store([]StoreOperation{})
+	if len(globalQueueOps) == 0 {
+		globalQueueMu.Unlock()
+		return
+	}
+	if !force && len(globalQueueOps) < getBatchSaveThreshold() {
+		globalQueueMu.Unlock()
+		return
+	}
+	ops := make([]StoreOperation, len(globalQueueOps))
+	copy(ops, globalQueueOps)
+	globalQueueOps = globalQueueOps[:0]
+	for k := range globalQueueIdx {
+		delete(globalQueueIdx, k)
+	}
+	publishQueueSnapshotLocked()
 	globalQueueMu.Unlock()
 	_ = s.BatchSave(ops)
 }
@@ -920,6 +1007,19 @@ func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, isUDP b
 	return nil
 }
 
+// ClearUnwrapByGroup drops every unwrap-cache entry scoped to (group, config).
+// Used by Smart.ClearSelection so a freshly unpinned group re-evaluates
+// every target on its next dial instead of riding the stale pin-era cache.
+// The unwrap LRU is process-global (to share entries across groups that map
+// the same target), so we scope the clear by FormatDBKey's group prefix
+// rather than the nuclear Clear() that would evict other groups too.
+func (s *Store) ClearUnwrapByGroup(group, config string) {
+	if group == "" {
+		return
+	}
+	unwrapCache.RemoveByPrefix(FormatDBKey(config, group))
+}
+
 // DeleteUnwrapResult removes a cached unwrap entry.
 func (s *Store) DeleteUnwrapResult(group, config, target, asnNumber string, isUDP bool) {
 	if target == "" {
@@ -1014,6 +1114,81 @@ func (s *Store) UpdateHostStatus(group, config, host string, failure, needLastUs
 	})
 }
 
+// TargetWeightEntry is the per-(target, node) raw weight readout used by
+// the /proxies/{name}/weights?target=... diagnostic endpoint. Every field
+// mirrors an exact bbolt stats row so operators can line up API output
+// against debug logs one-to-one (no aggregation, no normalisation).
+type TargetWeightEntry struct {
+	Target      string             `json:"target"`
+	Node        string             `json:"node"`
+	WeightTCP   float64            `json:"weight_tcp,omitempty"`
+	WeightUDP   float64            `json:"weight_udp,omitempty"`
+	WeightsByT  map[string]float64 `json:"weights_by_type,omitempty"`
+	Success     int64              `json:"success"`
+	Failure     int64              `json:"failure"`
+	ConnectTime int64              `json:"connect_time_ms,omitempty"`
+	Latency     int64              `json:"latency_ms,omitempty"`
+	LastUsed    int64              `json:"last_used"`
+	Upload      float64            `json:"upload_mb,omitempty"`
+	Download    float64            `json:"download_mb,omitempty"`
+}
+
+// GetPerTargetWeights returns every (target, node) weight row for the group,
+// straight from bbolt stats — no aggregation, no normalisation. This is
+// the authoritative ground truth that `selectProxiesTraced` tier 3
+// (GetBestProxyForTarget) sees at dial time. Exposed for the ClashAPI
+// `/proxies/{name}/weights?target=...&full=1` diagnostic path so users can
+// verify the API weight display matches the internal selection values.
+func (s *Store) GetPerTargetWeights(group, config string) []TargetWeightEntry {
+	allStats, err := s.GetAllStats(group, config)
+	if err != nil || len(allStats) == 0 {
+		return nil
+	}
+	out := make([]TargetWeightEntry, 0, 64)
+	for target, nodes := range allStats {
+		for node, data := range nodes {
+			var record StatsRecord
+			if json.Unmarshal(data, &record) != nil {
+				continue
+			}
+			entry := TargetWeightEntry{
+				Target:      target,
+				Node:        node,
+				Success:     record.Success,
+				Failure:     record.Failure,
+				ConnectTime: record.ConnectTime,
+				Latency:     record.Latency,
+				LastUsed:    record.LastUsed,
+				Upload:      record.UploadTotal,
+				Download:    record.DownloadTotal,
+			}
+			if record.Weights != nil {
+				entry.WeightTCP = record.Weights[WeightTypeTCP]
+				entry.WeightUDP = record.Weights[WeightTypeUDP]
+				// Full weight map (including ASN-scoped entries) so power
+				// users can audit per-ASN weight divergence.
+				entry.WeightsByT = make(map[string]float64, len(record.Weights))
+				for k, v := range record.Weights {
+					entry.WeightsByT[k] = math.Round(v*10000) / 10000
+				}
+				entry.WeightTCP = math.Round(entry.WeightTCP*10000) / 10000
+				entry.WeightUDP = math.Round(entry.WeightUDP*10000) / 10000
+			}
+			out = append(out, entry)
+		}
+	}
+	// Sort by (target, weight descending) so UI rendering is stable.
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Target != out[j].Target {
+			return out[i].Target < out[j].Target
+		}
+		wi := out[i].WeightTCP + out[i].WeightUDP
+		wj := out[j].WeightTCP + out[j].WeightUDP
+		return wi > wj
+	})
+	return out
+}
+
 // GetLiveNodeRanking aggregates NODE-level weights directly from raw stats —
 // bypassing the prefetch→ranking pipeline that takes minutes to warm up on a
 // fresh config. Sums each node's per-target WeightTypeTCP + WeightTypeUDP
@@ -1032,8 +1207,17 @@ func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string
 		return nil
 	}
 
-	nodeScores := make(map[string]float64, len(allTags))
-	nodeLastUsed := make(map[string]int64, len(allTags))
+	// Per-node accumulators. Switched from SUM to AVG-per-target so the
+	// output Weight matches the internal CalculateWeight scale (typically
+	// 0.3–3 range) regardless of how many targets a node has seen. The
+	// previous SUM aggregation inflated high-coverage nodes' display
+	// weight by 10× or more vs. their true per-dial scale.
+	type acc struct {
+		weightSum   float64
+		targetCount int
+		lastUsed    int64
+	}
+	accs := make(map[string]*acc, len(allTags))
 	for _, nodeStats := range allStats {
 		for nodeName, data := range nodeStats {
 			if !contains(allTags, nodeName) {
@@ -1043,37 +1227,60 @@ func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string
 			if json.Unmarshal(data, &record) != nil || record.Weights == nil {
 				continue
 			}
+			// Sum tcp + udp weights for THIS target (scalar per target),
+			// then average over targets in the final pass.
 			tcp := record.Weights[WeightTypeTCP]
 			udp := record.Weights[WeightTypeUDP]
 			w := tcp + udp
 			if w <= 0 {
 				continue
 			}
-			nodeScores[nodeName] += w
-			if record.LastUsed > nodeLastUsed[nodeName] {
-				nodeLastUsed[nodeName] = record.LastUsed
+			a := accs[nodeName]
+			if a == nil {
+				a = &acc{}
+				accs[nodeName] = a
+			}
+			a.weightSum += w
+			a.targetCount++
+			if record.LastUsed > a.lastUsed {
+				a.lastUsed = record.LastUsed
 			}
 		}
 	}
 
-	maxScore := 0.0
-	for _, w := range nodeScores {
-		if w > maxScore {
-			maxScore = w
+	if len(accs) == 0 {
+		return nil
+	}
+
+	// Raw average weight per node, in the same scale as internal selection.
+	rawWeights := make(map[string]float64, len(accs))
+	targetCounts := make(map[string]int, len(accs))
+	maxRaw := 0.0
+	for name, a := range accs {
+		avg := a.weightSum / float64(a.targetCount)
+		rawWeights[name] = avg
+		targetCounts[name] = a.targetCount
+		if avg > maxRaw {
+			maxRaw = avg
 		}
 	}
-	if maxScore == 0 {
+	if maxRaw == 0 {
 		return nil
 	}
 
 	now := time.Now().Unix()
 	result := make([]NodeRank, 0, len(allTags))
 	for _, tag := range allTags {
-		w := nodeScores[tag]
-		pct := math.Round(w/maxScore*100*100) / 100
+		raw := rawWeights[tag]
+		score := 0.0
+		if maxRaw > 0 {
+			score = math.Round(raw/maxRaw*100*100) / 100
+		}
 		result = append(result, NodeRank{
 			Name:        tag,
-			Weight:      pct,
+			Weight:      math.Round(raw*10000) / 10000, // 4 dp precision
+			Score:       score,
+			TargetCount: targetCounts[tag],
 			LastUpdated: now,
 		})
 	}
@@ -1085,55 +1292,67 @@ func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string
 		}
 		return result[i].Weight > result[j].Weight
 	})
+	assignRankCategories(result, isAlive)
+	return result
+}
 
+// assignRankCategories fills in NodeRank.Rank using a 20/50 split — top 20%
+// of alive nodes with a non-zero weight are MostUsed, the next 50% are
+// OccasionalUsed, the remainder are RarelyUsed. Dead nodes are always
+// RarelyUsed regardless of weight. Shared helper so every ranking
+// source (prefetch / live-stats / delay) categorises identically.
+func assignRankCategories(result []NodeRank, isAlive func(tag string) bool) {
 	aliveCount := 0
 	for _, r := range result {
 		if isAlive(r.Name) {
 			aliveCount++
 		}
 	}
-	if aliveCount > 0 {
-		result[0].Rank = RankMostUsed
-		if aliveCount == 2 {
-			if result[1].Weight > 0 {
-				result[1].Rank = RankOccasional
+	if aliveCount == 0 {
+		for i := range result {
+			result[i].Rank = RankRarelyUsed
+		}
+		return
+	}
+	result[0].Rank = RankMostUsed
+	if aliveCount == 2 {
+		if result[1].Weight > 0 {
+			result[1].Rank = RankOccasional
+		} else {
+			result[1].Rank = RankRarelyUsed
+		}
+	} else if aliveCount >= 3 {
+		mostUsedBound := int(float64(aliveCount) * 0.2)
+		if mostUsedBound < 1 {
+			mostUsedBound = 1
+		}
+		occasionalBound := mostUsedBound + int(float64(aliveCount)*0.5)
+		for i := 1; i < mostUsedBound && i < aliveCount; i++ {
+			if result[i].Weight > 0 {
+				result[i].Rank = RankMostUsed
 			} else {
-				result[1].Rank = RankRarelyUsed
-			}
-		} else if aliveCount >= 3 {
-			mostUsedBound := int(float64(aliveCount) * 0.2)
-			if mostUsedBound < 1 {
-				mostUsedBound = 1
-			}
-			occasionalBound := mostUsedBound + int(float64(aliveCount)*0.5)
-			for i := 1; i < mostUsedBound && i < aliveCount; i++ {
-				if result[i].Weight > 0 {
-					result[i].Rank = RankMostUsed
-				} else {
-					result[i].Rank = RankRarelyUsed
-				}
-			}
-			for i := mostUsedBound; i < occasionalBound && i < aliveCount; i++ {
-				if result[i].Weight > 0 {
-					result[i].Rank = RankOccasional
-				} else {
-					result[i].Rank = RankRarelyUsed
-				}
-			}
-			for i := occasionalBound; i < aliveCount; i++ {
 				result[i].Rank = RankRarelyUsed
 			}
 		}
-		for i := 0; i < aliveCount; i++ {
-			if result[i].Rank == "" {
+		for i := mostUsedBound; i < occasionalBound && i < aliveCount; i++ {
+			if result[i].Weight > 0 {
+				result[i].Rank = RankOccasional
+			} else {
 				result[i].Rank = RankRarelyUsed
 			}
+		}
+		for i := occasionalBound; i < aliveCount; i++ {
+			result[i].Rank = RankRarelyUsed
+		}
+	}
+	for i := 0; i < aliveCount; i++ {
+		if result[i].Rank == "" {
+			result[i].Rank = RankRarelyUsed
 		}
 	}
 	for i := aliveCount; i < len(result); i++ {
 		result[i].Rank = RankRarelyUsed
 	}
-	return result
 }
 
 // GetNodeWeightRankingCache returns cached ranking without recomputing.
@@ -1152,7 +1371,16 @@ func (s *Store) GetNodeWeightRankingCache(group, config string) ([]NodeRank, err
 	return []NodeRank{}, nil
 }
 
-// GetNodeWeightRanking computes a fresh ranking using prefetch scores.
+// GetNodeWeightRanking computes a fresh ranking using prefetch data AND
+// raw stats. Prefetch gives us "this node is in the top-N for target X"
+// signal (high-confidence, but summarized); stats give us the actual
+// weight magnitude. Combining both means the returned Weight field matches
+// the internal selection scale (raw CalculateWeight output) while the
+// rank ordering still benefits from prefetch's accumulated history.
+//
+// Previous version returned position-based scores (100 - i*10) normalised
+// to 0-100. That caused the "API weight != debug log weight" confusion —
+// users comparing the two saw wildly different numbers.
 func (s *Store) GetNodeWeightRanking(group, config, testURL string, isAlive func(tag string) bool, allTags []string) ([]NodeRank, error) {
 	if len(allTags) == 0 {
 		return nil, fmt.Errorf("no proxies provided")
@@ -1164,37 +1392,73 @@ func (s *Store) GetNodeWeightRanking(group, config, testURL string, isAlive func
 
 	activeTargets := s.GetActiveTargets(group, config, prefetchLimit)
 
-	nodeScores := make(map[string]int, len(allTags))
+	// Prefetch gives us a position-based signal of "which nodes tend to
+	// rank well across targets". Aggregate as (weightSum, targetCount)
+	// per node, using the ACTUAL prefetched weights (not synthetic position
+	// scores) so the final Weight matches the internal scale.
+	type acc struct {
+		weightSum   float64
+		targetCount int
+	}
+	accs := make(map[string]*acc, len(allTags))
 	for _, ad := range activeTargets {
-		nodes, _ := s.GetPrefetchResult(group, config, ad.Target, ad.ASN, ad.IsUDP)
+		nodes, weights := s.GetPrefetchResult(group, config, ad.Target, ad.ASN, ad.IsUDP)
 		for i := 0; i < len(nodes) && i < 10; i++ {
-			if contains(allTags, nodes[i]) {
-				nodeScores[nodes[i]] += 100 - i*10
+			if !contains(allTags, nodes[i]) {
+				continue
 			}
+			w := 0.0
+			if i < len(weights) {
+				w = weights[i]
+			}
+			if w <= 0 {
+				continue
+			}
+			a := accs[nodes[i]]
+			if a == nil {
+				a = &acc{}
+				accs[nodes[i]] = a
+			}
+			a.weightSum += w
+			a.targetCount++
 		}
 	}
 
-	maxScore := 0
-	for _, score := range nodeScores {
-		if score > maxScore {
-			maxScore = score
-		}
-	}
-
-	if maxScore == 0 {
+	if len(accs) == 0 {
 		return []NodeRank{}, nil
 	}
 
-	result := make([]NodeRank, 0, len(allTags))
-	for _, tag := range allTags {
-		score := nodeScores[tag]
-		pct := 0.0
-		if maxScore > 0 {
-			pct = math.Round(float64(score)/float64(maxScore)*100*100) / 100
+	rawWeights := make(map[string]float64, len(accs))
+	targetCounts := make(map[string]int, len(accs))
+	maxRaw := 0.0
+	for name, a := range accs {
+		avg := a.weightSum / float64(a.targetCount)
+		rawWeights[name] = avg
+		targetCounts[name] = a.targetCount
+		if avg > maxRaw {
+			maxRaw = avg
 		}
-		result = append(result, NodeRank{Name: tag, Weight: pct, LastUpdated: time.Now().Unix()})
+	}
+	if maxRaw == 0 {
+		return []NodeRank{}, nil
 	}
 
+	now := time.Now().Unix()
+	result := make([]NodeRank, 0, len(allTags))
+	for _, tag := range allTags {
+		raw := rawWeights[tag]
+		score := 0.0
+		if maxRaw > 0 {
+			score = math.Round(raw/maxRaw*100*100) / 100
+		}
+		result = append(result, NodeRank{
+			Name:        tag,
+			Weight:      math.Round(raw*10000) / 10000,
+			Score:       score,
+			TargetCount: targetCounts[tag],
+			LastUpdated: now,
+		})
+	}
 	sort.Slice(result, func(i, j int) bool {
 		ai := isAlive(result[i].Name)
 		aj := isAlive(result[j].Name)
@@ -1203,55 +1467,7 @@ func (s *Store) GetNodeWeightRanking(group, config, testURL string, isAlive func
 		}
 		return result[i].Weight > result[j].Weight
 	})
-
-	// Assign rank categories
-	aliveCount := 0
-	for _, r := range result {
-		if isAlive(r.Name) {
-			aliveCount++
-		}
-	}
-	if aliveCount > 0 {
-		result[0].Rank = RankMostUsed
-		if aliveCount == 2 {
-			if result[1].Weight > 0 {
-				result[1].Rank = RankOccasional
-			} else {
-				result[1].Rank = RankRarelyUsed
-			}
-		} else if aliveCount >= 3 {
-			mostUsedBound := int(float64(aliveCount) * 0.2)
-			if mostUsedBound < 1 {
-				mostUsedBound = 1
-			}
-			occasionalBound := mostUsedBound + int(float64(aliveCount)*0.5)
-			for i := 1; i < mostUsedBound && i < aliveCount; i++ {
-				if result[i].Weight > 0 {
-					result[i].Rank = RankMostUsed
-				} else {
-					result[i].Rank = RankRarelyUsed
-				}
-			}
-			for i := mostUsedBound; i < occasionalBound && i < aliveCount; i++ {
-				if result[i].Weight > 0 {
-					result[i].Rank = RankOccasional
-				} else {
-					result[i].Rank = RankRarelyUsed
-				}
-			}
-			for i := occasionalBound; i < aliveCount; i++ {
-				result[i].Rank = RankRarelyUsed
-			}
-		}
-		for i := 0; i < aliveCount; i++ {
-			if result[i].Rank == "" {
-				result[i].Rank = RankRarelyUsed
-			}
-		}
-	}
-	for i := aliveCount; i < len(result); i++ {
-		result[i].Rank = RankRarelyUsed
-	}
+	assignRankCategories(result, isAlive)
 
 	s.StoreNodeWeightRanking(group, config, result)
 	return result, nil
@@ -1899,7 +2115,11 @@ func (s *Store) FlushByLevel(level, config, group string) (FlushStats, error) {
 	switch level {
 	case "all":
 		globalQueueMu.Lock()
-		globalQueue.Store([]StoreOperation{})
+		globalQueueOps = globalQueueOps[:0]
+		for k := range globalQueueIdx {
+			delete(globalQueueIdx, k)
+		}
+		publishQueueSnapshotLocked()
 		globalQueueMu.Unlock()
 	case "config":
 		filterQueueByConfig(config)

@@ -106,8 +106,19 @@ type StatsRecord struct {
 type ModelInput struct {
 	Success     int64
 	Failure     int64
-	ConnectTime int64
-	Latency     int64
+	ConnectTime int64 // TCP / transport handshake (ms)
+	Latency     int64 // first-byte latency from post-connect write (ms)
+
+	// Jitter signals. Standard deviation (not variance) so the magnitude is
+	// comparable to ConnectTime / Latency. Populated from AtomicStatsRecord's
+	// Welford-online accumulators on snapshot; 0 when samples < 2.
+	ConnectTimeStdDev float64
+	LatencyStdDev     float64
+
+	// FirstByteLatency is the delay from dial-success to first upstream byte.
+	// Separate from Latency (= first-byte from write) so callers can tell
+	// TCP-handshake time from TLS + upstream RTT. 0 when not measured.
+	FirstByteLatency int64
 
 	UploadTotal            float64
 	HistoryUploadTotal     float64
@@ -167,10 +178,38 @@ type UnwrapMap struct {
 	RefUDP string   `json:"ref_udp,omitempty"`
 }
 
+// NodeRank is the API-surface representation of a node's weight standing.
+//
+// The distinction between Weight and Score is load-bearing — they encode
+// two different truths and UIs need both:
+//
+//   - Weight = raw average weight across targets, SAME scale as the
+//              internal CalculateWeight output used at dial selection.
+//              Typically ~0.3 (bad) to ~3 (excellent). This is what
+//              operators paste into logs to correlate API vs. debug.
+//
+//   - Score  = 0-100 percentage for progress-bar UIs. Normalised against
+//              the group's current max so bar fills always look meaningful
+//              even when absolute weights bunch up.
+//
+// Previous versions only exposed Score as "Weight", which confused users
+// comparing ClashAPI output against the debug logs — debug prints raw
+// CalculateWeight values, API printed a 0-100 bar, and they never agreed.
 type NodeRank struct {
-	Name        string
-	Rank        string
-	Weight      float64
+	Name string
+	Rank string
+	// Weight is the raw average weight across this node's active targets.
+	// Matches the scale of the internal weight store — comparable to the
+	// values printed by `[Smart] weight=...` debug logs.
+	Weight float64
+	// Score is a 0-100 normalised percentage derived from Weight / maxWeight
+	// within the same ranking batch. Use this for UI bars; use Weight for
+	// any comparison against the internal selection pipeline.
+	Score float64
+	// TargetCount is the number of distinct targets contributing to Weight.
+	// A node averaged over 1 target is far less confident than one averaged
+	// over 50 — exposing this lets UIs dim low-coverage rows.
+	TargetCount int
 	LastUpdated int64
 }
 
@@ -187,19 +226,36 @@ type ActiveTarget struct {
 	LastUsed int64
 }
 
-// AtomicStatsRecord uses native sync/atomic types (Go 1.19+)
+// AtomicStatsRecord uses native sync/atomic types (Go 1.19+).
+//
+// Connect-time and latency each carry Welford-online accumulators
+// (mean + M2 + n) so we can surface standard deviation without
+// round-tripping every sample to stable storage. The accumulators are
+// mutex-protected because Welford is three coupled reads + writes —
+// CAS looping would burn more CPU than just taking the lock.
 type AtomicStatsRecord struct {
-	success         atomic.Int64
-	failure         atomic.Int64
-	connectTime     atomic.Int64
-	latency         atomic.Int64
-	lastUsed        atomic.Int64
+	success     atomic.Int64
+	failure     atomic.Int64
+	connectTime atomic.Int64
+	latency     atomic.Int64
+	lastUsed    atomic.Int64
 
 	uploadTotal     atomic.Uint64 // bits of float64
 	downloadTotal   atomic.Uint64
 	duration        atomic.Uint64
 	maxUploadRate   atomic.Uint64
 	maxDownloadRate atomic.Uint64
+
+	// Welford online variance for connectTime and latency.
+	// Protected together by varianceMu because each Update needs all three
+	// fields consistent.
+	varianceMu     sync.Mutex
+	ctMean         float64 // running mean of connect time (ms)
+	ctM2           float64 // sum of squared deviations
+	ctN            int64
+	latMean        float64
+	latM2          float64
+	latN           int64
 
 	weightsMu sync.Mutex
 	weights   map[string]float64
@@ -338,6 +394,81 @@ func (r *AtomicStatsRecord) AddDownload(delta float64) {
 			return
 		}
 	}
+}
+
+// UpdateConnectTimeSample feeds a new connect-time measurement into the
+// Welford online variance algorithm. Call once per successful dial.
+// Thread-safe. Bounded samples (n capped at 2^31) so the accumulator
+// never overflows; the cap is far beyond any realistic conn count and
+// the update remains numerically stable long before it's reached.
+func (r *AtomicStatsRecord) UpdateConnectTimeSample(sampleMS int64) {
+	if sampleMS <= 0 {
+		return
+	}
+	x := float64(sampleMS)
+	r.varianceMu.Lock()
+	r.ctN++
+	if r.ctN > 1<<31 {
+		// Reset with the current mean as a fresh seed — keeps the stat
+		// responsive to recent behaviour once ancient history dominates.
+		r.ctN = 1
+		r.ctM2 = 0
+	}
+	delta := x - r.ctMean
+	r.ctMean += delta / float64(r.ctN)
+	delta2 := x - r.ctMean
+	r.ctM2 += delta * delta2
+	r.varianceMu.Unlock()
+}
+
+// UpdateLatencySample mirrors UpdateConnectTimeSample for first-byte latency.
+func (r *AtomicStatsRecord) UpdateLatencySample(sampleMS int64) {
+	if sampleMS <= 0 {
+		return
+	}
+	x := float64(sampleMS)
+	r.varianceMu.Lock()
+	r.latN++
+	if r.latN > 1<<31 {
+		r.latN = 1
+		r.latM2 = 0
+	}
+	delta := x - r.latMean
+	r.latMean += delta / float64(r.latN)
+	delta2 := x - r.latMean
+	r.latM2 += delta * delta2
+	r.varianceMu.Unlock()
+}
+
+// ConnectTimeStdDev returns the sample standard deviation (√(M2/(n-1)))
+// in milliseconds. Returns 0 when n < 2 — with a single sample variance
+// is undefined and downstream code treats 0 as "unknown jitter".
+func (r *AtomicStatsRecord) ConnectTimeStdDev() float64 {
+	r.varianceMu.Lock()
+	defer r.varianceMu.Unlock()
+	if r.ctN < 2 {
+		return 0
+	}
+	variance := r.ctM2 / float64(r.ctN-1)
+	if variance <= 0 {
+		return 0
+	}
+	return math.Sqrt(variance)
+}
+
+// LatencyStdDev returns the sample standard deviation for first-byte
+// latency in milliseconds.
+func (r *AtomicStatsRecord) LatencyStdDev() float64 {
+	r.varianceMu.Lock()
+	defer r.varianceMu.Unlock()
+	if r.latN < 2 {
+		return 0
+	}
+	variance := r.latM2 / float64(r.latN-1)
+	if variance <= 0 {
+		return 0
+	}
+	return math.Sqrt(variance)
 }
 
 func (r *AtomicStatsRecord) GetWeight(weightType string) float64 {
