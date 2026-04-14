@@ -5,7 +5,6 @@ package smart
 
 import (
 	"context"
-	"fmt"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -42,20 +41,22 @@ type Service struct {
 }
 
 // NewService constructs but does not start the service. Pass the resolved
-// SmartOptions (nil-safe: zero value means "nothing configured").
+// SmartOptions (nil-safe: zero value means "use defaults").
+//
+// Both LightGBM and the training-data collector are ALWAYS enabled at the
+// service level — groups that never opt in (via use_lightgbm / collect_data)
+// don't trigger any heavy initialization thanks to sync.Once lazy-init.
+// This is a behavioural change from earlier versions where a missing
+// experimental.smart.lightgbm / experimental.smart.collector block silently
+// disabled the feature; now sensible defaults kick in.
 func NewService(ctx context.Context, logger logger.Logger, options option.SmartOptions) *Service {
-	s := &Service{
-		ctx:     ctx,
-		logger:  logger,
-		options: options,
+	return &Service{
+		ctx:              ctx,
+		logger:           logger,
+		options:          options,
+		lightgbmEnabled:  true,
+		collectorEnabled: true,
 	}
-	if options.LightGBM != nil {
-		s.lightgbmEnabled = true
-	}
-	if options.Collector != nil {
-		s.collectorEnabled = true
-	}
-	return s
 }
 
 // Name returns the service name for logging / lifecycle management.
@@ -105,9 +106,12 @@ func (s *Service) WeightModel() (*lightgbm.WeightModel, error) {
 }
 
 func (s *Service) initModel() error {
+	// Use configured options when present; fall back to zero-value defaults.
+	// This lets a group opt in with just "use_lightgbm": true even when
+	// experimental.smart.lightgbm is missing from the config file.
 	opts := s.options.LightGBM
 	if opts == nil {
-		return fmt.Errorf("lightgbm options not configured")
+		opts = &option.SmartLightGBMOptions{}
 	}
 
 	modelPath := opts.ModelPath
@@ -187,9 +191,12 @@ func (s *Service) DataCollector() (*lightgbm.DataCollector, error) {
 }
 
 func (s *Service) initCollector() error {
+	// Zero-config path: a group's collect_data: true alone is enough. When
+	// experimental.smart.collector is not specified we fall back to default
+	// filename smart_weight_data.csv under base path and default 100 MB cap.
 	opts := s.options.Collector
 	if opts == nil {
-		return fmt.Errorf("collector options not configured")
+		opts = &option.SmartCollectorOptions{}
 	}
 	path := opts.Path
 	if path == "" {

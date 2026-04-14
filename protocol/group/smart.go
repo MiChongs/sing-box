@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"math"
 	"math/rand"
 	"net"
@@ -56,9 +57,20 @@ type smartDialMeta struct {
 	host        string
 	smartTarget string
 	asnCode     string
+	destGeoIP   []string // ISO country codes; best-effort from resolved IP
 	resolvedIPs []netip.Addr
 	isUDP       bool
 	destPort    uint16
+}
+
+// firstValidIPString returns the first valid IP from a slice as its string form, or "".
+func firstValidIPString(ips []netip.Addr) string {
+	for _, ip := range ips {
+		if ip.IsValid() {
+			return ip.String()
+		}
+	}
+	return ""
 }
 
 type smartMetaCtxKey struct{}
@@ -288,27 +300,27 @@ func (s *Smart) PostStart() error {
 
 	// Pull shared infrastructure from experimental.smart (SmartService).
 	// This lets multiple Smart groups share a single model/downloader/collector.
+	// Defaults kick in when experimental.smart.{lightgbm,collector} is absent —
+	// a group-level flag alone is enough.
 	if s.useLightGBM || s.collectData {
 		smartSvc, _ := service.FromContext[adapter.SmartService](s.ctx).(*smartservice.Service)
 		if smartSvc == nil {
 			s.logger.Warn("smart: use_lightgbm/collect_data requested but experimental.smart service unavailable; falling back to traditional algorithm")
 		} else {
 			if s.useLightGBM {
-				if !smartSvc.LightGBMEnabled() {
-					s.logger.Warn("smart: group [", s.Tag(), "] requested use_lightgbm but experimental.smart.lightgbm not configured")
-				} else if model, err := smartSvc.WeightModel(); err != nil {
+				if model, err := smartSvc.WeightModel(); err != nil {
 					s.logger.Warn("smart: failed to obtain shared LightGBM model: ", err)
 				} else {
 					s.weightModel = model
+					s.logger.Info("smart: group [", s.Tag(), "] ML prediction enabled")
 				}
 			}
 			if s.collectData {
-				if !smartSvc.CollectorEnabled() {
-					s.logger.Warn("smart: group [", s.Tag(), "] requested collect_data but experimental.smart.collector not configured")
-				} else if dc, err := smartSvc.DataCollector(); err != nil {
+				if dc, err := smartSvc.DataCollector(); err != nil {
 					s.logger.Warn("smart: failed to obtain shared data collector: ", err)
 				} else {
 					s.dataCollector = dc
+					s.logger.Info("smart: group [", s.Tag(), "] training-data collection enabled (sample_rate=", s.sampleRate, ")")
 				}
 			}
 		}
@@ -757,7 +769,7 @@ func (s *Smart) dialWithRetry(ctx context.Context, network string, dest M.Socksa
 		}
 
 		ctxDial, cancel := context.WithTimeout(ctx, timeout)
-		conn, proxyTag, connectTime, err := s.parallelDial(ctxDial, network, dest, batch)
+		conn, proxyTag, connectTime, err := s.parallelDial(ctxDial, network, dest, batch, meta)
 		cancel()
 
 		if err == nil {
@@ -803,14 +815,15 @@ func (s *Smart) getBatch(outbounds []adapter.Outbound, meta *smartDialMeta, roun
 	return batch, timeout
 }
 
-// parallelDial races all outbounds in batch; first success wins.
-func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksaddr, outbounds []adapter.Outbound) (net.Conn, string, int64, error) {
+// parallelDial races all outbounds in batch; first success wins. Losers get
+// their failure recorded against the real meta so weight history updates.
+func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksaddr, outbounds []adapter.Outbound, meta *smartDialMeta) (net.Conn, string, int64, error) {
 	if len(outbounds) == 1 {
 		start := time.Now()
 		conn, err := outbounds[0].DialContext(ctx, network, dest)
 		ct := time.Since(start).Milliseconds()
 		if err != nil {
-			go s.recordFailedDial(ctx, outbounds[0].Tag(), nil, ct)
+			go s.recordFailedDial(outbounds[0].Tag(), meta, ct)
 		}
 		return conn, outbounds[0].Tag(), ct, err
 	}
@@ -822,7 +835,7 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 		err         error
 	}
 
-	ctx, cancel := context.WithCancel(ctx)
+	raceCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	results := make(chan result, len(outbounds))
@@ -830,7 +843,7 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 		ob := ob
 		go func() {
 			start := time.Now()
-			conn, err := ob.DialContext(ctx, network, dest)
+			conn, err := ob.DialContext(raceCtx, network, dest)
 			ct := time.Since(start).Milliseconds()
 			results <- result{conn, ob.Tag(), ct, err}
 		}()
@@ -844,18 +857,24 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 			return r.conn, r.tag, r.connectTime, nil
 		}
 		errs = append(errs, r.err)
-		go s.recordFailedDial(ctx, r.tag, r.err, r.connectTime)
+		// Only record non-cancelled failures — losing race arms get cancelled
+		// via raceCtx after the winner returns, and that's not a real failure.
+		if r.err != context.Canceled && !errors.Is(r.err, context.Canceled) {
+			go s.recordFailedDial(r.tag, meta, r.connectTime)
+		}
 	}
 
 	return nil, "", 0, E.Errors(errs...)
 }
 
-func (s *Smart) recordFailedDial(ctx context.Context, tag string, err error, connectTime int64) {
-	if ctx.Err() != nil {
+// recordFailedDial records a dial failure against the node + target in the
+// stats store. Requires a valid meta.smartTarget; otherwise recordStats
+// drops the event (keeps Store bucket clean of bare-target entries).
+func (s *Smart) recordFailedDial(tag string, meta *smartDialMeta, connectTime int64) {
+	if meta == nil {
 		return
 	}
-	// no metadata in raw dial context — record with empty meta
-	go s.recordStats("failed", &smartDialMeta{}, tag, connectTime, 0, 0, 0, 0, 0, 0)
+	s.recordStats("failed", meta, tag, connectTime, 0, 0, 0, 0, 0, 0)
 }
 
 // ─── tracked connection wrappers ──────────────────────────────────────────────
@@ -1011,13 +1030,23 @@ func (s *Smart) recordStats(
 		}
 	}
 
+	// CRITICAL: snapshot history BEFORE mutating totals. ModelInput semantics
+	// (mihomo parity): UploadTotal / MaxuploadRate / DownloadTotal / MaxdownloadRate
+	// refer to THIS connection; History* fields refer to accumulated values prior
+	// to this connection. Swapping them breaks both CalculateWeight's scene
+	// detection and LightGBM features 4-11.
+	historyUploadTotal := record.GetFloat64("uploadTotal")
+	historyDownloadTotal := record.GetFloat64("downloadTotal")
+	historyMaxUploadRate := record.GetFloat64("maxUploadRate")
+	historyMaxDownloadRate := record.GetFloat64("maxDownloadRate")
+
 	record.AddUpload(uploadMB)
 	record.AddDownload(downloadMB)
 
-	if maxUpKB > record.GetFloat64("maxUploadRate") {
+	if maxUpKB > historyMaxUploadRate {
 		record.SetFloat64("maxUploadRate", maxUpKB)
 	}
-	if maxDownKB > record.GetFloat64("maxDownloadRate") {
+	if maxDownKB > historyMaxDownloadRate {
 		record.SetFloat64("maxDownloadRate", maxDownKB)
 	}
 
@@ -1025,23 +1054,29 @@ func (s *Smart) recordStats(
 	priorityFactor := s.getPriorityFactor(proxyTag)
 
 	input := &smart.ModelInput{
-		Success:            record.GetInt64("success"),
-		Failure:            record.GetInt64("failure"),
-		ConnectTime:        record.GetInt64("connectTime"),
-		Latency:            record.GetInt64("latency"),
-		IsUDP:              meta.isUDP,
-		IsTCP:              !meta.isUDP,
-		UploadTotal:        record.GetFloat64("uploadTotal"),
-		MaxuploadRate:      record.GetFloat64("maxUploadRate"),
-		DownloadTotal:      record.GetFloat64("downloadTotal"),
-		MaxdownloadRate:    record.GetFloat64("maxDownloadRate"),
-		ConnectionDuration: record.GetFloat64("duration"),
-		LastUsed:           record.GetInt64("lastUsed"),
-		DestIPASN:          meta.asnCode,
-		Host:               meta.host,
-		DestPort:           meta.destPort,
-		GroupName:          s.Tag(),
-		NodeName:           proxyTag,
+		Success:                record.GetInt64("success"),
+		Failure:                record.GetInt64("failure"),
+		ConnectTime:            record.GetInt64("connectTime"),
+		Latency:                record.GetInt64("latency"),
+		IsUDP:                  meta.isUDP,
+		IsTCP:                  !meta.isUDP,
+		UploadTotal:            uploadMB,               // this connection
+		HistoryUploadTotal:     historyUploadTotal,     // accumulated before
+		MaxuploadRate:          maxUpKB,                // this connection
+		HistoryMaxUploadRate:   historyMaxUploadRate,   // accumulated before
+		DownloadTotal:          downloadMB,
+		HistoryDownloadTotal:   historyDownloadTotal,
+		MaxdownloadRate:        maxDownKB,
+		HistoryMaxDownloadRate: historyMaxDownloadRate,
+		ConnectionDuration:     record.GetFloat64("duration"), // smoothed avg (post-update)
+		LastUsed:               record.GetInt64("lastUsed"),
+		DestIPASN:              meta.asnCode,
+		Host:                   meta.host,
+		DestIP:                 firstValidIPString(meta.resolvedIPs),
+		DestPort:               meta.destPort,
+		DestGeoIP:              meta.destGeoIP,
+		GroupName:              s.Tag(),
+		NodeName:               proxyTag,
 	}
 
 	// ML prediction path (LightGBM) with automatic fallback to traditional algorithm.
@@ -1073,14 +1108,34 @@ func (s *Smart) recordStats(
 		go s.dataCollector.AddSample(input, cmeta, calculatedWeight, source)
 	}
 
+	// Host-level failure tracking (mihomo parity): a wildcard target that has
+	// failed many times should NOT further penalize the node — the problem is
+	// the target, not the route. Default threshold 10; beyond that the host
+	// is considered "blocked" and node weight stays put.
+	const hostMaxFailedTimes = 10
+	hostFailCount, hostLastUsed := s.store.GetHostStatus(s.Tag(), smartConfigName, target)
+	hostBlocked := hostFailCount >= hostMaxFailedTimes
+
 	finalWeight, isDegraded := s.checkNodeQualityDegradation(
 		status, meta, proxyTag, calculatedWeight, oldWeight,
-		durationMS, uploadMB, downloadMB,
+		durationMS, uploadMB, downloadMB, hostBlocked,
 	)
 
 	if isDegraded {
 		s.updatePrefetchCache(meta, target, proxyTag, finalWeight)
+		// Drop the unwrap cache so the next connection to this target
+		// re-evaluates node selection (mihomo's findSameConnection equivalent;
+		// sing-box has no global statistic manager so we do the simple thing).
+		if s.store != nil {
+			s.store.DeleteUnwrapResult(s.Tag(), smartConfigName, target, meta.asnCode, meta.isUDP)
+		}
 	}
+
+	// Update host failure/success counter. Only update lastUsed on zero-traffic
+	// HTTPS 443 TCP — the "host might be blocked" heuristic from mihomo.
+	needLastUsedUpdate := downloadMB < 0.03 && meta.host != "" && meta.destPort == 443 && !meta.isUDP
+	s.store.UpdateHostStatus(s.Tag(), smartConfigName, target, isDegraded, needLastUsedUpdate)
+	_ = hostLastUsed // reserved for future StatusTest-like logic
 
 	record.SetInt64("lastUsed", time.Now().Unix())
 	record.SetWeight(weightType, finalWeight, meta.isUDP)
@@ -1104,6 +1159,7 @@ func (s *Smart) checkNodeQualityDegradation(
 	status string, meta *smartDialMeta, proxyTag string,
 	newWeight, oldWeight float64,
 	durationMS int64, uploadMB, downloadMB float64,
+	hostBlocked bool,
 ) (float64, bool) {
 	newWeight = smart.UpdateAverageFloat(oldWeight, newWeight, false)
 
@@ -1111,18 +1167,32 @@ func (s *Smart) checkNodeQualityDegradation(
 
 	if status == "failed" {
 		failedWeight, nodeBlock := s.handleFailedConnection(proxyTag, oldWeight, newWeight)
+		// If the host is known-blocked, do NOT propagate node-level block —
+		// the target is the cause, not the node.
+		if nodeBlock && hostBlocked {
+			return newWeight, false
+		}
 		return failedWeight, nodeBlock
 	}
 
-	// Zero-traffic HTTPS detection
+	// Zero-traffic HTTPS detection — strong signal of TLS handshake failure,
+	// upstream reset, or transparent blackhole. But if the host itself is
+	// blocked elsewhere, don't penalize the node.
 	if durationMS > 100 && downloadMB == 0 && uploadMB == 0 && meta.destPort == 443 && !meta.isUDP {
+		if hostBlocked {
+			return newWeight, false
+		}
 		return degradedWeight, true
 	}
 
-	// Weight drop detection
+	// Weight drop detection — >30% drop is a quality signal, but still
+	// skip it when the host is the culprit.
 	if oldWeight > 0 && newWeight > 0 {
 		drop := (oldWeight - newWeight) / oldWeight
 		if drop > 0.3 {
+			if hostBlocked {
+				return newWeight, false
+			}
 			return newWeight, true
 		}
 	}
