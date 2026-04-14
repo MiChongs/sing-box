@@ -790,7 +790,21 @@ func (s *Smart) buildMeta(metadata adapter.InboundContext, isUDP bool) *smartDia
 		host = metadata.SniffHost
 	}
 
+	// Build the IP list fed into target key / ASN / country lookups.
+	//
+	// DestinationAddresses is only populated by DNS-resolution in the router;
+	// connections issued to a raw IP (Telegram's 91.108.56.170, custom DNS
+	// servers, p2p bootstrap peers, etc.) leave that slice empty — the IP
+	// lives only in metadata.Destination.Addr. Ignoring it means:
+	//   - GetEffectiveTarget receives ("", "") → returns "" → target empty
+	//   - recordStats early-returns when target == "" → NO stats recorded
+	//   - /proxies/<tag>/weights ranking excludes these destinations forever
+	//   - lookupASN/lookupCountry return empty → LightGBM features 16/17/
+	//     23-26 silently degrade for IP-direct traffic
 	ips := metadata.DestinationAddresses
+	if len(ips) == 0 && metadata.Destination.Addr.IsValid() {
+		ips = []netip.Addr{metadata.Destination.Addr}
+	}
 	var firstIP string
 	if len(ips) > 0 {
 		firstIP = ips[0].String()
@@ -842,8 +856,8 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	}
 
 	s.logger.DebugContext(ctx, "smart[", s.Tag(), "] select via ", source,
-		": target=", meta.smartTarget, " asn=[", meta.asnCode,
-		"] candidates=", proxyTagsPreview(selectedOutbounds, 5))
+		": target=", displayTarget(meta, destination), " asn=", displayASN(meta),
+		" candidates=", proxyTagsPreview(selectedOutbounds, 5))
 
 	if !isUnwrap && s.store != nil && meta.smartTarget != "" {
 		names := outboundNames(selectedOutbounds)
@@ -859,8 +873,8 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	s.setLastSelected(proxyTag)
 	s.markAlive(proxyTag) // successful dial = confirmed alive; clears knownDead
 	s.logger.InfoContext(ctx, "smart[", s.Tag(), "] ", network, " → ", destination,
-		" via [", proxyTag, "] in ", connectTime, "ms (target=", meta.smartTarget,
-		" asn=[", meta.asnCode, "] source=", source, ")")
+		" via [", proxyTag, "] in ", connectTime, "ms (target=",
+		displayTarget(meta, destination), " asn=", displayASN(meta), " source=", source, ")")
 
 	return s.wrapConn(conn, proxyTag, meta, connectTime, isUDP), nil
 }
@@ -884,8 +898,8 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	selectedOutbounds, isUnwrap, source := s.selectProxiesTraced(meta, snap.outbounds, true)
 
 	s.logger.DebugContext(ctx, "smart[", s.Tag(), "] select via ", source,
-		" (UDP): target=", meta.smartTarget, " asn=[", meta.asnCode,
-		"] candidates=", proxyTagsPreview(selectedOutbounds, 5))
+		" (UDP): target=", displayTarget(meta, destination), " asn=", displayASN(meta),
+		" candidates=", proxyTagsPreview(selectedOutbounds, 5))
 
 	if !isUnwrap && s.store != nil && meta.smartTarget != "" {
 		names := outboundNames(selectedOutbounds)
@@ -912,7 +926,8 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 			s.markAlive(ob.Tag())
 			s.logger.InfoContext(ctx, "smart[", s.Tag(), "] UDP → ", destination,
 				" via [", ob.Tag(), "] in ", connectTime, "ms (target=",
-				meta.smartTarget, " asn=[", meta.asnCode, "] source=", source, ")")
+				displayTarget(meta, destination), " asn=", displayASN(meta),
+				" source=", source, ")")
 			return s.wrapPacketConn(pc, ob.Tag(), meta, connectTime), nil
 		}
 		finalErr = err
@@ -2381,6 +2396,29 @@ func (s *Smart) cleanupOrphanedNodeCache() {
 			s.logger.Warn("smart[", s.Tag(), "] failed to clean orphaned nodes: ", err)
 		}
 	}
+}
+
+// displayTarget renders a human-readable target for log output. When the
+// Smart-effective target is empty (rare: both Destination.Fqdn and all IPs
+// absent), falls back to the socksaddr string so the log still pinpoints
+// the destination the user is trying to reach.
+func displayTarget(meta *smartDialMeta, dest M.Socksaddr) string {
+	if meta != nil && meta.smartTarget != "" {
+		return meta.smartTarget
+	}
+	if dest.IsValid() {
+		return dest.String()
+	}
+	return "unknown"
+}
+
+// displayASN renders the ASN code for logging, using a placeholder when
+// unavailable so the field is never an empty "[]" hint.
+func displayASN(meta *smartDialMeta) string {
+	if meta == nil || meta.asnCode == "" {
+		return "[none]"
+	}
+	return "[" + meta.asnCode + "]"
 }
 
 // proxyTagsPreviewStrings is a variant of proxyTagsPreview that takes raw tag strings.
