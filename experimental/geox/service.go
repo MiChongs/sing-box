@@ -45,7 +45,11 @@ type Service struct {
 	geoipPath   string
 	geositePath string
 	mmdbPath    string
-	asnPath     string
+	// asnPaths holds one absolute path per configured ASN URL — supports
+	// multi-source ASN lookup where Smart's lookupASN tries each in order
+	// until a hit is found. Single-URL configs produce a single entry,
+	// preserving back-compat with the original ASN field.
+	asnPaths []string
 
 	dlMu  sync.Mutex
 	dls   []*assetdl.Downloader
@@ -70,11 +74,37 @@ func NewService(ctx context.Context, logger logger.Logger, options option.GeoXOp
 		if options.URL.MMDB != "" {
 			s.mmdbPath = filemanager.BasePath(ctx, DefaultMMDBFilename)
 		}
-		if options.URL.ASN != "" {
-			s.asnPath = filemanager.BasePath(ctx, DefaultASNFilename)
+		// One file per ASN URL. Filename suffix "" for index 0 keeps the
+		// pre-existing single-source filename intact (no migration needed
+		// for users upgrading from the single-string ASN config).
+		for i, u := range options.URL.ASN {
+			if u == "" {
+				continue
+			}
+			name := DefaultASNFilename
+			if i > 0 {
+				name = asnIndexedFilename(i)
+			}
+			s.asnPaths = append(s.asnPaths, filemanager.BasePath(ctx, name))
 		}
 	}
 	return s
+}
+
+// asnIndexedFilename returns the on-disk name for the i-th ASN source.
+// Index 0 keeps the original "GeoLite2-ASN.mmdb" filename; index ≥1 gets
+// a numeric suffix to avoid collisions when multiple sources are configured.
+func asnIndexedFilename(i int) string {
+	// e.g. GeoLite2-ASN-1.mmdb, GeoLite2-ASN-2.mmdb
+	return "GeoLite2-ASN-" + indexSuffix(i) + ".mmdb"
+}
+
+func indexSuffix(i int) string {
+	// Avoid importing strconv just for this — small inline impl.
+	if i < 10 {
+		return string(rune('0' + i))
+	}
+	return string(rune('0'+i/10)) + string(rune('0'+i%10))
 }
 
 // Name returns the service name (lifecycle).
@@ -114,7 +144,18 @@ func (s *Service) Start(stage adapter.StartStage) error {
 		{"geox/geoip", s.options.URL.GeoIP, s.geoipPath},
 		{"geox/geosite", s.options.URL.GeoSite, s.geositePath},
 		{"geox/mmdb", s.options.URL.MMDB, s.mmdbPath},
-		{"geox/asn", s.options.URL.ASN, s.asnPath},
+	}
+	// Fan out one downloader per ASN URL. Logger name encodes the index
+	// so users can see which provider failed when multiple are configured.
+	for i, u := range s.options.URL.ASN {
+		if i >= len(s.asnPaths) || u == "" {
+			continue
+		}
+		name := "geox/asn"
+		if i > 0 {
+			name = "geox/asn#" + indexSuffix(i)
+		}
+		specs = append(specs, spec{name, u, s.asnPaths[i]})
 	}
 
 	s.dlMu.Lock()
@@ -219,4 +260,23 @@ func (s *Service) GeoSitePath() string { return s.geositePath }
 func (s *Service) MMDBPath() string { return s.mmdbPath }
 
 // ASNPath returns the local GeoLite2-ASN.mmdb path.
-func (s *Service) ASNPath() string { return s.asnPath }
+// ASNPath returns the FIRST configured ASN mmdb path. Empty when no ASN URL
+// is configured. Single-source compat shim — multi-source consumers should
+// use ASNPaths().
+func (s *Service) ASNPath() string {
+	if len(s.asnPaths) == 0 {
+		return ""
+	}
+	return s.asnPaths[0]
+}
+
+// ASNPaths returns every configured ASN mmdb path in priority order.
+// Returns nil when no ASN URL was configured.
+func (s *Service) ASNPaths() []string {
+	if len(s.asnPaths) == 0 {
+		return nil
+	}
+	out := make([]string, len(s.asnPaths))
+	copy(out, s.asnPaths)
+	return out
+}

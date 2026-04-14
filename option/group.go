@@ -43,13 +43,19 @@ type LoadBalanceOutboundOptions struct {
 
 type SmartOutboundOptions struct {
 	GroupCommonOption
-	URL                       string             `json:"url,omitempty"`
-	Interval                  badoption.Duration `json:"interval,omitempty"`
-	PolicyPriority            string             `json:"policy_priority,omitempty"`
-	UseASN                    bool               `json:"use_asn,omitempty"`
-	ASNDatabase               string             `json:"asn_database,omitempty"`
-	DisableUDP                bool               `json:"disable_udp,omitempty"`
-	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
+	URL            string             `json:"url,omitempty"`
+	Interval       badoption.Duration `json:"interval,omitempty"`
+	PolicyPriority string             `json:"policy_priority,omitempty"`
+	UseASN         bool               `json:"use_asn,omitempty"`
+
+	// ASNDatabase is a Listable: a single mmdb path OR an array of paths.
+	// When empty, Smart falls back to experimental.geox.url.asn (which is
+	// also Listable). Multiple sources are queried in order on each lookup;
+	// the first hit wins. Use this when one provider's IP coverage has
+	// gaps you want filled by another.
+	ASNDatabase               badoption.Listable[string] `json:"asn_database,omitempty"`
+	DisableUDP                bool                       `json:"disable_udp,omitempty"`
+	InterruptExistConnections bool                       `json:"interrupt_exist_connections,omitempty"`
 
 	// Host-level blocking threshold (mihomo: maxFailedTimes). When the
 	// failure counter for a wildcard target reaches this value, Smart will

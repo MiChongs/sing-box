@@ -76,8 +76,13 @@ type GeoXService interface {
 	GeoSitePath() string
 	// MMDBPath returns the local path of the downloaded country.mmdb.
 	MMDBPath() string
-	// ASNPath returns the local path of the downloaded GeoLite2-ASN.mmdb.
+	// ASNPath returns the FIRST local ASN mmdb path (back-compat with the
+	// single-source API). Empty if no ASN URL is configured. Callers that
+	// want fallback across multiple providers should use ASNPaths().
 	ASNPath() string
+	// ASNPaths returns every configured ASN mmdb path in priority order.
+	// Empty slice when no ASN URL is configured.
+	ASNPaths() []string
 }
 
 type CacheFile interface {

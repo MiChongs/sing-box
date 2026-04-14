@@ -49,11 +49,17 @@ type GeoXOptions struct {
 
 // GeoXURLs holds remote URLs for the 4 recognised geo asset types.
 // Any empty field is skipped.
+//
+// ASN is a Listable: a single string OR an array of URLs is accepted.
+// When multiple ASN sources are configured, GeoXService downloads each
+// separately and Smart's lookupASN tries them in order until a hit is
+// found — useful because different providers (MaxMind / IPInfo / DBIP /
+// Cloudflare) have non-overlapping IP coverage.
 type GeoXURLs struct {
-	GeoIP   string `json:"geoip,omitempty"`
-	GeoSite string `json:"geosite,omitempty"`
-	MMDB    string `json:"mmdb,omitempty"`
-	ASN     string `json:"asn,omitempty"`
+	GeoIP   string                     `json:"geoip,omitempty"`
+	GeoSite string                     `json:"geosite,omitempty"`
+	MMDB    string                     `json:"mmdb,omitempty"`
+	ASN     badoption.Listable[string] `json:"asn,omitempty"`
 }
 
 type CacheFileOptions struct {

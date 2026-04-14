@@ -104,10 +104,10 @@ type Smart struct {
 	disableUDP         bool
 	policyPriority     []priorityRule
 	useASN             bool
-	asnDBPath          string // configured path; "" means "fall back to geox service"
-	asnDB              *maxminddb.Reader
-	countryDB          *maxminddb.Reader // country.mmdb from GeoX, optional
-	maxHostFailedTimes int               // mihomo parity; 0 = default 10
+	asnDBPaths         []string            // per-group configured paths; empty → fall back to geox service
+	asnDBs             []*maxminddb.Reader // multi-source: tried in order until one returns a hit
+	countryDB          *maxminddb.Reader   // country.mmdb from GeoX, optional
+	maxHostFailedTimes int                 // mihomo parity; 0 = default 10
 
 	store *smart.Store
 
@@ -241,10 +241,14 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 
 	s.parsePolicyPriority(options.PolicyPriority)
 
-	// Record the per-group ASN mmdb path; actual file open happens in
-	// PostStart so we can fall back to the global GeoX service path when
-	// the per-group field is empty.
-	s.asnDBPath = options.ASNDatabase
+	// Record per-group ASN mmdb paths (Listable: 0..N entries); actual
+	// file opens happen in PostStart so we can fall back to the global
+	// GeoX service paths when the per-group list is empty.
+	for _, p := range options.ASNDatabase {
+		if p != "" {
+			s.asnDBPaths = append(s.asnDBPaths, p)
+		}
+	}
 
 	return s, nil
 }
@@ -333,23 +337,36 @@ func (s *Smart) PostStart() error {
 		s.logger.Warn("smart: no cache file available, using ephemeral store")
 	}
 
-	// Resolve ASN mmdb: per-group path wins; fall back to global experimental.geox.
+	// Resolve ASN mmdb paths: per-group list wins (in order); fall back to
+	// the global experimental.geox.url.asn list. Multi-source lookup tries
+	// each opened reader in order until a hit is found, so users can stack
+	// providers (MaxMind / IPInfo / DBIP / Cloudflare) for better coverage.
 	if s.useASN {
-		asnPath := s.asnDBPath
-		if asnPath == "" {
+		paths := s.asnDBPaths
+		if len(paths) == 0 {
 			if geoSvc := service.FromContext[adapter.GeoXService](s.ctx); geoSvc != nil {
-				asnPath = geoSvc.ASNPath()
-				if asnPath != "" {
-					s.logger.Info("smart: ASN database path not configured; using global experimental.geox.asn = ", asnPath)
+				paths = geoSvc.ASNPaths()
+				if len(paths) > 0 {
+					s.logger.Info("smart: ASN database not configured per-group; using ",
+						len(paths), " global source(s) from experimental.geox.url.asn")
 				}
 			}
 		}
-		if asnPath == "" {
-			s.logger.Warn("smart: use_asn is true but no ASN database path resolved (set asn_database or experimental.geox.url.asn); ASN features disabled")
-		} else if db, err := maxminddb.Open(asnPath); err != nil {
-			s.logger.Warn("smart: failed to open ASN database [", asnPath, "]: ", err, " (will retry on next reload)")
+		if len(paths) == 0 {
+			s.logger.Warn("smart: use_asn is true but no ASN database resolved (set asn_database or experimental.geox.url.asn); ASN features disabled")
 		} else {
-			s.asnDB = db
+			for _, p := range paths {
+				db, err := maxminddb.Open(p)
+				if err != nil {
+					s.logger.Warn("smart: failed to open ASN database [", p, "]: ", err, " (skipping; other sources still tried)")
+					continue
+				}
+				s.asnDBs = append(s.asnDBs, db)
+				s.logger.Info("smart: ASN database loaded from ", p)
+			}
+			if len(s.asnDBs) == 0 {
+				s.logger.Warn("smart: all configured ASN databases failed to open; ASN features disabled")
+			}
 		}
 	}
 
@@ -437,10 +454,13 @@ func (s *Smart) PostStart() error {
 	}
 	asnStatus := "off"
 	if s.useASN {
-		if s.asnDB != nil {
-			asnStatus = "on"
-		} else {
+		switch n := len(s.asnDBs); {
+		case n == 0:
 			asnStatus = "on(no-db)"
+		case n == 1:
+			asnStatus = "on"
+		default:
+			asnStatus = "on(" + strconv.Itoa(n) + " sources)"
 		}
 	}
 	mlStatus := "off"
@@ -502,9 +522,10 @@ func (s *Smart) Close() error {
 	if s.store != nil {
 		s.store.FlushQueue(true)
 	}
-	if s.asnDB != nil {
-		_ = s.asnDB.Close()
+	for _, db := range s.asnDBs {
+		_ = db.Close()
 	}
+	s.asnDBs = nil
 	if s.countryDB != nil {
 		_ = s.countryDB.Close()
 	}
@@ -2706,19 +2727,26 @@ func (s *Smart) getHistoryConnectTime(meta *smartDialMeta, proxyTag string) int6
 	return record.GetInt64("connectTime")
 }
 
+// lookupASN resolves an ASN code for the first valid public destination IP.
+// Iterates s.asnDBs in priority order — when one provider lacks coverage
+// for an IP (e.g. small allocations / new ranges), the next is tried.
+// Returns the FIRST non-zero ASN found by ANY (db, ip) pair tried.
 func (s *Smart) lookupASN(ips []netip.Addr) string {
-	if !s.useASN || s.asnDB == nil {
+	if !s.useASN || len(s.asnDBs) == 0 {
 		return ""
 	}
 	for _, ip := range ips {
 		if !ip.IsValid() || ip.IsPrivate() || ip.IsLoopback() {
 			continue
 		}
-		var record struct {
-			AutonomousSystemNumber uint `maxminddb:"autonomous_system_number"`
-		}
-		if err := s.asnDB.Lookup(ip.AsSlice(), &record); err == nil && record.AutonomousSystemNumber != 0 {
-			return strconv.FormatUint(uint64(record.AutonomousSystemNumber), 10)
+		ipBytes := ip.AsSlice()
+		for _, db := range s.asnDBs {
+			var record struct {
+				AutonomousSystemNumber uint `maxminddb:"autonomous_system_number"`
+			}
+			if err := db.Lookup(ipBytes, &record); err == nil && record.AutonomousSystemNumber != 0 {
+				return strconv.FormatUint(uint64(record.AutonomousSystemNumber), 10)
+			}
 		}
 	}
 	return ""
