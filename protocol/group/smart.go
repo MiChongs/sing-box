@@ -626,6 +626,44 @@ func (s *Smart) FlushStore() error {
 // Returns nil if the cache file was not configured.
 func (s *Smart) SmartStore() *smart.Store { return s.store }
 
+// NotifyUserDisconnect records an unambiguous user-initiated disconnect
+// against (target, node). The Clash API connection-close handlers call
+// this so manual "close connection" clicks / API DELETEs participate in
+// the same short-life → markDead escalation path as in-process
+// smartTrackedConn.Close. Without this, disconnects routed exclusively
+// through the API bypassed the detection logic.
+//
+// target may be empty (derived from tracker metadata) — in that case we
+// still drop any unwrap cache that references the node across all
+// targets, so the next dial re-evaluates candidates.
+func (s *Smart) NotifyUserDisconnect(target, node string, isUDP bool, asnCode string) {
+	if node == "" {
+		return
+	}
+	if target == "" {
+		// Best-effort: we don't know which target to blame, so at minimum
+		// ensure the node re-enters short-life aggregation via a synthetic
+		// key. Uses node tag as the sole key so repeated API closes on the
+		// same node still accumulate.
+		target = "__clashapi__"
+	}
+	if s.recordShortLife(target, node) {
+		s.markDead(node)
+		if s.store != nil && target != "__clashapi__" {
+			s.store.DeleteUnwrapResult(s.Tag(), smartConfigName, target, asnCode, isUDP)
+		}
+		s.logger.Info("smart[", s.Tag(), "] node [", node,
+			"] marked dead after ", shortLifeThreshold,
+			" user-initiated disconnects (target=", target, ")")
+		return
+	}
+	// Below threshold: still clear unwrap for this target so the next dial
+	// re-selects rather than pinning back to the same node.
+	if s.store != nil && target != "__clashapi__" {
+		s.store.DeleteUnwrapResult(s.Tag(), smartConfigName, target, asnCode, isUDP)
+	}
+}
+
 // DefaultBlockDuration applied by MarkBlocked when caller doesn't specify one.
 const DefaultBlockDuration = 30 * time.Minute
 
@@ -1376,7 +1414,8 @@ func (c *smartTrackedConn) Close() error {
 		// the caller. This closes the timing window where the user's next
 		// DialContext races ahead of the stats update and re-selects the
 		// same bad node via stale unwrap cache.
-		if c.meta != nil && classifyShortLife(durMS, up, down) {
+		firstByteSeen := c.firstReadOnce.Load()
+		if c.meta != nil && classifyShortLife(durMS, up, down, firstByteSeen) {
 			if c.s.recordShortLife(c.meta.smartTarget, c.proxyTag) {
 				// Threshold crossed — take decisive action now.
 				c.s.markDead(c.proxyTag)
@@ -2451,18 +2490,42 @@ func (s *Smart) recordShortLife(target, node string) (crossed bool) {
 	return false
 }
 
-// classifyShortLife returns true when a close event has "user gave up"
-// signature — duration too short AND payload too small to be a real
-// interaction. Either condition alone isn't enough; we need both so we
-// don't penalise a legitimate quick API call that completed successfully.
-func classifyShortLife(durationMS int64, upBytes, downBytes int64) bool {
-	if durationMS >= int64(shortLifeDurationLimit/time.Millisecond) {
-		return false
+// classifyShortLife returns true when a close event has "user gave up on
+// this node" signature. Mihomo-inspired but with broader coverage — the
+// previous strict (duration<2s AND bytes<4KB) missed the common case of
+// a 10-second wait on a page that never loaded (duration long, bytes low).
+//
+// Any ONE of these patterns qualifies:
+//
+//  1. Very quick + barely any bytes — classic dropped-handshake abort.
+//     (duration < 2s AND total bytes < 4 KB)
+//
+//  2. No first-byte ever — we wrote to the node but the server never sent
+//     anything back. Strong "node is eating bytes" signal regardless of
+//     how long the user waited before giving up.
+//     (firstByteSeen == false AND duration > 500ms)
+//
+//  3. Long-but-empty — connection stayed alive for seconds but saw almost
+//     no downstream data. User watched the spinner and gave up.
+//     (download < 1 KB AND duration > 2s)
+//
+// Pattern 2 requires knowing whether we saw a first byte; caller passes
+// firstByteSeen flag from smartTrackedConn.firstReadOnce / firstReadMs.
+func classifyShortLife(durationMS int64, upBytes, downBytes int64, firstByteSeen bool) bool {
+	// Rule 1: classic short-abort
+	if durationMS < int64(shortLifeDurationLimit/time.Millisecond) &&
+		upBytes+downBytes < shortLifeBytesLimit {
+		return true
 	}
-	if upBytes+downBytes >= shortLifeBytesLimit {
-		return false
+	// Rule 2: no response ever from server
+	if !firstByteSeen && durationMS > 500 {
+		return true
 	}
-	return true
+	// Rule 3: long connection but effectively no downstream payload
+	if downBytes < 1024 && durationMS > int64(shortLifeDurationLimit/time.Millisecond) {
+		return true
+	}
+	return false
 }
 
 func (s *Smart) supportsUDP(ob adapter.Outbound) bool {
