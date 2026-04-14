@@ -30,8 +30,44 @@ func proxyRouter(server *Server, router adapter.Router) http.Handler {
 		r.Get("/", getProxy(server))
 		r.Get("/delay", getProxyDelay(server))
 		r.Put("/", updateProxy)
+		// Smart-specific: per-group weight ranking (mihomo parity).
+		// `?refresh=true` recomputes synchronously instead of returning cache.
+		r.Get("/weights", getSmartGroupWeights)
 	})
 	return r
+}
+
+// getSmartGroupWeights returns the Smart group's weight ranking.
+// Non-Smart groups get 400. Mirrors mihomo's GET /groups/{name}/weights.
+func getSmartGroupWeights(w http.ResponseWriter, r *http.Request) {
+	proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
+	sg, ok := proxy.(*group.Smart)
+	if !ok {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, render.M{
+			"weights": []any{},
+			"error":   "not a Smart group",
+		})
+		return
+	}
+	refresh := r.URL.Query().Get("refresh") == "true"
+	weights, err := sg.WeightRanking(refresh)
+	if err != nil {
+		render.Status(r, http.StatusInternalServerError)
+		render.JSON(w, r, render.M{
+			"weights": []any{},
+			"error":   err.Error(),
+		})
+		return
+	}
+	if len(weights) == 0 {
+		render.JSON(w, r, render.M{
+			"weights": []any{},
+			"message": "no weight data available for this group",
+		})
+		return
+	}
+	render.JSON(w, r, render.M{"weights": weights})
 }
 
 func parseProxyName(next http.Handler) http.Handler {
@@ -230,6 +266,16 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		}
 
 		proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
+
+		// Mihomo parity: running a delay test against a pinned Smart group
+		// should implicitly release the pin so the next dial re-enters
+		// auto-selection and the freshly measured delay can take effect.
+		if sg, ok := proxy.(*group.Smart); ok {
+			if pinned := sg.Selected(); pinned != "" {
+				sg.SelectOutbound("")
+			}
+		}
+
 		realTag := group.RealTag(proxy)
 		timeoutDuration := time.Millisecond * time.Duration(timeout)
 

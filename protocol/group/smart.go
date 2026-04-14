@@ -500,6 +500,106 @@ func (s *Smart) SelectOutbound(tag string) bool {
 // Surfaced in Clash API output as the `fixed` field.
 func (s *Smart) Selected() string { return s.getManualSelected() }
 
+// ConfigName returns the Smart store's config namespace ("singbox" in this
+// fork — mihomo used the config filename). Exposed for ClashAPI routes that
+// need to address the Smart store per-config.
+func (s *Smart) ConfigName() string { return smartConfigName }
+
+// WeightRanking returns the cached ranked node list (sorted by weight) for
+// this group, used by `GET /proxies/<tag>/weights`. Returns a non-nil empty
+// slice when no ranking has been computed yet; never returns nil.
+// When forceRefresh is true, the ranking is recomputed synchronously before
+// returning — useful for an explicit recompute button in the UI.
+func (s *Smart) WeightRanking(forceRefresh bool) ([]smart.NodeRank, error) {
+	if s.store == nil {
+		return []smart.NodeRank{}, nil
+	}
+	if forceRefresh {
+		snap := s.state.Load()
+		if snap == nil || len(snap.tags) == 0 {
+			return []smart.NodeRank{}, nil
+		}
+		ranking, err := s.store.GetNodeWeightRanking(s.Tag(), smartConfigName, s.testURL, s.isAlive, snap.tags)
+		if err != nil {
+			return []smart.NodeRank{}, err
+		}
+		if ranking == nil {
+			return []smart.NodeRank{}, nil
+		}
+		return ranking, nil
+	}
+	ranking, err := s.store.GetNodeWeightRankingCache(s.Tag(), smartConfigName)
+	if err != nil {
+		return []smart.NodeRank{}, err
+	}
+	if ranking == nil {
+		return []smart.NodeRank{}, nil
+	}
+	return ranking, nil
+}
+
+// FlushStore wipes all Smart persistent data for this specific group.
+func (s *Smart) FlushStore() error {
+	if s.store == nil {
+		return nil
+	}
+	s.manualSelected.Store("")
+	return s.store.FlushByGroup(s.Tag(), smartConfigName)
+}
+
+// SmartStore exposes the underlying store for global-flush operations.
+// Returns nil if the cache file was not configured.
+func (s *Smart) SmartStore() *smart.Store { return s.store }
+
+// DefaultBlockDuration applied by MarkBlocked when caller doesn't specify one.
+const DefaultBlockDuration = 30 * time.Minute
+
+// MarkBlocked writes an immediate long-duration block for a specific node.
+// Mirrors mihomo's `DELETE /connections/smart/{id}` flow where a user-initiated
+// block forces the Smart algorithm to stop selecting that node even if its
+// raw weight is still high (the failure hasn't propagated yet).
+//
+// duration <= 0 uses DefaultBlockDuration (30 min). Failure count is set to
+// 100 so the natural recovery (0.01 per tick) takes meaningful time.
+func (s *Smart) MarkBlocked(nodeTag string, duration time.Duration) error {
+	if s.store == nil {
+		return E.New("smart: store unavailable")
+	}
+	if nodeTag == "" {
+		return E.New("smart: empty node tag")
+	}
+	if duration <= 0 {
+		duration = DefaultBlockDuration
+	}
+	now := time.Now()
+	state := smart.NodeState{
+		Name:           nodeTag,
+		FailureCount:   100,
+		LastFailure:    now.Unix(),
+		Degraded:       true,
+		DegradedFactor: 0.1,
+		BlockedUntil:   now.Add(duration).Unix(),
+	}
+	data, err := json.Marshal(&state)
+	if err != nil {
+		return err
+	}
+	s.store.AppendToGlobalQueue(smart.StoreOperation{
+		Type:   smart.OpSaveNodeState,
+		Group:  s.Tag(),
+		Config: smartConfigName,
+		Node:   nodeTag,
+		Data:   data,
+	})
+	smart.ClearBlockedNodesCache(s.Tag(), smartConfigName)
+
+	// Also drop any unwrap-cache entries that might still point at this node.
+	// The alternative — traversing every cached target — is expensive; the
+	// blockedNodes filter in fillProxies handles it lazily on next dial.
+	s.logger.Info("smart[", s.Tag(), "] node [", nodeTag, "] manually blocked for ", duration)
+	return nil
+}
+
 // Now returns the most recently successfully dialed node tag.
 //
 // Smart has no single "current" outbound like Selector — it races and chooses
