@@ -2049,111 +2049,6 @@ func (s *Smart) updatePrefetchCache(meta *smartDialMeta, target, nodeName string
 
 // ─── background tasks ─────────────────────────────────────────────────────────
 
-// rankByDelay builds a NodeRank slice from URLTestHistoryStorage delays.
-// Used as a cold-start fallback when the prefetch-based ranking has no
-// data yet. Lower delay → higher weight; dead nodes (no history, or
-// history with Delay==0) sink to the bottom.
-//
-// Weight is a 0..100 percentage, same scale as GetNodeWeightRanking's
-// prefetch-score output, so consumers don't need to distinguish the two
-// sources. Rank category (MostUsed / Occasional / RarelyUsed) follows
-// mihomo's rules: top 20% = MostUsed, next 50% = Occasional, rest = RarelyUsed,
-// with a floor of 1 node in each category when ≥3 alive exist.
-func (s *Smart) rankByDelay(tags []string) []smart.NodeRank {
-	if s.history == nil || len(tags) == 0 {
-		return nil
-	}
-
-	type nodeDelay struct {
-		tag   string
-		delay uint16
-		alive bool
-	}
-	nodes := make([]nodeDelay, 0, len(tags))
-	for _, tag := range tags {
-		h := s.history.LoadURLTestHistory(tag)
-		if h != nil && h.Delay > 0 {
-			nodes = append(nodes, nodeDelay{tag, h.Delay, true})
-		} else {
-			nodes = append(nodes, nodeDelay{tag, 0, false})
-		}
-	}
-
-	// No probes have landed yet — can't rank anything, return empty rather
-	// than persisting garbage that would overwrite a future real ranking.
-	aliveCount := 0
-	for _, n := range nodes {
-		if n.alive {
-			aliveCount++
-		}
-	}
-	if aliveCount == 0 {
-		return nil
-	}
-
-	// Sort: alive first, then ascending delay, tag asc as tie-breaker.
-	sort.Slice(nodes, func(i, j int) bool {
-		if nodes[i].alive != nodes[j].alive {
-			return nodes[i].alive
-		}
-		if nodes[i].delay != nodes[j].delay {
-			return nodes[i].delay < nodes[j].delay
-		}
-		return nodes[i].tag < nodes[j].tag
-	})
-
-	// Find min/max delay among alive nodes for weight scaling.
-	var minD, maxD uint16 = 65535, 0
-	for _, n := range nodes {
-		if !n.alive {
-			continue
-		}
-		if n.delay < minD {
-			minD = n.delay
-		}
-		if n.delay > maxD {
-			maxD = n.delay
-		}
-	}
-
-	// mihomo-style category boundaries (see GetNodeWeightRanking).
-	mostBound := int(float64(aliveCount) * 0.2)
-	if mostBound < 1 {
-		mostBound = 1
-	}
-	occBound := mostBound + int(float64(aliveCount)*0.5)
-
-	now := time.Now().Unix()
-	result := make([]smart.NodeRank, 0, len(nodes))
-	for i, n := range nodes {
-		nr := smart.NodeRank{Name: n.tag, LastUpdated: now}
-		if !n.alive {
-			nr.Weight = 0
-			nr.Rank = smart.RankRarelyUsed
-			result = append(result, nr)
-			continue
-		}
-		// Linear interpolation: best delay → 100, worst → 1.
-		if maxD == minD {
-			nr.Weight = 100
-		} else {
-			// Invert: smaller delay yields larger weight.
-			frac := float64(maxD-n.delay) / float64(maxD-minD)
-			nr.Weight = math.Round((1+frac*99)*100) / 100
-		}
-		switch {
-		case i < mostBound:
-			nr.Rank = smart.RankMostUsed
-		case i < occBound:
-			nr.Rank = smart.RankOccasional
-		default:
-			nr.Rank = smart.RankRarelyUsed
-		}
-		result = append(result, nr)
-	}
-	return result
-}
-
 // runHealthCheck actively probes every outbound with urltest.URLTest and
 // writes the result into URLTestHistoryStorage. This is what populates the
 // isAlive()/selectFullScan/ranking inputs. Without it, a standalone Smart
@@ -2280,33 +2175,60 @@ func (s *Smart) updateNodeRanking() {
 		return
 	}
 
-	start := time.Now()
 	tags := snap.tags
+
+	// mihomo-parity shortcut: skip ranking recompute when we already have
+	// a recent cache that covers every current proxy and contains no dead
+	// ranked node. Saves bbolt scans on every tick in steady-state.
+	if cached, err := s.store.GetNodeWeightRankingCache(s.Tag(), smartConfigName); err == nil && len(cached) > 0 {
+		nowUnix := time.Now().Unix()
+		cacheAge := time.Duration(nowUnix-cached[0].LastUpdated) * time.Second
+
+		if cacheAge < 30*time.Minute {
+			ranked := make(map[string]bool, len(cached))
+			for _, r := range cached {
+				ranked[r.Name] = true
+			}
+			hasUnranked := false
+			for _, t := range tags {
+				if !ranked[t] {
+					hasUnranked = true
+					break
+				}
+			}
+			hasDeadRanked := false
+			for _, r := range cached {
+				if r.Rank != smart.RankRarelyUsed && !s.isAlive(r.Name) {
+					hasDeadRanked = true
+					break
+				}
+			}
+			// Cache is still authoritative iff the proxy set matches and
+			// no top-ranked node has gone dead, OR the cache is still fresh.
+			if !hasUnranked && (!hasDeadRanked || cacheAge <= 10*time.Minute) {
+				return
+			}
+		}
+	}
+
+	start := time.Now()
 	ranking, err := s.store.GetNodeWeightRanking(s.Tag(), smartConfigName, s.testURL, s.isAlive, tags)
 	if err != nil {
 		s.logger.Debug("smart[", s.Tag(), "] ranking update failed: ", err)
 		return
 	}
 
-	// Cold-start fallback — GetNodeWeightRanking derives scores purely from
-	// prefetch history. Before the "prefetch" task has fired (5+ minutes
-	// after start, or whenever the store is empty), maxScore==0 and we get
-	// an empty ranking even when we DO have fresh URLTest delay data.
-	//
-	// Fall back to delay-based ranking in that case: lower delay = higher
-	// weight, normalized to 0..100 with the same MostUsed / Occasional /
-	// RarelyUsed categorisation mihomo uses. Saves the result to the store
-	// so `GET /proxies/<tag>/weights` returns something meaningful even
-	// during the first few minutes of operation.
-	usingFallback := false
+	// Empty ranking during cold-start is EXPECTED behaviour (mihomo parity):
+	// GetNodeWeightRanking derives scores from prefetch-aggregated history,
+	// which is empty until the "prefetch" task has fired at least once (5+
+	// minutes after PostStart). Do NOT synthesize a fake ranking from
+	// URLTest delays — that conflates two orthogonal signals and would
+	// persist bogus weights into the store that future real data has to
+	// fight against.
 	if len(ranking) == 0 {
-		ranking = s.rankByDelay(tags)
-		if len(ranking) > 0 {
-			usingFallback = true
-			if s.store != nil {
-				s.store.StoreNodeWeightRanking(s.Tag(), smartConfigName, ranking)
-			}
-		}
+		s.logger.Debug("smart[", s.Tag(),
+			"] not enough data to generate node ranking yet (prefetch has not accumulated target history)")
+		return
 	}
 	most, occ, rare := 0, 0, 0
 	var topName string
@@ -2325,12 +2247,8 @@ func (s *Smart) updateNodeRanking() {
 			topWeight = r.Weight
 		}
 	}
-	source := "prefetch"
-	if usingFallback {
-		source = "delay-fallback"
-	}
 	s.logger.Info("smart[", s.Tag(), "] ranking updated in ", time.Since(start).Round(time.Millisecond),
-		" via ", source, ": ", len(ranking), " nodes (most=", most, " occasional=", occ,
+		": ", len(ranking), " nodes (most=", most, " occasional=", occ,
 		" rarely=", rare, ") top=[", topName, "] weight=", formatFloat(topWeight, 2))
 }
 
