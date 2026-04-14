@@ -351,16 +351,18 @@ func (r *AtomicStatsRecord) SetWeight(weightType string, value float64, isUDP bo
 	r.weightsMu.Lock()
 	defer r.weightsMu.Unlock()
 	r.weights[weightType] = value
+	// When writing an ASN-scoped weight (tcp_asn:<n> / udp_asn:<n>), also
+	// keep the generic tcp/udp weight in sync — set it to the minimum of
+	// all ASN-scoped entries so a target query without ASN context still
+	// sees a conservative view of node quality.
 	if weightType != WeightTypeTCP && weightType != WeightTypeUDP {
-		minW := r.minASNWeightLocked(WeightTypeUDP)
 		if isUDP {
-			if minW > 0 {
-				r.weights[WeightTypeUDP] = minW
+			if minUDP := r.minASNWeightLocked(WeightTypeUDP); minUDP > 0 {
+				r.weights[WeightTypeUDP] = minUDP
 			}
 		} else {
-			minW = r.minASNWeightLocked(WeightTypeTCP)
-			if minW > 0 {
-				r.weights[WeightTypeTCP] = minW
+			if minTCP := r.minASNWeightLocked(WeightTypeTCP); minTCP > 0 {
+				r.weights[WeightTypeTCP] = minTCP
 			}
 		}
 	}

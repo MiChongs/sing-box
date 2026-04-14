@@ -1197,10 +1197,20 @@ func (s *Store) GetActiveTargets(group, config string, limit int) []ActiveTarget
 			}
 
 			for key, weight := range record.Weights {
+				// Weight keys are "tcp_asn:13335" or "udp_asn:13335" — exactly one
+				// ':' separator between the prefix and the ASN number. Previous
+				// code used SplitN(..., 3) with len(parts) >= 3 which is
+				// unreachable (the string produces 2 parts, not 3). The ASN
+				// therefore never propagated to activeCombinations, so
+				// RunPrefetch + GetNodeWeightRanking never received any ASN
+				// data — breaking the /weights Clash API endpoints entirely
+				// for users with use_asn: true.
+				//
+				// Match mihomo exactly: strings.Split (no N cap) with parts[1].
 				if strings.HasPrefix(key, WeightTypeTCPASN) && weight > 0 {
-					parts := strings.SplitN(key, ":", 3)
-					if len(parts) >= 3 {
-						asn := parts[2]
+					parts := strings.Split(key, ":")
+					if len(parts) >= 2 {
+						asn := parts[1]
 						ck := asn + ":false"
 						if last, exists := activeCombinations[ck]; !exists || record.LastUsed > last {
 							activeCombinations[ck] = record.LastUsed
@@ -1208,9 +1218,9 @@ func (s *Store) GetActiveTargets(group, config string, limit int) []ActiveTarget
 						}
 					}
 				} else if strings.HasPrefix(key, WeightTypeUDPASN) && weight > 0 {
-					parts := strings.SplitN(key, ":", 3)
-					if len(parts) >= 3 {
-						asn := parts[2]
+					parts := strings.Split(key, ":")
+					if len(parts) >= 2 {
+						asn := parts[1]
 						ck := asn + ":true"
 						if last, exists := activeCombinations[ck]; !exists || record.LastUsed > last {
 							activeCombinations[ck] = record.LastUsed
