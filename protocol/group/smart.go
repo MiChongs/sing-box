@@ -142,6 +142,15 @@ type Smart struct {
 	// the file didn't exist yet).
 	countryDBRetryAt atomic.Int64
 
+	// shortLife tracks "user gave up quickly" closes per (target, node)
+	// pair. When the user reaches the threshold within the window we
+	// promote the node to knownDead — even though individual closes were
+	// not classified as failures. Makes Smart actually respond to the
+	// user's observable dissatisfaction (three Ctrl+W's in a row on a
+	// slow page) instead of silently re-picking the same bad node.
+	shortLifeMu sync.Mutex
+	shortLife   map[string][]time.Time
+
 	// provider support
 	provider         adapter.ProviderManager
 	providers        map[string]adapter.Provider
@@ -214,6 +223,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		sampleRate:         options.SampleRate,
 		maxHostFailedTimes: options.MaxHostFailedTimes,
 		targetConns:        make(map[string]map[*smartTrackedConn]struct{}),
+		shortLife:          make(map[string][]time.Time),
 	}
 	if s.maxHostFailedTimes <= 0 {
 		s.maxHostFailedTimes = 10
@@ -1361,6 +1371,33 @@ func (c *smartTrackedConn) Close() error {
 				"] classified as failed: ", reason)
 		}
 
+		// SYNCHRONOUS short-life handling — fires BEFORE the async
+		// recordStats goroutine below, and BEFORE Conn.Close returns to
+		// the caller. This closes the timing window where the user's next
+		// DialContext races ahead of the stats update and re-selects the
+		// same bad node via stale unwrap cache.
+		if c.meta != nil && classifyShortLife(durMS, up, down) {
+			if c.s.recordShortLife(c.meta.smartTarget, c.proxyTag) {
+				// Threshold crossed — take decisive action now.
+				c.s.markDead(c.proxyTag)
+				if c.s.store != nil && c.meta.smartTarget != "" {
+					c.s.store.DeleteUnwrapResult(c.s.Tag(), smartConfigName,
+						c.meta.smartTarget, c.meta.asnCode, c.meta.isUDP)
+				}
+				c.s.logger.Info("smart[", c.s.Tag(), "] node [", c.proxyTag,
+					"] marked dead after ", shortLifeThreshold,
+					" short-life closes on target [", c.meta.smartTarget,
+					"] within ", shortLifeWindow)
+			} else if c.s.store != nil && c.meta.smartTarget != "" {
+				// Even below threshold, drop the unwrap cache for this
+				// target so the very next dial re-evaluates the candidate
+				// list. Cheap operation, and it fixes the primary
+				// "same target always picks same dead node" loop.
+				c.s.store.DeleteUnwrapResult(c.s.Tag(), smartConfigName,
+					c.meta.smartTarget, c.meta.asnCode, c.meta.isUDP)
+			}
+		}
+
 		go c.s.recordStats(status, c.meta, c.proxyTag, c.connectTime,
 			latency, up, down, maxUpBps, maxDownBps, durMS)
 	})
@@ -2354,6 +2391,78 @@ func (s *Smart) markAlive(tag string) {
 	s.knownDeadMu.Lock()
 	delete(s.knownDead, tag)
 	s.knownDeadMu.Unlock()
+	// A successful dial also clears any short-life history for this node
+	// so a previously-problematic node that's recovered doesn't keep
+	// counting toward a future threshold.
+	s.shortLifeMu.Lock()
+	for k := range s.shortLife {
+		if strings.HasSuffix(k, "|"+tag) {
+			delete(s.shortLife, k)
+		}
+	}
+	s.shortLifeMu.Unlock()
+}
+
+// Short-life connection parameters — tuned so 3 consecutive "user gave up
+// quickly" closes within a minute mark a node dead for half a minute.
+const (
+	shortLifeDurationLimit = 2 * time.Second // below this = gave up
+	shortLifeBytesLimit    = int64(4096)     // below this = effectively no data
+	shortLifeThreshold     = 3               // events before banning the node
+	shortLifeWindow        = 60 * time.Second
+)
+
+// recordShortLife registers one short-life close for (target, node).
+// Returns true when the threshold has just been crossed so the caller
+// can escalate (mark the node dead + drop unwrap cache).
+//
+// Called SYNCHRONOUSLY from Close so the state updates before the user's
+// next DialContext races ahead of the async recordStats goroutine — that
+// timing gap was the primary cause of "user keeps disconnecting and
+// Smart keeps picking the same dead node".
+func (s *Smart) recordShortLife(target, node string) (crossed bool) {
+	if target == "" || node == "" {
+		return false
+	}
+	key := target + "|" + node
+	now := time.Now()
+	cutoff := now.Add(-shortLifeWindow)
+
+	s.shortLifeMu.Lock()
+	defer s.shortLifeMu.Unlock()
+
+	// Compact existing slice: drop entries outside the 60s window
+	old := s.shortLife[key]
+	kept := old[:0]
+	for _, t := range old {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	kept = append(kept, now)
+	s.shortLife[key] = kept
+
+	if len(kept) >= shortLifeThreshold {
+		// Clear so a single spike doesn't ban the node twice in a row;
+		// next short-life cycle starts fresh.
+		delete(s.shortLife, key)
+		return true
+	}
+	return false
+}
+
+// classifyShortLife returns true when a close event has "user gave up"
+// signature — duration too short AND payload too small to be a real
+// interaction. Either condition alone isn't enough; we need both so we
+// don't penalise a legitimate quick API call that completed successfully.
+func classifyShortLife(durationMS int64, upBytes, downBytes int64) bool {
+	if durationMS >= int64(shortLifeDurationLimit/time.Millisecond) {
+		return false
+	}
+	if upBytes+downBytes >= shortLifeBytesLimit {
+		return false
+	}
+	return true
 }
 
 func (s *Smart) supportsUDP(ob adapter.Outbound) bool {
