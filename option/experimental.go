@@ -6,8 +6,54 @@ type ExperimentalOptions struct {
 	CacheFile           *CacheFileOptions `json:"cache_file,omitempty"`
 	ClashAPI            *ClashAPIOptions  `json:"clash_api,omitempty"`
 	V2RayAPI            *V2RayAPIOptions  `json:"v2ray_api,omitempty"`
+	Smart               *SmartOptions     `json:"smart,omitempty"`
+	GeoX                *GeoXOptions      `json:"geox,omitempty"`
 	Debug               *DebugOptions     `json:"debug,omitempty"`
 	URLTestUnifiedDelay bool              `json:"urltest_unified_delay,omitempty"`
+}
+
+// SmartOptions configures global infrastructure shared by all Smart outbound groups:
+// the LightGBM model (single .bin file on disk) and the training-sample collector
+// (single CSV). Per-group opt-in is done via the Smart outbound's use_lightgbm /
+// collect_data flags.
+type SmartOptions struct {
+	LightGBM  *SmartLightGBMOptions  `json:"lightgbm,omitempty"`
+	Collector *SmartCollectorOptions `json:"collector,omitempty"`
+}
+
+type SmartLightGBMOptions struct {
+	URL            string             `json:"url,omitempty"`             // default: mihomo's Model-large.bin
+	AutoUpdate     bool               `json:"auto_update,omitempty"`     // periodic refresh
+	UpdateInterval badoption.Duration `json:"update_interval,omitempty"` // default 72h
+	ModelPath      string             `json:"model_path,omitempty"`      // default "smart_lgbm_model.bin" under base path
+	DownloadDetour string             `json:"download_detour,omitempty"` // optional outbound tag for fetch
+}
+
+type SmartCollectorOptions struct {
+	SizeLimitMB int64  `json:"size_limit_mb,omitempty"` // default 100
+	Path        string `json:"path,omitempty"`          // default "smart_weight_data.csv"
+}
+
+// GeoXOptions configures global Geo data-file downloads (mihomo-style).
+// Files are saved under filemanager base path and refreshed on an interval.
+// Currently the ASN mmdb is the only file consumed by sing-box itself
+// (Smart group's use_asn feature); other files are downloaded for manual
+// use or future consumers.
+type GeoXOptions struct {
+	Enabled        bool               `json:"enabled,omitempty"`         // master switch ("geodata-mode")
+	AutoUpdate     bool               `json:"auto_update,omitempty"`
+	UpdateInterval badoption.Duration `json:"update_interval,omitempty"` // default 24h
+	DownloadDetour string             `json:"download_detour,omitempty"` // optional outbound tag
+	URL            GeoXURLs           `json:"url,omitempty"`
+}
+
+// GeoXURLs holds remote URLs for the 4 recognised geo asset types.
+// Any empty field is skipped.
+type GeoXURLs struct {
+	GeoIP   string `json:"geoip,omitempty"`
+	GeoSite string `json:"geosite,omitempty"`
+	MMDB    string `json:"mmdb,omitempty"`
+	ASN     string `json:"asn,omitempty"`
 }
 
 type CacheFileOptions struct {

@@ -40,3 +40,21 @@ type LoadBalanceOutboundOptions struct {
 	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
 	Strategy                  string             `json:"strategy,omitempty"`
 }
+
+type SmartOutboundOptions struct {
+	GroupCommonOption
+	URL                       string             `json:"url,omitempty"`
+	Interval                  badoption.Duration `json:"interval,omitempty"`
+	PolicyPriority            string             `json:"policy_priority,omitempty"`
+	UseASN                    bool               `json:"use_asn,omitempty"`
+	ASNDatabase               string             `json:"asn_database,omitempty"`
+	DisableUDP                bool               `json:"disable_udp,omitempty"`
+	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
+
+	// Per-group opt-in flags. Infrastructure (model URL, update interval,
+	// collector path, etc.) lives in experimental.smart at the top level and
+	// is shared across all Smart groups.
+	UseLightGBM bool    `json:"use_lightgbm,omitempty"` // use the shared ML model
+	CollectData bool    `json:"collect_data,omitempty"` // emit training samples to shared CSV
+	SampleRate  float64 `json:"sample_rate,omitempty"`  // per-group sample rate (0,1]; default 1.0
+}

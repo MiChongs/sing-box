@@ -124,6 +124,10 @@ func (c *CacheFile) Name() string {
 	return "cache-file"
 }
 
+func (c *CacheFile) SmartDB() *bbolt.DB {
+	return c.DB
+}
+
 func (c *CacheFile) Dependencies() []string {
 	return nil
 }

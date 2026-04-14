@@ -1,0 +1,1495 @@
+package group
+
+import (
+	"context"
+	"encoding/json"
+	"math"
+	"math/rand"
+	"net"
+	"net/netip"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/oschwald/maxminddb-golang"
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/adapter/outbound"
+	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/common/smart"
+	"github.com/sagernet/sing-box/common/smart/lightgbm"
+	smartservice "github.com/sagernet/sing-box/experimental/smart"
+	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
+	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
+)
+
+const (
+	smartMaxRetries     = 4
+	smartMaxSelected    = 10
+	smartParallelDials  = 3
+	smartConnThreshold  = 2.0
+	smartConfigName     = "singbox"
+)
+
+func RegisterSmart(registry *outbound.Registry) {
+	outbound.Register[option.SmartOutboundOptions](registry, C.TypeSmart, NewSmart)
+}
+
+var _ adapter.OutboundGroup = (*Smart)(nil)
+
+// smartGroupState is an immutable snapshot of the outbound list.
+type smartGroupState struct {
+	outbounds []adapter.Outbound
+	tags      []string
+}
+
+// smartDialMeta carries per-request metadata injected from NewConnectionEx.
+type smartDialMeta struct {
+	host        string
+	smartTarget string
+	asnCode     string
+	resolvedIPs []netip.Addr
+	isUDP       bool
+	destPort    uint16
+}
+
+type smartMetaCtxKey struct{}
+
+// priorityRule is a policy-priority rule (pattern + factor).
+type priorityRule struct {
+	pattern string
+	regex   *regexp.Regexp
+	factor  float64
+	isRegex bool
+}
+
+// Smart is the Smart outbound group — history-weighted, parallel-race, ASN-aware.
+type Smart struct {
+	outbound.Adapter
+	ctx        context.Context
+	router     adapter.Router
+	outboundMgr adapter.OutboundManager
+	connection  adapter.ConnectionManager
+	logger      log.ContextLogger
+
+	state atomic.Pointer[smartGroupState]
+
+	interruptGroup               *interrupt.Group
+	interruptExternalConnections bool
+
+	testURL        string
+	interval       time.Duration
+	disableUDP     bool
+	policyPriority []priorityRule
+	useASN         bool
+	asnDBPath      string // configured path; "" means "fall back to geox service"
+	asnDB          *maxminddb.Reader
+
+	store *smart.Store
+
+	// provider support
+	provider         adapter.ProviderManager
+	providers        map[string]adapter.Provider
+	outboundsCacheMu sync.Mutex
+	outboundsCache   map[string][]adapter.Outbound
+	providerTags     []string
+	exclude          *regexp.Regexp
+	include          *regexp.Regexp
+	useAllProviders  bool
+
+	history adapter.URLTestHistoryStorage
+
+	taskCtx    context.Context
+	taskCancel context.CancelFunc
+	taskWg     sync.WaitGroup
+
+	started atomic.Bool
+
+	// Most recently selected (successfully dialed) node tag. Surfaced via
+	// Now() for ClashAPI / UI display. Updated on every successful dial
+	// from both DialContext and ListenPacket paths.
+	lastSelectedTag atomic.Value // string
+
+	// Per-group ML/collector opt-in flags. The actual model, downloader and
+	// collector are owned by the shared SmartService (experimental.smart);
+	// we only hold references here for zero-lookup on the hot path.
+	useLightGBM   bool
+	collectData   bool
+	sampleRate    float64
+	weightModel   *lightgbm.WeightModel
+	dataCollector *lightgbm.DataCollector
+}
+
+func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
+	networks := []string{N.NetworkTCP}
+	if !options.DisableUDP {
+		networks = append(networks, N.NetworkUDP)
+	}
+
+	s := &Smart{
+		Adapter: outbound.NewAdapter(C.TypeSmart, tag, networks, options.Outbounds),
+		ctx:     ctx,
+		router:  router,
+		outboundMgr: service.FromContext[adapter.OutboundManager](ctx),
+		connection:  service.FromContext[adapter.ConnectionManager](ctx),
+		logger:  logger,
+
+		interruptExternalConnections: options.InterruptExistConnections,
+
+		testURL:    options.URL,
+		interval:   time.Duration(options.Interval),
+		disableUDP: options.DisableUDP,
+		useASN:     options.UseASN,
+
+		provider:        service.FromContext[adapter.ProviderManager](ctx),
+		providers:       make(map[string]adapter.Provider),
+		outboundsCache:  make(map[string][]adapter.Outbound),
+		providerTags:    options.Providers,
+		exclude:         (*regexp.Regexp)(options.Exclude),
+		include:         (*regexp.Regexp)(options.Include),
+		useAllProviders: options.UseAllProviders,
+
+		useLightGBM: options.UseLightGBM,
+		collectData: options.CollectData,
+		sampleRate:  options.SampleRate,
+	}
+
+	if s.testURL == "" {
+		s.testURL = "https://www.gstatic.com/generate_204"
+	}
+	if s.interval <= 0 {
+		s.interval = 3 * time.Minute
+	}
+	if s.sampleRate <= 0 || s.sampleRate > 1 {
+		s.sampleRate = 1.0
+	}
+
+	s.parsePolicyPriority(options.PolicyPriority)
+
+	// Record the per-group ASN mmdb path; actual file open happens in
+	// PostStart so we can fall back to the global GeoX service path when
+	// the per-group field is empty.
+	s.asnDBPath = options.ASNDatabase
+
+	return s, nil
+}
+
+func (s *Smart) parsePolicyPriority(raw string) {
+	if raw == "" {
+		return
+	}
+	for _, pair := range strings.Split(raw, ";") {
+		kv := strings.SplitN(pair, ":", 2)
+		if len(kv) != 2 || strings.TrimSpace(kv[1]) == "" {
+			continue
+		}
+		factor, err := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64)
+		if err != nil || factor <= 0 {
+			continue
+		}
+		rule := priorityRule{pattern: kv[0], factor: factor}
+		if re, err := regexp.Compile(kv[0]); err == nil {
+			rule.regex = re
+			rule.isRegex = true
+		}
+		s.policyPriority = append(s.policyPriority, rule)
+	}
+}
+
+func (s *Smart) Start() error {
+	if s.useAllProviders {
+		for _, provider := range s.provider.Providers() {
+			s.providers[provider.Tag()] = provider
+			s.providerTags = append(s.providerTags, provider.Tag())
+			provider.RegisterCallback(s.onProviderUpdated)
+		}
+	} else {
+		for i, tag := range s.providerTags {
+			provider, loaded := s.provider.Get(tag)
+			if !loaded {
+				return E.New("outbound provider ", i, " not found: ", tag)
+			}
+			s.providers[tag] = provider
+			provider.RegisterCallback(s.onProviderUpdated)
+		}
+	}
+
+	deps := s.Dependencies()
+	if len(deps)+len(s.providerTags) == 0 {
+		return E.New("missing outbound and provider tags")
+	}
+
+	var outbounds []adapter.Outbound
+	var tags []string
+	for i, tag := range deps {
+		detour, loaded := s.outboundMgr.Outbound(tag)
+		if !loaded {
+			return E.New("outbound ", i, " not found: ", tag)
+		}
+		outbounds = append(outbounds, detour)
+		tags = append(tags, tag)
+	}
+	if len(tags) == 0 {
+		detour, _ := s.outboundMgr.Outbound("Compatible")
+		tags = append(tags, detour.Tag())
+		outbounds = append(outbounds, detour)
+	}
+
+	s.interruptGroup = interrupt.NewGroup()
+	s.state.Store(&smartGroupState{outbounds: outbounds, tags: tags})
+	return nil
+}
+
+func (s *Smart) PostStart() error {
+	// Get history storage from Clash server (for alive-checking)
+	if clashServer := service.FromContext[adapter.ClashServer](s.ctx); clashServer != nil {
+		s.history = clashServer.HistoryStorage()
+	}
+
+	// Get cache file and init store
+	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil {
+		db := cacheFile.SmartDB()
+		if db != nil {
+			s.store = smart.GetOrInitStore(db)
+		}
+	}
+
+	if s.store == nil {
+		s.logger.Warn("smart: no cache file available, using ephemeral store")
+	}
+
+	// Resolve ASN mmdb: per-group path wins; fall back to global experimental.geox.
+	if s.useASN {
+		asnPath := s.asnDBPath
+		if asnPath == "" {
+			if geoSvc := service.FromContext[adapter.GeoXService](s.ctx); geoSvc != nil {
+				asnPath = geoSvc.ASNPath()
+				if asnPath != "" {
+					s.logger.Info("smart: ASN database path not configured; using global experimental.geox.asn = ", asnPath)
+				}
+			}
+		}
+		if asnPath == "" {
+			s.logger.Warn("smart: use_asn is true but no ASN database path resolved (set asn_database or experimental.geox.url.asn); ASN features disabled")
+		} else if db, err := maxminddb.Open(asnPath); err != nil {
+			s.logger.Warn("smart: failed to open ASN database [", asnPath, "]: ", err, " (will retry on next reload)")
+		} else {
+			s.asnDB = db
+		}
+	}
+
+	// Pull shared infrastructure from experimental.smart (SmartService).
+	// This lets multiple Smart groups share a single model/downloader/collector.
+	if s.useLightGBM || s.collectData {
+		smartSvc, _ := service.FromContext[adapter.SmartService](s.ctx).(*smartservice.Service)
+		if smartSvc == nil {
+			s.logger.Warn("smart: use_lightgbm/collect_data requested but experimental.smart service unavailable; falling back to traditional algorithm")
+		} else {
+			if s.useLightGBM {
+				if !smartSvc.LightGBMEnabled() {
+					s.logger.Warn("smart: group [", s.Tag(), "] requested use_lightgbm but experimental.smart.lightgbm not configured")
+				} else if model, err := smartSvc.WeightModel(); err != nil {
+					s.logger.Warn("smart: failed to obtain shared LightGBM model: ", err)
+				} else {
+					s.weightModel = model
+				}
+			}
+			if s.collectData {
+				if !smartSvc.CollectorEnabled() {
+					s.logger.Warn("smart: group [", s.Tag(), "] requested collect_data but experimental.smart.collector not configured")
+				} else if dc, err := smartSvc.DataCollector(); err != nil {
+					s.logger.Warn("smart: failed to obtain shared data collector: ", err)
+				} else {
+					s.dataCollector = dc
+				}
+			}
+		}
+	}
+
+	// Start background tasks
+	s.taskCtx, s.taskCancel = context.WithCancel(context.Background())
+
+	type taskDef struct {
+		name    string
+		initial time.Duration
+		period  time.Duration
+		fn      func()
+		once    bool
+	}
+
+	tasks := []taskDef{
+		{"nodes-ranking", 1 * time.Minute, 5 * time.Minute, s.updateNodeRanking, false},
+		{"prefetch", 5 * time.Minute, 10 * time.Minute, s.runPrefetch, false},
+		{"recovery-check", 5 * time.Minute, 5 * time.Minute, s.checkAndRecoverDegradedNodes, false},
+		{"cleanup-old", 10 * time.Minute, 120 * time.Minute, s.cleanupOldRecords, false},
+		{"cleanup-orphan", 10 * time.Minute, 10 * time.Minute, s.cleanupOrphanedNodeCache, false},
+		{"flush-queue", 5 * time.Second, 5 * time.Minute, s.flushQueue, false},
+		{"cache-adjust", 5 * time.Second, 5 * time.Minute, s.adjustCache, false},
+	}
+
+	for _, t := range tasks {
+		s.startTimedTask(t.name, t.initial, t.period, t.fn, t.once)
+	}
+
+	s.started.Store(true)
+	return nil
+}
+
+func (s *Smart) startTimedTask(name string, initial, period time.Duration, fn func(), once bool) {
+	s.taskWg.Add(1)
+	go func() {
+		defer s.taskWg.Done()
+		jitter := time.Duration(rand.Float64() * 30 * float64(time.Second))
+		select {
+		case <-time.After(initial + jitter):
+		case <-s.taskCtx.Done():
+			return
+		}
+		fn()
+		if once {
+			return
+		}
+		ticker := time.NewTicker(period + jitter)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				fn()
+			case <-s.taskCtx.Done():
+				return
+			}
+		}
+	}()
+}
+
+func (s *Smart) Close() error {
+	s.started.Store(false)
+	if s.taskCancel != nil {
+		s.taskCancel()
+	}
+	s.taskWg.Wait()
+	// Shared LightGBM model, downloader and collector are owned by
+	// experimental.smart.Service — do NOT close them here.
+	if s.store != nil {
+		s.store.FlushQueue(true)
+	}
+	if s.asnDB != nil {
+		_ = s.asnDB.Close()
+	}
+	return nil
+}
+
+// TestURL returns the URL used for aliveness checks.
+func (s *Smart) TestURL() string { return s.testURL }
+
+// UseASN returns whether ASN-based routing is enabled.
+func (s *Smart) UseASN() bool { return s.useASN }
+
+// UseLightGBM reports whether ML prediction is enabled.
+func (s *Smart) UseLightGBM() bool { return s.useLightGBM }
+
+// CollectData reports whether training-data collection is enabled.
+func (s *Smart) CollectData() bool { return s.collectData }
+
+// LGBMModelAge returns time since last successful model load.
+// Returns 0 when no model is loaded (useful for API display).
+func (s *Smart) LGBMModelAge() time.Duration {
+	if s.weightModel == nil {
+		return 0
+	}
+	last := s.weightModel.LastUpdate()
+	if last.IsZero() {
+		return 0
+	}
+	return time.Since(last)
+}
+
+// Now returns the most recently successfully dialed node tag.
+//
+// Smart has no single "current" outbound like Selector — it races and chooses
+// per-connection. This surfaces the last winner so ClashAPI / dashboards can
+// show a useful value instead of a static placeholder.
+//
+// Fallback order:
+//  1. Last successful dial's winning tag.
+//  2. Top-ranked node from the pre-sorted ranking cache, if any.
+//  3. First outbound in the snapshot (best-effort guess before any traffic).
+//  4. Empty string — OutboundGroup helpers fall back to the group's own tag.
+func (s *Smart) Now() string {
+	if v, ok := s.lastSelectedTag.Load().(string); ok && v != "" {
+		return v
+	}
+	// Second-best: use the ranking cache's top entry.
+	if s.store != nil {
+		if ranking, err := s.store.GetNodeWeightRankingCache(s.Tag(), smartConfigName); err == nil {
+			for _, r := range ranking {
+				if r.Weight > 0 {
+					return r.Name
+				}
+			}
+		}
+	}
+	// Third-best: first available node from the snapshot.
+	if snap := s.state.Load(); snap != nil && len(snap.tags) > 0 {
+		return snap.tags[0]
+	}
+	return ""
+}
+
+// setLastSelected records a successful dial winner for Now() reporting.
+func (s *Smart) setLastSelected(tag string) {
+	if tag == "" {
+		return
+	}
+	s.lastSelectedTag.Store(tag)
+}
+
+// All returns a snapshot of all outbound tags.
+func (s *Smart) All() []string {
+	snap := s.state.Load()
+	if snap == nil {
+		return nil
+	}
+	result := make([]string, len(snap.tags))
+	copy(result, snap.tags)
+	return result
+}
+
+// NewConnectionEx injects Smart metadata and delegates to connection manager.
+func (s *Smart) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	meta := s.buildMeta(metadata, false)
+	ctx = context.WithValue(ctx, smartMetaCtxKey{}, meta)
+	if s.interruptExternalConnections {
+		ctx = interrupt.ContextWithIsExternalConnection(ctx)
+	}
+	s.connection.NewConnection(ctx, s, conn, metadata, onClose)
+}
+
+// NewPacketConnectionEx injects Smart metadata (UDP) and delegates.
+func (s *Smart) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	meta := s.buildMeta(metadata, true)
+	ctx = context.WithValue(ctx, smartMetaCtxKey{}, meta)
+	if s.interruptExternalConnections {
+		ctx = interrupt.ContextWithIsExternalConnection(ctx)
+	}
+	s.connection.NewPacketConnection(ctx, s, conn, metadata, onClose)
+}
+
+func (s *Smart) buildMeta(metadata adapter.InboundContext, isUDP bool) *smartDialMeta {
+	host := metadata.Destination.Fqdn
+	if host == "" {
+		host = metadata.SniffHost
+	}
+
+	ips := metadata.DestinationAddresses
+	var firstIP string
+	if len(ips) > 0 {
+		firstIP = ips[0].String()
+	}
+
+	target := smart.GetEffectiveTarget(host, firstIP)
+	asnCode := s.lookupASN(ips)
+
+	return &smartDialMeta{
+		host:        host,
+		smartTarget: target,
+		asnCode:     asnCode,
+		resolvedIPs: ips,
+		isUDP:       isUDP,
+		destPort:    metadata.Destination.Port,
+	}
+}
+
+// DialContext implements the race-dial with retry logic.
+func (s *Smart) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	meta, _ := ctx.Value(smartMetaCtxKey{}).(*smartDialMeta)
+	if meta == nil {
+		meta = &smartDialMeta{}
+	}
+
+	snap := s.state.Load()
+	if snap == nil || len(snap.outbounds) == 0 {
+		return nil, E.New("smart: no outbounds available")
+	}
+
+	isUDP := N.NetworkName(network) == N.NetworkUDP
+	selectedOutbounds, isUnwrap := s.selectProxies(meta, snap.outbounds, isUDP)
+
+	if !isUnwrap && s.store != nil && meta.smartTarget != "" {
+		names := outboundNames(selectedOutbounds)
+		s.store.StoreUnwrapResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP, names)
+	}
+
+	conn, proxyTag, connectTime, err := s.dialWithRetry(ctx, network, destination, selectedOutbounds, meta)
+	if err != nil {
+		return nil, err
+	}
+	s.setLastSelected(proxyTag)
+
+	return s.wrapConn(conn, proxyTag, meta, connectTime, isUDP), nil
+}
+
+// ListenPacket implements UDP race-dial.
+func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	if s.disableUDP {
+		return nil, E.New("smart: UDP disabled")
+	}
+
+	meta, _ := ctx.Value(smartMetaCtxKey{}).(*smartDialMeta)
+	if meta == nil {
+		meta = &smartDialMeta{isUDP: true}
+	}
+
+	snap := s.state.Load()
+	if snap == nil || len(snap.outbounds) == 0 {
+		return nil, E.New("smart: no outbounds available")
+	}
+
+	selectedOutbounds, isUnwrap := s.selectProxies(meta, snap.outbounds, true)
+
+	if !isUnwrap && s.store != nil && meta.smartTarget != "" {
+		names := outboundNames(selectedOutbounds)
+		s.store.StoreUnwrapResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, true, names)
+	}
+
+	var finalErr error
+	for i := 0; i < len(selectedOutbounds) && i < 3; i++ {
+		ob := selectedOutbounds[i]
+		histCT := s.getHistoryConnectTime(meta, ob.Tag())
+		timeout := time.Duration(float64(histCT)*smartConnThreshold) * time.Millisecond
+		if timeout <= 0 || timeout > 10*time.Second {
+			timeout = 10 * time.Second
+		}
+
+		ctxDial, cancel := context.WithTimeout(ctx, timeout)
+		start := time.Now()
+		pc, err := ob.ListenPacket(ctxDial, destination)
+		connectTime := time.Since(start).Milliseconds()
+		cancel()
+
+		if err == nil {
+			s.setLastSelected(ob.Tag())
+			return s.wrapPacketConn(pc, ob.Tag(), meta, connectTime), nil
+		}
+		finalErr = err
+		go s.recordStats("failed", meta, ob.Tag(), connectTime, 0, 0, 0, 0, 0, 0)
+	}
+
+	return nil, finalErr
+}
+
+// selectProxies performs 3-tier lookup: unwrap → prefetch → GetBest.
+func (s *Smart) selectProxies(meta *smartDialMeta, all []adapter.Outbound, isUDP bool) ([]adapter.Outbound, bool) {
+	if s.store == nil || meta.smartTarget == "" {
+		return s.fillProxies(nil, nil, all, smartMaxSelected, isUDP, false), false
+	}
+
+	// Tier 1: unwrap cache
+	if names := s.store.GetUnwrapResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP); len(names) > 0 {
+		return s.fillProxies(names, nil, all, smartMaxSelected, isUDP, true), true
+	}
+
+	// Tier 2: prefetch cache
+	if names, weights := s.store.GetPrefetchResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP); len(names) > 0 {
+		return s.fillProxies(names, weights, all, smartMaxSelected, isUDP, false), false
+	}
+
+	// Tier 3: real-time computation
+	if names, weights, err := s.store.GetBestProxyForTarget(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP); err == nil && len(names) > 0 {
+		return s.fillProxies(names, weights, all, smartMaxSelected, isUDP, false), false
+	}
+
+	return s.fillProxies(nil, nil, all, smartMaxSelected, isUDP, false), false
+}
+
+// fillProxies assembles the final candidate list with alive/blocked checks and fallback.
+func (s *Smart) fillProxies(names []string, weights []float64, all []adapter.Outbound, minCount int, isUDP bool, unwrap bool) []adapter.Outbound {
+	var blockedNodes map[string]bool
+	if s.store != nil {
+		blockedNodes, _ = s.store.GetBlockedNodes(s.Tag(), smartConfigName)
+	}
+
+	proxyByName := make(map[string]adapter.Outbound, len(all))
+	for _, ob := range all {
+		proxyByName[ob.Tag()] = ob
+	}
+
+	var selected []adapter.Outbound
+	for i, name := range names {
+		ob := proxyByName[name]
+		if ob == nil || blockedNodes[name] || !s.isAlive(name) || (isUDP && !s.supportsUDP(ob)) {
+			continue
+		}
+		w := 0.0
+		if weights != nil && i < len(weights) {
+			w = weights[i]
+		}
+		if weights == nil || w >= smart.AllowedWeight {
+			selected = append(selected, ob)
+		}
+	}
+
+	if unwrap && len(selected) > 0 {
+		return selected
+	}
+
+	if len(selected) >= minCount {
+		return selected[:minCount]
+	}
+
+	// Build supplemental pool from nodes not already in named list
+	inNamed := make(map[string]bool, len(names))
+	for _, name := range names {
+		inNamed[name] = true
+	}
+
+	filteredAll := make([]adapter.Outbound, 0, len(all))
+	for _, ob := range all {
+		if !inNamed[ob.Tag()] {
+			filteredAll = append(filteredAll, ob)
+		}
+	}
+
+	// Sort supplemental: policyPriority > ranking > random
+	if len(s.policyPriority) > 0 {
+		sort.Slice(filteredAll, func(i, j int) bool {
+			fi := s.getPriorityFactor(filteredAll[i].Tag())
+			fj := s.getPriorityFactor(filteredAll[j].Tag())
+			if fi != fj {
+				return fi > fj
+			}
+			return filteredAll[i].Tag() < filteredAll[j].Tag()
+		})
+	} else if s.store != nil {
+		if ranking, err := s.store.GetNodeWeightRankingCache(s.Tag(), smartConfigName); err == nil && len(ranking) > 0 {
+			rankMap := make(map[string]float64, len(ranking))
+			for _, r := range ranking {
+				rankMap[r.Name] = r.Weight
+			}
+			sort.Slice(filteredAll, func(i, j int) bool {
+				wi, oki := rankMap[filteredAll[i].Tag()]
+				wj, okj := rankMap[filteredAll[j].Tag()]
+				if oki && okj {
+					if wi != wj {
+						return wi > wj
+					}
+					return filteredAll[i].Tag() < filteredAll[j].Tag()
+				}
+				return oki
+			})
+		} else {
+			rand.Shuffle(len(filteredAll), func(i, j int) {
+				filteredAll[i], filteredAll[j] = filteredAll[j], filteredAll[i]
+			})
+		}
+	} else {
+		rand.Shuffle(len(filteredAll), func(i, j int) {
+			filteredAll[i], filteredAll[j] = filteredAll[j], filteredAll[i]
+		})
+	}
+
+	firstAppended := false
+	for _, ob := range filteredAll {
+		if blockedNodes[ob.Tag()] || !s.isAlive(ob.Tag()) || (isUDP && !s.supportsUDP(ob)) {
+			continue
+		}
+		if !firstAppended && len(names) < minCount {
+			selected = append([]adapter.Outbound{ob}, selected...)
+			firstAppended = true
+		} else {
+			selected = append(selected, ob)
+		}
+		if len(selected) >= minCount {
+			break
+		}
+	}
+
+	if len(selected) == 0 {
+		// Last resort: any alive outbound
+		for _, ob := range all {
+			if s.isAlive(ob.Tag()) {
+				selected = append(selected, ob)
+				if len(selected) >= minCount {
+					break
+				}
+			}
+		}
+		if len(selected) == 0 {
+			for _, ob := range all {
+				selected = append(selected, ob)
+				if len(selected) >= minCount {
+					break
+				}
+			}
+		}
+	}
+
+	return selected
+}
+
+// dialWithRetry runs up to maxRetries rounds with exponential jitter backoff.
+func (s *Smart) dialWithRetry(ctx context.Context, network string, dest M.Socksaddr, outbounds []adapter.Outbound, meta *smartDialMeta) (net.Conn, string, int64, error) {
+	var finalErr error
+
+	for i := 0; i < smartMaxRetries; i++ {
+		if i > 0 {
+			base := time.Duration(math.Pow(2, float64(i-1))) * 50 * time.Millisecond
+			jitter := 1.0 + (rand.Float64()*2-1)*0.2
+			delay := time.Duration(float64(base) * jitter)
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return nil, "", 0, ctx.Err()
+			}
+		}
+
+		batch, timeout := s.getBatch(outbounds, meta, i)
+		if len(batch) == 0 {
+			break
+		}
+
+		ctxDial, cancel := context.WithTimeout(ctx, timeout)
+		conn, proxyTag, connectTime, err := s.parallelDial(ctxDial, network, dest, batch)
+		cancel()
+
+		if err == nil {
+			return conn, proxyTag, connectTime, nil
+		}
+		finalErr = err
+	}
+
+	return nil, "", 0, E.New("smart: all retries failed: ", finalErr)
+}
+
+// getBatch returns the batch for retry round i and the dial timeout.
+func (s *Smart) getBatch(outbounds []adapter.Outbound, meta *smartDialMeta, round int) ([]adapter.Outbound, time.Duration) {
+	var batch []adapter.Outbound
+	if round == 0 {
+		if len(outbounds) > 0 {
+			batch = outbounds[:1]
+		}
+	} else {
+		begin := (round-1)*smartParallelDials + 1
+		if begin >= len(outbounds) {
+			return nil, 0
+		}
+		end := begin + smartParallelDials
+		if end > len(outbounds) {
+			end = len(outbounds)
+		}
+		batch = outbounds[begin:end]
+	}
+
+	var maxHistCT int64
+	for _, ob := range batch {
+		if ct := s.getHistoryConnectTime(meta, ob.Tag()); ct > maxHistCT {
+			maxHistCT = ct
+		}
+	}
+
+	timeout := time.Duration(float64(maxHistCT)*smartConnThreshold) * time.Millisecond
+	if timeout <= 0 || timeout > 10*time.Second {
+		timeout = 10 * time.Second
+	}
+
+	return batch, timeout
+}
+
+// parallelDial races all outbounds in batch; first success wins.
+func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksaddr, outbounds []adapter.Outbound) (net.Conn, string, int64, error) {
+	if len(outbounds) == 1 {
+		start := time.Now()
+		conn, err := outbounds[0].DialContext(ctx, network, dest)
+		ct := time.Since(start).Milliseconds()
+		if err != nil {
+			go s.recordFailedDial(ctx, outbounds[0].Tag(), nil, ct)
+		}
+		return conn, outbounds[0].Tag(), ct, err
+	}
+
+	type result struct {
+		conn        net.Conn
+		tag         string
+		connectTime int64
+		err         error
+	}
+
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan result, len(outbounds))
+	for _, ob := range outbounds {
+		ob := ob
+		go func() {
+			start := time.Now()
+			conn, err := ob.DialContext(ctx, network, dest)
+			ct := time.Since(start).Milliseconds()
+			results <- result{conn, ob.Tag(), ct, err}
+		}()
+	}
+
+	var errs []error
+	for i := 0; i < len(outbounds); i++ {
+		r := <-results
+		if r.err == nil {
+			cancel()
+			return r.conn, r.tag, r.connectTime, nil
+		}
+		errs = append(errs, r.err)
+		go s.recordFailedDial(ctx, r.tag, r.err, r.connectTime)
+	}
+
+	return nil, "", 0, E.Errors(errs...)
+}
+
+func (s *Smart) recordFailedDial(ctx context.Context, tag string, err error, connectTime int64) {
+	if ctx.Err() != nil {
+		return
+	}
+	// no metadata in raw dial context — record with empty meta
+	go s.recordStats("failed", &smartDialMeta{}, tag, connectTime, 0, 0, 0, 0, 0, 0)
+}
+
+// ─── tracked connection wrappers ──────────────────────────────────────────────
+
+type smartTrackedConn struct {
+	net.Conn
+	s           *Smart
+	proxyTag    string
+	meta        *smartDialMeta
+	connectTime int64
+	startTime   time.Time
+	upload      atomic.Int64
+	download    atomic.Int64
+	closeOnce   sync.Once
+}
+
+func (c *smartTrackedConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.download.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c *smartTrackedConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if n > 0 {
+		c.upload.Add(int64(n))
+	}
+	return n, err
+}
+
+func (c *smartTrackedConn) Close() error {
+	c.closeOnce.Do(func() {
+		dur := time.Since(c.startTime).Milliseconds()
+		go c.s.recordStats("closed", c.meta, c.proxyTag, c.connectTime,
+			0, c.upload.Load(), c.download.Load(), 0, 0, dur)
+	})
+	return c.Conn.Close()
+}
+
+func (c *smartTrackedConn) Upstream() any { return c.Conn }
+
+type smartTrackedPacketConn struct {
+	net.PacketConn
+	s           *Smart
+	proxyTag    string
+	meta        *smartDialMeta
+	connectTime int64
+	startTime   time.Time
+	upload      atomic.Int64
+	download    atomic.Int64
+	closeOnce   sync.Once
+}
+
+func (c *smartTrackedPacketConn) Close() error {
+	c.closeOnce.Do(func() {
+		dur := time.Since(c.startTime).Milliseconds()
+		go c.s.recordStats("closed", c.meta, c.proxyTag, c.connectTime,
+			0, c.upload.Load(), c.download.Load(), 0, 0, dur)
+	})
+	return c.PacketConn.Close()
+}
+
+func (s *Smart) wrapConn(conn net.Conn, tag string, meta *smartDialMeta, connectTime int64, isUDP bool) net.Conn {
+	tracked := &smartTrackedConn{
+		Conn:        conn,
+		s:           s,
+		proxyTag:    tag,
+		meta:        meta,
+		connectTime: connectTime,
+		startTime:   time.Now(),
+	}
+	if s.interruptExternalConnections {
+		return s.interruptGroup.NewConn(tracked,
+			interrupt.IsExternalConnectionFromContext(context.Background()),
+			false)
+	}
+	return tracked
+}
+
+func (s *Smart) wrapPacketConn(pc net.PacketConn, tag string, meta *smartDialMeta, connectTime int64) net.PacketConn {
+	return &smartTrackedPacketConn{
+		PacketConn:  pc,
+		s:           s,
+		proxyTag:    tag,
+		meta:        meta,
+		connectTime: connectTime,
+		startTime:   time.Now(),
+	}
+}
+
+// ─── connection statistics ────────────────────────────────────────────────────
+
+func (s *Smart) recordStats(
+	status string, meta *smartDialMeta, proxyTag string,
+	connectTime, latency, uploadBytes, downloadBytes, maxUploadRate, maxDownloadRate, durationMS int64,
+) {
+	if s.store == nil {
+		return
+	}
+
+	target := meta.smartTarget
+	if target == "" {
+		return
+	}
+
+	uploadMB := float64(uploadBytes) / (1024.0 * 1024.0)
+	downloadMB := float64(downloadBytes) / (1024.0 * 1024.0)
+	maxUpKB := float64(maxUploadRate) / 1024.0
+	maxDownKB := float64(maxDownloadRate) / 1024.0
+	durationMin := float64(durationMS) / 60000.0
+
+	weightType := smart.WeightTypeTCP
+	if meta.asnCode != "" && !smart.CdnASNs[meta.asnCode] {
+		if meta.isUDP {
+			weightType = smart.WeightTypeUDPASN + ":" + meta.asnCode
+		} else {
+			weightType = smart.WeightTypeTCPASN + ":" + meta.asnCode
+		}
+	} else if meta.isUDP {
+		weightType = smart.WeightTypeUDP
+	}
+
+	lock := smart.GetTargetNodeLock(target, s.Tag(), proxyTag)
+	lock.Lock()
+	defer lock.Unlock()
+
+	cacheKey := smart.FormatDBKey(smart.KeyTypeStats, smartConfigName, s.Tag(), target, proxyTag)
+	record := s.store.GetOrCreateAtomicRecord(cacheKey, s.Tag(), smartConfigName, target, proxyTag)
+
+	switch status {
+	case "failed":
+		record.AddInt64("failure", 1)
+	case "closed":
+		record.AddInt64("success", 1)
+	}
+
+	if connectTime > 0 {
+		old := record.GetInt64("connectTime")
+		record.SetInt64("connectTime", smart.UpdateAverageInt(old, connectTime))
+	}
+	if latency > 0 {
+		old := record.GetInt64("latency")
+		record.SetInt64("latency", smart.UpdateAverageInt(old, latency))
+	}
+	if durationMin > 0 {
+		old := record.GetFloat64("duration")
+		if old > 0 {
+			record.SetFloat64("duration", (old+durationMin)/2.0)
+		} else {
+			record.SetFloat64("duration", durationMin)
+		}
+	}
+
+	record.AddUpload(uploadMB)
+	record.AddDownload(downloadMB)
+
+	if maxUpKB > record.GetFloat64("maxUploadRate") {
+		record.SetFloat64("maxUploadRate", maxUpKB)
+	}
+	if maxDownKB > record.GetFloat64("maxDownloadRate") {
+		record.SetFloat64("maxDownloadRate", maxDownKB)
+	}
+
+	oldWeight := record.GetWeight(weightType)
+	priorityFactor := s.getPriorityFactor(proxyTag)
+
+	input := &smart.ModelInput{
+		Success:            record.GetInt64("success"),
+		Failure:            record.GetInt64("failure"),
+		ConnectTime:        record.GetInt64("connectTime"),
+		Latency:            record.GetInt64("latency"),
+		IsUDP:              meta.isUDP,
+		IsTCP:              !meta.isUDP,
+		UploadTotal:        record.GetFloat64("uploadTotal"),
+		MaxuploadRate:      record.GetFloat64("maxUploadRate"),
+		DownloadTotal:      record.GetFloat64("downloadTotal"),
+		MaxdownloadRate:    record.GetFloat64("maxDownloadRate"),
+		ConnectionDuration: record.GetFloat64("duration"),
+		LastUsed:           record.GetInt64("lastUsed"),
+		DestIPASN:          meta.asnCode,
+		Host:               meta.host,
+		DestPort:           meta.destPort,
+		GroupName:          s.Tag(),
+		NodeName:           proxyTag,
+	}
+
+	// ML prediction path (LightGBM) with automatic fallback to traditional algorithm.
+	var calculatedWeight float64
+	var mlPredicted bool
+	if s.useLightGBM && s.weightModel != nil && s.weightModel.IsLoaded() {
+		calculatedWeight, mlPredicted = s.weightModel.PredictWeight(input, priorityFactor)
+	} else {
+		calculatedWeight, _ = smart.CalculateWeight(input, priorityFactor)
+	}
+
+	// Training-sample collection (sample rate applied).
+	if s.dataCollector != nil && (s.sampleRate >= 1 || rand.Float64() < s.sampleRate) {
+		source := "traditional"
+		if mlPredicted {
+			source = "lightgbm"
+		}
+		cmeta := &lightgbm.CollectorMeta{
+			DestASN:  meta.asnCode,
+			Host:     meta.host,
+			DestPort: meta.destPort,
+		}
+		for _, ip := range meta.resolvedIPs {
+			if ip.IsValid() {
+				cmeta.DestIP = ip.String()
+				break
+			}
+		}
+		go s.dataCollector.AddSample(input, cmeta, calculatedWeight, source)
+	}
+
+	finalWeight, isDegraded := s.checkNodeQualityDegradation(
+		status, meta, proxyTag, calculatedWeight, oldWeight,
+		durationMS, uploadMB, downloadMB,
+	)
+
+	if isDegraded {
+		s.updatePrefetchCache(meta, target, proxyTag, finalWeight)
+	}
+
+	record.SetInt64("lastUsed", time.Now().Unix())
+	record.SetWeight(weightType, finalWeight, meta.isUDP)
+
+	snapshot := record.CreateStatsSnapshot()
+	if data, err := json.Marshal(snapshot); err == nil {
+		go s.store.AppendToGlobalQueue(smart.StoreOperation{
+			Type:   smart.OpSaveStats,
+			Group:  s.Tag(),
+			Config: smartConfigName,
+			Target: target,
+			Node:   proxyTag,
+			Data:   data,
+		})
+	}
+
+	s.logger.Debug("smart: [", status, "] group=[", s.Tag(), "] node=[", proxyTag, "] target=[", target, "] weight=[", finalWeight, "]")
+}
+
+func (s *Smart) checkNodeQualityDegradation(
+	status string, meta *smartDialMeta, proxyTag string,
+	newWeight, oldWeight float64,
+	durationMS int64, uploadMB, downloadMB float64,
+) (float64, bool) {
+	newWeight = smart.UpdateAverageFloat(oldWeight, newWeight, false)
+
+	degradedWeight := smart.UpdateAverageFloat(oldWeight, newWeight*0.1, false)
+
+	if status == "failed" {
+		failedWeight, nodeBlock := s.handleFailedConnection(proxyTag, oldWeight, newWeight)
+		return failedWeight, nodeBlock
+	}
+
+	// Zero-traffic HTTPS detection
+	if durationMS > 100 && downloadMB == 0 && uploadMB == 0 && meta.destPort == 443 && !meta.isUDP {
+		return degradedWeight, true
+	}
+
+	// Weight drop detection
+	if oldWeight > 0 && newWeight > 0 {
+		drop := (oldWeight - newWeight) / oldWeight
+		if drop > 0.3 {
+			return newWeight, true
+		}
+	}
+
+	return newWeight, false
+}
+
+func (s *Smart) handleFailedConnection(proxyName string, oldWeight, calculatedWeight float64) (float64, bool) {
+	if s.store == nil {
+		return smart.UpdateAverageFloat(oldWeight, calculatedWeight, false), false
+	}
+
+	now := time.Now().Unix()
+	stateData, _ := s.store.GetNodeStates(s.Tag(), smartConfigName)
+
+	var state smart.NodeState
+	if data, exists := stateData[proxyName]; exists {
+		if json.Unmarshal(data, &state) != nil {
+			state = smart.NodeState{Name: proxyName, FailureCount: 1, LastFailure: now, DegradedFactor: 1.0}
+		} else {
+			state.FailureCount++
+			state.LastFailure = now
+		}
+	} else {
+		state = smart.NodeState{Name: proxyName, FailureCount: 1, LastFailure: now, DegradedFactor: 1.0}
+	}
+
+	k := 0.01
+	linearFactor := math.Max(0.1, 1.0-k*float64(state.FailureCount))
+	state.DegradedFactor = linearFactor
+	state.Degraded = true
+
+	block := false
+	if linearFactor <= 0.7 {
+		block = true
+		blockDur := time.Duration(30+state.FailureCount*2) * time.Minute
+		additional := time.Duration(state.FailureCount/10) * time.Minute
+		state.BlockedUntil = time.Now().Add(blockDur + additional).Unix()
+	}
+
+	if data, err := json.Marshal(&state); err == nil {
+		s.store.AppendToGlobalQueue(smart.StoreOperation{
+			Type:   smart.OpSaveNodeState,
+			Group:  s.Tag(),
+			Config: smartConfigName,
+			Node:   proxyName,
+			Data:   data,
+		})
+	}
+
+	if block {
+		smart.ClearBlockedNodesCache(s.Tag(), smartConfigName)
+	}
+
+	return smart.UpdateAverageFloat(oldWeight, calculatedWeight*state.DegradedFactor, false), block
+}
+
+func (s *Smart) updatePrefetchCache(meta *smartDialMeta, target, nodeName string, weight float64) {
+	if s.store == nil {
+		return
+	}
+	nodes, weights := s.store.GetPrefetchResult(s.Tag(), smartConfigName, target, meta.asnCode, meta.isUDP)
+
+	type nw struct {
+		node   string
+		weight float64
+	}
+	list := make([]nw, 0, len(nodes)+1)
+	found := false
+	for i, n := range nodes {
+		w := 0.0
+		if i < len(weights) {
+			w = weights[i]
+		}
+		if n == nodeName {
+			list = append(list, nw{n, weight})
+			found = true
+		} else {
+			list = append(list, nw{n, w})
+		}
+	}
+	if !found {
+		list = append(list, nw{nodeName, weight})
+	}
+
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].weight != list[j].weight {
+			return list[i].weight > list[j].weight
+		}
+		return list[i].node < list[j].node
+	})
+
+	sortedNodes := make([]string, len(list))
+	sortedWeights := make([]float64, len(list))
+	for i, item := range list {
+		sortedNodes[i] = item.node
+		sortedWeights[i] = item.weight
+	}
+	s.store.StorePrefetchResult(s.Tag(), smartConfigName, target, meta.asnCode, meta.isUDP, sortedNodes, sortedWeights)
+}
+
+// ─── background tasks ─────────────────────────────────────────────────────────
+
+func (s *Smart) updateNodeRanking() {
+	if s.store == nil {
+		return
+	}
+	snap := s.state.Load()
+	if snap == nil {
+		return
+	}
+
+	tags := snap.tags
+	_, err := s.store.GetNodeWeightRanking(s.Tag(), smartConfigName, s.testURL, s.isAlive, tags)
+	if err != nil {
+		s.logger.Debug("smart: ranking update: ", err)
+	}
+}
+
+func (s *Smart) runPrefetch() {
+	if s.store == nil {
+		return
+	}
+	snap := s.state.Load()
+	if snap == nil {
+		return
+	}
+	proxyMap := make(map[string]string, len(snap.outbounds))
+	for _, ob := range snap.outbounds {
+		if s.isAlive(ob.Tag()) {
+			proxyMap[ob.Tag()] = ob.Tag()
+		}
+	}
+	count := s.store.RunPrefetch(s.Tag(), smartConfigName, proxyMap)
+	s.logger.Debug("smart: prefetch completed for ", s.Tag(), " targets=", count)
+}
+
+func (s *Smart) checkAndRecoverDegradedNodes() {
+	if s.store == nil {
+		return
+	}
+	stateData, err := s.store.GetNodeStates(s.Tag(), smartConfigName)
+	if err != nil {
+		return
+	}
+
+	var ops []smart.StoreOperation
+	now := time.Now().Unix()
+
+	for nodeName, data := range stateData {
+		var state smart.NodeState
+		if json.Unmarshal(data, &state) != nil {
+			continue
+		}
+
+		updated := false
+		if state.BlockedUntil > 0 && state.BlockedUntil <= now {
+			state.BlockedUntil = 0
+			updated = true
+			s.logger.Debug("smart: unblocked node [", nodeName, "]")
+		}
+
+		if state.Degraded && state.BlockedUntil == 0 {
+			recoveryFactor := math.Min(1.0, state.DegradedFactor+0.01)
+			state.FailureCount = int(float64(state.FailureCount) * 0.95)
+			if recoveryFactor >= 0.99 {
+				state.Degraded = false
+				state.DegradedFactor = 1.0
+			} else {
+				state.DegradedFactor = recoveryFactor
+			}
+			updated = true
+		}
+
+		if updated {
+			if stateBytes, err := json.Marshal(&state); err == nil {
+				ops = append(ops, smart.StoreOperation{
+					Type:   smart.OpSaveNodeState,
+					Group:  s.Tag(),
+					Config: smartConfigName,
+					Node:   nodeName,
+					Data:   stateBytes,
+				})
+			}
+		}
+	}
+
+	if len(ops) > 0 {
+		s.store.AppendToGlobalQueue(ops...)
+	}
+}
+
+func (s *Smart) cleanupOldRecords() {
+	if s.store != nil {
+		_ = s.store.CleanupOldRecords(s.Tag(), smartConfigName)
+	}
+}
+
+func (s *Smart) cleanupOrphanedNodeCache() {
+	if s.store == nil {
+		return
+	}
+	snap := s.state.Load()
+	if snap == nil {
+		return
+	}
+
+	currentNodes := make(map[string]bool, len(snap.tags))
+	for _, tag := range snap.tags {
+		currentNodes[tag] = true
+	}
+
+	cachedNodes, err := s.store.GetAllNodesForGroup(s.Tag(), smartConfigName)
+	if err != nil {
+		return
+	}
+
+	var orphaned []string
+	for _, node := range cachedNodes {
+		if !currentNodes[node] {
+			orphaned = append(orphaned, node)
+		}
+	}
+
+	if len(orphaned) > 0 {
+		s.logger.Debug("smart: cleaning ", len(orphaned), " orphaned nodes for [", s.Tag(), "]")
+		if err := s.store.RemoveNodesData(s.Tag(), smartConfigName, orphaned); err != nil {
+			s.logger.Warn("smart: failed to clean orphaned nodes: ", err)
+		}
+	}
+}
+
+func (s *Smart) flushQueue() {
+	if s.store != nil {
+		s.store.FlushQueue(true)
+	}
+}
+
+func (s *Smart) adjustCache() {
+	if s.store != nil {
+		s.store.AdjustCacheParameters()
+	}
+}
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+func (s *Smart) isAlive(tag string) bool {
+	if s.history == nil {
+		return true
+	}
+	h := s.history.LoadURLTestHistory(tag)
+	if h == nil {
+		return true // no data = assume alive
+	}
+	return time.Since(h.Time) < s.interval*2
+}
+
+func (s *Smart) supportsUDP(ob adapter.Outbound) bool {
+	for _, n := range ob.Network() {
+		if n == N.NetworkUDP {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Smart) getPriorityFactor(tag string) float64 {
+	for _, rule := range s.policyPriority {
+		if rule.isRegex && rule.regex != nil {
+			if rule.regex.MatchString(tag) {
+				return rule.factor
+			}
+		} else if strings.Contains(tag, rule.pattern) {
+			return rule.factor
+		}
+	}
+	return 1.0
+}
+
+func (s *Smart) getHistoryConnectTime(meta *smartDialMeta, proxyTag string) int64 {
+	if s.store == nil || meta.smartTarget == "" {
+		return 0
+	}
+	cacheKey := smart.FormatDBKey(smart.KeyTypeStats, smartConfigName, s.Tag(), meta.smartTarget, proxyTag)
+	record := s.store.GetOrCreateAtomicRecord(cacheKey, s.Tag(), smartConfigName, meta.smartTarget, proxyTag)
+	return record.GetInt64("connectTime")
+}
+
+func (s *Smart) lookupASN(ips []netip.Addr) string {
+	if !s.useASN || s.asnDB == nil {
+		return ""
+	}
+	for _, ip := range ips {
+		if !ip.IsValid() || ip.IsPrivate() || ip.IsLoopback() {
+			continue
+		}
+		var record struct {
+			AutonomousSystemNumber uint `maxminddb:"autonomous_system_number"`
+		}
+		if err := s.asnDB.Lookup(ip.AsSlice(), &record); err == nil && record.AutonomousSystemNumber != 0 {
+			return strconv.FormatUint(uint64(record.AutonomousSystemNumber), 10)
+		}
+	}
+	return ""
+}
+
+func (s *Smart) onProviderUpdated(tag string) error {
+	if _, loaded := s.providers[tag]; !loaded {
+		return E.New("outbound provider not found: ", tag)
+	}
+
+	deps := s.Dependencies()
+	var (
+		tags      []string
+		outbounds []adapter.Outbound
+	)
+	for _, dep := range deps {
+		detour, _ := s.outboundMgr.Outbound(dep)
+		tags = append(tags, dep)
+		outbounds = append(outbounds, detour)
+	}
+
+	s.outboundsCacheMu.Lock()
+	for _, providerTag := range s.providerTags {
+		if providerTag != tag && s.outboundsCache[providerTag] != nil {
+			for _, detour := range s.outboundsCache[providerTag] {
+				tags = append(tags, detour.Tag())
+				outbounds = append(outbounds, detour)
+			}
+			continue
+		}
+		provider := s.providers[providerTag]
+		var cache []adapter.Outbound
+		for _, detour := range provider.Outbounds() {
+			t := detour.Tag()
+			if s.exclude != nil && s.exclude.MatchString(t) {
+				continue
+			}
+			if s.include != nil && !s.include.MatchString(t) {
+				continue
+			}
+			tags = append(tags, t)
+			cache = append(cache, detour)
+		}
+		outbounds = append(outbounds, cache...)
+		s.outboundsCache[providerTag] = cache
+	}
+	s.outboundsCacheMu.Unlock()
+
+	if len(tags) == 0 {
+		detour, _ := s.outboundMgr.Outbound("Compatible")
+		tags = append(tags, detour.Tag())
+		outbounds = append(outbounds, detour)
+	}
+
+	s.state.Store(&smartGroupState{outbounds: outbounds, tags: tags})
+	return nil
+}
+
+// outboundNames extracts tag strings from outbound slice.
+func outboundNames(outbounds []adapter.Outbound) []string {
+	names := make([]string, len(outbounds))
+	for i, ob := range outbounds {
+		names[i] = ob.Tag()
+	}
+	return names
+}
+
+// CloseHandlerFunc N.CloseHandlerFunc alias used in NewConnectionEx / NewPacketConnectionEx
+type CloseHandlerFunc = N.CloseHandlerFunc

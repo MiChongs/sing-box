@@ -7,6 +7,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/sagernet/bbolt"
 	"github.com/sagernet/sing-box/common/hash"
 	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/common/varbin"
@@ -39,6 +40,46 @@ type V2RayServer interface {
 	StatsService() ConnectionTracker
 }
 
+// SmartService is the singleton that owns infrastructure shared by all Smart
+// outbound groups: the LightGBM model, its auto-updater, and the training
+// sample collector. It is registered on startup when experimental.smart is
+// configured; Smart groups retrieve it via service.FromContext and opt in
+// per-group via their use_lightgbm / collect_data flags.
+//
+// The concrete type lives in experimental/smart. Callers that need typed
+// accessors (e.g. for LightGBM model / collector) should type-assert to the
+// concrete *smart.Service.
+type SmartService interface {
+	LifecycleService
+	// LightGBMEnabled reports whether the shared ML model is configured.
+	LightGBMEnabled() bool
+	// CollectorEnabled reports whether the shared training-data collector is configured.
+	CollectorEnabled() bool
+}
+
+// GeoXService is the singleton that downloads and tracks global geo data
+// assets (geoip.dat / geosite.dat / country.mmdb / GeoLite2-ASN.mmdb).
+//
+// Other services (currently only Smart group, via use_asn) retrieve local
+// file paths through this service when their per-group config leaves the
+// corresponding path empty.
+type GeoXService interface {
+	LifecycleService
+
+	// Enabled reports whether experimental.geox.enabled was set.
+	Enabled() bool
+
+	// GeoIPPath returns the local path of the downloaded geoip.dat, or
+	// "" if not configured / not yet downloaded.
+	GeoIPPath() string
+	// GeoSitePath returns the local path of the downloaded geosite.dat.
+	GeoSitePath() string
+	// MMDBPath returns the local path of the downloaded country.mmdb.
+	MMDBPath() string
+	// ASNPath returns the local path of the downloaded GeoLite2-ASN.mmdb.
+	ASNPath() string
+}
+
 type CacheFile interface {
 	LifecycleService
 
@@ -66,6 +107,8 @@ type CacheFile interface {
 	SaveExternalUI(tag string, info *SavedBinary) error
 	LoadSubscription(tag string) *SavedBinary
 	SaveSubscription(tag string, sub *SavedBinary) error
+
+	SmartDB() *bbolt.DB
 }
 
 type SavedBinary struct {

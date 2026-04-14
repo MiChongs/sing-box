@@ -23,6 +23,8 @@ import (
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/experimental"
 	"github.com/sagernet/sing-box/experimental/cachefile"
+	geoxservice "github.com/sagernet/sing-box/experimental/geox"
+	smartservice "github.com/sagernet/sing-box/experimental/smart"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/direct"
@@ -419,6 +421,27 @@ func New(options Options) (*Box, error) {
 		cacheFile := cachefile.New(ctx, logFactory.NewLogger("cache-file"), common.PtrValueOrDefault(experimentalOptions.CacheFile))
 		service.MustRegister[adapter.CacheFile](ctx, cacheFile)
 		internalServices = append(internalServices, cacheFile)
+	}
+	// Register Smart service (shared LightGBM model + collector) whenever
+	// experimental.smart is present in the config. Absent the config block,
+	// we still register an empty service so Smart groups can safely look it
+	// up via FromContext without nil checks.
+	{
+		smartOpts := common.PtrValueOrDefault(experimentalOptions.Smart)
+		smartSvc := smartservice.NewService(ctx, logFactory.NewLogger("smart"), smartOpts)
+		service.MustRegister[adapter.SmartService](ctx, smartSvc)
+		internalServices = append(internalServices, smartSvc)
+	}
+	// Register GeoX service (global geoip/geosite/mmdb/asn downloader).
+	// Always registered so consumers (e.g. Smart group's use_asn fallback)
+	// can safely query it via FromContext without nil checks. When
+	// experimental.geox.enabled is false, all paths return "" and the service
+	// is inert.
+	{
+		geoxOpts := common.PtrValueOrDefault(experimentalOptions.GeoX)
+		geoxSvc := geoxservice.NewService(ctx, logFactory.NewLogger("geox"), geoxOpts)
+		service.MustRegister[adapter.GeoXService](ctx, geoxSvc)
+		internalServices = append(internalServices, geoxSvc)
 	}
 	if needClashAPI {
 		clashAPIOptions := common.PtrValueOrDefault(experimentalOptions.ClashAPI)

@@ -88,6 +88,16 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 		info.Put("now", groupOutbound.Now())
 		allTags := groupOutbound.All()
 		info.Put("all", allTags)
+
+		if sg, ok := detour.(*group.Smart); ok {
+			info.Put("testUrl", sg.TestURL())
+			info.Put("useASN", sg.UseASN())
+			info.Put("useLightGBM", sg.UseLightGBM())
+			info.Put("collectData", sg.CollectData())
+			if age := sg.LGBMModelAge(); age > 0 {
+				info.Put("lgbmModelAge", age.Truncate(time.Second).String())
+			}
+		}
 	}
 	return &info
 }
