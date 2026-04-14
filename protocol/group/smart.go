@@ -23,6 +23,7 @@ import (
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/smart"
 	"github.com/sagernet/sing-box/common/smart/lightgbm"
+	"github.com/sagernet/sing-box/common/urltest"
 	smartservice "github.com/sagernet/sing-box/experimental/smart"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -105,7 +106,8 @@ type Smart struct {
 	useASN             bool
 	asnDBPath          string // configured path; "" means "fall back to geox service"
 	asnDB              *maxminddb.Reader
-	maxHostFailedTimes int    // mihomo parity; 0 = default 10
+	countryDB          *maxminddb.Reader // country.mmdb from GeoX, optional
+	maxHostFailedTimes int               // mihomo parity; 0 = default 10
 
 	store *smart.Store
 
@@ -324,6 +326,20 @@ func (s *Smart) PostStart() error {
 		}
 	}
 
+	// Optional country mmdb — feeds ModelInput.DestGeoIP (LightGBM features
+	// 17 and 26). When the GeoX service has downloaded country.mmdb we use
+	// it; otherwise DestGeoIP stays nil and those features fall back to 0.
+	if geoSvc := service.FromContext[adapter.GeoXService](s.ctx); geoSvc != nil {
+		if mmdbPath := geoSvc.MMDBPath(); mmdbPath != "" {
+			if db, err := maxminddb.Open(mmdbPath); err == nil {
+				s.countryDB = db
+				s.logger.Info("smart: country mmdb loaded from ", mmdbPath, " (feeds DestGeoIP feature)")
+			} else {
+				s.logger.Debug("smart: country mmdb not yet available: ", err)
+			}
+		}
+	}
+
 	// Pull shared infrastructure from experimental.smart (SmartService).
 	// This lets multiple Smart groups share a single model/downloader/collector.
 	// Defaults kick in when experimental.smart.{lightgbm,collector} is absent —
@@ -364,11 +380,20 @@ func (s *Smart) PostStart() error {
 	}
 
 	tasks := []taskDef{
+		// Active URL probing — populates URLTestHistoryStorage so isAlive,
+		// selectFullScan ranking and fillProxies actually see dead nodes.
+		// Without this a standalone Smart group treats every node as alive.
+		{"health-check", 10 * time.Second, s.interval, s.runHealthCheck, false},
 		{"nodes-ranking", 1 * time.Minute, 5 * time.Minute, s.updateNodeRanking, false},
 		{"prefetch", 5 * time.Minute, 10 * time.Minute, s.runPrefetch, false},
 		{"recovery-check", 5 * time.Minute, 5 * time.Minute, s.checkAndRecoverDegradedNodes, false},
 		{"cleanup-old", 10 * time.Minute, 120 * time.Minute, s.cleanupOldRecords, false},
 		{"cleanup-orphan", 10 * time.Minute, 10 * time.Minute, s.cleanupOrphanedNodeCache, false},
+		// Orphan-groups cleanup only runs on one arbitrarily-chosen group each
+		// interval; it's process-global work (remove Smart store data for
+		// groups no longer present in config). Doing it per group still works
+		// because the logic is idempotent.
+		{"cleanup-orphan-groups", 15 * time.Minute, 120 * time.Minute, s.cleanupOrphanedGroups, false},
 		{"flush-queue", 5 * time.Second, 5 * time.Minute, s.flushQueue, false},
 		{"cache-adjust", 5 * time.Second, 5 * time.Minute, s.adjustCache, false},
 	}
@@ -452,6 +477,9 @@ func (s *Smart) Close() error {
 	}
 	if s.asnDB != nil {
 		_ = s.asnDB.Close()
+	}
+	if s.countryDB != nil {
+		_ = s.countryDB.Close()
 	}
 	return nil
 }
@@ -705,11 +733,13 @@ func (s *Smart) buildMeta(metadata adapter.InboundContext, isUDP bool) *smartDia
 
 	target := smart.GetEffectiveTarget(host, firstIP)
 	asnCode := s.lookupASN(ips)
+	geoIP := s.lookupCountry(ips)
 
 	return &smartDialMeta{
 		host:        host,
 		smartTarget: target,
 		asnCode:     asnCode,
+		destGeoIP:   geoIP,
 		resolvedIPs: ips,
 		isUDP:       isUDP,
 		destPort:    metadata.Destination.Port,
@@ -1907,6 +1937,118 @@ func (s *Smart) updatePrefetchCache(meta *smartDialMeta, target, nodeName string
 
 // ─── background tasks ─────────────────────────────────────────────────────────
 
+// runHealthCheck actively probes every outbound with urltest.URLTest and
+// writes the result into URLTestHistoryStorage. This is what populates the
+// isAlive()/selectFullScan/ranking inputs. Without it, a standalone Smart
+// group (no URLTest group covering the same nodes) has no idea which of
+// its members are actually reachable.
+//
+// Concurrency is capped at smartHealthCheckConcurrency (8) to avoid
+// stampeding the test URL host with hundreds of simultaneous probes when
+// a large provider is loaded.
+func (s *Smart) runHealthCheck() {
+	if s.history == nil {
+		return
+	}
+	snap := s.state.Load()
+	if snap == nil || len(snap.outbounds) == 0 {
+		return
+	}
+
+	const smartHealthCheckConcurrency = 8
+	ctx, cancel := context.WithTimeout(s.taskCtx, s.interval)
+	defer cancel()
+
+	sem := make(chan struct{}, smartHealthCheckConcurrency)
+	var wg sync.WaitGroup
+	start := time.Now()
+
+	var alive, dead atomic.Int32
+	for _, ob := range snap.outbounds {
+		ob := ob
+		tag := ob.Tag()
+		// Skip outbounds that aren't real routes
+		if smartSkipType(ob.Type()) {
+			continue
+		}
+		// If we already have a fresh history entry (≤ 1 interval), reuse it.
+		if h := s.history.LoadURLTestHistory(tag); h != nil && time.Since(h.Time) < s.interval {
+			if h.Delay > 0 {
+				alive.Add(1)
+			}
+			continue
+		}
+
+		wg.Add(1)
+		sem <- struct{}{}
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
+			delay, err := urltest.URLTest(probeCtx, s.testURL, ob)
+			probeCancel()
+
+			if err != nil || delay == 0 {
+				s.history.DeleteURLTestHistory(tag)
+				dead.Add(1)
+				return
+			}
+			s.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+				Time:  time.Now(),
+				Delay: delay,
+			})
+			alive.Add(1)
+		}()
+	}
+	wg.Wait()
+
+	s.logger.Info("smart[", s.Tag(), "] health-check in ",
+		time.Since(start).Round(time.Millisecond), ": ",
+		alive.Load(), " alive, ", dead.Load(), " dead")
+}
+
+// cleanupOrphanedGroups removes Smart store data for group tags that no
+// longer exist in the live outbound manager. Handles the case where a user
+// renames / removes a Smart group between runs — without this the bbolt
+// bucket grows unbounded.
+func (s *Smart) cleanupOrphanedGroups() {
+	if s.store == nil {
+		return
+	}
+	cachedGroups, err := s.store.GetAllGroupsForConfig(smartConfigName)
+	if err != nil {
+		return
+	}
+
+	liveGroups := make(map[string]struct{})
+	if s.outboundMgr != nil {
+		for _, ob := range s.outboundMgr.Outbounds() {
+			if _, isSmart := ob.(*Smart); isSmart {
+				liveGroups[ob.Tag()] = struct{}{}
+			}
+		}
+	}
+
+	var orphaned []string
+	for _, g := range cachedGroups {
+		if _, ok := liveGroups[g]; !ok {
+			orphaned = append(orphaned, g)
+		}
+	}
+	if len(orphaned) == 0 {
+		return
+	}
+	for _, g := range orphaned {
+		if err := s.store.FlushByGroup(g, smartConfigName); err != nil {
+			s.logger.Warn("smart: orphan-groups cleanup failed for [", g, "]: ", err)
+			continue
+		}
+	}
+	s.logger.Info("smart[", s.Tag(), "] cleaned ", len(orphaned),
+		" orphaned group(s): ", proxyTagsPreviewStrings(orphaned, 5))
+}
+
 func (s *Smart) updateNodeRanking() {
 	if s.store == nil {
 		return
@@ -2166,6 +2308,30 @@ func (s *Smart) lookupASN(ips []netip.Addr) string {
 		}
 	}
 	return ""
+}
+
+// lookupCountry returns a single-element ISO country code slice from the GeoX
+// country mmdb for the first valid non-private destination IP, or nil.
+// Format matches mihomo's ModelInput.DestGeoIP ([]string); LightGBM
+// extractGeoIPFeature + FNV hash bucket consume it.
+func (s *Smart) lookupCountry(ips []netip.Addr) []string {
+	if s.countryDB == nil {
+		return nil
+	}
+	for _, ip := range ips {
+		if !ip.IsValid() || ip.IsPrivate() || ip.IsLoopback() {
+			continue
+		}
+		var record struct {
+			Country struct {
+				ISOCode string `maxminddb:"iso_code"`
+			} `maxminddb:"country"`
+		}
+		if err := s.countryDB.Lookup(ip.AsSlice(), &record); err == nil && record.Country.ISOCode != "" {
+			return []string{record.Country.ISOCode}
+		}
+	}
+	return nil
 }
 
 func (s *Smart) onProviderUpdated(tag string) error {
