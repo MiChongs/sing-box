@@ -56,6 +56,9 @@ jobs:
         with:
           go-version: ~1.25.8
 
+      - name: Drop local replacements for CI
+        run: go mod edit -dropreplace=github.com/sagernet/sing-tun || true
+
       - name: Set Build Tags and Ldflags
         run: |
           if [ "${{ matrix.os }}" = "windows" ]; then

@@ -31,6 +31,8 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: ^1.25
+      - name: Drop local replacements for CI
+        run: go mod edit -dropreplace=github.com/sagernet/sing-tun || true
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v8
         with:
