@@ -68,6 +68,34 @@ const (
 	cbMaxConsecFail = 2
 	cbWindow        = 30 * time.Second
 	cbOpenDuration  = 15 * time.Second
+
+	// manualPinWeightBoost is the confidence multiplier applied to the
+	// user's manually-pinned node during recordStats. 1.15 = 15% uplift.
+	//
+	// Rationale: when the user pins a node, that pin itself is a strong
+	// preference signal — the user has decided this route is worth
+	// keeping even if the algorithm would pick another. We persist that
+	// intent into the weight store so that:
+	//
+	//  1. If the user unpins later, auto-selection still remembers the
+	//     preference and biases toward the formerly-pinned node.
+	//  2. The priority factor (policy_priority config rules) composes
+	//     multiplicatively with the boost, matching how other weight
+	//     signals combine.
+	//
+	// The boost is applied BEFORE CalculateWeight / PredictWeight via
+	// the priority factor, so both traditional and LightGBM paths see
+	// it. The training target (baseWeight = finalWeight/priorityFactor)
+	// divides the boost back out — we want LightGBM to learn the raw
+	// algorithmic signal, not a user-preference-inflated version, and
+	// keeping the boost out of training prevents a feedback loop where
+	// the model overfits to manually-pinned nodes across retrainings.
+	//
+	// Value picked empirically: 1.15 is large enough to survive a few
+	// bad samples from a marginal pinned node (~one rank tier) without
+	// making a genuinely broken node ride the pin indefinitely (two
+	// consecutive failures still trip degradation / circuit breaker).
+	manualPinWeightBoost = 1.15
 )
 
 func RegisterSmart(registry *outbound.Registry) {
@@ -105,12 +133,42 @@ func firstValidIPString(ips []netip.Addr) string {
 
 type smartMetaCtxKey struct{}
 
-// priorityRule is a policy-priority rule (pattern + factor).
+// priorityMatchKind enumerates the four ways a single rule can match a
+// node tag. The kind is fixed at parse time from the rule's prefix; at
+// match time we just dispatch on the kind without re-inspecting the
+// pattern.
+type priorityMatchKind uint8
+
+const (
+	priorityMatchSubstring priorityMatchKind = iota // default (no prefix)
+	priorityMatchExact                              // "=tag"
+	priorityMatchRegex                              // "~regex"
+	priorityMatchGlob                               // "*globpat*" (translated to regex)
+)
+
+// priorityRule is one parsed entry from option.SmartOutboundOptions.PolicyPriority.
+//
+// Compared to the previous design (silently autopilot regex when the
+// pattern compiled as one), each rule now carries an EXPLICIT match
+// kind decided by the prefix the user wrote. This makes config
+// behaviour deterministic — `HK*` is no longer ambiguously treated as
+// a regex matching empty string.
+//
+// Negate flips the match outcome: a `!` prefix means "factor applies
+// to every node EXCEPT those matching this pattern".
+//
+// Multiple rules can match the same tag; getPriorityFactor multiplies
+// every matching rule's factor instead of stopping at the first hit
+// (mihomo parity for compositional config like "HK:1.5;VIP:1.2"). 1.0
+// is the identity factor — rules that resolve to 1.0 are dropped at
+// parse time so the hot path doesn't iterate them.
 type priorityRule struct {
-	pattern string
-	regex   *regexp.Regexp
+	raw     string         // original user text (without prefix) — for logging
+	pattern string         // canonical pattern body (substring or regex source)
+	regex   *regexp.Regexp // populated for regex / glob kinds
 	factor  float64
-	isRegex bool
+	kind    priorityMatchKind
+	negate  bool
 }
 
 // Smart is the Smart outbound group — history-weighted, parallel-race, ASN-aware.
@@ -131,6 +189,12 @@ type Smart struct {
 	interval           time.Duration
 	disableUDP         bool
 	policyPriority     []priorityRule
+	// priorityFactorCache memoises getPriorityFactor(tag) so the dial
+	// hot path doesn't re-walk the rule slice for every selection. The
+	// node tag set is effectively static — cache size grows to ≤
+	// |snap.tags|. Lazily allocated by parsePolicyPriority when at
+	// least one rule survives parsing.
+	priorityFactorCache *xsync.MapOf[string, float64]
 	useASN             bool
 	asnDBPaths         []string            // per-group configured paths; empty → fall back to geox service
 	asnDBs             []*maxminddb.Reader // multi-source: tried in order until one returns a hit
@@ -169,6 +233,12 @@ type Smart struct {
 	// on every write and took a full mutex on every read.
 	knownDead *xsync.MapOf[string, time.Time]
 
+	// targetDebargo soft-breaks a specific node for a specific target when it fails
+	// via WatchDog or Mid-Stream RST (like an IP filter). This stops the engine from
+	// continually repicking it from the generic URLTest fallback ranking.
+	// Key format: "target|proxyTag". Expiry bounded like knownDead.
+	targetDebargo *xsync.MapOf[string, time.Time]
+
 	// Per-node circuit breaker. Tracks consecutive-failure count and the
 	// "breaker open until" timestamp. When the breaker is open, the node
 	// is filtered out of selectProxiesTraced candidate lists even if
@@ -178,6 +248,18 @@ type Smart struct {
 	// Reset on successful dial (onDialOutcome(true)). xsync.MapOf gives
 	// us lock-free reads on the dial hot path.
 	breakers *xsync.MapOf[string, *circuitBreakerState]
+
+	// aliveAt stores the unix-nano timestamp of the most recent successful
+	// DIAL for each node. Used by runHealthCheck to skip probing nodes
+	// that just proved alive via real user traffic — no point spending an
+	// HTTP probe on a node that handled a real dial 5 seconds ago.
+	//
+	// This is intentionally SEPARATE from URLTestHistory: the history
+	// feeds the dashboard latency display, and writing synthetic sentinels
+	// (Delay=1) into it would make every dialed node show "1ms" which is
+	// misleading. aliveAt is the Smart-internal signal; URLTestHistory
+	// stays populated ONLY by real timed probes.
+	aliveAt *xsync.MapOf[string, int64]
 
 	// countryDBRetryAt throttles re-opening country.mmdb when the GeoX
 	// download finishes after PostStart (first open was a no-op because
@@ -192,6 +274,15 @@ type Smart struct {
 	// slow page) instead of silently re-picking the same bad node.
 	shortLifeMu sync.Mutex
 	shortLife   map[string][]time.Time
+
+	// resetEvents tracks upstream TCP RST / broken-pipe / forcibly-
+	// closed events per (target, node) pair. Distinct from shortLife
+	// (which captures user-side abandonment) because a server-initiated
+	// reset is a much stronger "this node is broken" signal: the user
+	// wasn't going anywhere, the proxy node is silently dropping or
+	// being filtered. Threshold (2 events / 60 s) is intentionally
+	// lower than shortLife so we cut over faster.
+	resetEvents *resetEventTracker
 
 	// provider support
 	provider         adapter.ProviderManager
@@ -215,16 +306,35 @@ type Smart struct {
 	taskCancel context.CancelFunc
 	taskWg     sync.WaitGroup
 
+	// scheduledTasks holds handles to every task this group registered on
+	// the shared timing wheel so Close() can cancel them (the wheel is
+	// process-wide; individual groups must explicitly unregister).
+	scheduledTasks []*scheduledTask
+
 	started atomic.Bool
 
 	// coldStartLogged guards the once-per-process "no ranking data yet" log
 	// so we don't re-spam it every tick while the pipeline warms up.
 	coldStartLogged atomic.Bool
 
+	// pinBypassLogged gates the "pinned node unhealthy, bypassing"
+	// warning to once-per-outage. Flipped false the moment the pin
+	// recovers so the NEXT unhealthy window gets its own log line —
+	// otherwise operators can't tell a continuous outage apart from
+	// a flapping pin.
+	pinBypassLogged atomic.Bool
+
 	// Most recently selected (successfully dialed) node tag. Surfaced via
 	// Now() for ClashAPI / UI display. Updated on every successful dial
 	// from both DialContext and ListenPacket paths.
 	lastSelectedTag atomic.Value // string
+
+	// lastDialAt is the unix-nano timestamp of the most recent successful
+	// dial through this group. Used by the idle-aware task scheduler to
+	// STOP running health-check / prefetch / ranking when the group has
+	// seen no traffic for `idleThreshold` — critical for Android battery
+	// life when the phone is in the user's pocket.
+	lastDialAt atomic.Int64
 
 	// Manually pinned node tag (ClashAPI PUT /proxies/<tag> with {"name": X}).
 	// When non-empty, selectProxies short-circuits to only this node — the
@@ -239,6 +349,88 @@ type Smart struct {
 	sampleRate    float64
 	weightModel   *lightgbm.WeightModel
 	dataCollector *lightgbm.DataCollector
+
+	// Dashboard hints surfaced through Clash API (mihomo parity). Set
+	// from option.GroupCommonOption at construction; read-only afterwards.
+	hidden bool
+	icon   string
+
+	// rankingSnapshot is the in-process cache of the most recent
+	// successful ranking computation. WeightRanking reads it first so
+	// the API surface returns real numbers IMMEDIATELY after
+	// updateNodeRanking finishes — no waiting on the bbolt batch
+	// flusher (5 s task interval) or the 50-op BatchSaveThreshold.
+	//
+	// Persisted bbolt cache (StoreNodeWeightRanking) is still written
+	// in parallel for cross-restart durability, but it is no longer the
+	// only path between "computed" and "visible". This eliminates the
+	// 5–60 s window after every ranking refresh during which
+	// WeightRanking() would silently fall back to GetLiveNodeRanking
+	// or delayBasedRanking even though prefetch-derived data was ready.
+	//
+	// atomic.Pointer keeps the reader path fully lock-free; writers
+	// publish a fresh snapshot via Store. nil means "no ranking
+	// computed yet this process lifetime" — fall through to the
+	// existing live/delay paths in that case.
+	rankingSnapshot atomic.Pointer[smartRankingSnapshot]
+
+	// rankingKickOnce gates the post-first-dial kick of updateNodeRanking.
+	// The 45 s scheduled initial delay made every fresh process
+	// look "fallback-only" until the first nodes-ranking task fired,
+	// regardless of how quickly real dial data accumulated. After the
+	// first successful dial we kick the ranking task immediately so
+	// /weights returns prefetch-derived data within seconds.
+	rankingKickOnce sync.Once
+
+	// algorithm is the post-tier reordering strategy. atomic.Pointer
+	// allows ClashAPI to swap it at runtime via SetAlgorithm without
+	// holding any lock on the Smart struct. nil → smartAlgoStrictBest
+	// (handled by currentAlgorithm()).
+	algorithm atomic.Pointer[string]
+
+	// configAlgorithm 保存用户在配置文件中填写的原始算法字符串。
+	// 用于 PostStart 阶段重新应用——确保即使 NewSmart 阶段的
+	// atomic.Store 因某种生命周期原因未持久生效，PostStart 也能
+	// 将正确的值写入 algorithm atomic.Pointer。
+	configAlgorithm string
+
+	// nodeLoad tracks active dial counts per proxy tag. Powers the
+	// least-loaded algorithm; updated on register/deregister of every
+	// smartTrackedConn so the read path is one xsync load per node.
+	nodeLoad *nodeLoadCounter
+
+	// stickyByTarget remembers the last successfully-dialled node for
+	// each target so the sticky-session algorithm can prefer it on the
+	// next request to the same target. Lazily allocated when algorithm
+	// == sticky-session — other algorithms pay no overhead. The
+	// structured key avoids per-call string concatenation that
+	// previously dominated the dial hot path under load.
+	stickyByTarget *xsync.MapOf[stickyKey, string]
+
+	// rrCounter / wrrCounter back the round-robin and weighted-round-
+	// robin algorithms. Lazily allocated only when their algorithm is
+	// selected; idle Smart groups never pay for unused counters.
+	rrCounter  *roundRobinCounter
+	wrrCounter *roundRobinCounter
+
+	// hysteresisWindow + hysteresisMemo implement the cross-cutting
+	// anti-flap layer. When window is 0 the layer is a no-op; the
+	// memo map is allocated lazily so the disabled path costs nothing.
+	hysteresisWindow time.Duration
+	hysteresisMemo   *xsync.MapOf[stickyKey, hysteresisEntry]
+
+	// pinEndorsements is the Smart-instance-level store tracking manual
+	// pins to apply decayed multiplicative boosts.
+	pinEndorsements     *xsync.MapOf[string, *pinEndorsementEntry]
+	pinEndorsementsOnce sync.Once
+}
+
+// smartRankingSnapshot bundles the ranking slice with its computation
+// timestamp so WeightRanking can both serve the cached result and
+// expire it (>30 min stale → recompute on next refresh).
+type smartRankingSnapshot struct {
+	ranking    []smart.NodeRank
+	computedAt time.Time
 }
 
 func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
@@ -274,10 +466,16 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		collectData:        options.CollectData,
 		sampleRate:         options.SampleRate,
 		maxHostFailedTimes: options.MaxHostFailedTimes,
+		hidden:             options.Hidden,
+		icon:               options.Icon,
+		nodeLoad:           newNodeLoadCounter(),
 		targetConns:        make(map[string]map[*smartTrackedConn]struct{}),
 		shortLife:          make(map[string][]time.Time),
+		resetEvents:        newResetEventTracker(),
 		knownDead:          xsync.NewMapOf[string, time.Time](),
+		targetDebargo:      xsync.NewMapOf[string, time.Time](),
 		breakers:           xsync.NewMapOf[string, *circuitBreakerState](),
+		aliveAt:            xsync.NewMapOf[string, int64](),
 		groupOrdinal:       nextGroupOrdinal(),
 	}
 	if s.maxHostFailedTimes <= 0 {
@@ -292,6 +490,19 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	}
 	if s.sampleRate <= 0 || s.sampleRate > 1 {
 		s.sampleRate = 1.0
+	}
+	// 保存原始配置值，用于 PostStart 阶段重新应用。
+	s.configAlgorithm = options.Algorithm
+	// Apply the configured algorithm via the same SetAlgorithm path
+	// that ClashAPI uses for runtime swaps — keeps the lazy-allocation
+	// rules (sticky map, RR counters) in one place.
+	s.SetAlgorithm(options.Algorithm)
+	// Hysteresis is orthogonal to the algorithm choice — allocate the
+	// memo whenever the user requested a non-zero window. Costs ~one
+	// xsync map (≈ 200 B baseline) per Smart group.
+	if d := time.Duration(options.Hysteresis); d > 0 {
+		s.hysteresisWindow = d
+		s.hysteresisMemo = xsync.NewMapOf[stickyKey, hysteresisEntry]()
 	}
 
 	s.parsePolicyPriority(options.PolicyPriority)
@@ -308,27 +519,8 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	return s, nil
 }
 
-func (s *Smart) parsePolicyPriority(raw string) {
-	if raw == "" {
-		return
-	}
-	for _, pair := range strings.Split(raw, ";") {
-		kv := strings.SplitN(pair, ":", 2)
-		if len(kv) != 2 || strings.TrimSpace(kv[1]) == "" {
-			continue
-		}
-		factor, err := strconv.ParseFloat(strings.TrimSpace(kv[1]), 64)
-		if err != nil || factor <= 0 {
-			continue
-		}
-		rule := priorityRule{pattern: kv[0], factor: factor}
-		if re, err := regexp.Compile(kv[0]); err == nil {
-			rule.regex = re
-			rule.isRegex = true
-		}
-		s.policyPriority = append(s.policyPriority, rule)
-	}
-}
+// parsePolicyPriority moved to smart_priority.go (richer prefix grammar
+// + multiplicative aggregation + per-tag factor cache).
 
 func (s *Smart) Start() error {
 	if s.useAllProviders {
@@ -370,11 +562,27 @@ func (s *Smart) Start() error {
 	}
 
 	s.interruptGroup = interrupt.NewGroup()
+	// Intern tag strings so N Smart groups sharing the same node hold
+	// pointers to ONE backing byte slice — saves ~1 KB per overlapping
+	// node across the process (13 KB → ~1 KB on a 15-group × 30-node
+	// overlap scenario).
+	for i := range tags {
+		tags[i] = internTag(tags[i])
+	}
 	s.state.Store(&smartGroupState{outbounds: outbounds, tags: tags})
 	return nil
 }
 
 func (s *Smart) PostStart() error {
+	// 在 PostStart 阶段重新应用配置中的算法。NewSmart 构造阶段虽然
+	// 已经调用了 SetAlgorithm，但 logFactory 尚未 Start()，日志会
+	// 被丢弃且无法确认。这里重新应用确保：
+	//   1. atomic.Pointer 中的值一定是最新的（防御性保障）
+	//   2. 日志在 logFactory 已启动后输出，用户一定能看到
+	if s.configAlgorithm != "" {
+		s.SetAlgorithm(s.configAlgorithm)
+	}
+
 	// Get history storage from Clash server (for alive-checking)
 	if clashServer := service.FromContext[adapter.ClashServer](s.ctx); clashServer != nil {
 		s.history = clashServer.HistoryStorage()
@@ -411,13 +619,13 @@ func (s *Smart) PostStart() error {
 			s.logger.Warn("smart: use_asn is true but no ASN database resolved (set asn_database or experimental.geox.url.asn); ASN features disabled")
 		} else {
 			for _, p := range paths {
-				db, err := maxminddb.Open(p)
+				db, err := getSharedMMDB(p)
 				if err != nil {
 					s.logger.Warn("smart: failed to open ASN database [", p, "]: ", err, " (skipping; other sources still tried)")
 					continue
 				}
 				s.asnDBs = append(s.asnDBs, db)
-				s.logger.Info("smart: ASN database loaded from ", p)
+				s.logger.Info("smart: ASN database loaded from ", p, " (shared across groups via mmdbPool)")
 			}
 			if len(s.asnDBs) == 0 {
 				s.logger.Warn("smart: all configured ASN databases failed to open; ASN features disabled")
@@ -430,9 +638,9 @@ func (s *Smart) PostStart() error {
 	// it; otherwise DestGeoIP stays nil and those features fall back to 0.
 	if geoSvc := service.FromContext[adapter.GeoXService](s.ctx); geoSvc != nil {
 		if mmdbPath := geoSvc.MMDBPath(); mmdbPath != "" {
-			if db, err := maxminddb.Open(mmdbPath); err == nil {
+			if db, err := getSharedMMDB(mmdbPath); err == nil {
 				s.countryDB = db
-				s.logger.Info("smart: country mmdb loaded from ", mmdbPath, " (feeds DestGeoIP feature)")
+				s.logger.Info("smart: country mmdb loaded from ", mmdbPath, " (shared via mmdbPool)")
 			} else {
 				s.logger.Debug("smart: country mmdb not yet available: ", err)
 			}
@@ -467,38 +675,52 @@ func (s *Smart) PostStart() error {
 		}
 	}
 
+	// Hydrate runtime state from bbolt BEFORE any background task / dial
+	// path can read knownDead / breakers / manualSelected. Keeps the dial
+	// pipeline consistent with the pre-shutdown view within TTL bounds.
+	s.hydratePersistedState()
+	s.restorePinEndorsements()
+
 	// Start background tasks
 	s.taskCtx, s.taskCancel = context.WithCancel(context.Background())
 
 	type taskDef struct {
-		name    string
-		initial time.Duration
-		period  time.Duration
-		fn      func()
-		once    bool
+		name     string
+		initial  time.Duration
+		period   time.Duration
+		fn       func()
+		once     bool
+		idleSkip bool // true = skip execution when s.isGroupIdle() (battery-friendly)
 	}
 
 	tasks := []taskDef{
 		// Active URL probing — populates URLTestHistoryStorage so isAlive,
 		// selectFullScan ranking and fillProxies actually see dead nodes.
-		// Without this a standalone Smart group treats every node as alive.
-		{"health-check", 10 * time.Second, s.interval, s.runHealthCheck, false},
+		// SKIP when idle: 16 groups × 30 probes is the #1 CPU/battery
+		// drain on Android when the phone is in the user's pocket with
+		// no active traffic.
+		{"health-check", 10 * time.Second, s.interval, s.runHealthCheck, false, true},
 		// Warm the pipeline fast so /proxies/<tag>/weights returns non-empty
-		// within a minute of first traffic. Prefetch runs first (30 s) so the
-		// ranking tick (45 s) has per-target aggregates to score against; the
-		// live-stats fallback in WeightRanking covers the earliest window.
-		{"nodes-ranking", 45 * time.Second, 1 * time.Minute, s.updateNodeRanking, false},
-		{"prefetch", 30 * time.Second, 2 * time.Minute, s.runPrefetch, false},
-		{"recovery-check", 5 * time.Minute, 5 * time.Minute, s.checkAndRecoverDegradedNodes, false},
-		{"cleanup-old", 10 * time.Minute, 120 * time.Minute, s.cleanupOldRecords, false},
-		{"cleanup-orphan", 10 * time.Minute, 10 * time.Minute, s.cleanupOrphanedNodeCache, false},
-		// Orphan-groups cleanup only runs on one arbitrarily-chosen group each
-		// interval; it's process-global work (remove Smart store data for
-		// groups no longer present in config). Doing it per group still works
-		// because the logic is idempotent.
-		{"cleanup-orphan-groups", 15 * time.Minute, 120 * time.Minute, s.cleanupOrphanedGroups, false},
-		{"flush-queue", 5 * time.Second, 5 * time.Minute, s.flushQueue, false},
-		{"cache-adjust", 5 * time.Second, 5 * time.Minute, s.adjustCache, false},
+		// within a minute of first traffic. Idle-skip: ranking is pointless
+		// when no one's dialing.
+		{"nodes-ranking", 45 * time.Second, 1 * time.Minute, s.updateNodeRanking, false, true},
+		{"prefetch", 30 * time.Second, 2 * time.Minute, s.runPrefetch, false, true},
+		{"recovery-check", 5 * time.Minute, 5 * time.Minute, s.checkAndRecoverDegradedNodes, false, true},
+		// Stalled-conn watchdog: catches dialled-OK conns that never
+		// produce a first byte OR went silent mid-transfer. NOT idle-
+		// gated because by definition it only does work when at least
+		// one conn is in flight; an idle group skips in O(1).
+		{"stalled-watchdog", 10 * time.Second, watchdogScanInterval, s.runStalledConnWatchdog, false, false},
+		// Cleanup tasks are process-global (gated via claimGlobalTask) and
+		// their work is bounded — safe to keep running so data hygiene
+		// survives long idle periods.
+		{"cleanup-old", 10 * time.Minute, 120 * time.Minute, s.cleanupOldRecords, false, false},
+		{"cleanup-orphan", 10 * time.Minute, 10 * time.Minute, s.cleanupOrphanedNodeCache, false, false},
+		{"cleanup-orphan-groups", 15 * time.Minute, 120 * time.Minute, s.cleanupOrphanedGroups, false, false},
+		// Queue flush must run even when idle — ensures pending writes
+		// from the final pre-idle dials actually land on disk.
+		{"flush-queue", 5 * time.Second, 5 * time.Minute, s.flushQueue, false, false},
+		{"cache-adjust", 5 * time.Second, 5 * time.Minute, s.adjustCache, false, false},
 	}
 
 	for _, t := range tasks {
@@ -507,7 +729,22 @@ func (s *Smart) PostStart() error {
 		// singleflight de-dup kicks in even without staggering, but
 		// staggering also spreads the freshness-cache fill across time.
 		initial := staggeredInitialDelay(t.initial, s.groupOrdinal)
-		s.startTimedTask(t.name, initial, t.period, t.fn, t.once)
+		fn := t.fn
+		if t.idleSkip {
+			tname := t.name
+			fn = func() {
+				if s.isGroupIdle() {
+					// Idle groups skip CPU-heavy tasks entirely.
+					// Single-line debug trace so operators investigating
+					// "task stopped firing" can see it's intentional.
+					s.logger.Debug("smart[", s.Tag(), "] skip ", tname,
+						" — group idle (no dial in ", idleThresholdNanos/int64(time.Second), "s)")
+					return
+				}
+				t.fn()
+			}
+		}
+		s.startTimedTask(t.name, initial, t.period, fn, t.once)
 	}
 
 	// Startup summary — single info line with all relevant flags.
@@ -539,61 +776,88 @@ func (s *Smart) PostStart() error {
 	if s.dataCollector != nil {
 		collectStatus = "on(" + formatFloat(s.sampleRate, 2) + ")"
 	}
+	// 在 PostStart 阶段重新输出 algorithm 确认日志。
+	// NewSmart 构造阶段 SetAlgorithm 已经设置了算法，但那时
+	// logFactory 还未 Start()，日志可能被丢弃。这里确保
+	// 用户一定能看到生效的算法名称——解决 "配置无效" 的误解。
+	algoStatus := s.currentAlgorithm()
+	hysteresisStatus := "off"
+	if s.hysteresisWindow > 0 {
+		hysteresisStatus = s.hysteresisWindow.String()
+	}
 	s.logger.Info("smart[", s.Tag(), "] started: ", outboundCount, " outbounds, ",
 		len(tasks), " background tasks, testURL=", s.testURL,
 		" interval=", s.interval, " asn=", asnStatus,
+		" algorithm=", algoStatus, " hysteresis=", hysteresisStatus,
 		" ml=", mlStatus, " collect=", collectStatus)
+	// 对非默认算法额外输出一条醒目的单独日志行，方便用户通过
+	// grep 确认算法配置已生效。
+	if algoStatus != smartAlgoStrictBest {
+		s.logger.Info("smart[", s.Tag(), "] algorithm: ", algoStatus, " (confirmed in PostStart)")
+	}
 
 	s.started.Store(true)
 	return nil
 }
 
+// startTimedTask registers a periodic task on the process-wide timing wheel.
+//
+// The previous implementation spawned one goroutine per task that blocked on
+// time.NewTicker — for 15 Smart groups × 9 tasks = 135 parked goroutines
+// each costing 2-8 KB stack + a runtime timer slot. Now a single bucket
+// processor goroutine in timingwheel.TimingWheel drives every group's
+// tasks, and the actual work routes through the shared ants pool (which
+// already caps global concurrency at 64 workers).
+//
+// Semantic preservation:
+//   - "task completes before next tick considers firing" — enforced by
+//     running fn() synchronously inside the ants worker before the
+//     scheduler's Next() computes the next firing time.
+//   - Cancellation via s.taskCtx.Done() — checked inside the fire
+//     callback AND via scheduledTask.stop() on Close().
+//   - Per-group startup staggering via groupOrdinal to avoid
+//     thundering-herd on cold start.
 func (s *Smart) startTimedTask(name string, initial, period time.Duration, fn func(), once bool) {
-	s.taskWg.Add(1)
-	// Route the actual work through the shared ants pool so concurrent
-	// ticks across N Smart groups don't all fire CPU-heavy prefetch /
-	// ranking / cleanup simultaneously. The pool caps total concurrency;
-	// excess work queues briefly instead of spawning unbounded goroutines.
-	// The ticker goroutine itself stays lightweight (just waiting on tick).
 	worker := getSmartWorker()
-	submit := func() {
-		done := make(chan struct{})
-		worker.submit(func() {
-			defer close(done)
-			fn()
-		})
-		// Block only if pool back-pressure engages — otherwise the call
-		// returns immediately once the worker starts. This preserves the
-		// prior "task completes before next tick considers firing"
-		// invariant so updateNodeRanking doesn't race against itself.
+	s.taskWg.Add(1)
+	wrapped := func() {
+		defer func() {
+			if once {
+				s.taskWg.Done()
+			}
+		}()
+		// Cheap context check at fire time — wheel might have queued us
+		// before group close but run us after.
 		select {
-		case <-done:
 		case <-s.taskCtx.Done():
+			return
+		default:
+		}
+		fn()
+	}
+	// Add a sub-second random skew on top of the staggered initial to
+	// spread tasks that share the same ordinal bucket.
+	skew := time.Duration(rand.Float64() * float64(period) * 0.1)
+	task := worker.scheduleTask(initial+skew, period, wrapped, once, s.taskCtx)
+	s.scheduledTasks = append(s.scheduledTasks, task)
+	if !once {
+		// For non-once tasks we keep a slot on taskWg so Close() waits
+		// for the final fire. Release it during Close by calling Done()
+		// from stopScheduledTasks.
+	}
+}
+
+// stopScheduledTasks cancels every timing-wheel entry this group registered
+// and releases the matching taskWg slots so Close() can proceed without
+// waiting for the wheel processor to notice cancellation via context.
+func (s *Smart) stopScheduledTasks() {
+	for _, t := range s.scheduledTasks {
+		t.stop()
+		if !t.once {
+			s.taskWg.Done()
 		}
 	}
-	go func() {
-		defer s.taskWg.Done()
-		jitter := time.Duration(rand.Float64() * 30 * float64(time.Second))
-		select {
-		case <-time.After(initial + jitter):
-		case <-s.taskCtx.Done():
-			return
-		}
-		submit()
-		if once {
-			return
-		}
-		ticker := time.NewTicker(period + jitter)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ticker.C:
-				submit()
-			case <-s.taskCtx.Done():
-				return
-			}
-		}
-	}()
+	s.scheduledTasks = nil
 }
 
 func (s *Smart) Close() error {
@@ -601,21 +865,37 @@ func (s *Smart) Close() error {
 	if s.taskCancel != nil {
 		s.taskCancel()
 	}
+	// Stop every timing-wheel registration BEFORE waiting on taskWg.
+	// The wheel's bucket processor might still be mid-fire for our group
+	// when Close is called; stopScheduledTasks tells it to drop future
+	// firings and releases the WaitGroup slots that would otherwise
+	// block here forever (the periodic tasks never naturally "finish").
+	s.stopScheduledTasks()
 	s.taskWg.Wait()
 	// Shared LightGBM model, downloader and collector are owned by
 	// experimental.smart.Service — do NOT close them here.
 	if s.store != nil {
-		s.store.FlushQueue(true)
+		// StoreFlushNow drains in-flight async BatchSaves AND fsyncs, so
+		// a process kill immediately after Close cannot lose the last
+		// batch of observed dial stats. FlushQueue(true) alone would
+		// return before the async goroutines finish committing.
+		_ = s.store.StoreFlushNow()
 	}
 	for _, db := range s.asnDBs {
-		_ = db.Close()
+		releaseSharedMMDB(db)
 	}
 	s.asnDBs = nil
 	if s.countryDB != nil {
-		_ = s.countryDB.Close()
+		releaseSharedMMDB(s.countryDB)
+		s.countryDB = nil
 	}
 	return nil
 }
+
+// Hidden / Icon expose the dashboard hints from option.GroupCommonOption.
+// See adapter.OutboundGroup interface for the semantic contract.
+func (s *Smart) Hidden() bool { return s.hidden }
+func (s *Smart) Icon() string { return s.icon }
 
 // TestURL returns the URL used for aliveness checks.
 func (s *Smart) TestURL() string { return s.testURL }
@@ -659,6 +939,7 @@ func (s *Smart) getManualSelected() string {
 func (s *Smart) SelectOutbound(tag string) bool {
 	if tag == "" {
 		s.manualSelected.Store("")
+		s.persistManualPinDelete()
 		s.logger.Info("smart[", s.Tag(), "] manual pin cleared, automatic selection resumed")
 		return true
 	}
@@ -670,6 +951,7 @@ func (s *Smart) SelectOutbound(tag string) bool {
 		if ob.Tag() == tag {
 			s.manualSelected.Store(tag)
 			s.setLastSelected(tag)
+			s.persistManualPin(tag)
 			s.logger.Info("smart[", s.Tag(), "] manually pinned to [", tag, "]")
 			return true
 		}
@@ -709,25 +991,137 @@ func (s *Smart) WeightRanking(forceRefresh bool) ([]smart.NodeRank, error) {
 	if snap == nil || len(snap.tags) == 0 {
 		return []smart.NodeRank{}, nil
 	}
+	// Primary source (non-refresh path): in-process snapshot from the
+	// last successful updateNodeRanking. Always preferred when fresh
+	// because it bypasses the bbolt write→flush→read round-trip that
+	// previously made WeightRanking fall through for several seconds
+	// after every recompute.
+	const snapshotMaxAge = 30 * time.Minute
+	if !forceRefresh {
+		if mem := s.rankingSnapshot.Load(); mem != nil &&
+			len(mem.ranking) > 0 && time.Since(mem.computedAt) < snapshotMaxAge {
+			return s.finalizeRanking(mem.ranking, true), nil
+		}
+	}
 	if forceRefresh {
 		ranking, err := s.store.GetNodeWeightRanking(s.Tag(), smartConfigName, s.testURL, s.isAlive, snap.tags)
 		if err != nil {
 			return []smart.NodeRank{}, err
 		}
 		if len(ranking) > 0 {
+			ranking = s.finalizeRanking(ranking, false)
+			s.publishRankingSnapshot(ranking)
 			return ranking, nil
 		}
 		// Authoritative recompute came up empty — fall through to live.
 	} else if cached, err := s.store.GetNodeWeightRankingCache(s.Tag(), smartConfigName); err == nil && len(cached) > 0 {
+		// bbolt-cached ranking exists (recovered after restart): warm
+		// the in-process snapshot so subsequent calls hit the fast path.
+		cached = s.finalizeRanking(cached, false)
+		s.publishRankingSnapshot(cached)
 		return cached, nil
 	}
 	if live := s.store.GetLiveNodeRanking(s.Tag(), smartConfigName, s.isAlive, snap.tags); len(live) > 0 {
+		// Live computation succeeded — also publish to the snapshot so
+		// repeat calls in the next 30 min skip the GetAllStats scan.
+		// finalizeRanking is a no-op for live results (they already
+		// have correct counts by construction) but kept for symmetry.
+		live = s.finalizeRanking(live, false)
+		s.publishRankingSnapshot(live)
 		return live, nil
 	}
 	if delayed := s.delayBasedRanking(); len(delayed) > 0 {
-		return delayed, nil
+		return s.finalizeRanking(delayed, false), nil
 	}
 	return []smart.NodeRank{}, nil
+}
+
+// publishRankingSnapshot updates the in-process ranking cache. Idempotent;
+// concurrent callers all overwrite with the latest result. Used by both
+// the API path (when it computes via live/cache fallback) and the
+// scheduled updateNodeRanking task.
+func (s *Smart) publishRankingSnapshot(ranking []smart.NodeRank) {
+	if len(ranking) == 0 {
+		return
+	}
+	// Defensive copy so a concurrent mutation of the source slice
+	// (sort.Slice in updateNodeRanking, for example) can't tear the
+	// snapshot mid-read on another goroutine.
+	clone := make([]smart.NodeRank, len(ranking))
+	copy(clone, ranking)
+	s.rankingSnapshot.Store(&smartRankingSnapshot{
+		ranking:    clone,
+		computedAt: time.Now(),
+	})
+}
+
+// DiagnosticSnapshot returns the deep internal state of this Smart
+// group for the /smart/groups/{name}/diag endpoint. Read-only — never
+// mutates anything. Designed so operators staring at "TargetCount is
+// wrong" can see exactly which path the API would serve from and
+// what the source-of-truth bbolt table actually contains.
+func (s *Smart) DiagnosticSnapshot() map[string]any {
+	out := map[string]any{
+		"name":             s.Tag(),
+		"algorithm":        s.CurrentAlgorithm(),
+		"hysteresis":       s.HysteresisDuration().String(),
+		"policy_priority":  s.PolicyPriorityRules(),
+		"members":          len(s.All()),
+		"now":              s.Now(),
+		"fixed":            s.Selected(),
+		"test_url":         s.TestURL(),
+	}
+
+	// Snapshot age — hint for which tier serves the next /weights call.
+	if mem := s.rankingSnapshot.Load(); mem != nil {
+		out["snapshot_entries"] = len(mem.ranking)
+		out["snapshot_age"] = time.Since(mem.computedAt).Truncate(time.Second).String()
+	} else {
+		out["snapshot_entries"] = 0
+		out["snapshot_age"] = "(none)"
+	}
+
+	// Source-of-truth from bbolt stats table — which (target, node)
+	// pairs actually carry observed dial outcomes RIGHT NOW. Bypasses
+	// every cache layer above bbolt's GetSubBytesByPath.
+	if s.store != nil {
+		snap := s.state.Load()
+		if snap != nil {
+			realTC, realSC := s.collectRealCoverage(snap.tags)
+			perNode := make(map[string]map[string]int, len(realTC))
+			for tag, tc := range realTC {
+				perNode[tag] = map[string]int{
+					"target_count":   tc,
+					"sample_count":   realSC[tag],
+				}
+			}
+			out["live_coverage"] = perNode
+		}
+	}
+	return out
+}
+
+// finalizeRanking is the single chokepoint every WeightRanking return
+// path runs through. It force-refreshes TargetCount / SampleCount
+// from the live bbolt stats so the API surface always reports counts
+// consistent with what the dial path observes. Called on a fresh
+// (defensive-copied) slice when the source might be a shared
+// snapshot, otherwise mutates in place.
+func (s *Smart) finalizeRanking(ranking []smart.NodeRank, fromSnapshot bool) []smart.NodeRank {
+	if len(ranking) == 0 || s.store == nil {
+		return ranking
+	}
+	target := ranking
+	if fromSnapshot {
+		// Snapshot is shared between callers; mutate a copy so a
+		// transient enrich result doesn't poison the cached snapshot
+		// for callers that follow. The snapshot itself is also
+		// re-enriched on its own cadence elsewhere.
+		target = make([]smart.NodeRank, len(ranking))
+		copy(target, ranking)
+	}
+	s.store.EnrichRankingCounts(s.Tag(), smartConfigName, target)
+	return target
 }
 
 // delayBasedRanking synthesizes a NodeRank list from URLTestHistoryStorage
@@ -773,6 +1167,12 @@ func (s *Smart) delayBasedRanking() []smart.NodeRank {
 	if maxDelay == 0 {
 		return nil
 	}
+	// Pull real per-node target/sample counts from the stats table so the
+	// delay-based fallback reports the same TargetCount semantic as the
+	// live/prefetch paths: number of distinct targets the node has been
+	// observed on. Truly cold-start nodes (no stats yet) get 0 — that is
+	// the honest answer, not a guess.
+	realTargets, realSamples := s.collectRealCoverage(snap.tags)
 	now := time.Now().Unix()
 	result := make([]smart.NodeRank, 0, len(rows))
 	for _, r := range rows {
@@ -791,6 +1191,8 @@ func (s *Smart) delayBasedRanking() []smart.NodeRank {
 			Name:        r.name,
 			Weight:      raw,
 			Score:       pct,
+			TargetCount: realTargets[r.name],
+			SampleCount: realSamples[r.name],
 			LastUpdated: now,
 		})
 	}
@@ -843,6 +1245,82 @@ func (s *Smart) delayBasedRanking() []smart.NodeRank {
 	return result
 }
 
+// collectRealCoverage walks the bbolt stats table once and returns, per
+// node tag, (a) the number of distinct targets it has been observed
+// on and (b) the lifetime sum of success+failure samples across those
+// targets. Restricted to tags in `wanted` so we don't pay for nodes
+// that aren't members of the calling group.
+//
+// Used by delayBasedRanking to populate NodeRank.TargetCount /
+// SampleCount with REAL counts instead of placeholder values, so the
+// dashboard's confidence indicator stays honest even on the cold-start
+// fallback. Returns (nil, nil) when the store is unavailable or has no
+// data — callers must handle that as "all zeros, no coverage yet".
+func (s *Smart) collectRealCoverage(wanted []string) (targets, samples map[string]int) {
+	if s.store == nil || len(wanted) == 0 {
+		return nil, nil
+	}
+	wantSet := make(map[string]struct{}, len(wanted))
+	for _, t := range wanted {
+		wantSet[t] = struct{}{}
+	}
+	targets = make(map[string]int, len(wanted))
+	samples = make(map[string]int, len(wanted))
+	// Per-node set of (target) tuples already counted, so the two
+	// data sources don't double-add the same pair. atomic record
+	// cache wins on conflict — it's ALWAYS at least as fresh as
+	// bbolt (bbolt is the lagging copy after BatchSave).
+	seen := make(map[string]map[string]struct{}, len(wanted))
+	addPair := func(node, target string, count int) {
+		if count <= 0 {
+			return
+		}
+		ts := seen[node]
+		if ts == nil {
+			ts = make(map[string]struct{}, 4)
+			seen[node] = ts
+		}
+		if _, dup := ts[target]; dup {
+			return
+		}
+		ts[target] = struct{}{}
+		targets[node]++
+		samples[node] += count
+	}
+
+	// Source 1: in-memory atomic records — reflects success/failure
+	// increments the moment recordStats runs, before BatchSave has
+	// flushed to bbolt. Without this the diag endpoint reports zero
+	// coverage on a busy group right after dials succeed.
+	s.store.IterateAtomicRecords(s.Tag(), smartConfigName, func(target, node string, rec *smart.AtomicStatsRecord) bool {
+		if _, want := wantSet[node]; !want {
+			return true
+		}
+		count := int(rec.GetInt64("success") + rec.GetInt64("failure"))
+		addPair(node, target, count)
+		return true
+	})
+
+	// Source 2: bbolt — covers entries that were evicted from the
+	// in-memory recordCache (LRU pressure) but still persist on disk.
+	if allStats, err := s.store.GetAllStats(s.Tag(), smartConfigName); err == nil {
+		for target, nodeStats := range allStats {
+			for nodeName, data := range nodeStats {
+				if _, want := wantSet[nodeName]; !want {
+					continue
+				}
+				var rec smart.StatsRecord
+				if smart.UnmarshalStatsRecord(data, &rec) != nil {
+					continue
+				}
+				count := int(rec.Success + rec.Failure)
+				addPair(nodeName, target, count)
+			}
+		}
+	}
+	return targets, samples
+}
+
 // FlushStore wipes all Smart persistent data for this specific group AND
 // resets every piece of in-process runtime state that could otherwise
 // make a flushed group still "feel" populated: manual pin, cold-start
@@ -864,10 +1342,17 @@ func (s *Smart) FlushStore() (smart.FlushStats, error) {
 
 	s.knownDead.Clear()
 	s.breakers.Clear()
+	s.aliveAt.Clear()
+	if s.pinEndorsements != nil {
+		s.pinEndorsements.Clear()
+	}
 
 	s.shortLifeMu.Lock()
 	s.shortLife = make(map[string][]time.Time)
 	s.shortLifeMu.Unlock()
+	if s.resetEvents != nil {
+		s.resetEvents.reset()
+	}
 
 	// Drop per-target registry so a subsequent mass-close doesn't chase
 	// pointers to conns that were relevant only to the pre-flush state.
@@ -921,6 +1406,7 @@ func (s *Smart) ClearSelection() ClearSelectionResult {
 
 	s.manualSelected.Store("")
 	s.lastSelectedTag.Store("")
+	s.persistManualPinDelete()
 
 	if s.store != nil {
 		s.store.ClearUnwrapByGroup(s.Tag(), smartConfigName)
@@ -938,10 +1424,10 @@ func (s *Smart) ClearSelection() ClearSelectionResult {
 	// Kick the ranking pipeline asynchronously so the next /weights or
 	// DialContext sees fresh data. Cheap: goroutines are work-stealing and
 	// the functions are idempotent.
-	go func() {
+	getSmartWorker().submit(func() {
 		s.runPrefetch()
 		s.updateNodeRanking()
-	}()
+	})
 
 	res.Now = s.Now()
 	return res
@@ -957,10 +1443,10 @@ func (s *Smart) RecomputeWeights() {
 	if s.store == nil {
 		return
 	}
-	go func() {
+	getSmartWorker().submit(func() {
 		s.runPrefetch()
 		s.updateNodeRanking()
-	}()
+	})
 }
 
 // DefaultBlockDuration applied by MarkBlocked when caller doesn't specify one.
@@ -1019,12 +1505,19 @@ func (s *Smart) MarkBlocked(nodeTag string, duration time.Duration) error {
 // show a useful value instead of a static placeholder.
 //
 // Fallback order:
-//  1. Last successful dial's winning tag.
-//  2. Top-ranked node from the pre-sorted ranking cache, if any.
-//  3. Lowest URLTest latency among alive outbounds (cold-start signal).
-//  4. First outbound in the snapshot (best-effort guess).
-//  5. Empty string — OutboundGroup helpers fall back to the group's own tag.
+//  1. Active manual pin — reflects the user's explicit choice immediately,
+//     even before the first dial has landed. Without this, the dashboard
+//     "now" field lagged behind the "fixed" field for several seconds
+//     after pinning, which users interpreted as "the pin didn't take".
+//  2. Last successful dial's winning tag.
+//  3. Top-ranked node from the pre-sorted ranking cache, if any.
+//  4. Lowest URLTest latency among alive outbounds (cold-start signal).
+//  5. First outbound in the snapshot (best-effort guess).
+//  6. Empty string — OutboundGroup helpers fall back to the group's own tag.
 func (s *Smart) Now() string {
+	if pinned := s.getManualSelected(); pinned != "" {
+		return pinned
+	}
 	if v, ok := s.lastSelectedTag.Load().(string); ok && v != "" {
 		return v
 	}
@@ -1064,12 +1557,57 @@ func (s *Smart) Now() string {
 	return ""
 }
 
-// setLastSelected records a successful dial winner for Now() reporting.
+// setLastSelected records a successful dial winner for Now() reporting
+// AND bumps the activity timestamp used by the idle-aware task
+// scheduler. Called from every successful DialContext / ListenPacket
+// path so the group is considered "active" while traffic is flowing.
 func (s *Smart) setLastSelected(tag string) {
 	if tag == "" {
 		return
 	}
 	s.lastSelectedTag.Store(tag)
+	s.lastDialAt.Store(time.Now().UnixNano())
+	// First successful dial of this process lifetime: kick the ranking
+	// pipeline immediately instead of waiting up to 45 s for the
+	// scheduled "nodes-ranking" task to fire. Without this, a fresh
+	// process serves /weights from delayBasedRanking for nearly a
+	// minute even when stats already exist on disk and the user is
+	// actively dialing. The kick runs on the shared worker pool so
+	// it doesn't block this dial, and Once-gating ensures we pay the
+	// scan cost only once per restart.
+	s.rankingKickOnce.Do(func() {
+		if s.store == nil {
+			return
+		}
+		// Defer slightly so the very first dial's stats record has
+		// time to land in the queue (BatchSave threshold kicks in for
+		// the synchronous path; otherwise the 5 s flush task picks it
+		// up). 2 s is enough for both paths and keeps the kick well
+		// inside the 45 s window we're cutting short.
+		w := getSmartWorker()
+		w.scheduleTask(2*time.Second, 0, s.updateNodeRanking, true, s.taskCtx)
+	})
+}
+
+// idleThresholdNanos — how long without a successful dial before the
+// group's periodic tasks (health-check / prefetch / ranking / cache-adjust)
+// are skipped. Queue-flush still runs so any pending writes land on disk,
+// but the CPU-heavy scans are skipped entirely. Chosen at 2 minutes —
+// short enough that "phone in pocket" idles catch within one probe
+// cycle, long enough that brief pauses in browsing don't cause
+// measurable extra probes on resume.
+const idleThresholdNanos = int64(2 * time.Minute)
+
+// isGroupIdle reports whether the group has seen no successful dial in
+// the last idleThresholdNanos and its periodic tasks can safely skip.
+// A group that's never dialed (lastDialAt == 0) is considered idle too —
+// the scheduler will skip until the first real dial wakes it.
+func (s *Smart) isGroupIdle() bool {
+	last := s.lastDialAt.Load()
+	if last == 0 {
+		return true
+	}
+	return time.Now().UnixNano()-last > idleThresholdNanos
 }
 
 // All returns a snapshot of all outbound tags.
@@ -1104,32 +1642,14 @@ func (s *Smart) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, me
 }
 
 func (s *Smart) buildMeta(metadata adapter.InboundContext, isUDP bool) *smartDialMeta {
-	host := metadata.Destination.Fqdn
-	if host == "" {
-		host = metadata.SniffHost
-	}
-
-	// Build the IP list fed into target key / ASN / country lookups.
-	//
-	// DestinationAddresses is only populated by DNS-resolution in the router;
-	// connections issued to a raw IP (Telegram's 91.108.56.170, custom DNS
-	// servers, p2p bootstrap peers, etc.) leave that slice empty — the IP
-	// lives only in metadata.Destination.Addr. Ignoring it means:
-	//   - GetEffectiveTarget receives ("", "") → returns "" → target empty
-	//   - recordStats early-returns when target == "" → NO stats recorded
-	//   - /proxies/<tag>/weights ranking excludes these destinations forever
-	//   - lookupASN/lookupCountry return empty → LightGBM features 16/17/
-	//     23-26 silently degrade for IP-direct traffic
-	ips := metadata.DestinationAddresses
-	if len(ips) == 0 && metadata.Destination.Addr.IsValid() {
-		ips = []netip.Addr{metadata.Destination.Addr}
-	}
+	host := pickHostFromMetadata(metadata)
+	ips := pickIPsFromMetadata(metadata)
 	var firstIP string
 	if len(ips) > 0 {
 		firstIP = ips[0].String()
 	}
 
-	target := smart.GetEffectiveTarget(host, firstIP)
+	target := normaliseDialTarget(host, firstIP)
 	asnCode := s.lookupASN(ips)
 	geoIP := s.lookupCountry(ips)
 
@@ -1144,6 +1664,103 @@ func (s *Smart) buildMeta(metadata adapter.InboundContext, isUDP bool) *smartDia
 	}
 }
 
+// pickHostFromMetadata walks every InboundContext field that can carry
+// a hostname for the dial target and returns the first non-empty one.
+//
+// The router doesn't always populate the same field — TUN inbounds
+// rely on sniff, DNS rules expose Domain, and rule-action redirects
+// move the original target into OriginDestination /
+// RouteOriginalDestination. Reading only the first source (as the
+// previous version did) silently dropped target context for whole
+// classes of connections, leaving recordStats with no key under
+// which to record success / failure.
+func pickHostFromMetadata(m adapter.InboundContext) string {
+	if m.Destination.Fqdn != "" {
+		return m.Destination.Fqdn
+	}
+	if m.SniffHost != "" {
+		return m.SniffHost
+	}
+	if m.Domain != "" {
+		return m.Domain
+	}
+	if m.OriginDestination.Fqdn != "" {
+		return m.OriginDestination.Fqdn
+	}
+	if m.RouteOriginalDestination.Fqdn != "" {
+		return m.RouteOriginalDestination.Fqdn
+	}
+	return ""
+}
+
+// pickIPsFromMetadata aggregates every IP candidate carried by the
+// InboundContext into one ordered, de-duplicated list. DestinationAddresses
+// (post-DNS) goes first; the bare Destination.Addr (when Destination is
+// already an IP literal) is next; CacheIPs / OriginDestination /
+// RouteOriginalDestination cover redirected and dns-cache paths the
+// previous single-source read missed entirely.
+func pickIPsFromMetadata(m adapter.InboundContext) []netip.Addr {
+	cap := len(m.DestinationAddresses) + len(m.CacheIPs) + 3
+	out := make([]netip.Addr, 0, cap)
+	seen := make(map[netip.Addr]struct{}, cap)
+	add := func(a netip.Addr) {
+		if !a.IsValid() {
+			return
+		}
+		if _, dup := seen[a]; dup {
+			return
+		}
+		seen[a] = struct{}{}
+		out = append(out, a)
+	}
+	for _, a := range m.DestinationAddresses {
+		add(a)
+	}
+	add(m.Destination.Addr)
+	for _, a := range m.CacheIPs {
+		add(a)
+	}
+	add(m.OriginDestination.Addr)
+	add(m.RouteOriginalDestination.Addr)
+	return out
+}
+
+// normaliseDialTarget produces the target key fed into the stats
+// store. Three-tier resolution:
+//
+//  1. GetEffectiveTarget normalises the hostname into a wildcard form
+//     (e.g. a1b2.example.com → *.example.com) so unrelated subdomains
+//     of the same site share a single bucket.
+//  2. If the host turns out to be an IP literal (ParseAddr succeeds)
+//     and we already have an IP fallback, route that through directly
+//     instead of letting it fall into a degenerate wildcard like
+//     "*.4" (publicsuffix mis-handling) and split a single endpoint
+//     into multiple stats keys.
+//  3. Final fallback ladder: host → IP → "_unbound_" sentinel so
+//     recordStats never sees an empty target. The empty-target
+//     early-return in recordStats was the single biggest cause of
+//     "TargetCount stays 0 in /weights" reports.
+func normaliseDialTarget(host, firstIP string) string {
+	// IP literal in the host slot: short-circuit so it doesn't go
+	// through the wildcard normaliser (which assumes domain shape).
+	if host != "" {
+		if _, err := netip.ParseAddr(host); err == nil {
+			return host
+		}
+	}
+	target := smart.GetEffectiveTarget(host, firstIP)
+	if target != "" {
+		return target
+	}
+	if host != "" {
+		return host
+	}
+	if firstIP != "" {
+		return firstIP
+	}
+	return "_unbound_"
+}
+
 // metaFromDestination synthesizes a smartDialMeta directly from the
 // socksaddr argument when the per-conn meta wasn't populated by
 // NewConnectionEx — typical when an upper-level group (Selector / URLTest /
@@ -1155,26 +1772,45 @@ func (s *Smart) buildMeta(metadata adapter.InboundContext, isUDP bool) *smartDia
 // destGeoIP / asnCode if present so we don't lose data the upstream layer
 // might have populated.
 func (s *Smart) metaFromDestination(existing *smartDialMeta, destination M.Socksaddr, isUDP bool) *smartDialMeta {
+	// Host preference: existing meta (already-resolved upstream
+	// context) wins over the bare destination Fqdn so a Selector →
+	// Smart chain doesn't lose the SniffHost or Domain that the
+	// inbound originally provided.
 	host := ""
-	if destination.IsFqdn() {
-		host = destination.Fqdn
-	}
 	if existing != nil && existing.host != "" {
 		host = existing.host
+	} else if destination.IsFqdn() {
+		host = destination.Fqdn
 	}
 
+	// IP list: union of existing.resolvedIPs and destination.Addr,
+	// de-duplicated. Existing IPs come first because they typically
+	// reflect the real DNS resolution; the bare destination.Addr is
+	// kept as a last-resort literal.
 	var ips []netip.Addr
-	if existing != nil && len(existing.resolvedIPs) > 0 {
-		ips = existing.resolvedIPs
-	} else if destination.Addr.IsValid() {
-		ips = []netip.Addr{destination.Addr}
+	seen := make(map[netip.Addr]struct{}, 4)
+	if existing != nil {
+		for _, a := range existing.resolvedIPs {
+			if a.IsValid() {
+				if _, dup := seen[a]; !dup {
+					seen[a] = struct{}{}
+					ips = append(ips, a)
+				}
+			}
+		}
+	}
+	if destination.Addr.IsValid() {
+		if _, dup := seen[destination.Addr]; !dup {
+			seen[destination.Addr] = struct{}{}
+			ips = append(ips, destination.Addr)
+		}
 	}
 	firstIP := ""
 	if len(ips) > 0 {
 		firstIP = ips[0].String()
 	}
 
-	target := smart.GetEffectiveTarget(host, firstIP)
+	target := normaliseDialTarget(host, firstIP)
 	asnCode := ""
 	if existing != nil && existing.asnCode != "" {
 		asnCode = existing.asnCode
@@ -1251,6 +1887,8 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		return nil, err
 	}
 	s.setLastSelected(proxyTag)
+	s.rememberStickyChoice(meta.smartTarget, proxyTag, isUDP)
+	s.rememberHysteresisChoice(meta.smartTarget, proxyTag, isUDP)
 	s.markAlive(proxyTag) // successful dial = confirmed alive; clears knownDead
 	s.logger.InfoContext(ctx, "smart[", s.Tag(), "] ", network, " → ", destination,
 		" via [", proxyTag, "] in ", connectTime, "ms (target=",
@@ -1303,6 +1941,8 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 
 		if err == nil {
 			s.setLastSelected(ob.Tag())
+			s.rememberStickyChoice(meta.smartTarget, ob.Tag(), true)
+			s.rememberHysteresisChoice(meta.smartTarget, ob.Tag(), true)
 			s.markAlive(ob.Tag())
 			s.logger.InfoContext(ctx, "smart[", s.Tag(), "] UDP → ", destination,
 				" via [", ob.Tag(), "] in ", connectTime, "ms (target=",
@@ -1314,7 +1954,10 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		s.markDead(ob.Tag())
 		s.logger.DebugContext(ctx, "smart[", s.Tag(), "] UDP probe [", ob.Tag(),
 			"] failed in ", connectTime, "ms: ", err)
-		go s.recordStats("failed", meta, ob.Tag(), connectTime, 0, 0, 0, 0, 0, 0)
+		tag, ct, m := ob.Tag(), connectTime, meta
+		getSmartWorker().submit(func() {
+			s.recordStats("failed", m, tag, ct, 0, 0, 0, 0, 0, 0)
+		})
 	}
 
 	return nil, finalErr
@@ -1330,40 +1973,88 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 //                  still bias toward fast nodes before any stats accumulate)
 //   - "fallback" : no signal at all; random pick filtered by alive/blocked
 func (s *Smart) selectProxiesTraced(meta *smartDialMeta, all []adapter.Outbound, isUDP bool) ([]adapter.Outbound, bool, string) {
-	// Manual selection short-circuit: if user pinned a node, use ONLY that node
-	// (matches mihomo's Set/ForceSet semantics).
+	// Manual selection short-circuit — respects the user's pin while
+	// refusing to be trapped by a dead node.
+	//
+	// Three cases:
+	//
+	//   a) Pin points at an existing node AND the node is currently
+	//      healthy (isAlive && breaker closed) → honour the pin,
+	//      exclusive dial. Matches mihomo Set/ForceSet semantics.
+	//
+	//   b) Pin points at an existing node BUT the node is currently
+	//      dead or its breaker has tripped → temporarily bypass to
+	//      the algorithm path so the user's request still completes.
+	//      The pin state is LEFT INTACT, so the moment markAlive
+	//      clears knownDead / resets the breaker, the next dial
+	//      snaps back to the pin automatically. This is what "user
+	//      pinned 10x JP but it's broken right now" should feel like.
+	//
+	//   c) Pin points at a non-existent node (provider reloaded,
+	//      subscription refreshed) → clear the pin outright and
+	//      fall through; the pin has no meaning any more.
 	if selected := s.getManualSelected(); selected != "" {
+		var pinnedOb adapter.Outbound
 		for _, ob := range all {
 			if ob.Tag() == selected {
-				return []adapter.Outbound{ob}, true, "manual"
+				pinnedOb = ob
+				break
 			}
 		}
-		// Pinned tag no longer in provider set — clear pin and fall through.
-		s.manualSelected.Store("")
-		s.logger.Warn("smart[", s.Tag(), "] pinned node [", selected, "] no longer exists, clearing pin")
+		switch {
+		case pinnedOb == nil:
+			s.manualSelected.Store("")
+			s.persistManualPinDelete()
+			s.logger.Warn("smart[", s.Tag(), "] pinned node [", selected,
+				"] no longer exists, clearing pin")
+		case !s.isAlive(selected) || s.isBreakerOpen(selected):
+			// Log once-per-event so operators see the bypass happen
+			// without spamming on every dial to a still-broken pin.
+			if s.pinBypassLogged.CompareAndSwap(false, true) {
+				s.logger.Warn("smart[", s.Tag(), "] pinned node [", selected,
+					"] unhealthy (alive=", s.isAlive(selected),
+					" breaker-open=", s.isBreakerOpen(selected),
+					"); bypassing to algorithm until it recovers")
+			}
+		default:
+			// Pin healthy — reset the bypass-log latch so the NEXT
+			// outage gets its own log line.
+			s.pinBypassLogged.Store(false)
+			return []adapter.Outbound{pinnedOb}, true, "manual"
+		}
 	}
 
-	if s.store == nil || meta.smartTarget == "" {
+	target := ""
+	if meta != nil {
+		target = meta.smartTarget
+	}
+
+	if s.store == nil || meta == nil || meta.smartTarget == "" {
 		// No store AND no target — try delay tier anyway before giving up.
 		if names, weights := s.delayRankedNames(all, isUDP); len(names) > 0 {
-			return s.fillProxies(names, weights, all, smartMaxSelected, isUDP, false), false, "delay"
+			out := s.fillProxies(target, names, weights, all, smartMaxSelected, isUDP, false)
+			return s.applyHysteresis(s.reorderForAlgorithm(s.reorderByPriority(out, meta), target, isUDP), target, isUDP), false, "delay"
 		}
-		return s.fillProxies(nil, nil, all, smartMaxSelected, isUDP, false), false, "fallback"
+		out := s.fillProxies(target, nil, nil, all, smartMaxSelected, isUDP, false)
+		return s.applyHysteresis(s.reorderForAlgorithm(s.reorderByPriority(out, meta), target, isUDP), target, isUDP), false, "fallback"
 	}
 
 	// Tier 1: unwrap cache
 	if names := s.store.GetUnwrapResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP); len(names) > 0 {
-		return s.fillProxies(names, nil, all, smartMaxSelected, isUDP, true), true, "unwrap"
+		out := s.fillProxies(target, names, nil, all, smartMaxSelected, isUDP, true)
+		return s.applyHysteresis(s.reorderForAlgorithm(s.reorderByPriority(out, meta), target, isUDP), target, isUDP), true, "unwrap"
 	}
 
 	// Tier 2: prefetch cache
 	if names, weights := s.store.GetPrefetchResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP); len(names) > 0 {
-		return s.fillProxies(names, weights, all, smartMaxSelected, isUDP, false), false, "prefetch"
+		out := s.fillProxies(target, names, weights, all, smartMaxSelected, isUDP, false)
+		return s.applyHysteresis(s.reorderForAlgorithm(s.reorderByPriority(out, meta), target, isUDP), target, isUDP), false, "prefetch"
 	}
 
 	// Tier 3: real-time computation from stats
 	if names, weights, err := s.store.GetBestProxyForTarget(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP); err == nil && len(names) > 0 {
-		return s.fillProxies(names, weights, all, smartMaxSelected, isUDP, false), false, "weight"
+		out := s.fillProxies(target, names, weights, all, smartMaxSelected, isUDP, false)
+		return s.applyHysteresis(s.reorderForAlgorithm(s.reorderByPriority(out, meta), target, isUDP), target, isUDP), false, "weight"
 	}
 
 	// Tier 4: URLTest-delay ranking (cold-start / no-stats path).
@@ -1371,10 +2062,12 @@ func (s *Smart) selectProxiesTraced(meta *smartDialMeta, all []adapter.Outbound,
 	// soon as the first probe cycle finishes. Without it every (target,
 	// node) pair that hadn't yet seen traffic would dial randomly.
 	if names, weights := s.delayRankedNames(all, isUDP); len(names) > 0 {
-		return s.fillProxies(names, weights, all, smartMaxSelected, isUDP, false), false, "delay"
+		out := s.fillProxies(target, names, weights, all, smartMaxSelected, isUDP, false)
+		return s.applyHysteresis(s.reorderForAlgorithm(s.reorderByPriority(out, meta), target, isUDP), target, isUDP), false, "delay"
 	}
 
-	return s.fillProxies(nil, nil, all, smartMaxSelected, isUDP, false), false, "fallback"
+	out := s.fillProxies(target, nil, nil, all, smartMaxSelected, isUDP, false)
+	return s.applyHysteresis(s.reorderForAlgorithm(s.reorderByPriority(out, meta), target, isUDP), target, isUDP), false, "fallback"
 }
 
 // delayRankedNames returns (names, synthetic-weights) sorted by URLTest
@@ -1457,14 +2150,16 @@ func proxyTagsPreview(outbounds []adapter.Outbound, limit int) string {
 	return s
 }
 
-// fillProxies assembles the final candidate list with alive/blocked checks and fallback.
-func (s *Smart) fillProxies(names []string, weights []float64, all []adapter.Outbound, minCount int, isUDP bool, unwrap bool) []adapter.Outbound {
+// fillProxies assembles the final candidate list with alive/blocked checks, debargo checks, and fallback.
+func (s *Smart) fillProxies(target string, names []string, weights []float64, all []adapter.Outbound, minCount int, isUDP bool, unwrap bool) []adapter.Outbound {
 	var blockedNodes map[string]bool
 	if s.store != nil {
 		blockedNodes, _ = s.store.GetBlockedNodes(s.Tag(), smartConfigName)
 	}
 
-	proxyByName := make(map[string]adapter.Outbound, len(all))
+	proxyByNamePtr := getStringOutboundMap()
+	defer putStringOutboundMap(proxyByNamePtr)
+	proxyByName := *proxyByNamePtr
 	for _, ob := range all {
 		proxyByName[ob.Tag()] = ob
 	}
@@ -1472,7 +2167,7 @@ func (s *Smart) fillProxies(names []string, weights []float64, all []adapter.Out
 	var selected []adapter.Outbound
 	for i, name := range names {
 		ob := proxyByName[name]
-		if ob == nil || blockedNodes[name] || !s.isAlive(name) || (isUDP && !s.supportsUDP(ob)) {
+		if ob == nil || blockedNodes[name] || !s.isAlive(name) || (isUDP && !s.supportsUDP(ob)) || s.isTargetDebargoed(target, name) {
 			continue
 		}
 		w := 0.0
@@ -1493,7 +2188,9 @@ func (s *Smart) fillProxies(names []string, weights []float64, all []adapter.Out
 	}
 
 	// Build supplemental pool from nodes not already in named list
-	inNamed := make(map[string]bool, len(names))
+	inNamedPtr := getStringBoolMap()
+	defer putStringBoolMap(inNamedPtr)
+	inNamed := *inNamedPtr
 	for _, name := range names {
 		inNamed[name] = true
 	}
@@ -1518,7 +2215,8 @@ func (s *Smart) fillProxies(names []string, weights []float64, all []adapter.Out
 	} else if s.store != nil {
 		sorted := false
 		if ranking, err := s.store.GetNodeWeightRankingCache(s.Tag(), smartConfigName); err == nil && len(ranking) > 0 {
-			rankMap := make(map[string]float64, len(ranking))
+			rankMapPtr := getStringFloatMap()
+			rankMap := *rankMapPtr
 			for _, r := range ranking {
 				rankMap[r.Name] = r.Weight
 			}
@@ -1533,13 +2231,15 @@ func (s *Smart) fillProxies(names []string, weights []float64, all []adapter.Out
 				}
 				return oki
 			})
+			putStringFloatMap(rankMapPtr)
 			sorted = true
 		}
 		if !sorted && s.history != nil {
 			// Ranking cache not warmed yet — bias supplemental ordering by
 			// URLTest delay so cold-start dials still prefer fast nodes over
 			// a purely random shuffle (mihomo parity).
-			delayMap := make(map[string]uint16, len(filteredAll))
+			delayMapPtr := getStringUint16Map()
+			delayMap := *delayMapPtr
 			anyDelay := false
 			for _, ob := range filteredAll {
 				if h := s.history.LoadURLTestHistory(ob.Tag()); h != nil && h.Delay > 0 {
@@ -1561,6 +2261,7 @@ func (s *Smart) fillProxies(names []string, weights []float64, all []adapter.Out
 				})
 				sorted = true
 			}
+			putStringUint16Map(delayMapPtr)
 		}
 		if !sorted {
 			rand.Shuffle(len(filteredAll), func(i, j int) {
@@ -1575,7 +2276,7 @@ func (s *Smart) fillProxies(names []string, weights []float64, all []adapter.Out
 
 	firstAppended := false
 	for _, ob := range filteredAll {
-		if blockedNodes[ob.Tag()] || !s.isAlive(ob.Tag()) || (isUDP && !s.supportsUDP(ob)) {
+		if blockedNodes[ob.Tag()] || !s.isAlive(ob.Tag()) || (isUDP && !s.supportsUDP(ob)) || s.isTargetDebargoed(target, ob.Tag()) {
 			continue
 		}
 		if !firstAppended && len(names) < minCount {
@@ -1590,9 +2291,9 @@ func (s *Smart) fillProxies(names []string, weights []float64, all []adapter.Out
 	}
 
 	if len(selected) == 0 {
-		// Last resort: any alive outbound
+		// Last resort: any alive outbound not blocked for this target
 		for _, ob := range all {
-			if s.isAlive(ob.Tag()) {
+			if s.isAlive(ob.Tag()) && !s.isTargetDebargoed(target, ob.Tag()) {
 				selected = append(selected, ob)
 				if len(selected) >= minCount {
 					break
@@ -1721,7 +2422,12 @@ func sameOutboundSet(a, b []adapter.Outbound) bool {
 func (s *Smart) getBatch(outbounds []adapter.Outbound, meta *smartDialMeta, round int) ([]adapter.Outbound, time.Duration) {
 	var batch []adapter.Outbound
 	if round == 0 {
-		n := smartRound0Parallel
+		// Algorithm decides the race width: selection-style algorithms
+		// (sticky / RR / p2c / weighted-random) already chose ONE
+		// specific node, so racing a second candidate would discard
+		// that choice on the loser dial. Ranking-style algorithms
+		// keep the legacy 2-wide race for fast-failover.
+		n := s.algoRound0Width()
 		if n > len(outbounds) {
 			n = len(outbounds)
 		}
@@ -1772,7 +2478,8 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 				s.logger.DebugContext(ctx, "smart[", s.Tag(), "] circuit-breaker OPEN for [", tag,
 					"] after ", cbMaxConsecFail, " consecutive failures in ", cbWindow)
 			}
-			go s.recordFailedDial(tag, meta, ct)
+			ct2, tag2, meta2 := ct, tag, meta
+			getSmartWorker().submit(func() { s.recordFailedDial(tag2, meta2, ct2) })
 		}
 		return conn, outbounds[0].Tag(), ct, err
 	}
@@ -1814,7 +2521,8 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 				s.logger.DebugContext(ctx, "smart[", s.Tag(), "] circuit-breaker OPEN for [", r.tag,
 					"] after ", cbMaxConsecFail, " consecutive failures in ", cbWindow)
 			}
-			go s.recordFailedDial(r.tag, meta, r.connectTime)
+			rtag, rct, rmeta := r.tag, r.connectTime, meta
+			getSmartWorker().submit(func() { s.recordFailedDial(rtag, rmeta, rct) })
 		}
 	}
 
@@ -1855,11 +2563,25 @@ type smartTrackedConn struct {
 	download atomic.Int64
 
 	// first-byte tracking
+	currentFirstByteTimeout time.Duration
 	firstReadOnce  atomic.Bool
 	firstReadMs    atomic.Int64   // latency in ms from dial-success
 	firstReadErr   atomic.Pointer[error]
 	firstWriteOnce atomic.Bool
 	firstWriteErr  atomic.Pointer[error]
+
+	// lastReadAt is the unix-nano timestamp of the most recent successful
+	// Read (n > 0). Drives the stalled-transfer watchdog: when a conn
+	// has data but stops moving for stalledTransferTimeout the watchdog
+	// force-closes it and triggers an algorithm-aware node switch.
+	// 0 means no successful read yet — first-byte watchdog handles that.
+	lastReadAt atomic.Int64
+
+	// watchdogTriggered guards against double-handling when the
+	// watchdog and a natural close race. Set the moment the watchdog
+	// decides to evict the conn so the close path's recordStats
+	// classifies it as failed even though Conn.Close was caller-initiated.
+	watchdogTriggered atomic.Bool
 
 	// peak byte-rate tracking (sampled on each IO call)
 	rateMu        sync.Mutex
@@ -1873,16 +2595,87 @@ type smartTrackedConn struct {
 }
 
 func (c *smartTrackedConn) Read(b []byte) (int, error) {
+	// Capture the pre-CAS state so the pre-first-byte fatal-error
+	// branch below can tell whether THIS Read is the one that's
+	// supposed to deliver the first byte. Using firstReadOnce.Load()
+	// after the CAS would always observe true and miss the case.
+	wasPreFirstByte := !c.firstReadOnce.Load()
 	n, err := c.Conn.Read(b)
 	if n > 0 {
 		c.download.Add(int64(n))
+		// Stamp last-active for the stalled-transfer watchdog. Atomic
+		// store on every payload Read is cheap; the watchdog reads it
+		// at most once per scan tick.
+		c.lastReadAt.Store(time.Now().UnixNano())
 	}
+	firstByteJustNow := false
 	if c.firstReadOnce.CompareAndSwap(false, true) {
 		c.firstReadMs.Store(time.Since(c.startTime).Milliseconds())
 		if err != nil {
 			e := err // copy to heap before pointer-atomic Store
 			c.firstReadErr.Store(&e)
+		} else if n > 0 {
+			firstByteJustNow = true
 		}
+	}
+	// Real-time RST detection. Two complementary triggers:
+	//
+	//   - isResetErr matches the kernel-level error directly (TCP
+	//     RST / EPIPE / "forcibly closed") for transports that
+	//     surface the syscall verbatim.
+	//
+	//   - isPreFirstByteFatal catches the case where mux / QUIC-based
+	//     outbounds (hysteria2 / tuic / shadow-tls) translate the
+	//     underlying RST into their own framing error that no string
+	//     match recognises. If the conn never produced a payload byte
+	//     and Read returned ANY non-EOF error, the node didn't
+	//     deliver — same eviction sequence as a kernel-level RST.
+	//
+	// Both triggers funnel through the CAS-guarded
+	// triggerInstantResetEviction so a follow-up Write(EPIPE) or
+	// Close(reset) can't double-handle the same conn.
+	if err != nil {
+		switch {
+		case isResetErr(err):
+			c.s.triggerInstantResetEviction(c, "read", err)
+		case wasPreFirstByte && isPreFirstByteFatal(err):
+			c.s.triggerInstantResetEviction(c, "read-prefirst", err)
+		}
+	}
+	// Kernel-driven watchdog: Read returned a deadline-style timeout.
+	// Decide between (a) a genuine stall (no recent activity) → trigger
+	// the same eviction sequence as a TCP RST so the algorithm picks
+	// a different node on the very next dial; or (b) a benign deadline
+	// fire (we just had real bytes a moment ago — the deadline simply
+	// hasn't been re-armed yet) → push the deadline forward and let
+	// the caller decide whether to retry. This is the "极速响应"
+	// path: the trigger fires the instant the kernel observes the
+	// stall, no goroutine sleep / wakeup involved.
+	if err != nil && isWatchdogDeadlineErr(err) && !c.watchdogTriggered.Load() {
+		lastNS := c.lastReadAt.Load()
+		idle := time.Since(c.startTime)
+		if lastNS != 0 {
+			idle = time.Since(time.Unix(0, lastNS))
+		}
+		genuineStall := !c.firstReadOnce.Load() ||
+			idle >= stalledTransferTimeout-stalledTransferGrace
+		if genuineStall && c.watchdogTriggered.CompareAndSwap(false, true) {
+			c.s.logger.Warn("smart[", c.s.Tag(), "] kernel watchdog evicting [",
+				c.proxyTag, "] target=[", c.meta.smartTarget,
+				"] reason=", classifyWatchdogStall(c), " idle=", idle.Truncate(time.Millisecond))
+			// Don't close the conn here — the caller will hit our
+			// Close() through their normal flow once Read returns,
+			// and that path runs recordStats. We DO need to fire
+			// the eviction so the breaker / unwrap-cache / ranking
+			// catch up before the user's next dial.
+			c.s.handleResetThresholdCrossed(c.meta, c.proxyTag)
+		} else if !genuineStall {
+			// Push the deadline forward and let the read loop retry.
+			c.rearmTransferStalledDeadline()
+		}
+	}
+	if firstByteJustNow {
+		c.armTransferStalledDeadline()
 	}
 	c.sampleRate()
 	return n, err
@@ -1898,6 +2691,13 @@ func (c *smartTrackedConn) Write(b []byte) (int, error) {
 			e := err
 			c.firstWriteErr.Store(&e)
 		}
+	}
+	// Symmetric to Read: a Write returning EPIPE / ECONNRESET / etc
+	// means the kernel has already torn down the socket on its end.
+	// Fire the same instant-eviction path so the next dial sees the
+	// new selection without waiting for the caller's Close.
+	if err != nil && isResetErr(err) {
+		c.s.triggerInstantResetEviction(c, "write", err)
 	}
 	c.sampleRate()
 	return n, err
@@ -1960,6 +2760,10 @@ func (c *smartTrackedConn) classifyStatus() (string, error) {
 
 func (c *smartTrackedConn) Close() error {
 	c.closeOnce.Do(func() {
+		// Clear the kernel watchdog deadline before any post-close
+		// cleanup so a stale deadline doesn't surface as a spurious
+		// timeout during downstream EOF propagation.
+		c.clearReadDeadline()
 		// Remove from per-target registry so a subsequent mass-close doesn't
 		// try to close this already-closed connection.
 		if c.meta != nil {
@@ -1986,6 +2790,16 @@ func (c *smartTrackedConn) Close() error {
 		if status == "failed" && reason != nil {
 			c.s.logger.Debug("smart[", c.s.Tag(), "] conn [", c.proxyTag,
 				"] classified as failed: ", reason)
+
+			// Upstream-initiated reset detection. The Read/Write paths
+			// already fire the eviction the moment the kernel returns
+			// the error — `triggerInstantResetEviction` is idempotent
+			// via CAS, so this Close-time call is just a safety net
+			// for transports that surface RST only at close (rare:
+			// some mux layers buffer the error until session cleanup).
+			if c.meta != nil && isResetErr(reason) {
+				c.s.triggerInstantResetEviction(c, "close", reason)
+			}
 		}
 
 		// SYNCHRONOUS short-life handling — fires BEFORE the async
@@ -2016,8 +2830,13 @@ func (c *smartTrackedConn) Close() error {
 			}
 		}
 
-		go c.s.recordStats(status, c.meta, c.proxyTag, c.connectTime,
-			latency, up, down, maxUpBps, maxDownBps, durMS)
+		cs, meta, tag, ctime := c.s, c.meta, c.proxyTag, c.connectTime
+		statusCopy := status
+		latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy := latency, up, down, maxUpBps, maxDownBps, durMS
+		getSmartWorker().submit(func() {
+			cs.recordStats(statusCopy, meta, tag, ctime,
+				latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy)
+		})
 	})
 	return c.Conn.Close()
 }
@@ -2112,8 +2931,12 @@ func (c *smartTrackedPacketConn) Close() error {
 		if maxDownBps == 0 && durSec > 0 && down > 0 {
 			maxDownBps = int64(float64(down) / durSec)
 		}
-		go c.s.recordStats("closed", c.meta, c.proxyTag, c.connectTime,
-			latency, up, down, maxUpBps, maxDownBps, durMS)
+		cs, meta, tag, ctime := c.s, c.meta, c.proxyTag, c.connectTime
+		latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy := latency, up, down, maxUpBps, maxDownBps, durMS
+		getSmartWorker().submit(func() {
+			cs.recordStats("closed", meta, tag, ctime,
+				latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy)
+		})
 	})
 	return c.PacketConn.Close()
 }
@@ -2127,6 +2950,12 @@ func (s *Smart) wrapConn(conn net.Conn, tag string, meta *smartDialMeta, connect
 		connectTime: connectTime,
 		startTime:   time.Now(),
 	}
+	// Arm the kernel-level read deadline so a silent node returns
+	// from the very next Read instead of hanging until the kernel /
+	// TLS timeout. This is the "real-time" detection path — the
+	// periodic watchdog is just a backstop for transports that
+	// silently ignore SetReadDeadline.
+	tracked.applyFirstByteDeadline()
 	s.registerTargetConn(meta.smartTarget, tracked)
 	if s.interruptExternalConnections {
 		return s.interruptGroup.NewConn(tracked,
@@ -2138,18 +2967,24 @@ func (s *Smart) wrapConn(conn net.Conn, tag string, meta *smartDialMeta, connect
 
 // registerTargetConn adds a tracked conn to the per-target registry used by
 // closeTargetConnections for mihomo-style findSameConnection cleanup.
+// Also bumps the global per-node load counter consulted by the
+// least-loaded algorithm — kept in lock-step with deregisterTargetConn
+// so the count stays accurate across the conn lifetime.
 func (s *Smart) registerTargetConn(target string, c *smartTrackedConn) {
 	if target == "" {
 		return
 	}
 	s.targetConnsMu.Lock()
-	defer s.targetConnsMu.Unlock()
 	set := s.targetConns[target]
 	if set == nil {
 		set = make(map[*smartTrackedConn]struct{})
 		s.targetConns[target] = set
 	}
 	set[c] = struct{}{}
+	s.targetConnsMu.Unlock()
+	if s.nodeLoad != nil {
+		s.nodeLoad.inc(c.proxyTag)
+	}
 }
 
 // deregisterTargetConn removes a tracked conn from the registry at Close time.
@@ -2158,12 +2993,15 @@ func (s *Smart) deregisterTargetConn(target string, c *smartTrackedConn) {
 		return
 	}
 	s.targetConnsMu.Lock()
-	defer s.targetConnsMu.Unlock()
 	if set := s.targetConns[target]; set != nil {
 		delete(set, c)
 		if len(set) == 0 {
 			delete(s.targetConns, target)
 		}
+	}
+	s.targetConnsMu.Unlock()
+	if s.nodeLoad != nil {
+		s.nodeLoad.dec(c.proxyTag)
 	}
 }
 
@@ -2216,12 +3054,13 @@ func (s *Smart) onDialOutcome(success bool) {
 	}
 	cnt := s.dialFailCount.Add(1)
 	if cnt >= 5 && s.recheckOnce.CompareAndSwap(false, true) {
-		go func() {
+		cntCopy := cnt
+		getSmartWorker().submit(func() {
 			defer s.recheckOnce.Store(false)
-			s.logger.Info("smart[", s.Tag(), "] accumulated ", cnt,
+			s.logger.Info("smart[", s.Tag(), "] accumulated ", cntCopy,
 				" dial failures in short window; triggering emergency prefetch refresh")
 			s.runPrefetch()
-		}()
+		})
 	}
 }
 
@@ -2279,6 +3118,25 @@ func (s *Smart) recordStats(
 		return
 	}
 
+	// Hot-patch ML features for domain-only requests (e.g. AsIs strategy where 
+	// IP resolution is deferred to the remote endpoint).
+	// Without this, LightGBM features 16 (ASN) and 17 (GeoIP) are zero-filled.
+	// Since recordStats runs post-connection, we can afford a tiny 200ms 
+	// lookup block to drastically improve ML model accuracy and CSV collection.
+	if len(meta.resolvedIPs) == 0 && meta.host != "" && (s.useASN || s.useLightGBM || s.collectData) {
+		if dnsRouter := service.FromContext[adapter.DNSRouter](s.ctx); dnsRouter != nil {
+			lookupCtx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+			if ips, err := dnsRouter.Lookup(lookupCtx, meta.host, adapter.DNSQueryOptions{}); err == nil && len(ips) > 0 {
+				meta.resolvedIPs = ips
+				meta.asnCode = s.lookupASN(ips)
+				meta.destGeoIP = s.lookupCountry(ips)
+			}
+			cancel()
+		}
+	}
+
+	// recordPinEndorsement logic moved below record initialisation
+
 	uploadMB := float64(uploadBytes) / (1024.0 * 1024.0)
 	downloadMB := float64(downloadBytes) / (1024.0 * 1024.0)
 	maxUpKB := float64(maxUploadRate) / 1024.0
@@ -2308,6 +3166,10 @@ func (s *Smart) recordStats(
 		record.AddInt64("failure", 1)
 	case "closed":
 		record.AddInt64("success", 1)
+	}
+
+	if s.getManualSelected() == proxyTag {
+		s.recordPinEndorsement(proxyTag, meta, status != "failed", record.ShortRTT())
 	}
 
 	if connectTime > 0 {
@@ -2354,33 +3216,53 @@ func (s *Smart) recordStats(
 	oldWeight := record.GetWeight(weightType)
 	priorityFactor := s.getPriorityFactor(proxyTag)
 
-	input := &smart.ModelInput{
+	// Inject dynamic Pin-Endorsement Learning contextual boost!
+	// Without this, the LightGBM data collection mechanism and offline model
+	// prediction are completely blind to user's habitual routing pins.
+	priorityFactor *= s.applyPinEndorsementBoost(proxyTag, meta, float64(latency))
+
+	// Manual-pin learning: user explicitly chose this node, so treat
+	// every sample as carrying extra confidence. Multiplied onto
+	// priorityFactor BEFORE CalculateWeight / PredictWeight so both
+	// traditional and ML paths see the uplift, and the uplift persists
+	// into the stored finalWeight — ensuring that when the user later
+	// unpins, the auto-selector biases toward the previously-pinned
+	// node rather than acting as if the pin never happened.
+	//
+	// Training target math below divides priorityFactor back out, so
+	// LightGBM does NOT learn pin-biased labels — we want the model to
+	// learn the raw algorithmic signal and let runtime priority factors
+	// (including this boost) compose on top at selection time.
+	isPinnedDial := s.getManualSelected() == proxyTag
+	if isPinnedDial {
+		priorityFactor *= manualPinWeightBoost
+	}
+
+	// Pool-acquired ModelInput — eliminates ~512-byte allocation per
+	// closed connection. Released at end of recordStats; the async
+	// dataCollector path takes a stack-local copy before submit.
+	input := smart.AcquireModelInput()
+	*input = smart.ModelInput{
 		Success:                record.GetInt64("success"),
 		Failure:                record.GetInt64("failure"),
 		ConnectTime:            record.GetInt64("connectTime"),
 		Latency:                record.GetInt64("latency"),
-		// Jitter inputs — read after the UpdateSample calls above so the
-		// new sample is included. Zero when the node has <2 samples.
-		ConnectTimeStdDev: record.ConnectTimeStdDev(),
-		LatencyStdDev:     record.LatencyStdDev(),
-		// FirstByteLatency equals Latency under the current tracker —
-		// we measure Latency from dial-success to first upstream byte,
-		// which IS the TLS+upstream RTT post-connect. Kept as separate
-		// input field so future per-connection measurements (e.g. TCP
-		// handshake time in ms, measured inside the dialer) can populate
-		// it independently without breaking ModelInput consumers.
+		ConnectTimeStdDev:      record.ConnectTimeStdDev(),
+		LatencyStdDev:          record.LatencyStdDev(),
 		FirstByteLatency:       latency,
+		ShortRTT:               record.ShortRTT(),
+		ShortSuccessRate:       record.ShortSuccessRate(),
 		IsUDP:                  meta.isUDP,
 		IsTCP:                  !meta.isUDP,
-		UploadTotal:            uploadMB,             // this connection
-		HistoryUploadTotal:     historyUploadTotal,   // accumulated before
-		MaxuploadRate:          maxUpKB,              // this connection
-		HistoryMaxUploadRate:   historyMaxUploadRate, // accumulated before
+		UploadTotal:            uploadMB,
+		HistoryUploadTotal:     historyUploadTotal,
+		MaxuploadRate:          maxUpKB,
+		HistoryMaxUploadRate:   historyMaxUploadRate,
 		DownloadTotal:          downloadMB,
 		HistoryDownloadTotal:   historyDownloadTotal,
 		MaxdownloadRate:        maxDownKB,
 		HistoryMaxDownloadRate: historyMaxDownloadRate,
-		ConnectionDuration:     record.GetFloat64("duration"), // smoothed avg (post-update)
+		ConnectionDuration:     record.GetFloat64("duration"),
 		LastUsed:               record.GetInt64("lastUsed"),
 		DestIPASN:              meta.asnCode,
 		Host:                   meta.host,
@@ -2390,6 +3272,7 @@ func (s *Smart) recordStats(
 		GroupName:              s.Tag(),
 		NodeName:               proxyTag,
 	}
+	defer smart.ReleaseModelInput(input)
 
 	// ML prediction path (LightGBM) with automatic fallback to traditional algorithm.
 	var calculatedWeight float64
@@ -2422,14 +3305,22 @@ func (s *Smart) recordStats(
 		if mlPredicted {
 			source = "lightgbm"
 		}
+		// Tag user-endorsed samples so retraining can weight them
+		// distinctly (or filter them out for a pure-algorithmic model).
+		// The suffix preserves the weight-computation channel — a grep
+		// for `lightgbm` / `traditional` still groups everything.
+		if isPinnedDial {
+			source += ":manual"
+		}
 		baseWeight := finalWeight
 		if priorityFactor > 0 {
 			baseWeight = finalWeight / priorityFactor
 		}
 		cmeta := &lightgbm.CollectorMeta{
-			DestASN:  meta.asnCode,
-			Host:     meta.host,
-			DestPort: meta.destPort,
+			DestASN:   meta.asnCode,
+			Host:      meta.host,
+			DestPort:  meta.destPort,
+			DestGeoIP: meta.destGeoIP,
 		}
 		for _, ip := range meta.resolvedIPs {
 			if ip.IsValid() {
@@ -2437,7 +3328,16 @@ func (s *Smart) recordStats(
 				break
 			}
 		}
-		go s.dataCollector.AddSample(input, cmeta, baseWeight, source)
+		// Route sample collection through the shared ants pool so a high-
+		// throughput config doesn't spawn thousands of goroutines.
+		// Must COPY the ModelInput by value — `input` gets released back
+		// to the pool when recordStats returns (via defer), and the
+		// async goroutine can't hold a reference to pooled memory.
+		inputSnap := *input
+		cmetaCopy, w, srcCopy := cmeta, baseWeight, source
+		getSmartWorker().submit(func() {
+			s.dataCollector.AddSample(&inputSnap, cmetaCopy, w, srcCopy)
+		})
 	}
 
 	if isDegraded {
@@ -2461,14 +3361,25 @@ func (s *Smart) recordStats(
 	record.SetWeight(weightType, finalWeight, meta.isUDP)
 
 	snapshot := record.CreateStatsSnapshot()
-	if data, err := json.Marshal(snapshot); err == nil {
-		go s.store.AppendToGlobalQueue(smart.StoreOperation{
+	// msgpack instead of JSON — ~3× smaller per record on disk and in
+	// the pending-write queue. The read path (UnmarshalStatsRecord)
+	// sniffs the first byte and still handles legacy JSON rows.
+	data, err := smart.MarshalStatsRecord(snapshot)
+	smart.ReleaseStatsRecord(snapshot) // safe: marshal copies bytes
+	if err == nil {
+		// AppendToGlobalQueue is O(1) and takes a short mutex; routing
+		// through the shared pool bounds concurrency so the burst of
+		// N closed conns doesn't spawn N goroutines simultaneously.
+		op := smart.StoreOperation{
 			Type:   smart.OpSaveStats,
 			Group:  s.Tag(),
 			Config: smartConfigName,
 			Target: target,
 			Node:   proxyTag,
 			Data:   data,
+		}
+		getSmartWorker().submit(func() {
+			s.store.AppendToGlobalQueue(op)
 		})
 	}
 
@@ -2678,17 +3589,39 @@ func (s *Smart) runHealthCheck() {
 	var wg sync.WaitGroup
 	start := time.Now()
 
-	var alive, dead atomic.Int32
+	var alive, dead, skipped atomic.Int32
+	// Freshness window = max(configured interval, 5 min). A node is
+	// considered fresh if EITHER:
+	//   1. URLTestHistory has a recent probe entry (real measured latency
+	//      that the dashboard displays), OR
+	//   2. aliveAt has a recent dial-heartbeat timestamp (real traffic
+	//      successfully routed through this node recently — no need to
+	//      re-verify via an HTTP probe).
+	// Cuts Android CPU/network by ~80% during active browsing because
+	// dial-heartbeats obviate most scheduled probes.
+	freshWindow := s.interval
+	if freshWindow < 5*time.Minute {
+		freshWindow = 5 * time.Minute
+	}
+	freshWindowNS := int64(freshWindow)
+	nowNS := time.Now().UnixNano()
 	for _, ob := range snap.outbounds {
 		ob := ob
 		tag := ob.Tag()
 		if smartSkipType(ob.Type()) {
 			continue
 		}
-		// If we already have a fresh history entry (≤ 1 interval), reuse it.
-		if h := s.history.LoadURLTestHistory(tag); h != nil && time.Since(h.Time) < s.interval {
+		// Check #2 first — dial heartbeats are cheapest to consult and
+		// most authoritative (a real TCP handshake just succeeded).
+		if ts, ok := s.aliveAt.Load(tag); ok && nowNS-ts < freshWindowNS {
+			alive.Add(1)
+			skipped.Add(1)
+			continue
+		}
+		if h := s.history.LoadURLTestHistory(tag); h != nil && time.Since(h.Time) < freshWindow {
 			if h.Delay > 0 {
 				alive.Add(1)
+				skipped.Add(1)
 			}
 			continue
 		}
@@ -2719,15 +3652,25 @@ func (s *Smart) runHealthCheck() {
 
 	s.logger.Info("smart[", s.Tag(), "] health-check in ",
 		time.Since(start).Round(time.Millisecond), ": ",
-		alive.Load(), " alive, ", dead.Load(), " dead")
+		alive.Load(), " alive, ", dead.Load(), " dead, ",
+		skipped.Load(), " skipped (fresh via recent dial)")
 }
 
 // cleanupOrphanedGroups removes Smart store data for group tags that no
 // longer exist in the live outbound manager. Handles the case where a user
 // renames / removes a Smart group between runs — without this the bbolt
 // bucket grows unbounded.
+//
+// Gated process-wide: the list of "live groups" is identical from every
+// Smart's point of view (they all query the same outboundMgr), so
+// running this per-group scans the bbolt store N times for no benefit.
+// On Android where every bbolt scan reads mmap pages into memory, this
+// matters for RSS stability.
 func (s *Smart) cleanupOrphanedGroups() {
 	if s.store == nil {
+		return
+	}
+	if !claimGlobalTask("cleanup-orphan-groups", globalCleanupOrphanGroupsInterval) {
 		return
 	}
 	cachedGroups, err := s.store.GetAllGroupsForConfig(smartConfigName)
@@ -2826,8 +3769,19 @@ func (s *Smart) updateNodeRanking() {
 			s.logger.Debug("smart[", s.Tag(),
 				"] no prefetch-derived ranking yet; /weights serving live stats fallback until the first prefetch cycle completes")
 		}
+		// Even when prefetch hasn't yielded data, GetLiveNodeRanking can
+		// often produce a real ranking from the raw stats table. Cache
+		// that in the snapshot so /weights doesn't keep re-scanning
+		// allStats on every dashboard refresh.
+		if live := s.store.GetLiveNodeRanking(s.Tag(), smartConfigName, s.isAlive, tags); len(live) > 0 {
+			s.publishRankingSnapshot(live)
+		}
 		return
 	}
+	// Prefetch-derived ranking is ready: publish to the in-process
+	// snapshot BEFORE the bbolt write so WeightRanking sees the new
+	// data immediately instead of waiting for BatchSave to flush.
+	s.publishRankingSnapshot(ranking)
 	most, occ, rare := 0, 0, 0
 	var topName string
 	var topWeight float64
@@ -3032,16 +3986,34 @@ func proxyTagsPreviewStrings(tags []string, limit int) string {
 	return out
 }
 
+// flushQueue runs the shared bbolt write-flush. Gated to once-per-interval
+// process-wide — the queue is global, so N Smart groups all calling this
+// would race to drain the same data. First caller wins; rest return
+// immediately without paying the mutex cost.
 func (s *Smart) flushQueue() {
-	if s.store != nil {
-		s.store.FlushQueue(true)
+	if s.store == nil {
+		return
 	}
+	if !claimGlobalTask("flush-queue", globalFlushQueueInterval) {
+		return
+	}
+	s.store.FlushQueue(true)
 }
 
+// adjustCache sizes the process-wide LRU caches based on heap pressure.
+// Gated to once-per-interval across all groups because:
+//  1. The caches are process-global, so only one resize is meaningful.
+//  2. runtime.ReadMemStats is a STW operation. Running it 16 times per
+//     5-min interval = 16 stop-the-world pauses. On Android that's a
+//     direct UX cost. Gating cuts it to 1 STW per interval.
 func (s *Smart) adjustCache() {
-	if s.store != nil {
-		s.store.AdjustCacheParameters()
+	if s.store == nil {
+		return
 	}
+	if !claimGlobalTask("cache-adjust", globalCacheAdjustInterval) {
+		return
+	}
+	s.store.AdjustCacheParameters()
 }
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
@@ -3090,13 +4062,33 @@ func (s *Smart) isAlive(tag string) bool {
 	return time.Since(h.Time) < s.interval*3
 }
 
-// circuitBreakerState tracks per-node consecutive failures for the
+// circuitBreakerState tracks per-node failure state for the
 // fast-failover pipeline. All fields are atomic — reads from the dial
 // hot path are lock-free.
+//
+// State machine:
+//
+//	Closed   : openUntil == 0, consecFails may be accumulating in the
+//	           current streak window.
+//	Open     : openUntil != 0, now <  openUntil. isOpen() returns true.
+//	HalfOpen : openUntil != 0, now >= openUntil. isOpen() returns false
+//	           (allowing one trial dial). A trial failure calls
+//	           recordFailure which detects the half-open condition and
+//	           re-trips with escalated backoff; a trial success is
+//	           usually surfaced via markAlive → reset().
+//
+// tripCount is the consecutive-trip counter used for exponential
+// backoff: every trip within the same "open-period chain" (i.e.
+// without an intervening reset() via markAlive) escalates the
+// cooldown by 2× up to an 8× cap. Combined with ±20 % jitter, this
+// prevents a flapping node from pinning down the selector at exactly
+// cbOpenDuration and also avoids a herd of nodes recovering
+// simultaneously after a shared outage.
 type circuitBreakerState struct {
 	consecFails atomic.Int32 // consecutive failures since last success
 	firstFailAt atomic.Int64 // unix-nano of first failure in current streak
-	openUntil   atomic.Int64 // unix-nano; non-zero = breaker open
+	openUntil   atomic.Int64 // unix-nano; non-zero = breaker has been tripped at least once
+	tripCount   atomic.Int32 // consecutive trips (cleared by reset())
 }
 
 // isOpen reports whether the breaker is currently tripped (node should
@@ -3106,9 +4098,30 @@ func (c *circuitBreakerState) isOpen(now int64) bool {
 	return ou != 0 && now < ou
 }
 
-// recordFailure increments the failure count and opens the breaker when
-// the streak crosses cbMaxConsecFail within cbWindow.
-func (c *circuitBreakerState) recordFailure(now int64, windowNS, openForNS int64, limit int32) (justTripped bool) {
+// recordFailure records one failure event.
+//
+// Two code paths:
+//
+//   - Half-open trial failure (openUntil > 0 && now >= openUntil):
+//     re-trip immediately with escalated backoff. The trial dial has
+//     proven the node is still broken; waiting for another
+//     consecutive-failure streak would waste time.
+//
+//   - Normal failure: accumulate consecFails within the streak window.
+//     Once the count reaches `limit`, trip the breaker. Streaks older
+//     than windowNS are discarded so a failure after a long quiet
+//     period restarts the counter (matches pre-PR3 behaviour).
+func (c *circuitBreakerState) recordFailure(now int64, windowNS, baseOpenForNS int64, limit int32) (justTripped bool) {
+	// Half-open trial re-trip. openUntil != 0 means we have tripped at
+	// least once before; now >= openUntil means the cooldown elapsed
+	// and this failure is the half-open probe outcome.
+	if openUntil := c.openUntil.Load(); openUntil != 0 && now >= openUntil {
+		trip := c.tripCount.Add(1)
+		dur := expBackoffJitter(baseOpenForNS, trip)
+		c.openUntil.Store(now + dur)
+		return true
+	}
+
 	firstAt := c.firstFailAt.Load()
 	if firstAt == 0 || now-firstAt > windowNS {
 		c.firstFailAt.Store(now)
@@ -3117,17 +4130,49 @@ func (c *circuitBreakerState) recordFailure(now int64, windowNS, openForNS int64
 	}
 	n := c.consecFails.Add(1)
 	if n >= limit {
-		old := c.openUntil.Swap(now + openForNS)
+		trip := c.tripCount.Add(1)
+		dur := expBackoffJitter(baseOpenForNS, trip)
+		old := c.openUntil.Swap(now + dur)
 		return old == 0 || now >= old
 	}
 	return false
 }
 
-// reset clears the failure streak after a successful dial.
+// reset clears the failure streak after a successful dial. Drops
+// tripCount too — markAlive uses this to signal the node has fully
+// recovered, so the next failure cycle starts from the base cooldown.
 func (c *circuitBreakerState) reset() {
 	c.consecFails.Store(0)
 	c.firstFailAt.Store(0)
 	c.openUntil.Store(0)
+	c.tripCount.Store(0)
+}
+
+// expBackoffJitter returns a cooldown duration in nanoseconds derived
+// from the base and the current trip ordinal:
+//
+//	trip=1 → base × 1
+//	trip=2 → base × 2
+//	trip=3 → base × 4
+//	trip≥4 → base × 8  (capped)
+//
+// Multiplied by a uniform random jitter in [0.8, 1.2] to prevent a
+// thundering-herd recovery when many nodes tripped together.
+//
+// Deterministic for tests: seed math/rand if you need repeatable runs;
+// the jitter envelope is narrow enough (±20 %) that non-determinism
+// never breaks the ordering-based assertions the test suite relies on.
+func expBackoffJitter(baseNS int64, trip int32) int64 {
+	if trip < 1 {
+		trip = 1
+	}
+	exp := trip - 1
+	if exp > 3 {
+		exp = 3
+	}
+	scaled := baseNS << uint(exp) // × 2^exp
+	jitter := 0.8 + rand.Float64()*0.4
+	return int64(float64(scaled) * jitter)
 }
 
 // breakerFor returns (or lazily creates) the circuit breaker for tag.
@@ -3147,42 +4192,107 @@ func (s *Smart) isBreakerOpen(tag string) bool {
 	if !ok {
 		return false
 	}
-	return cb.isOpen(time.Now().UnixNano())
+	return cb.isOpen(breakerNow())
 }
 
 // recordDialFailure updates the circuit breaker for tag. Returns true if
 // the breaker just tripped — callers use this to log the demotion and
 // optionally kick off a re-selection for in-flight dials.
+//
+// Persists the post-mutation breaker state so a restart-within-15s
+// doesn't silently re-open the breaker and let a just-tripped node be
+// retried immediately.
 func (s *Smart) recordDialFailure(tag string) (tripped bool) {
 	if tag == "" {
 		return false
 	}
 	cb := s.breakerFor(tag)
-	return cb.recordFailure(time.Now().UnixNano(),
+	tripped = cb.recordFailure(breakerNow(),
 		int64(cbWindow), int64(cbOpenDuration), cbMaxConsecFail)
+	s.persistBreaker(tag, cb)
+	return tripped
 }
 
-// markDead records a probe / dial failure for tag.
+// markDead records a probe / dial failure for tag. Persists the
+// "last-failed-at" timestamp so the next-boot hydrate path can honour
+// knownDeadTTL without waiting a full probe cycle to re-learn.
 func (s *Smart) markDead(tag string) {
 	if tag == "" {
 		return
 	}
-	s.knownDead.Store(tag, time.Now())
+	now := time.Now()
+	s.knownDead.Store(tag, now)
+	s.persistKnownDead(tag, now)
+}
+
+// targetDebargoTTL is how long a node is excluded from a specific target
+// after a target-level failure (WatchDog/RST).
+const targetDebargoTTL = 10 * time.Minute
+
+// markDeadForTarget soft-breaks a proxy node for a specific target.
+// Used when a node is globally healthy but fails to dial or stalls out 
+// on a specific target (e.g. SNI blocking or IP ban).
+func (s *Smart) markDeadForTarget(target, proxyTag string) {
+	if target == "" || proxyTag == "" {
+		return
+	}
+	s.targetDebargo.Store(target+"|"+proxyTag, time.Now())
+	s.logger.Warn("smart[", s.Tag(), "] target debargo enacted for [", proxyTag, "] on target [", target, "]")
+}
+
+// isTargetDebargoed returns true if the node is currently soft-broken
+// for this specific target.
+func (s *Smart) isTargetDebargoed(target, proxyTag string) bool {
+	if target == "" || proxyTag == "" {
+		return false
+	}
+	key := target + "|" + proxyTag
+	at, ok := s.targetDebargo.Load(key)
+	if !ok {
+		return false
+	}
+	if time.Since(at) > targetDebargoTTL {
+		s.targetDebargo.Delete(key)
+		return false
+	}
+	return true
 }
 
 // markAlive clears tag from knownDead and resets its circuit breaker.
-// Called on successful probe or dial.
+// Called on successful probe or dial. Emits delete-tombstones for both
+// bbolt key types so the in-memory "alive" consensus survives restart.
+//
+// Also stamps `aliveAt[tag]` with the current time so `runHealthCheck`
+// can skip probing nodes that just proved alive via real user traffic.
+// We deliberately do NOT write to URLTestHistory — that would pollute
+// the dashboard's latency column with a sentinel value (previously
+// Delay=1 displayed as 1ms everywhere, which users misread as the real
+// probe result).
 func (s *Smart) markAlive(tag string) {
 	if tag == "" {
 		return
 	}
-	s.knownDead.Delete(tag)
+	_, wasDead := s.knownDead.LoadAndDelete(tag)
+	var hadBreaker bool
 	if cb, ok := s.breakers.Load(tag); ok {
 		cb.reset()
+		hadBreaker = true
 	}
-	// A successful dial also clears any short-life history for this node
-	// so a previously-problematic node that's recovered doesn't keep
-	// counting toward a future threshold.
+	// Record the dial heartbeat — runHealthCheck consults this BEFORE
+	// URLTestHistory so the probe gets skipped while keeping the history
+	// (and thus the dashboard) untouched by synthetic values.
+	s.aliveAt.Store(tag, time.Now().UnixNano())
+	// Only enqueue tombstones when there WAS a persisted state — avoids
+	// flooding the queue with deletes for nodes that were never failed.
+	if wasDead {
+		s.persistKnownDeadDelete(tag)
+	}
+	if hadBreaker {
+		s.persistBreakerDelete(tag)
+	}
+	// A successful dial also clears any short-life AND reset history
+	// for this node so a previously-problematic node that's recovered
+	// doesn't keep counting toward a future threshold.
 	s.shortLifeMu.Lock()
 	for k := range s.shortLife {
 		if strings.HasSuffix(k, "|"+tag) {
@@ -3190,6 +4300,268 @@ func (s *Smart) markAlive(tag string) {
 		}
 	}
 	s.shortLifeMu.Unlock()
+	if s.resetEvents != nil {
+		s.resetEvents.resetForNode(tag)
+	}
+}
+
+// ─── runtime-state persistence helpers ────────────────────────────────────────
+//
+// These helpers push in-memory runtime state (manual pin, known-dead
+// nodes, circuit breakers) through the existing bbolt write queue so the
+// state survives process restart. Every helper is nil-safe on s.store and
+// the async queue path — none of them block the dialer or the health
+// probe for more than an O(1) mutex acquire on globalQueueMu.
+
+// persistManualPin writes or deletes the group's manual-pin record based
+// on whether tag is set. Called whenever s.manualSelected.Store() fires
+// so the bbolt view stays in sync with the in-memory atomic.
+func (s *Smart) persistManualPin(tag string) {
+	if s.store == nil {
+		return
+	}
+	if tag == "" {
+		s.persistManualPinDelete()
+		return
+	}
+	rec := smart.ManualPinRecord{Tag: tag, UpdatedAt: time.Now().Unix()}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	s.store.AppendToGlobalQueue(smart.StoreOperation{
+		Type:   smart.OpSaveManualPin,
+		Group:  s.Tag(),
+		Config: smartConfigName,
+		Data:   data,
+	})
+}
+
+// persistManualPinDelete emits a tombstone for the group's manual-pin slot.
+func (s *Smart) persistManualPinDelete() {
+	if s.store == nil {
+		return
+	}
+	s.store.AppendToGlobalQueue(smart.StoreOperation{
+		Type:   smart.OpDeleteManualPin,
+		Group:  s.Tag(),
+		Config: smartConfigName,
+	})
+}
+
+// persistKnownDead persists "node is dead as of at" for the given tag.
+// Paired with persistKnownDeadDelete on recovery.
+func (s *Smart) persistKnownDead(tag string, at time.Time) {
+	if s.store == nil || tag == "" {
+		return
+	}
+	rec := smart.KnownDeadRecord{DeadAt: at.Unix()}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	s.store.AppendToGlobalQueue(smart.StoreOperation{
+		Type:   smart.OpSaveKnownDead,
+		Group:  s.Tag(),
+		Config: smartConfigName,
+		Node:   tag,
+		Data:   data,
+	})
+}
+
+func (s *Smart) persistKnownDeadDelete(tag string) {
+	if s.store == nil || tag == "" {
+		return
+	}
+	s.store.AppendToGlobalQueue(smart.StoreOperation{
+		Type:   smart.OpDeleteKnownDead,
+		Group:  s.Tag(),
+		Config: smartConfigName,
+		Node:   tag,
+	})
+}
+
+// persistBreaker snapshots the current circuit-breaker state. Called
+// right after recordFailure bumps the atomic counters so restart within
+// cbOpenDuration restores the OPEN state.
+func (s *Smart) persistBreaker(tag string, cb *circuitBreakerState) {
+	if s.store == nil || tag == "" || cb == nil {
+		return
+	}
+	rec := smart.BreakerRecord{
+		ConsecFails: cb.consecFails.Load(),
+		FirstFailAt: cb.firstFailAt.Load(),
+		OpenUntil:   cb.openUntil.Load(),
+		TripCount:   cb.tripCount.Load(),
+	}
+	data, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	s.store.AppendToGlobalQueue(smart.StoreOperation{
+		Type:   smart.OpSaveBreaker,
+		Group:  s.Tag(),
+		Config: smartConfigName,
+		Node:   tag,
+		Data:   data,
+	})
+}
+
+func (s *Smart) persistBreakerDelete(tag string) {
+	if s.store == nil || tag == "" {
+		return
+	}
+	s.store.AppendToGlobalQueue(smart.StoreOperation{
+		Type:   smart.OpDeleteBreaker,
+		Group:  s.Tag(),
+		Config: smartConfigName,
+		Node:   tag,
+	})
+}
+
+// hydratePersistedState reads the three persisted maps back from bbolt
+// and seeds the in-memory structures. Called from PostStart AFTER the
+// store is wired and BEFORE background tasks begin firing.
+//
+// Expired entries (outside TTL / breaker window) are NOT restored, and
+// lazy-GC tombstones are enqueued for them so the bbolt cleanup happens
+// opportunistically on the next flush without needing a dedicated task.
+//
+// Manual-pin restoration also validates that the persisted tag is still
+// in the current outbound set — a config change that removed the node
+// makes a stale pin meaningless, so we drop it explicitly.
+func (s *Smart) hydratePersistedState() {
+	if s.store == nil {
+		return
+	}
+	snap := s.state.Load()
+	if snap == nil {
+		return
+	}
+
+	// 1. Manual pin
+	pinRows, err := s.store.GetSubBytesByPath(
+		smart.FormatDBKey(smart.KeyTypeManualPin, smartConfigName, s.Tag()))
+	if err == nil {
+		for _, data := range pinRows {
+			var rec smart.ManualPinRecord
+			if err := json.Unmarshal(data, &rec); err != nil || rec.Tag == "" {
+				continue
+			}
+			// Confirm the pinned node still exists in the live outbound set.
+			found := false
+			for _, t := range snap.tags {
+				if t == rec.Tag {
+					found = true
+					break
+				}
+			}
+			if !found {
+				s.logger.Info("smart[", s.Tag(), "] discarded stale persisted pin [", rec.Tag,
+					"] — node no longer in outbound set")
+				s.persistManualPinDelete()
+				continue
+			}
+			s.manualSelected.Store(rec.Tag)
+			s.logger.Info("smart[", s.Tag(), "] restored manual pin [", rec.Tag,
+				"] from persisted state (pinned ", time.Since(time.Unix(rec.UpdatedAt, 0)).Round(time.Second), " ago)")
+			break // only one pin per group
+		}
+	}
+
+	// 2. knownDead — drop anything beyond knownDeadTTL, emit tombstone.
+	deadRows, err := s.store.GetSubBytesByPath(
+		smart.FormatDBKey(smart.KeyTypeKnownDead, smartConfigName, s.Tag()))
+	restored, expired := 0, 0
+	if err == nil {
+		now := time.Now()
+		for key, data := range deadRows {
+			var rec smart.KnownDeadRecord
+			if err := json.Unmarshal(data, &rec); err != nil {
+				continue
+			}
+			// The key is smart/dead/<cfg>/<grp>/<node>; node is the last
+			// segment. Unescape because FormatDBKey percent-escaped the
+			// node tag — outbound tags can contain `/` (subscription
+			// naming) and we'd otherwise compare against the wrong
+			// substring downstream.
+			parts := strings.Split(key, "/")
+			if len(parts) == 0 {
+				continue
+			}
+			node := smart.UnescapeKeyPart(parts[len(parts)-1])
+			if node == "" {
+				continue
+			}
+			deadAt := time.Unix(rec.DeadAt, 0)
+			if now.Sub(deadAt) >= knownDeadTTL {
+				expired++
+				s.persistKnownDeadDelete(node)
+				continue
+			}
+			s.knownDead.Store(node, deadAt)
+			restored++
+		}
+	}
+
+	// 3. breakers — restore if still within window, else tombstone.
+	breakerRows, err := s.store.GetSubBytesByPath(
+		smart.FormatDBKey(smart.KeyTypeBreaker, smartConfigName, s.Tag()))
+	breakerRestored, breakerExpired := 0, 0
+	if err == nil {
+		now := breakerNow()
+		for key, data := range breakerRows {
+			var rec smart.BreakerRecord
+			if err := json.Unmarshal(data, &rec); err != nil {
+				continue
+			}
+			parts := strings.Split(key, "/")
+			if len(parts) == 0 {
+				continue
+			}
+			node := smart.UnescapeKeyPart(parts[len(parts)-1])
+			if node == "" {
+				continue
+			}
+			// Case 1: breaker is open and cooldown hasn't elapsed.
+			if rec.OpenUntil != 0 && now < rec.OpenUntil {
+				cb := &circuitBreakerState{}
+				cb.consecFails.Store(rec.ConsecFails)
+				cb.firstFailAt.Store(rec.FirstFailAt)
+				cb.openUntil.Store(rec.OpenUntil)
+				cb.tripCount.Store(rec.TripCount)
+				s.breakers.Store(node, cb)
+				breakerRestored++
+				continue
+			}
+			// Case 2: open window expired — drop it.
+			if rec.OpenUntil != 0 && now >= rec.OpenUntil {
+				breakerExpired++
+				s.persistBreakerDelete(node)
+				continue
+			}
+			// Case 3: streak started but not yet tripped; keep only if within cbWindow.
+			if rec.OpenUntil == 0 && rec.ConsecFails > 0 && rec.FirstFailAt > 0 {
+				if now-rec.FirstFailAt >= int64(cbWindow) {
+					breakerExpired++
+					s.persistBreakerDelete(node)
+					continue
+				}
+				cb := &circuitBreakerState{}
+				cb.consecFails.Store(rec.ConsecFails)
+				cb.firstFailAt.Store(rec.FirstFailAt)
+				cb.tripCount.Store(rec.TripCount)
+				s.breakers.Store(node, cb)
+				breakerRestored++
+			}
+		}
+	}
+
+	if restored+expired+breakerRestored+breakerExpired > 0 {
+		s.logger.Info("smart[", s.Tag(), "] hydrated runtime state: knownDead=",
+			restored, " (dropped ", expired, " expired), breakers=",
+			breakerRestored, " (dropped ", breakerExpired, " expired)")
+	}
 }
 
 // Short-life connection parameters — tuned so 3 consecutive "user gave up
@@ -3200,6 +4572,60 @@ const (
 	shortLifeThreshold     = 3               // events before banning the node
 	shortLifeWindow        = 60 * time.Second
 )
+
+// handleResetThresholdCrossed runs the decisive cleanup when the
+// per-(target, node) RST counter has crossed resetEventThreshold within
+// the sliding window. Three actions, in dependency order:
+//
+//  1. recordDialFailure → kicks the circuit breaker so isAlive drops
+//     the node from candidate lists for cbOpenDuration immediately.
+//     Also persists the breaker state so a restart during cooldown
+//     doesn't silently re-elect the same node.
+//
+//  2. markDead → writes the per-node "known bad" tombstone so
+//     selectProxiesTraced excludes this node even before the next
+//     health check cycle catches up.
+//
+//  3. DeleteUnwrapResult + meta target/ASN → invalidates any sticky
+//     "this target prefers this node" cache so the user's next dial
+//     starts fresh from the candidate list.
+//
+//  4. Async kick of updateNodeRanking — refreshes the ranking
+//     snapshot so /weights surfaces the new ordering within seconds
+//     instead of waiting for the next 1-min scheduled tick.
+//
+// All steps are best-effort: a nil store (test setup) is tolerated.
+func (s *Smart) handleResetThresholdCrossed(meta *smartDialMeta, proxyTag string) {
+	if proxyTag == "" {
+		return
+	}
+	tripped := s.recordDialFailure(proxyTag)
+	s.markDead(proxyTag)
+	if s.store != nil && meta != nil && meta.smartTarget != "" {
+		s.store.DeleteUnwrapResult(s.Tag(), smartConfigName,
+			meta.smartTarget, meta.asnCode, meta.isUDP)
+	}
+	target := ""
+	if meta != nil && meta.smartTarget != "" {
+		target = meta.smartTarget
+		// Critical: Execute the target-level soft break so this dead node
+		// isn't continuously repicked via the generic URLTest default tier!
+		s.markDeadForTarget(target, proxyTag)
+	}
+	s.logger.Info("smart[", s.Tag(), "] node [", proxyTag,
+		"] marked dead after ", resetEventThreshold,
+		" upstream resets on target [", target,
+		"] within ", resetEventWindow,
+		" (breaker tripped=", tripped, ")")
+
+	// Kick the ranking refresh on the shared worker so the next
+	// /weights call and the next selectProxies pass both see the
+	// post-eviction state. Bounded by the worker pool — never
+	// spawns an unbounded goroutine even under reset storms.
+	if w := getSmartWorker(); w != nil {
+		w.submit(s.updateNodeRanking)
+	}
+}
 
 // recordShortLife registers one short-life close for (target, node).
 // Returns true when the threshold has just been crossed so the caller
@@ -3287,18 +4713,7 @@ func (s *Smart) supportsUDP(ob adapter.Outbound) bool {
 	return false
 }
 
-func (s *Smart) getPriorityFactor(tag string) float64 {
-	for _, rule := range s.policyPriority {
-		if rule.isRegex && rule.regex != nil {
-			if rule.regex.MatchString(tag) {
-				return rule.factor
-			}
-		} else if strings.Contains(tag, rule.pattern) {
-			return rule.factor
-		}
-	}
-	return 1.0
-}
+// getPriorityFactor moved to smart_priority.go.
 
 func (s *Smart) getHistoryConnectTime(meta *smartDialMeta, proxyTag string) int64 {
 	if s.store == nil || meta.smartTarget == "" {
@@ -3389,13 +4804,13 @@ func (s *Smart) maybeOpenCountryDB() {
 	if mmdbPath == "" {
 		return
 	}
-	db, err := maxminddb.Open(mmdbPath)
+	db, err := getSharedMMDB(mmdbPath)
 	if err != nil {
 		return // file still not present; try again next time
 	}
 	s.countryDB = db
 	s.logger.Info("smart[", s.Tag(), "] country mmdb lazily opened from ",
-		mmdbPath, " (feeds DestGeoIP feature)")
+		mmdbPath, " (shared via mmdbPool)")
 }
 
 func (s *Smart) onProviderUpdated(tag string) error {
@@ -3447,6 +4862,13 @@ func (s *Smart) onProviderUpdated(tag string) error {
 		outbounds = append(outbounds, detour)
 	}
 
+	// Intern tag strings so N Smart groups sharing the same node hold
+	// pointers to ONE backing byte slice — saves ~1 KB per overlapping
+	// node across the process (13 KB → ~1 KB on a 15-group × 30-node
+	// overlap scenario).
+	for i := range tags {
+		tags[i] = internTag(tags[i])
+	}
 	s.state.Store(&smartGroupState{outbounds: outbounds, tags: tags})
 	return nil
 }

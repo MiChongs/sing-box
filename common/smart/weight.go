@@ -115,9 +115,18 @@ func CalculateWeight(input *ModelInput, priorityFactor float64) (float64, bool) 
 	}
 
 	// ─── time decay ──────────────────────────────────────────────────────
-	timeFactor := 1.0
+	// Positive observations (connect/latency/success) and negative
+	// observations (failure) decay on separate curves so a once-burned
+	// node stays pessimistic even after its good samples have faded.
+	// adaptiveHalfLifeScale also stretches halfLife for records with
+	// few samples, preserving their signal until more arrive.
+	timeFactor := 1.0           // applied to success/connect/latency
+	timeFactorFailure := 1.0    // applied to failure (≥ timeFactor)
+	n := input.Success + input.Failure
 	if input.LastUsed > 0 {
-		timeFactor = GetTimeDecay(input.LastUsed, time.Now().Unix(), params.minDecayFactor)
+		now := time.Now().Unix()
+		timeFactor = GetTimeDecayAdaptive(input.LastUsed, now, params.minDecayFactor, n)
+		timeFactorFailure = GetTimeDecayForFailure(input.LastUsed, now, params.minDecayFactor, n)
 	}
 
 	// ─── WILSON LOWER BOUND success rate ─────────────────────────────────
@@ -126,7 +135,7 @@ func CalculateWeight(input *ModelInput, priorityFactor float64) (float64, bool) 
 	//   lower = (p_hat + z²/2n - z·√((p_hat·(1-p_hat) + z²/4n)/n)) / (1 + z²/n)
 	// Apply time decay to n so ancient samples aren't fully weighted.
 	decayedSuccess := math.Max(0, float64(input.Success)*timeFactor)
-	decayedFailure := math.Max(0, float64(input.Failure)*timeFactor)
+	decayedFailure := math.Max(0, float64(input.Failure)*timeFactorFailure)
 	decayedN := decayedSuccess + decayedFailure
 	// Minimum effective n of 1 — keeps Wilson numerator/denominator stable
 	// for nodes that had only failures recently.
@@ -282,6 +291,21 @@ func CalculateWeight(input *ModelInput, priorityFactor float64) (float64, bool) 
 		quality*params.qualityWeight +
 		asnBonus) * efficiencyFactor * priorityFactor
 
+	// ─── RECENT-WINDOW PENALTY (VividCortex/ewma signals) ────────────────
+	// Short-horizon moving averages maintained by AtomicStatsRecord catch
+	// "just got worse" before the lifetime Welford mean has enough weight
+	// to swing. We translate them to a multiplicative penalty in
+	// [recentMinMul, 1.0] so a node that looks fine on paper but is
+	// currently flapping drops out of the top ranks within a dozen dials.
+	//
+	// Multiplicative instead of additive because the composite has already
+	// been through trafficFactor + quality + asnBonus adjustments; a
+	// straight addition would stack explosively on already-high scores.
+	//
+	// Both signals are skipped when they haven't warmed up (value == 0)
+	// or when lifetime counters are too sparse to give them context.
+	composite *= recentPenaltyMultiplier(input, latency)
+
 	// ─── CONFIDENCE FACTOR ───────────────────────────────────────────────
 	// Low-sample nodes are untrustworthy regardless of their raw score.
 	// sampleConfidence(n) = 1 - 1/√(n+1), so n=2 → 0.42, n=10 → 0.70,
@@ -345,6 +369,53 @@ func sampleConfidence(n int64) float64 {
 		return 0
 	}
 	return 1.0 - 1.0/math.Sqrt(float64(n)+1)
+}
+
+// recentPenaltyMultiplier turns the two short-window EWMA signals into
+// a single multiplier in [recentMinMul, 1.0] for the composite weight.
+//
+// Two triggers, each contributing at most half of the total drag:
+//
+//  1. Recent RTT much worse than long-term latency: if ShortRTT is
+//     ≥ recentRTTBadRatio × long-term latency AND the ShortRTT is above
+//     a meaningful absolute floor (to avoid over-reacting when both are
+//     tiny), scale down by up to recentPenaltyMax × 0.5.
+//
+//  2. Recent success rate dropped well below 1.0: applied only after
+//     the lifetime counters have enough samples to compare against
+//     (shortEnoughSamples). Drag proportional to (1 - shortSuccessRate)
+//     up to recentPenaltyMax × 0.5.
+//
+// Both signals are gated on Value() > 0 because VividCortex/ewma treats
+// zero as "uninitialized" — we don't want the first few dials of a
+// freshly-constructed record to look artificially awful.
+func recentPenaltyMultiplier(input *ModelInput, latencyMS int64) float64 {
+	const (
+		recentPenaltyMax     = 0.30 // max total drag = 30 %
+		recentRTTBadRatio    = 1.50 // shortRTT / longTerm >= 1.5 triggers
+		recentRTTAbsFloorMS  = 80.0 // don't react when both are tiny
+		recentSuccessFloor   = 0.95 // below 0.95 starts penalising
+		shortEnoughSamples   = 10   // need ≥10 lifetime samples to judge
+	)
+	recentMinMul := 1.0 - recentPenaltyMax
+
+	drag := 0.0
+	if input.ShortRTT > recentRTTAbsFloorMS && float64(latencyMS) > 0 {
+		if ratio := input.ShortRTT / float64(latencyMS); ratio >= recentRTTBadRatio {
+			// Saturate via tanh so a 10× ratio doesn't pin drag at max.
+			drag += (recentPenaltyMax * 0.5) * math.Tanh(ratio-recentRTTBadRatio)
+		}
+	}
+	if input.ShortSuccessRate > 0 && input.Success+input.Failure >= shortEnoughSamples &&
+		input.ShortSuccessRate < recentSuccessFloor {
+		deficit := recentSuccessFloor - input.ShortSuccessRate
+		drag += (recentPenaltyMax * 0.5) * clamp(deficit/recentSuccessFloor, 0, 1)
+	}
+	mul := 1.0 - drag
+	if mul < recentMinMul {
+		return recentMinMul
+	}
+	return mul
 }
 
 // jitterCost maps coefficient-of-variation (σ/μ) to a penalty in [0, 1].
@@ -570,13 +641,106 @@ func calculateTrafficFactor(trafficMB, maxRateKB, durationMinutes float64, isSho
 	return math.Min(1.25, baseFactor*connectionFactor)
 }
 
-// GetTimeDecay computes time-based weight decay for historical data.
-// Piecewise-linear: full weight in first 24h, gradual decay over a month,
-// then floor at minDecay.
+// GetTimeDecay computes a 0..1 weight multiplier for historical stats
+// based on how long ago the sample was last refreshed.
+//
+// Default (post-refactor): smooth exponential decay with a half-life
+// of 168 h (7 days). decay = 2^(-elapsedHours / halfLife), floored at
+// minDecay. The 168 h half-life is chosen so the new curve crosses the
+// old piecewise curve near its midpoint (old: decay=0.5 at 7 d; new:
+// decay=0.5 at 7 d) — keeps selection-volume distribution close to
+// legacy builds while eliminating the hard plateau transitions that
+// caused measurable reselection jitter on records that straddled a
+// boundary (e.g. exactly 72 h).
+//
+// Legacy (SMART_LEGACY=1): piecewise linear plateaus (24 h full → 72 h
+// 80 % → 7 d 50 % → 30 d 10 %), bit-identical to prior builds. Used as
+// the regression baseline during rollout; will be removed once the
+// exponential path is validated.
+//
+// Why not pull in an EWMA library: EWMA (VividCortex/ewma and peers)
+// averages a stream of SAMPLES, not a weight-from-elapsed-time; it has
+// no natural fit for "how stale is this single stored datapoint".
+// Evaluating an exp decay is one math.Exp2 — no state, no library.
+//
+// Override: SMART_DECAY_HALF_LIFE_HOURS env var adjusts half-life for
+// ops who want shorter/longer memory (range 1..8760 h = 1y).
 func GetTimeDecay(lastUsedTime, now int64, minDecay float64) float64 {
+	// Fuzzy-round to the hour boundary so two dials within the same
+	// minute yield identical decay (reduces ordering noise in ranking).
 	fuzzy := (lastUsedTime / 3600) * 3600
 	hours := float64(now-fuzzy) / 3600.0
+	if hours < 0 {
+		hours = 0
+	}
 
+	if LegacyMode() {
+		return legacyTimeDecay(hours, minDecay)
+	}
+
+	halfLife := timeDecayHalfLifeHours()
+	decay := math.Exp2(-hours / halfLife)
+	return math.Max(minDecay, decay)
+}
+
+// GetTimeDecayAdaptive is the sample-count-aware variant of
+// GetTimeDecay. The base halfLife is multiplied by
+// adaptiveHalfLifeScale(n) so records with few samples decay slowly
+// (retain their sparse signal) and records with many samples decay
+// faster (adapt quickly to recent behaviour).
+//
+// n is typically Success + Failure. Pass 0 to keep the non-adaptive
+// behaviour — adaptiveHalfLifeScale returns adaptiveScaleMax in that
+// case, which collapses back to GetTimeDecay when combined with a
+// base halfLife.
+//
+// Legacy mode (SMART_LEGACY=1) ignores n entirely and returns the
+// piecewise curve for A/B parity.
+func GetTimeDecayAdaptive(lastUsedTime, now int64, minDecay float64, n int64) float64 {
+	fuzzy := (lastUsedTime / 3600) * 3600
+	hours := float64(now-fuzzy) / 3600.0
+	if hours < 0 {
+		hours = 0
+	}
+	if LegacyMode() {
+		return legacyTimeDecay(hours, minDecay)
+	}
+	halfLife := timeDecayHalfLifeHours() * adaptiveHalfLifeScale(n)
+	decay := math.Exp2(-hours / halfLife)
+	return math.Max(minDecay, decay)
+}
+
+// GetTimeDecayForFailure computes the decay factor for the failure
+// half of a record's observations. The halfLife is scaled by both
+// adaptiveHalfLifeScale(n) AND failureStickyFactor (default 2.0), so
+// negative samples outlast positive ones and a node that just burned
+// us stays pessimistically weighted longer than it stays optimistic.
+//
+// Call site pattern in CalculateWeight:
+//
+//	decayedSuccess := Success * GetTimeDecayAdaptive(...)
+//	decayedFailure := Failure * GetTimeDecayForFailure(...)
+//	wilson(decayedSuccess, decayedN)  // biased toward pessimism
+//
+// Legacy mode falls back to the piecewise curve (no stickiness).
+func GetTimeDecayForFailure(lastUsedTime, now int64, minDecay float64, n int64) float64 {
+	fuzzy := (lastUsedTime / 3600) * 3600
+	hours := float64(now-fuzzy) / 3600.0
+	if hours < 0 {
+		hours = 0
+	}
+	if LegacyMode() {
+		return legacyTimeDecay(hours, minDecay)
+	}
+	halfLife := timeDecayHalfLifeHours() * adaptiveHalfLifeScale(n) * failureStickyFactor()
+	decay := math.Exp2(-hours / halfLife)
+	return math.Max(minDecay, decay)
+}
+
+// legacyTimeDecay implements the pre-refactor piecewise-linear curve.
+// Preserved verbatim so SMART_LEGACY=1 is bit-for-bit equivalent to
+// previous builds — used as the regression baseline during rollout.
+func legacyTimeDecay(hours, minDecay float64) float64 {
 	var decay float64
 	switch {
 	case hours <= 24:

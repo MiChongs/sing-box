@@ -94,6 +94,8 @@ type URLTest struct {
 	exclude         *regexp.Regexp
 	include         *regexp.Regexp
 	useAllProviders bool
+	hidden          bool
+	icon            string
 }
 
 type URLTestFallback struct {
@@ -123,6 +125,8 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		exclude:         (*regexp.Regexp)(options.Exclude),
 		include:         (*regexp.Regexp)(options.Include),
 		useAllProviders: options.UseAllProviders,
+		hidden:          options.Hidden,
+		icon:            options.Icon,
 	}
 	if options.Fallback.Enabled {
 		outbound.fallback = URLTestFallback{
@@ -132,6 +136,11 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	return outbound, nil
 }
+
+// Hidden / Icon expose the dashboard hints from option.GroupCommonOption.
+// See adapter.OutboundGroup interface for the semantic contract.
+func (s *URLTest) Hidden() bool { return s.hidden }
+func (s *URLTest) Icon() string { return s.icon }
 
 func (s *URLTest) Start() error {
 	if s.useAllProviders {

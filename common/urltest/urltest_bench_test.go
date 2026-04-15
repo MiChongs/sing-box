@@ -28,7 +28,7 @@ func BenchmarkDrainResponse_HEAD204(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		reader.Reset(strings.NewReader(raw))
-		if err := drainResponse(reader, req); err != nil {
+		if err := drainResponse(reader, req, false); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -48,21 +48,21 @@ func BenchmarkDrainResponse_HEADWithBody(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		reader.Reset(strings.NewReader(raw))
-		if err := drainResponse(reader, req); err != nil {
+		if err := drainResponse(reader, req, false); err != nil {
 			b.Fatal(err)
 		}
 	}
 }
 
-// BenchmarkGetOrBuildRequest 验证缓存命中路径零分配
-func BenchmarkGetOrBuildRequest(b *testing.B) {
+// BenchmarkBuildDynamicRequest 验证缓存命中路径零分配
+func BenchmarkBuildDynamicRequest(b *testing.B) {
 	u, _ := url.Parse("https://www.gstatic.com/generate_204")
-	_ = getOrBuildRequest(u, u.Hostname()) // 预热
+	_ = buildDynamicRequest(u, u.Hostname()) // 预热
 
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = getOrBuildRequest(u, u.Hostname())
+		_ = buildDynamicRequest(u, u.Hostname())
 	}
 }
 
@@ -82,7 +82,7 @@ func TestDrainResponse_NoBodyRead(t *testing.T) {
 	raw := "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\nLEFTOVER"
 	req, _ := http.NewRequest(http.MethodHead, "http://x/", nil)
 	reader := bufio.NewReader(strings.NewReader(raw))
-	if err := drainResponse(reader, req); err != nil {
+	if err := drainResponse(reader, req, false); err != nil {
 		t.Fatal(err)
 	}
 	rest, _ := io.ReadAll(reader)
@@ -96,7 +96,7 @@ func TestDrainResponse_HEADResidualDrain(t *testing.T) {
 	raw := "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nHELLOTAIL"
 	req, _ := http.NewRequest(http.MethodHead, "http://x/", nil)
 	reader := bufio.NewReader(strings.NewReader(raw))
-	if err := drainResponse(reader, req); err != nil {
+	if err := drainResponse(reader, req, false); err != nil {
 		t.Fatal(err)
 	}
 	rest, _ := io.ReadAll(reader)
@@ -110,7 +110,7 @@ func TestDrainResponse_BodyTooLarge(t *testing.T) {
 	raw := "HTTP/1.1 200 OK\r\nContent-Length: 99999999\r\n\r\n"
 	req, _ := http.NewRequest(http.MethodHead, "http://x/", nil)
 	reader := bufio.NewReader(strings.NewReader(raw))
-	if err := drainResponse(reader, req); err != errBodyTooLarge {
+	if err := drainResponse(reader, req, false); err != errBodyTooLarge {
 		t.Fatalf("expected errBodyTooLarge, got %v", err)
 	}
 }
@@ -120,7 +120,7 @@ func TestDrainResponse_4xx(t *testing.T) {
 	raw := "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
 	req, _ := http.NewRequest(http.MethodHead, "http://x/", nil)
 	reader := bufio.NewReader(strings.NewReader(raw))
-	err := drainResponse(reader, req)
+	err := drainResponse(reader, req, false)
 	if err == nil {
 		t.Fatal("expected error for 4xx")
 	}
@@ -188,7 +188,7 @@ func TestMeasureRequest_FirstByteRTT(t *testing.T) {
 	reader := bufio.NewReader(mc)
 	req, _ := http.NewRequest(http.MethodHead, "http://x/", nil)
 
-	rtt, err := measureRequest(mc, reader, req, []byte("HEAD / HTTP/1.1\r\n\r\n"))
+	rtt, err := measureRequest(mc, reader, req, []byte("HEAD / HTTP/1.1\r\n\r\n"), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestMeasureRequest_WriteError(t *testing.T) {
 	reader := bufio.NewReader(strings.NewReader(""))
 	req, _ := http.NewRequest(http.MethodHead, "http://x/", nil)
 
-	_, err := measureRequest(mc, reader, req, []byte("HEAD / HTTP/1.1\r\n\r\n"))
+	_, err := measureRequest(mc, reader, req, []byte("HEAD / HTTP/1.1\r\n\r\n"), false)
 	if err != io.ErrUnexpectedEOF {
 		t.Fatalf("expected write error, got %v", err)
 	}
@@ -217,7 +217,7 @@ func TestMeasureRequest_ResponseError(t *testing.T) {
 	reader := bufio.NewReader(mc)
 	req, _ := http.NewRequest(http.MethodHead, "http://x/", nil)
 
-	rtt, err := measureRequest(mc, reader, req, []byte("HEAD / HTTP/1.1\r\n\r\n"))
+	rtt, err := measureRequest(mc, reader, req, []byte("HEAD / HTTP/1.1\r\n\r\n"), false)
 	if err == nil {
 		t.Fatal("expected error for 5xx")
 	}
@@ -239,7 +239,7 @@ func BenchmarkMeasureRequest(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		mc := &mockConn{readSrc: strings.NewReader(resp)}
 		reader.Reset(mc)
-		if _, err := measureRequest(mc, reader, req, reqBytes); err != nil {
+		if _, err := measureRequest(mc, reader, req, reqBytes, false); err != nil {
 			b.Fatal(err)
 		}
 	}

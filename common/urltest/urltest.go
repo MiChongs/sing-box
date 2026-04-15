@@ -3,12 +3,16 @@ package urltest
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
+	"encoding/hex"
 	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -89,34 +93,35 @@ var readerPool = sync.Pool{
 	New: func() any { return bufio.NewReaderSize(nil, bufioSize) },
 }
 
-// 每个 URL 预构建一次 HEAD 请求字节，永久复用。绝大多数场景 URL 固定（generate_204），命中率 100%。
-var requestCache sync.Map // map[string]*cachedRequest
-
-type cachedRequest struct {
-	headKeepAlive []byte // HEAD ... Connection: keep-alive
-	headClose     []byte // HEAD ... Connection: close
+// requestPayloads contains the raw byte sequences for HEAD tests
+type requestPayloads struct {
+	headKeepAlive []byte
+	headClose     []byte
 	headReq       *http.Request
 }
 
 var errBodyTooLarge = errors.New("urltest: response body exceeds safety limit")
 
-func getOrBuildRequest(linkURL *url.URL, hostname string) *cachedRequest {
+func buildDynamicRequest(linkURL *url.URL, hostname string) *requestPayloads {
+	// Anti-Spoofing: Inject a high-entropy nonce to defeat aggressive ISP/Airport caches
+	b := make([]byte, 4)
+	rand.Read(b)
+	nonce := hex.EncodeToString(b)
+	
+	q := linkURL.Query()
+	q.Set("rnd", nonce)
+	linkURL.RawQuery = q.Encode()
+
 	key := linkURL.String()
-	if v, ok := requestCache.Load(key); ok {
-		return v.(*cachedRequest)
-	}
 	uri := linkURL.RequestURI()
 	head := "HEAD " + uri + " HTTP/1.1\r\nHost: " + hostname + "\r\nUser-Agent: sing-box\r\nAccept: */*\r\n"
-	// http.ReadResponse 需要 Request 参考来正确解释 body 语义
-	// （HEAD 方法下 body 永远为空，避免误读下一条响应）
+	
 	req, _ := http.NewRequest(http.MethodHead, key, nil)
-	cr := &cachedRequest{
+	return &requestPayloads{
 		headKeepAlive: []byte(head + "Connection: keep-alive\r\n\r\n"),
 		headClose:     []byte(head + "Connection: close\r\n\r\n"),
 		headReq:       req,
 	}
-	requestCache.Store(key, cr)
-	return cr
 }
 
 // ════════════════ URLTest ════════════════
@@ -156,6 +161,7 @@ func getOrBuildRequest(linkURL *url.URL, hostname string) *cachedRequest {
 //   - chunked / gzip / 无 Content-Length 响应：交由 http.ReadResponse 处理
 //   - 2xx/3xx 均视可达（仅 4xx/5xx 判失败）
 func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err error) {
+	dialStart := time.Now()
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
 	}
@@ -204,7 +210,7 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 	}
 
 	// ── Phase 3: HTTP HEAD + First-Byte RTT ──
-	req := getOrBuildRequest(linkURL, hostname)
+	req := buildDynamicRequest(linkURL, hostname)
 	reader := readerPool.Get().(*bufio.Reader)
 	reader.Reset(conn)
 	defer func() {
@@ -212,33 +218,45 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		readerPool.Put(reader)
 	}()
 
-	var rtt time.Duration
+	dialDuration := time.Since(dialStart)
+	
+	// Assess if the target URL implies a strict 204 No Content assertion
+	require204 := strings.Contains(linkURL.Path, "204") || strings.Contains(linkURL.Host, "204")
+
+	var totalDelay time.Duration
 	if C.URLTestUnifiedDelay {
-		// 请求 1：暖身 + 首次 RTT 测量
-		rtt1, err1 := measureRequest(conn, reader, req.headReq, req.headKeepAlive)
+		// UnifiedDelay mode semantics (Aligned with Clash Meta):
+		// Unify protocol disparity by completely ignoring the preliminary dial, TCP, 
+		// and explicit TLS handshake overheads (DialDuration).
+		// We execute a warm-up strike first, then measure the pure un-adulterated steady-state RTT
+		// of the naked conduit.
+		rtt1, err1 := measureRequest(conn, reader, req.headReq, req.headKeepAlive, require204)
 		if err1 != nil {
-			err = err1
-			return
+			return 0, err1
 		}
-		// 请求 2：稳态 RTT 测量（首选）
-		rtt2, err2 := measureRequest(conn, reader, req.headReq, req.headClose)
+		
+		// Strike 2: Measure steady-state naked line RTT.
+		rtt2, err2 := measureRequest(conn, reader, req.headReq, req.headClose, require204)
 		if err2 != nil {
-			// 降级：hy2/tuic 等 QUIC 协议或服务器拒绝 keep-alive 时，
-			// 用暖身 RTT 兜底，保证测试不作废
-			rtt = rtt1
+			// Degradation recovery: MUX protocols like HY2/TUIC may freak out over connection: close 
+			// stream severing. If so, fall back to pure rtt1 (which already ignores dialDuration).
+			totalDelay = rtt1
 		} else {
-			rtt = rtt2
+			totalDelay = rtt2
 		}
 	} else {
-		rtt, err = measureRequest(conn, reader, req.headReq, req.headClose)
+		// Strict Truth Mode: Test using a clean single shot.
+		rtt, err := measureRequest(conn, reader, req.headReq, req.headClose, require204)
 		if err != nil {
-			return
+			return 0, err
 		}
+		// The total user-perceived UX delay includes the painful tunnel/handshake creation penalty!
+		totalDelay = dialDuration + rtt
 	}
 
-	t = uint16(rtt.Milliseconds())
+	t = uint16(totalDelay.Milliseconds())
 	// 亚毫秒级响应提升到 1ms，避免 0 被上层判为失败
-	if t == 0 && rtt > 0 {
+	if t == 0 && totalDelay > 0 {
 		t = 1
 	}
 	return
@@ -252,7 +270,13 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 //   - 排除 TCP/TLS 握手，排除 QUIC 连接建立，排除 BBR 窗口扩张
 //   - 即使读到首字节后 drainResponse 失败（如 4xx 状态），仍返回已测 RTT + 错误，
 //     调用方可决定是否采用
-func measureRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, reqBytes []byte) (time.Duration, error) {
+//     调用方可决定是否采用
+func measureRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, reqBytes []byte, require204 bool) (time.Duration, error) {
+	// Deep-Penetration kill limit: Prevent proxy stream deadlocks or fake-connected hangs!
+	// Ensures Peek(1) never hangs infinitely if the wall/node silently drops the packet.
+	_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	defer conn.SetReadDeadline(time.Time{})
+
 	writeStart := time.Now()
 	if _, err := conn.Write(reqBytes); err != nil {
 		return 0, err
@@ -263,7 +287,7 @@ func measureRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, reqB
 	}
 	rtt := time.Since(writeStart)
 	// 完整消费响应头与 body，保持 stream 干净（下次请求可复用）
-	if err := drainResponse(reader, req); err != nil {
+	if err := drainResponse(reader, req, require204); err != nil {
 		return rtt, err
 	}
 	return rtt, nil
@@ -284,7 +308,7 @@ func measureRequest(conn net.Conn, reader *bufio.Reader, req *http.Request, reqB
 //   - resp 结构体本身一次性堆分配 ~1KB，随返回即可被 GC 回收；
 //   - 违规服务器对 HEAD 返回 body 时，标准库将 Body 置为 NoBody —— 字节仍在 reader，
 //     主动按 Content-Length drain，避免污染下次 keep-alive 请求。
-func drainResponse(reader *bufio.Reader, req *http.Request) error {
+func drainResponse(reader *bufio.Reader, req *http.Request, require204 bool) error {
 	resp, err := http.ReadResponse(reader, req)
 	if err != nil {
 		return err
@@ -301,6 +325,14 @@ func drainResponse(reader *bufio.Reader, req *http.Request) error {
 	// Body 为 NoBody 时 Copy/Close 均为 no-op；非 HEAD 场景完整 drain
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
+	
+	// Anti-Poisoning Validation: 
+	// If target expects a clean 204 (generate_204), reject 200/302 redirects often fed by captive portals, 
+	// ISPs, or airport-proxy mock hijacks.
+	if require204 && resp.StatusCode != 204 {
+		return errors.New("urltest: proxy hijack or poison detected (expected 204, got " + strconv.Itoa(resp.StatusCode) + ")")
+	}
+	
 	if resp.StatusCode >= 400 {
 		return &httpStatusError{resp.StatusCode}
 	}

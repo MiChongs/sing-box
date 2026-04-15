@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"os"
 	"runtime"
 	"sort"
 	"strconv"
@@ -54,6 +55,13 @@ var (
 	globalQueueDirty atomic.Bool
 	globalQueueMu    sync.Mutex
 
+	// inflightBatches counts asynchronous BatchSave goroutines that have
+	// not yet returned. AppendToGlobalQueue spawns one whenever the queue
+	// crosses BatchSaveThreshold; StoreFlushNow must Wait on this before
+	// it can claim "everything is on disk", otherwise a concurrent async
+	// flush mid-commit would leak past shutdown.
+	inflightBatches sync.WaitGroup
+
 	globalCacheParams struct {
 		BatchSaveThreshold int
 		MaxTargets         int
@@ -83,11 +91,11 @@ func GetOrInitStore(db *bbolt.DB) *Store {
 }
 
 func initCaches() {
-	sz := MinTargetsLimit / 4
+	sz, batch := resolveCacheBudget()
 
 	globalCacheParams.mu.Lock()
-	globalCacheParams.BatchSaveThreshold = MinBatchThreshLimit
-	globalCacheParams.MaxTargets = MinTargetsLimit
+	globalCacheParams.BatchSaveThreshold = batch
+	globalCacheParams.MaxTargets = sz * 4
 	globalCacheParams.mu.Unlock()
 
 	targetCache = newLRU[string, string](sz)
@@ -95,6 +103,65 @@ func initCaches() {
 	recordCache = newLRU[string, *AtomicStatsRecord](sz)
 	dbResultCache = newLRUWithTTL[string, map[string][]byte](sz, 300*time.Second)
 	blockedNodesCache = newLRUWithTTL[string, map[string]bool](sz, 300*time.Second)
+}
+
+// resolveCacheBudget returns (per-cache capacity in number-of-entries,
+// batch-save threshold). It honours two env-var overrides:
+//
+//   - SMART_CACHE_BUDGET_MB: total memory budget across all five caches,
+//     interpreted as an approximate byte-cost MaxCost divided five ways.
+//     We convert it back to an entry count by assuming a ~2 KiB typical
+//     entry size (empirical from a 16-group production profile).
+//   - SMART_LEGACY: keeps a single floor value regardless of platform —
+//     used for A/B comparison during the ristretto rollout.
+//
+// Defaults: desktop 32 MB → ~1600 entries per cache; Android 8 MB → ~400.
+// Both numbers respect the MinTargetsLimit / MaxTargetsLimit bounds the
+// rest of the store assumes.
+func resolveCacheBudget() (perCacheEntries, batchThreshold int) {
+	mb := defaultCacheBudgetMB()
+	if raw := os.Getenv("SMART_CACHE_BUDGET_MB"); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
+			mb = v
+		}
+	}
+
+	// ~2 KiB per entry, 5 caches share the budget.
+	entriesTotal := (mb * 1024) / 2
+	perCacheEntries = entriesTotal / 5
+	if perCacheEntries < MinTargetsLimit/4 {
+		perCacheEntries = MinTargetsLimit / 4
+	}
+	if perCacheEntries > MaxTargetsLimit/4 {
+		perCacheEntries = MaxTargetsLimit / 4
+	}
+
+	// Batch threshold scales linearly between Min/Max bounds proportional
+	// to the cache size (bigger cache → larger batches amortise bbolt
+	// transaction cost better).
+	span := MaxTargetsLimit/4 - MinTargetsLimit/4
+	frac := 0.0
+	if span > 0 {
+		frac = float64(perCacheEntries-MinTargetsLimit/4) / float64(span)
+	}
+	batchThreshold = MinBatchThreshLimit + int(float64(MaxBatchThreshLimit-MinBatchThreshLimit)*frac)
+	if batchThreshold < MinBatchThreshLimit {
+		batchThreshold = MinBatchThreshLimit
+	}
+	if batchThreshold > MaxBatchThreshLimit {
+		batchThreshold = MaxBatchThreshLimit
+	}
+	return perCacheEntries, batchThreshold
+}
+
+// defaultCacheBudgetMB returns the platform-default cache budget. Android
+// (and other constrained mobile runtimes) picks a smaller number because
+// the OS aggressively kills background processes exceeding RSS caps.
+func defaultCacheBudgetMB() int {
+	if runtime.GOOS == "android" || runtime.GOOS == "ios" {
+		return 8
+	}
+	return 32
 }
 
 func initQueue() {
@@ -167,7 +234,9 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 	globalQueueMu.Unlock()
 
 	if shouldFlush && len(snapshot) > 0 {
+		inflightBatches.Add(1)
 		go func() {
+			defer inflightBatches.Done()
 			_ = s.BatchSave(snapshot)
 		}()
 	}
@@ -276,32 +345,86 @@ func (s *Store) FlushQueue(force bool) {
 	_ = s.BatchSave(ops)
 }
 
-// BatchSave persists a list of operations to bbolt in a single Batch transaction.
+// BatchSave persists a list of operations to bbolt in a single Batch
+// transaction. Tombstone ops (OpDelete*) invoke bucket.Delete instead of
+// bucket.Put so deletes propagate through the same batched path.
+//
+// Save and Delete for the same key share FormatOperationKey, so when both
+// land in the batch only the LAST action wins — the writeMap below just
+// replays insertion order into a deterministic map. This is fine because
+// the queue already dedups at enqueue time; BatchSave is a best-effort
+// coalesce for any stragglers that escaped the enqueue dedup window
+// (e.g. two concurrent writers racing the append).
+type writeOp struct {
+	data []byte
+	del  bool
+}
+
 func (s *Store) BatchSave(operations []StoreOperation) error {
 	if len(operations) == 0 {
 		return nil
 	}
 
-	writeMap := make(map[string][]byte, len(operations))
+	writeMap := make(map[string]writeOp, len(operations))
 	for i := range operations {
 		key := FormatOperationKey(&operations[i])
-		if key != "" {
-			writeMap[key] = operations[i].Data
+		if key == "" {
+			continue
+		}
+		writeMap[key] = writeOp{
+			data: operations[i].Data,
+			del:  isDeleteOp(operations[i].Type),
 		}
 	}
 
-	return globalDB.Batch(func(tx *bbolt.Tx) error {
+	if err := globalDB.Batch(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists(bucketSmartStats)
 		if err != nil {
 			return err
 		}
-		for key, data := range writeMap {
-			if err := bucket.Put([]byte(key), data); err != nil {
-				return err
+		for key, op := range writeMap {
+			if op.del {
+				if err := bucket.Delete([]byte(key)); err != nil {
+					return err
+				}
+			} else {
+				if err := bucket.Put([]byte(key), op.data); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
-	})
+	}); err != nil {
+		return err
+	}
+	// Explicit fsync. bbolt.DB.Batch already commits synchronously and —
+	// unless NoSync has been set — issues its own fsync per transaction.
+	// We call Sync anyway so this function's contract is independent of
+	// how globalDB was opened: a successful return means the write is on
+	// stable storage. Cost: one fsync per batch, amortised over
+	// BatchSaveThreshold ops (default 50–300), which is negligible next
+	// to the per-op bbolt write path.
+	return globalDB.Sync()
+}
+
+// StoreFlushNow drains every pending queue entry AND any in-flight async
+// BatchSave goroutine, then issues a final fsync on the bbolt store.
+//
+// Call this from shutdown / SIGTERM / cache-reset paths where you need
+// the "everything the Smart group has observed is on disk" guarantee.
+// Unlike FlushQueue(true), which only drains the queue snapshot visible
+// at call time, StoreFlushNow also waits on goroutines spawned by
+// earlier AppendToGlobalQueue calls that may still be committing.
+//
+// Idempotent and safe to call concurrently; overlapping calls simply
+// share the same waitgroup drain + final Sync.
+func (s *Store) StoreFlushNow() error {
+	if s == nil || globalDB == nil {
+		return nil
+	}
+	s.FlushQueue(true)
+	inflightBatches.Wait()
+	return globalDB.Sync()
 }
 
 // GetSubBytesByPath returns all bbolt records matching a key prefix.
@@ -341,7 +464,22 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 		if len(pathParts) == 6 {
 			strict = true
 		}
+	case KeyTypeManualPin:
+		// smart/manual/<cfg>/<grp> — exactly 4 parts
+		if len(pathParts) == 4 {
+			strict = true
+		}
+	case KeyTypeKnownDead, KeyTypeBreaker, KeyTypePinEndorsement:
+		// smart/dead|breaker|pinendor/<cfg>/<grp>/<node> — exactly 5 parts
+		if len(pathParts) == 5 {
+			strict = true
+		}
 	}
+
+	// Tombstones from the in-flight queue MUST be visible to readers —
+	// otherwise hydrate would see a stale bbolt value that a pending
+	// Delete hasn't yet flushed. Collected here and applied at the end.
+	var tombstoned map[string]struct{}
 
 	// Pull from write-queue first (in-flight data takes precedence)
 	for _, op := range getGlobalQueueSnapshot() {
@@ -384,6 +522,80 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 				key = FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)
 				result[key] = op.Data
 			}
+		case KeyTypeManualPin:
+			switch op.Type {
+			case OpSaveManualPin:
+				key = FormatDBKey(KeyTypeManualPin, op.Config, op.Group)
+				result[key] = op.Data
+				delete(tombstoned, key)
+			case OpDeleteManualPin:
+				key = FormatDBKey(KeyTypeManualPin, op.Config, op.Group)
+				delete(result, key)
+				if tombstoned == nil {
+					tombstoned = make(map[string]struct{})
+				}
+				tombstoned[key] = struct{}{}
+			}
+		case KeyTypeKnownDead:
+			if op.Node == "" {
+				continue
+			}
+			if len(pathParts) >= 5 && pathParts[4] != op.Node {
+				continue
+			}
+			switch op.Type {
+			case OpSaveKnownDead:
+				key = FormatDBKey(KeyTypeKnownDead, op.Config, op.Group, op.Node)
+				result[key] = op.Data
+				delete(tombstoned, key)
+			case OpDeleteKnownDead:
+				key = FormatDBKey(KeyTypeKnownDead, op.Config, op.Group, op.Node)
+				delete(result, key)
+				if tombstoned == nil {
+					tombstoned = make(map[string]struct{})
+				}
+				tombstoned[key] = struct{}{}
+			}
+		case KeyTypeBreaker:
+			if op.Node == "" {
+				continue
+			}
+			if len(pathParts) >= 5 && pathParts[4] != op.Node {
+				continue
+			}
+			switch op.Type {
+			case OpSaveBreaker:
+				key = FormatDBKey(KeyTypeBreaker, op.Config, op.Group, op.Node)
+				result[key] = op.Data
+				delete(tombstoned, key)
+			case OpDeleteBreaker:
+				key = FormatDBKey(KeyTypeBreaker, op.Config, op.Group, op.Node)
+				delete(result, key)
+				if tombstoned == nil {
+					tombstoned = make(map[string]struct{})
+				}
+				tombstoned[key] = struct{}{}
+			}
+		case KeyTypePinEndorsement:
+			if op.Node == "" {
+				continue
+			}
+			if len(pathParts) >= 5 && pathParts[4] != op.Node {
+				continue
+			}
+			switch op.Type {
+			case OpSavePinEndorsement:
+				key = FormatDBKey(KeyTypePinEndorsement, op.Config, op.Group, op.Node)
+				result[key] = op.Data
+				delete(tombstoned, key)
+			case OpDeletePinEndorsement:
+				key = FormatDBKey(KeyTypePinEndorsement, op.Config, op.Group, op.Node)
+				delete(result, key)
+				if tombstoned == nil {
+					tombstoned = make(map[string]struct{})
+				}
+				tombstoned[key] = struct{}{}
+			}
 		}
 	}
 
@@ -399,6 +611,9 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 	if cached, ok := dbResultCache.Get(prefix); ok && maxResults > 0 {
 		for k, v := range cached {
 			if _, exists := result[k]; !exists {
+				if _, gone := tombstoned[k]; gone {
+					continue
+				}
 				result[k] = v
 			}
 		}
@@ -407,10 +622,15 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 		if err != nil {
 			return result, nil
 		}
-		if maxResults > 0 && !(keyType == KeyTypeStats && strict) {
+		if maxResults > 0 && !(keyType == KeyTypeStats && strict) && len(tombstoned) == 0 {
+			// Don't cache when tombstones are in flight — the cached copy
+			// would include values that are about to be deleted.
 			dbResultCache.Set(prefix, dbResult)
 		}
 		for k, v := range dbResult {
+			if _, gone := tombstoned[k]; gone {
+				continue
+			}
 			if _, exists := result[k]; !exists {
 				result[k] = v
 			}
@@ -530,6 +750,74 @@ func (s *Store) DBBatchPutItem(key string, value []byte) error {
 	})
 }
 
+// IterateAtomicRecords walks every cached AtomicStatsRecord under the
+// given (group, config) namespace. The callback receives the parsed
+// (target, node) tuple plus the live record so callers can read the
+// most-recent atomic counters WITHOUT going through bbolt — that
+// avoids the BatchSave-flush latency window where in-memory
+// success/failure increments aren't yet visible to GetAllStats.
+//
+// Order is unspecified. Returning false from the callback stops the
+// walk early.
+func (s *Store) IterateAtomicRecords(group, config string, cb func(target, node string, rec *AtomicStatsRecord) bool) {
+	if recordCache == nil || cb == nil {
+		return
+	}
+	prefix := FormatDBKey(KeyTypeStats, config, group)
+	recordCache.keysIndex.Range(func(k string, _ struct{}) bool {
+		if !strings.HasPrefix(k, prefix) {
+			return true
+		}
+		// Key shape: smart/stats/<config>/<group>/<target>/<node>.
+		// User-supplied parts (target / node) are percent-escaped by
+		// FormatDBKey so a `/` inside an outbound tag doesn't add an
+		// extra segment — must unescape here to recover the real
+		// values for the callback contract.
+		parts := strings.Split(k, "/")
+		if len(parts) < 6 {
+			return true
+		}
+		target := UnescapeKeyPart(parts[len(parts)-2])
+		node := UnescapeKeyPart(parts[len(parts)-1])
+		rec, ok := recordCache.Get(k)
+		if !ok || rec == nil {
+			return true
+		}
+		return cb(target, node, rec)
+	})
+}
+
+// LookupAnyAtomicRecord returns the first cached AtomicStatsRecord for
+// (group, config, proxy) regardless of which target it belongs to.
+//
+// Used by node-level signal queries (e.g. ShortRTT for the
+// fastest-recent algorithm) where the caller wants the EWMA reading on
+// a node tag without knowing which target most recently dialled it.
+// Walks the keys index of the recordCache rather than reconstructing
+// from bbolt — saves a hit on the (already in-memory) data path.
+//
+// Returns nil when no cached record exists. Callers MUST treat nil as
+// "no signal yet" rather than "node is bad".
+func (s *Store) LookupAnyAtomicRecord(group, config, proxy string) *AtomicStatsRecord {
+	if recordCache == nil || proxy == "" {
+		return nil
+	}
+	prefix := FormatDBKey(KeyTypeStats, config, group)
+	suffix := "/" + proxy
+	var found *AtomicStatsRecord
+	recordCache.keysIndex.Range(func(k string, _ struct{}) bool {
+		if !strings.HasPrefix(k, prefix) || !strings.HasSuffix(k, suffix) {
+			return true // continue
+		}
+		if r, ok := recordCache.Get(k); ok {
+			found = r
+			return false // stop iteration
+		}
+		return true
+	})
+	return found
+}
+
 // GetOrCreateAtomicRecord fetches or creates an in-memory AtomicStatsRecord,
 // seeding it from bbolt if available.
 func (s *Store) GetOrCreateAtomicRecord(cacheKey, group, config, target, proxy string) *AtomicStatsRecord {
@@ -543,7 +831,7 @@ func (s *Store) GetOrCreateAtomicRecord(cacheKey, group, config, target, proxy s
 	if err == nil {
 		if data, exists := existingData[proxy]; exists {
 			var sr StatsRecord
-			if json.Unmarshal(data, &sr) == nil {
+			if UnmarshalStatsRecord(data, &sr) == nil {
 				record.success.Store(sr.Success)
 				record.failure.Store(sr.Failure)
 				record.connectTime.Store(sr.ConnectTime)
@@ -560,6 +848,9 @@ func (s *Store) GetOrCreateAtomicRecord(cacheKey, group, config, target, proxy s
 						record.weights[k] = v
 					}
 					record.weightsMu.Unlock()
+				}
+				if len(sr.RTTDigest) > 0 {
+					record.loadRTTDigestBytes(sr.RTTDigest)
 				}
 			}
 		}
@@ -613,8 +904,13 @@ func (s *Store) GetAllStats(group, config string) (map[string]map[string][]byte,
 		if len(parts) < 6 {
 			continue
 		}
-		target := parts[len(parts)-2]
-		node := parts[len(parts)-1]
+		// unescape because FormatDBKey percent-escaped the user-
+		// supplied bits (target hostname / outbound tag) so a `/`
+		// inside e.g. "ENET/🇳🇿 Base 新西兰" doesn't fragment the
+		// path. Without this, target / node end up as the wrong
+		// substring and the wantSet match in callers always misses.
+		target := UnescapeKeyPart(parts[len(parts)-2])
+		node := UnescapeKeyPart(parts[len(parts)-1])
 		if _, ok := result[target]; !ok {
 			result[target] = make(map[string][]byte)
 		}
@@ -710,7 +1006,7 @@ func (s *Store) GetBestProxyForTarget(group, config, target, asnNumber string, i
 		for _, mapStats := range allStatsMap {
 			for nodeName, data := range mapStats {
 				var record StatsRecord
-				if json.Unmarshal(data, &record) != nil || record.Weights == nil {
+				if UnmarshalStatsRecord(data, &record) != nil || record.Weights == nil {
 					continue
 				}
 				if weight, ok := record.Weights[asnWeightType]; ok && weight > 0 {
@@ -737,7 +1033,7 @@ func (s *Store) GetBestProxyForTarget(group, config, target, asnNumber string, i
 
 		for nodeName, data := range mapStats {
 			var record StatsRecord
-			if json.Unmarshal(data, &record) != nil || record.Weights == nil {
+			if UnmarshalStatsRecord(data, &record) != nil || record.Weights == nil {
 				continue
 			}
 			if weight := record.Weights[weightType]; weight > 0 {
@@ -1148,7 +1444,7 @@ func (s *Store) GetPerTargetWeights(group, config string) []TargetWeightEntry {
 	for target, nodes := range allStats {
 		for node, data := range nodes {
 			var record StatsRecord
-			if json.Unmarshal(data, &record) != nil {
+			if UnmarshalStatsRecord(data, &record) != nil {
 				continue
 			}
 			entry := TargetWeightEntry{
@@ -1215,6 +1511,7 @@ func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string
 	type acc struct {
 		weightSum   float64
 		targetCount int
+		sampleCount int
 		lastUsed    int64
 	}
 	accs := make(map[string]*acc, len(allTags))
@@ -1224,24 +1521,39 @@ func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string
 				continue
 			}
 			var record StatsRecord
-			if json.Unmarshal(data, &record) != nil || record.Weights == nil {
+			if UnmarshalStatsRecord(data, &record) != nil {
 				continue
 			}
-			// Sum tcp + udp weights for THIS target (scalar per target),
-			// then average over targets in the final pass.
-			tcp := record.Weights[WeightTypeTCP]
-			udp := record.Weights[WeightTypeUDP]
+			// Real-data gate: count this (node, target) pair only when the
+			// node has actually been dialled to that target. Pure tombstones
+			// or weight-only rows would otherwise inflate TargetCount with
+			// fake coverage. SampleCount uses the same gate so the two
+			// confidence numbers move together.
+			samples := int(record.Success + record.Failure)
+			if samples <= 0 {
+				continue
+			}
+			tcp := 0.0
+			udp := 0.0
+			if record.Weights != nil {
+				tcp = record.Weights[WeightTypeTCP]
+				udp = record.Weights[WeightTypeUDP]
+			}
 			w := tcp + udp
-			if w <= 0 {
-				continue
-			}
+
 			a := accs[nodeName]
 			if a == nil {
 				a = &acc{}
 				accs[nodeName] = a
 			}
-			a.weightSum += w
+			// Both counters increment per real (node, target) pair —
+			// TargetCount is the genuine breadth of dial coverage. Weight
+			// might still be zero for a target where every dial failed;
+			// that's a real signal worth keeping in the average rather
+			// than silently filtering out.
 			a.targetCount++
+			a.sampleCount += samples
+			a.weightSum += w
 			if record.LastUsed > a.lastUsed {
 				a.lastUsed = record.LastUsed
 			}
@@ -1255,11 +1567,13 @@ func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string
 	// Raw average weight per node, in the same scale as internal selection.
 	rawWeights := make(map[string]float64, len(accs))
 	targetCounts := make(map[string]int, len(accs))
+	sampleCounts := make(map[string]int, len(accs))
 	maxRaw := 0.0
 	for name, a := range accs {
 		avg := a.weightSum / float64(a.targetCount)
 		rawWeights[name] = avg
 		targetCounts[name] = a.targetCount
+		sampleCounts[name] = a.sampleCount
 		if avg > maxRaw {
 			maxRaw = avg
 		}
@@ -1281,6 +1595,7 @@ func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string
 			Weight:      math.Round(raw*10000) / 10000, // 4 dp precision
 			Score:       score,
 			TargetCount: targetCounts[tag],
+			SampleCount: sampleCounts[tag],
 			LastUpdated: now,
 		})
 	}
@@ -1356,6 +1671,15 @@ func assignRankCategories(result []NodeRank, isAlive func(tag string) bool) {
 }
 
 // GetNodeWeightRankingCache returns cached ranking without recomputing.
+//
+// Stale-schema guard: cached entries written by older builds (before
+// the TargetCount + SampleCount fields existed) deserialise with both
+// counters zero across every entry. We treat that pattern as a stale
+// schema and return empty so WeightRanking falls through to the live
+// recompute path — otherwise the API would keep echoing a cached zero
+// indefinitely (GitHub issue: "TargetCount always 0"). Dial-real
+// rankings always populate at least TargetCount, so this can't false-
+// positive a genuinely-warm cache.
 func (s *Store) GetNodeWeightRankingCache(group, config string) ([]NodeRank, error) {
 	pathPrefix := FormatDBKey(KeyTypeRanking, config, group)
 	rawResult, err := s.GetSubBytesByPath(pathPrefix)
@@ -1364,11 +1688,137 @@ func (s *Store) GetNodeWeightRankingCache(group, config string) ([]NodeRank, err
 	}
 	for _, data := range rawResult {
 		var ranking []NodeRank
-		if json.Unmarshal(data, &ranking) == nil && len(ranking) > 0 {
-			return ranking, nil
+		if json.Unmarshal(data, &ranking) != nil || len(ranking) == 0 {
+			continue
 		}
+		// Try to repair stale entries in place — succeeds whenever the
+		// stats table still has the data needed to recompute the
+		// counts. Failure to repair (no stats yet, or every record has
+		// zero samples) means the entry is genuinely empty in the
+		// modern schema sense; we drop it and let the caller fall
+		// through to GetLiveNodeRanking instead of echoing zeros.
+		if isLegacyZeroCountRanking(ranking) {
+			repaired := s.EnrichRankingCounts(group, config, ranking)
+			if isLegacyZeroCountRanking(ranking) {
+				// Still broken after enrichment — abandon the entry.
+				continue
+			}
+			if repaired {
+				// Persist the patched ranking so the next restart
+				// reads a clean copy instead of repairing every time.
+				s.StoreNodeWeightRanking(group, config, ranking)
+			}
+		}
+		return ranking, nil
 	}
 	return []NodeRank{}, nil
+}
+
+// isLegacyZeroCountRanking reports whether the deserialised ranking
+// breaks the "Weight > 0 ↔ TargetCount > 0" invariant — fresh code
+// from every ranking source guarantees that pairing, so any entry
+// with positive weight but zero TargetCount is unambiguous evidence
+// of stale schema or a write that pre-dated the TargetCount fix.
+//
+// Earlier versions of this function only flagged rankings where
+// EVERY entry had TC==0; a single non-zero TC entry could "save" a
+// payload that otherwise contained dozens of weight>0 / TC=0 rows,
+// letting the bbolt cache re-publish those broken rows indefinitely
+// (the visible "TargetCount always 0 in /smart/weights" symptom).
+//
+// The strict invariant catches the mixed case too — callers can drop
+// the ranking and recompute, or call EnrichRankingCounts to repair it
+// in place.
+func isLegacyZeroCountRanking(ranking []NodeRank) bool {
+	for i := range ranking {
+		if ranking[i].Weight > 0 && ranking[i].TargetCount == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// EnrichRankingCounts force-recomputes TargetCount and SampleCount
+// for every entry in the supplied ranking by walking BOTH the in-memory
+// atomic recordCache AND the bbolt stats table, deduplicating any
+// (node, target) pair seen in both sources. Atomic records win on
+// conflict because they reflect the freshest state — bbolt is the
+// lagging copy after BatchSave.
+//
+// Returns true when at least one entry's count actually changed.
+func (s *Store) EnrichRankingCounts(group, config string, ranking []NodeRank) bool {
+	if len(ranking) == 0 {
+		return false
+	}
+	wantSet := make(map[string]struct{}, len(ranking))
+	for i := range ranking {
+		wantSet[ranking[i].Name] = struct{}{}
+	}
+	tc := make(map[string]int, len(wantSet))
+	sc := make(map[string]int, len(wantSet))
+	seen := make(map[string]map[string]struct{}, len(wantSet))
+
+	addPair := func(node, target string, count int) {
+		if count <= 0 {
+			return
+		}
+		ts := seen[node]
+		if ts == nil {
+			ts = make(map[string]struct{}, 4)
+			seen[node] = ts
+		}
+		if _, dup := ts[target]; dup {
+			return
+		}
+		ts[target] = struct{}{}
+		tc[node]++
+		sc[node] += count
+	}
+
+	// Source 1: in-memory atomic records — freshest data, reflects
+	// recordStats writes immediately without waiting for BatchSave.
+	s.IterateAtomicRecords(group, config, func(target, node string, rec *AtomicStatsRecord) bool {
+		if _, want := wantSet[node]; !want {
+			return true
+		}
+		addPair(node, target, int(rec.GetInt64("success")+rec.GetInt64("failure")))
+		return true
+	})
+
+	// Source 2: bbolt — covers entries evicted from recordCache.
+	if rawStats, err := s.GetAllStats(group, config); err == nil {
+		for target, nodeStats := range rawStats {
+			for nodeName, data := range nodeStats {
+				if _, want := wantSet[nodeName]; !want {
+					continue
+				}
+				var rec StatsRecord
+				if UnmarshalStatsRecord(data, &rec) != nil {
+					continue
+				}
+				addPair(nodeName, target, int(rec.Success+rec.Failure))
+			}
+		}
+	}
+
+	changed := false
+	for i := range ranking {
+		newTC := tc[ranking[i].Name]
+		newSC := sc[ranking[i].Name]
+		// Don't overwrite a non-zero count with zero — both sources
+		// can transiently come up empty (cache eviction crossed with
+		// read). Preserving the previous count means "couldn't
+		// refresh, last known good wins".
+		if newTC > 0 && ranking[i].TargetCount != newTC {
+			ranking[i].TargetCount = newTC
+			changed = true
+		}
+		if newSC > 0 && ranking[i].SampleCount != newSC {
+			ranking[i].SampleCount = newSC
+			changed = true
+		}
+	}
+	return changed
 }
 
 // GetNodeWeightRanking computes a fresh ranking using prefetch data AND
@@ -1443,6 +1893,41 @@ func (s *Store) GetNodeWeightRanking(group, config, testURL string, isAlive func
 		return []NodeRank{}, nil
 	}
 
+	// TargetCount and SampleCount come from the raw stats table — the
+	// prefetch tally above only records "this node placed in the top-N
+	// for target X" and would under-report coverage for any node whose
+	// real dial history extends beyond the prefetched targets. Walk
+	// allStats once and overwrite both maps with the genuine numbers
+	// so this function and GetLiveNodeRanking and delayBasedRanking
+	// all agree on the same real-data semantic.
+	targetCoverage := make(map[string]int, len(accs))
+	sampleCounts := make(map[string]int, len(accs))
+	if rawStats, statsErr := s.GetAllStats(group, config); statsErr == nil {
+		for _, nodeStats := range rawStats {
+			for nodeName, data := range nodeStats {
+				if _, want := accs[nodeName]; !want {
+					continue
+				}
+				var rec StatsRecord
+				if UnmarshalStatsRecord(data, &rec) != nil {
+					continue
+				}
+				if rec.Success+rec.Failure <= 0 {
+					continue
+				}
+				targetCoverage[nodeName]++
+				sampleCounts[nodeName] += int(rec.Success + rec.Failure)
+			}
+		}
+	}
+	// Fall back to the prefetch-derived count only when stats are
+	// unavailable — better a partial number than an empty field.
+	for name, cov := range targetCounts {
+		if _, ok := targetCoverage[name]; !ok {
+			targetCoverage[name] = cov
+		}
+	}
+
 	now := time.Now().Unix()
 	result := make([]NodeRank, 0, len(allTags))
 	for _, tag := range allTags {
@@ -1455,7 +1940,8 @@ func (s *Store) GetNodeWeightRanking(group, config, testURL string, isAlive func
 			Name:        tag,
 			Weight:      math.Round(raw*10000) / 10000,
 			Score:       score,
-			TargetCount: targetCounts[tag],
+			TargetCount: targetCoverage[tag],
+			SampleCount: sampleCounts[tag],
 			LastUpdated: now,
 		})
 	}
@@ -1517,7 +2003,7 @@ func (s *Store) GetActiveTargets(group, config string, limit int) []ActiveTarget
 
 		for _, data := range nodeStats {
 			var record StatsRecord
-			if json.Unmarshal(data, &record) != nil || record.Weights == nil {
+			if UnmarshalStatsRecord(data, &record) != nil || record.Weights == nil {
 				continue
 			}
 
@@ -1966,7 +2452,7 @@ func (s *Store) CleanupOldRecords(group, config string) error {
 					continue
 				}
 				var record StatsRecord
-				if err := json.Unmarshal(data, &record); err != nil {
+				if err := UnmarshalStatsRecord(data, &record); err != nil {
 					continue
 				}
 				lastTime = record.LastUsed
@@ -2039,68 +2525,67 @@ func (s *Store) CleanupOldRecords(group, config string) error {
 	return nil
 }
 
-// AdjustCacheParameters dynamically resizes caches based on system memory.
+// AdjustCacheParameters applies the cache-budget policy.
+//
+// Background: the previous implementation called runtime.ReadMemStats on
+// every invocation to infer heap pressure and dynamically resize all five
+// caches. That was a cumulative 16 STW passes per 5-minute cycle (once
+// per Smart group) which showed up as UI-visible jitter on Android. Since
+// switching the caches to ristretto, cost-based admission + TinyLFU
+// eviction handle overflow on their own — we no longer need per-cycle
+// heap introspection to pick a capacity.
+//
+// The function still exists because a handful of management paths
+// (including the Clash API cache/smart/flush endpoint) historically
+// invoked it to "refresh" cache sizing. It now just applies the static
+// budget derived from the SMART_CACHE_BUDGET_MB env var (Android
+// defaults to a smaller cap than desktops) to ristretto via
+// UpdateMaxCost. Idempotent and allocation-free.
 func (s *Store) AdjustCacheParameters() {
-	memUsage := getSystemMemoryUsage()
+	sz, batch := resolveCacheBudget()
 
 	globalCacheParams.mu.Lock()
-	defer globalCacheParams.mu.Unlock()
+	globalCacheParams.MaxTargets = sz * 4 // legacy consumers expect MaxTargets ≈ 4×per-cache capacity
+	globalCacheParams.BatchSaveThreshold = batch
+	globalCacheParams.mu.Unlock()
 
-	isFirst := globalCacheParams.LastMemoryUsage == 0
-	needAdjust := isFirst
-
-	if !isFirst {
-		memChanged := math.Abs(memUsage-globalCacheParams.LastMemoryUsage) > 0.05
-		needAdjust = memChanged || memUsage > 0.5
+	if targetCache != nil {
+		targetCache.Resize(sz)
 	}
-
-	globalCacheParams.LastMemoryUsage = memUsage
-	if !needAdjust && !isFirst {
-		return
+	if unwrapCache != nil {
+		unwrapCache.Resize(sz)
 	}
-
-	if memUsage > 0.9 {
-		globalCacheParams.MaxTargets = MinTargetsLimit
-		globalCacheParams.BatchSaveThreshold = MinBatchThreshLimit
-	} else {
-		factor := (1 - memUsage) * 0.5
-		globalCacheParams.MaxTargets = MinTargetsLimit + int(float64(MaxTargetsLimit-MinTargetsLimit)*factor)
-		globalCacheParams.BatchSaveThreshold = MinBatchThreshLimit + int(float64(MaxBatchThreshLimit-MinBatchThreshLimit)*factor)
+	if recordCache != nil {
+		recordCache.Resize(sz)
 	}
-
-	sz := globalCacheParams.MaxTargets / 4
-	targetCache.Resize(sz)
-	unwrapCache.Resize(sz)
-	recordCache.Resize(sz)
-	dbResultCache.Resize(sz)
-	blockedNodesCache.Resize(sz)
-}
-
-func getSystemMemoryUsage() float64 {
-	var ms runtime.MemStats
-	runtime.ReadMemStats(&ms)
-	// Use heap alloc as a proxy for pressure (no OS-level call)
-	if ms.Sys > 0 {
-		return math.Min(float64(ms.HeapInuse)/float64(ms.Sys), 1.0)
+	if dbResultCache != nil {
+		dbResultCache.Resize(sz)
 	}
-	return 0.5
+	if blockedNodesCache != nil {
+		blockedNodesCache.Resize(sz)
+	}
 }
 
 // FlushStats holds per-key-type deletion counts returned by FlushByLevel.
 // Zero values mean "nothing matched" — NOT "skipped". Callers surface this
 // to operators so `POST /cache/smart/flush/{name}` is visibly effective.
 type FlushStats struct {
-	Stats    int `json:"stats"`
-	Nodes    int `json:"nodes"`
-	Ranking  int `json:"ranking"`
-	Prefetch int `json:"prefetch"`
-	Failures int `json:"failures"`
-	Queue    int `json:"queue"`
+	Stats          int `json:"stats"`
+	Nodes          int `json:"nodes"`
+	Ranking        int `json:"ranking"`
+	Prefetch       int `json:"prefetch"`
+	Failures       int `json:"failures"`
+	Queue          int `json:"queue"`
+	ManualPin      int `json:"manual_pin"`
+	KnownDead      int `json:"known_dead"`
+	Breakers       int `json:"breakers"`
+	PinEndorsement int `json:"pin_endorsement"`
 }
 
 // Total sums every deletion bucket — convenient for "nothing happened" checks.
 func (f FlushStats) Total() int {
-	return f.Stats + f.Nodes + f.Ranking + f.Prefetch + f.Failures + f.Queue
+	return f.Stats + f.Nodes + f.Ranking + f.Prefetch + f.Failures + f.Queue +
+		f.ManualPin + f.KnownDead + f.Breakers + f.PinEndorsement
 }
 
 // FlushByLevel clears queue and DB data at the given level and returns the
@@ -2149,18 +2634,30 @@ func (s *Store) FlushByLevel(level, config, group string) (FlushStats, error) {
 		stats.Ranking = deletePrefix(FormatDBKey(KeyTypeRanking), false)
 		stats.Prefetch = deletePrefix(FormatDBKey(KeyTypePrefetch), false)
 		stats.Failures = deletePrefix(FormatDBKey(KeyTypeHostFailures), false)
+		stats.ManualPin = deletePrefix(FormatDBKey(KeyTypeManualPin), false)
+		stats.KnownDead = deletePrefix(FormatDBKey(KeyTypeKnownDead), false)
+		stats.Breakers = deletePrefix(FormatDBKey(KeyTypeBreaker), false)
+		stats.PinEndorsement = deletePrefix(FormatDBKey(KeyTypePinEndorsement), false)
 	case "config":
 		stats.Stats = deletePrefix(FormatDBKey(KeyTypeStats, config), true)
 		stats.Nodes = deletePrefix(FormatDBKey(KeyTypeNode, config), true)
 		stats.Ranking = deletePrefix(FormatDBKey(KeyTypeRanking, config), true)
 		stats.Prefetch = deletePrefix(FormatDBKey(KeyTypePrefetch, config), true)
 		stats.Failures = deletePrefix(FormatDBKey(KeyTypeHostFailures, config), true)
+		stats.ManualPin = deletePrefix(FormatDBKey(KeyTypeManualPin, config), true)
+		stats.KnownDead = deletePrefix(FormatDBKey(KeyTypeKnownDead, config), true)
+		stats.Breakers = deletePrefix(FormatDBKey(KeyTypeBreaker, config), true)
+		stats.PinEndorsement = deletePrefix(FormatDBKey(KeyTypePinEndorsement, config), true)
 	case "group":
 		stats.Stats = deletePrefix(FormatDBKey(KeyTypeStats, config, group), true)
 		stats.Nodes = deletePrefix(FormatDBKey(KeyTypeNode, config, group), true)
 		stats.Ranking = deletePrefix(FormatDBKey(KeyTypeRanking, config, group), true)
 		stats.Prefetch = deletePrefix(FormatDBKey(KeyTypePrefetch, config, group), true)
 		stats.Failures = deletePrefix(FormatDBKey(KeyTypeHostFailures, config, group), true)
+		stats.ManualPin = deletePrefix(FormatDBKey(KeyTypeManualPin, config, group), true)
+		stats.KnownDead = deletePrefix(FormatDBKey(KeyTypeKnownDead, config, group), true)
+		stats.Breakers = deletePrefix(FormatDBKey(KeyTypeBreaker, config, group), true)
+		stats.PinEndorsement = deletePrefix(FormatDBKey(KeyTypePinEndorsement, config, group), true)
 	}
 	return stats, firstErr
 }

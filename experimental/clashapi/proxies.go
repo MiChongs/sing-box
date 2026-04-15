@@ -216,6 +216,11 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 		info.Put("now", groupOutbound.Now())
 		allTags := groupOutbound.All()
 		info.Put("all", allTags)
+		// mihomo-compatible dashboard hints. Always emitted (no
+		// omitempty) so front-ends can rely on the field's presence —
+		// `hidden=false`, `icon=""` are the documented "absent" sentinels.
+		info.Put("hidden", groupOutbound.Hidden())
+		info.Put("icon", groupOutbound.Icon())
 
 		if sg, ok := detour.(*group.Smart); ok {
 			info.Put("testUrl", sg.TestURL())
@@ -223,6 +228,20 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 			info.Put("useLightGBM", sg.UseLightGBM())
 			info.Put("collectData", sg.CollectData())
 			info.Put("fixed", sg.Selected())
+			// Live algorithm + anti-flap window so /proxies dashboards
+			// can verify what's actually in effect (especially after a
+			// runtime PUT /groups/{name}/algorithm swap). Always-output
+			// even when hysteresis is 0 — matches the hidden/icon
+			// contract so front-ends never have to handle "field missing
+			// vs field present-and-zero".
+			info.Put("algorithm", sg.CurrentAlgorithm())
+			info.Put("hysteresis", sg.HysteresisDuration().String())
+			// Parsed policy_priority rules (nil when nothing configured).
+			// Surfacing the rule list — not the original raw string —
+			// lets dashboards verify that prefixes like ! / = / ~ /
+			// auto-glob were interpreted as intended.
+			info.Put("policyPriority", sg.PolicyPriorityRules())
+			info.Put("pinEndorsements", sg.PinEndorsementDebug())
 			if age := sg.LGBMModelAge(); age > 0 {
 				info.Put("lgbmModelAge", age.Truncate(time.Second).String())
 			}
@@ -359,14 +378,14 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 
 		proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
 
-		// Mihomo parity: running a delay test against a pinned Smart group
-		// should implicitly release the pin so the next dial re-enters
-		// auto-selection and the freshly measured delay can take effect.
-		if sg, ok := proxy.(*group.Smart); ok {
-			if pinned := sg.Selected(); pinned != "" {
-				sg.SelectOutbound("")
-			}
-		}
+		// NOTE: previously this path auto-released a Smart group's manual
+		// pin before running the delay test ("mihomo parity"). Dashboards
+		// like zashboard / metacubexd poll per-group delay every few
+		// seconds, which silently wiped the user's pin within moments of
+		// setting it. Kept off: the delay test still dials through the
+		// pinned node (correct behaviour — measures what traffic actually
+		// uses), and explicit unpin is available via DELETE /proxies/<tag>
+		// or PUT {"name":""} when the user really wants it.
 
 		realTag := group.RealTag(proxy)
 		timeoutDuration := time.Millisecond * time.Duration(timeout)
