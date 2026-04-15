@@ -186,4 +186,4 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/sagernet/sing-tun => ../sing-tun
+replace github.com/sagernet/sing-tun => ./sing-tun
