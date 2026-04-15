@@ -1,0 +1,125 @@
+name: Xiaobaf14g Testing Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  calculate_version:
+    name: Calculate Release Version and Type
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version_calc.outputs.version }}
+      is_prerelease: ${{ steps.version_calc.outputs.is_prerelease }}
+    steps:
+      - name: Calculate version from tag
+        id: version_calc
+        run: |-
+          VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          
+          # If version contains a hyphen (e.g. v1.10.0-test), treat it as prerelease
+          if [[ "$VERSION" == *"-"* ]]; then
+            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
+            echo "Detected Prerelease version: $VERSION"
+          else
+            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "Detected Official Release version: $VERSION"
+          fi
+
+  build:
+    name: Build Core Binaries
+    runs-on: ubuntu-latest
+    needs:
+      - calculate_version
+    strategy:
+      matrix:
+        include:
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm64 }
+          - { os: windows, arch: amd64 }
+          - { os: windows, arch: arm64 }
+          - { os: darwin, arch: amd64 }
+          - { os: darwin, arch: arm64 }
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ~1.25.8
+
+      - name: Set Build Tags and Ldflags
+        run: |
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            TAGS=$(cat release/DEFAULT_BUILD_TAGS_WINDOWS)
+          else
+            TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+          fi
+          LDFLAGS_SHARED=$(cat release/LDFLAGS)
+          echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
+          echo "LDFLAGS_SHARED=${LDFLAGS_SHARED}" >> "${GITHUB_ENV}"
+
+      - name: Build Binary
+        run: |
+          mkdir -p dist
+          BIN_NAME="sing-box"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            BIN_NAME="sing-box.exe"
+          fi
+          CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -v -trimpath -o "dist/${BIN_NAME}" -tags "${BUILD_TAGS}" \
+          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
+          ./cmd/sing-box
+
+      - name: Archive Binary
+        run: |
+          cd dist
+          DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "${DIR_NAME}"
+          cp ../LICENSE "${DIR_NAME}/"
+          
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            mv sing-box.exe "${DIR_NAME}/"
+            zip -r "${DIR_NAME}.zip" "${DIR_NAME}"
+            rm -r "${DIR_NAME}"
+          else
+            mv sing-box "${DIR_NAME}/"
+            tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
+            rm -r "${DIR_NAME}"
+          fi
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binary-${{ matrix.os }}_${{ matrix.arch }}
+          path: dist/*.*
+
+  publish:
+    name: Publish Github Release
+    needs:
+      - calculate_version
+      - build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all core builds
+        uses: actions/download-artifact@v4
+        with:
+          path: builds/
+          merge-multiple: true
+
+      - name: Create or Update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Sing-box Xiaobaf14g ${{ github.ref_name }}
+          prerelease: ${{ needs.calculate_version.outputs.is_prerelease == 'true' }}
+          draft: false
+          files: |
+            builds/*.*
