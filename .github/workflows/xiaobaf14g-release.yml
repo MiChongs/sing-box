@@ -190,7 +190,13 @@ jobs:
         id: ndk
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r27c
+          # r28+ (LLVM 19+) 必需 —— 旧版 libcronet.a 用 R_AARCH64_AUTH_ABS64
+          # (relocation type 315, arm64e PAC pointer-authentication 扩展)，
+          # NDK r27 及更早的 lld 17 不认识这个 reloc 会报:
+          #   "unknown relocation (315) against symbol typeinfo for ..."
+          # 影响所有 cronet 依赖的符号：__cxxabiv1 / std::bad_* / libunwind.
+          # r28c (2025-10, LLVM 19) 原生支持；后续 NDK (r29+) 保持向后兼容。
+          ndk-version: r28c
           add-to-path: true
 
       - name: Install 7z
