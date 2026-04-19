@@ -1,0 +1,39 @@
+---
+import DocLayout from '../../layouts/DocLayout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+import { examples } from '../../data/example-metadata';
+
+const rawFiles = import.meta.glob<string>('../../examples/*.json', {
+  eager: true,
+  query: '?raw',
+  import: 'default',
+});
+
+function bodyOf(file: string): string {
+  const key = Object.keys(rawFiles).find((k) => k.endsWith('/' + file));
+  return key ? (rawFiles[key] as string) : '';
+}
+---
+
+<DocLayout lang="en" title="Example configs">
+  <article class="py-16 max-w-prose lg:max-w-none">
+    <h1 class="font-serif text-section-52 mb-4">Example configs</h1>
+    <p class="font-sans text-lead-20 text-olive-gray mb-10 max-w-prose">
+      Five Smart configs from simplest to most elaborate. Each is drop-in JSON — keep your existing top-level
+      <code class="font-mono">inbounds</code> and <code class="font-mono">route</code> sections as-is.
+    </p>
+
+    {examples.map((ex) => (
+      <section class="mt-12 pt-6 border-t border-border-cream first:border-0 first:pt-0 first:mt-0">
+        <h2 class="font-serif text-card-32 mb-2" id={ex.id}>{ex.enTitle}</h2>
+        <p class="font-sans text-body-17 text-charcoal-warm mb-4 max-w-prose">{ex.enIntro}</p>
+        <CodeBlock code={bodyOf(ex.file)} lang="json" filename={ex.file} />
+        <ul class="mt-4 list-disc pl-6 text-body-16 text-olive-gray space-y-1 max-w-prose">
+          {ex.enNotes.map((n) => (
+            <li set:html={n.replace(/`([^`]+)`/g, '<code class="font-mono text-caption-14 text-terracotta">$1</code>')} />
+          ))}
+        </ul>
+      </section>
+    ))}
+  </article>
+</DocLayout>

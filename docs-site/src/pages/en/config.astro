@@ -1,0 +1,62 @@
+---
+import DocLayout from '../../layouts/DocLayout.astro';
+import ConfigSchema from '../../components/ConfigSchema.astro';
+import Callout from '../../components/Callout.astro';
+import { smartOutbound } from '../../data/schema-smart-outbound';
+import { smartLightgbm, smartCollector } from '../../data/schema-smart';
+import { geoxTop, geoxUrl } from '../../data/schema-geox';
+---
+
+<DocLayout lang="en" title="Config reference">
+  <article class="py-16 max-w-prose lg:max-w-none">
+    <h1 class="font-serif text-section-52 mb-4">Config reference</h1>
+    <p class="font-sans text-lead-20 text-olive-gray mb-10 max-w-prose">
+      Smart splits into three blocks: the outbound itself (<code class="font-mono text-body-16 text-terracotta">type: "smart"</code>),
+      the global <code class="font-mono text-body-16 text-terracotta">experimental.smart</code> (LightGBM model and CSV collector),
+      and the global <code class="font-mono text-body-16 text-terracotta">experimental.geox</code> (geo-data downloader, including ASN).
+    </p>
+
+    <Callout type="info" title="Minimal setup">
+      <p>
+        Only <code>outbounds</code> is strictly required. Fill in <code>experimental.smart</code> or <code>experimental.geox</code>
+        only when you enable <code>use_lightgbm</code> or <code>use_asn</code> respectively.
+      </p>
+    </Callout>
+
+    <section class="mt-12">
+      <h2 class="font-serif text-card-32 mb-3" id="smart-outbound">Smart outbound</h2>
+      <p class="text-charcoal-warm mb-2">
+        Backed by the Go type <code class="font-mono">option.SmartOutboundOptions</code> (<code>option/group.go</code>).
+      </p>
+      <ConfigSchema lang="en" fields={smartOutbound} />
+    </section>
+
+    <section class="mt-16">
+      <h2 class="font-serif text-card-32 mb-3" id="experimental-smart">experimental.smart</h2>
+      <p class="text-charcoal-warm mb-2">
+        The LightGBM model and training collector shared across every Smart group. Required only when at least one
+        Smart group sets <code class="font-mono">use_lightgbm: true</code> or <code class="font-mono">collect_data: true</code>.
+      </p>
+
+      <h3 class="font-serif text-feat-20 mt-6 mb-2">lightgbm</h3>
+      <ConfigSchema lang="en" fields={smartLightgbm} />
+
+      <h3 class="font-serif text-feat-20 mt-6 mb-2">collector</h3>
+      <ConfigSchema lang="en" fields={smartCollector} />
+    </section>
+
+    <section class="mt-16">
+      <h2 class="font-serif text-card-32 mb-3" id="experimental-geox">experimental.geox</h2>
+      <p class="text-charcoal-warm mb-2">
+        Global geo-asset manager (geoip / geosite / mmdb / ASN mmdb). Smart currently consumes only the ASN column;
+        the rest is wired up for future consumers.
+      </p>
+
+      <h3 class="font-serif text-feat-20 mt-6 mb-2">Top-level</h3>
+      <ConfigSchema lang="en" fields={geoxTop} />
+
+      <h3 class="font-serif text-feat-20 mt-6 mb-2">url sub-fields</h3>
+      <ConfigSchema lang="en" fields={geoxUrl} />
+    </section>
+  </article>
+</DocLayout>

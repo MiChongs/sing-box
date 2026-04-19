@@ -1,0 +1,12 @@
+{
+  "outbounds": [
+    {
+      "type": "smart",
+      "tag": "auto",
+      "url": "https://www.cloudflare.com/cdn-cgi/trace",
+      "interval": "3m",
+      "providers": ["my-subscription"],
+      "use_all_providers": false
+    }
+  ]
+}

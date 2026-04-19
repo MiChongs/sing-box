@@ -1,0 +1,63 @@
+---
+import DocLayout from '../../layouts/DocLayout.astro';
+import HeroSection from '../../components/HeroSection.astro';
+import FeatureCard from '../../components/FeatureCard.astro';
+import ComparisonTable from '../../components/ComparisonTable.astro';
+import { zh } from '../../i18n/zh';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const t = zh;
+
+const rows = [
+  { feature: '基于延迟排序',         selector: '—', urltest: '✓',           loadbalance: '✓',      smart: '✓' },
+  { feature: '基于历史学习',         selector: '—', urltest: '—',           loadbalance: '△',      smart: '✓', note: '按 (target, ASN, 节点) 独立学习' },
+  { feature: '失败自动降权',         selector: '—', urltest: '△',           loadbalance: '△',      smart: '✓', note: '线性降权 + 30 min+ 冷却' },
+  { feature: 'ML 模型辅助',          selector: '—', urltest: '—',           loadbalance: '—',      smart: '✓', note: 'LightGBM 27+ 维特征' },
+  { feature: 'RST/TLS 级 Watchdog',  selector: '—', urltest: '—',           loadbalance: '—',      smart: '✓', note: '22 种错误形态识别' },
+  { feature: '多种排序算法',         selector: '—', urltest: '—',           loadbalance: '3 策略', smart: '11 策略' },
+];
+---
+
+<DocLayout lang="zh" title="智能出站策略组">
+  <HeroSection
+    eyebrow={t.hero.eyebrow}
+    title={t.hero.title}
+    subtitle={t.hero.subtitle}
+    primary={{ href: `${base}/zh/examples/`, label: t.hero.primary }}
+    secondary={{ href: `${base}/zh/config/`, label: t.hero.secondary }}
+  />
+
+  <section class="py-16">
+    <h2 class="font-serif text-section-52 mb-10">{t.features.title}</h2>
+    <div class="grid gap-5 md:grid-cols-2">
+      {t.features.items.map((f) => (
+        <FeatureCard title={f.title} body={f.body} />
+      ))}
+    </div>
+  </section>
+
+  <section class="py-16">
+    <h2 class="font-serif text-section-52 mb-10">{t.comparison.title}</h2>
+    <ComparisonTable headers={t.comparison.headers} rows={rows} />
+  </section>
+
+  <section class="py-16">
+    <h2 class="font-serif text-section-52 mb-10">{t.scenarios.title}</h2>
+    <div class="grid gap-5 md:grid-cols-3">
+      {t.scenarios.items.map((s) => (
+        <FeatureCard title={s.title} body={s.body} />
+      ))}
+    </div>
+  </section>
+
+  <section class="py-16">
+    <div class="rounded-card bg-deep-dark text-warm-silver p-10 md:p-14 shadow-ring-3">
+      <h2 class="font-serif text-card-32 md:text-section-52 text-ivory mb-4">{t.cta.title}</h2>
+      <p class="font-sans text-lead-20 mb-8 max-w-prose">{t.cta.body}</p>
+      <div class="flex flex-wrap gap-3">
+        <a href={`${base}/zh/examples/`} class="rounded-card bg-terracotta text-ivory px-5 py-3 text-body-16 font-medium hover:bg-coral transition-colors focus-ring">{t.cta.primary}</a>
+        <a href={`${base}/zh/config/`} class="rounded-card bg-dark-surface text-warm-silver px-5 py-3 text-body-16 font-medium hover:bg-charcoal-warm transition-colors focus-ring">{t.cta.secondary}</a>
+      </div>
+    </div>
+  </section>
+</DocLayout>

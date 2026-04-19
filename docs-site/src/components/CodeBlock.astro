@@ -1,0 +1,72 @@
+---
+import { codeToHtml } from 'shiki';
+
+// Build-time syntax highlighting via Shiki. Renders `<pre>` HTML inline;
+// copy-button wrapper handles clipboard. Kept framework-free on purpose:
+// Astro markdown already uses Shiki under the hood, this component
+// unifies the inline-snippet look (JSON examples, curl commands, etc.).
+
+export interface Props {
+  code: string;
+  lang?: string;
+  filename?: string;
+  copy?: boolean;
+}
+
+const { code, lang = 'json', filename, copy = true } = Astro.props;
+
+const html = await codeToHtml(code, {
+  lang,
+  theme: 'github-light',
+});
+---
+
+<figure class="my-6 rounded-card overflow-hidden shadow-ring-1 bg-ivory">
+  {filename && (
+    <figcaption class="flex items-center justify-between px-4 py-2 bg-warm-sand text-caption-14 font-mono text-charcoal-warm border-b border-border-warm">
+      <span>{filename}</span>
+      {copy && (
+        <button
+          type="button"
+          data-code={code}
+          class="copy-btn text-label-12 uppercase tracking-wider text-stone-gray hover:text-terracotta transition-colors focus-ring"
+        >
+          Copy
+        </button>
+      )}
+    </figcaption>
+  )}
+  <div class="relative">
+    <Fragment set:html={html} />
+    {copy && !filename && (
+      <button
+        type="button"
+        data-code={code}
+        class="copy-btn absolute top-2 right-2 text-label-12 uppercase tracking-wider text-stone-gray bg-ivory/80 px-2 py-1 rounded hover:text-terracotta transition-colors focus-ring"
+      >
+        Copy
+      </button>
+    )}
+  </div>
+</figure>
+
+<script>
+  // Attach copy handlers once. Idempotent across navigations because we
+  // key off a data-bound flag on the element.
+  document.querySelectorAll<HTMLButtonElement>('.copy-btn').forEach((btn) => {
+    if (btn.dataset.wired === '1') return;
+    btn.dataset.wired = '1';
+    const original = btn.textContent ?? 'Copy';
+    btn.addEventListener('click', async () => {
+      const code = btn.dataset.code ?? '';
+      try {
+        await navigator.clipboard.writeText(code);
+        btn.textContent = '✓ Copied';
+        setTimeout(() => { btn.textContent = original; }, 1400);
+      } catch {
+        btn.textContent = '✗ Failed';
+        setTimeout(() => { btn.textContent = original; }, 1400);
+      }
+    });
+  });
+</script>

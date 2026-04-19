@@ -1,0 +1,22 @@
+{
+  "experimental": {
+    "geox": {
+      "enabled": true,
+      "auto_update": true,
+      "update_interval": "24h",
+      "download_detour": "direct",
+      "url": {
+        "asn": "https://raw.githubusercontent.com/xream/geoip/lite/GeoLite2-ASN.mmdb"
+      }
+    }
+  },
+  "outbounds": [
+    {
+      "type": "smart",
+      "tag": "auto",
+      "providers": ["my-subscription"],
+      "use_asn": true,
+      "policy_priority": "香港:1.5;日本:1.2;美国:0.9"
+    }
+  ]
+}

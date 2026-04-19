@@ -1,0 +1,99 @@
+---
+import DocLayout from '../../layouts/DocLayout.astro';
+import Callout from '../../components/Callout.astro';
+import { transferFatalFamilies, excluded, constants } from '../../data/watchdog';
+---
+
+<DocLayout lang="zh" title="Watchdog / RST 行为">
+  <article class="py-16 max-w-prose">
+    <h1 class="font-serif text-section-52 mb-4">Watchdog / RST 行为</h1>
+    <p class="font-sans text-lead-20 text-olive-gray mb-8">
+      Smart 不只看 URLTest 的"可达性"。它在每条真实业务连接的 Read / Write / Close 三个接入点监听 RST、TLS alert、
+      h2 stream reset、QUIC CRYPTO_ERROR、代理帧解码错等 <strong>22 种</strong> 致命错误形态。单次触发就让该节点对该目标
+      软屏蔽 10 分钟，避免"假存活"的节点被反复重选。
+    </p>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">三个接入点</h2>
+    <p class="text-charcoal-warm mb-4">
+      所有触发都通过 <code class="font-mono">triggerInstantResetEviction()</code> 收敛，内部用 CAS 去重，所以
+      一次事件被多个接入点命中也只处理一次：
+    </p>
+    <ul class="list-disc pl-6 text-body-17 text-charcoal-warm space-y-2">
+      <li>
+        <code class="font-mono">Read</code> — 每次返回都检查：首字节前用 <code>isPreFirstByteFatal</code>
+        （非 EOF 即致命）；已有字节后用 <code>isTransferFatalErr</code> (下表 22 种)。
+      </li>
+      <li>
+        <code class="font-mono">Write</code> — 每次返回都检查：命中 <code>isResetErr</code> 立即触发。
+      </li>
+      <li>
+        <code class="font-mono">Close</code> — <code>classifyStatus()</code> 优先读 <code class="font-mono">lastIOErr</code>
+        (中期 RST 会被存在这里), 避免只看 firstReadErr 导致 "TLS 握手 OK 后中期 RST" 被误判为 closed。
+      </li>
+    </ul>
+
+    <Callout type="info" title="lastIOErr 修复点">
+      <p>
+        之前 <code>firstReadErr</code> 只在首次 Read 记一次, 首字节后的错误全丢。<code>lastIOErr</code>
+        每次 IO 失败都 atomic 覆盖, <code>classifyStatus</code> 优先读它 —— 这是 watchdog 接入点修复的核心 patch (A)。
+      </p>
+    </Callout>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">isTransferFatalErr — 22 种致命错误</h2>
+    <p class="text-charcoal-warm mb-4">
+      <code class="font-mono">isResetErr</code> 只认纯净 kernel RST 字符串 (ECONNRESET / EPIPE / "connection reset by peer")。
+      <code class="font-mono">isTransferFatalErr</code> 额外覆盖传输中期被代理栈"翻译过"的 RST 衍生错误 —— 这是 GFW 定点阻断最常见的表现形态。
+    </p>
+
+    {transferFatalFamilies.map((f) => (
+      <section class="mt-8">
+        <h3 class="font-serif text-feat-20 text-ink mb-2">{f.zhTitle}</h3>
+        <p class="text-body-16 text-olive-gray mb-3">{f.zhDesc}</p>
+        <div class="rounded-card bg-ivory shadow-ring-1 p-4">
+          <ul class="text-caption-14 font-mono text-charcoal-warm space-y-1">
+            {f.patterns.map((p) => <li>{p}</li>)}
+          </ul>
+        </div>
+      </section>
+    ))}
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">明确不触发 (防假阳性)</h2>
+    <ul class="list-disc pl-6 text-body-17 text-charcoal-warm space-y-1">
+      {excluded.zh.map((item) => (
+        <li set:html={item.replace(/`([^`]+)`/g, '<code class="font-mono text-caption-14 text-terracotta">$1</code>')} />
+      ))}
+    </ul>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">软屏蔽 — markDeadForTarget</h2>
+    <p class="text-charcoal-warm mb-4">
+      <strong>首次</strong> RST 就立刻调用 <code class="font-mono">markDeadForTarget(target, node)</code>。
+      在 <code>targetDebargoTTL</code> (10 分钟) 内, <code>selectProxies</code> 的三个过滤点都把该节点从候选中剔除。
+      全局健康度不变 —— 节点可以继续服务其他 target。TTL 到期自动解封, 无需人工干预。
+      这修复了"单次 RST 阈值未达 → 只 drop unwrap cache → 下次 dial 仍可能重选同一节点"的顽疾。
+    </p>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">阈值 / 常量</h2>
+    <div class="overflow-x-auto rounded-card shadow-ring-1 bg-ivory my-4">
+      <table class="w-full text-small-15 font-sans">
+        <thead>
+          <tr class="border-b border-border-warm text-left">
+            <th class="px-4 py-3 font-medium text-charcoal-warm">常量</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm whitespace-nowrap">值</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm">说明</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm">文件</th>
+          </tr>
+        </thead>
+        <tbody>
+          {constants.map((c) => (
+            <tr class="border-b border-border-cream last:border-0 align-top">
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-terracotta">{c.name}</code></td>
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-charcoal-warm whitespace-nowrap">{c.value}</code></td>
+              <td class="px-4 py-3 text-charcoal-warm">{c.zh}</td>
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-stone-gray">{c.go}</code></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </article>
+</DocLayout>

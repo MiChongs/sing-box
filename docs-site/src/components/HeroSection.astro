@@ -1,0 +1,48 @@
+---
+export interface Props {
+  eyebrow?: string;
+  title: string;
+  subtitle: string;
+  primary?: { href: string; label: string };
+  secondary?: { href: string; label: string };
+}
+
+const { eyebrow, title, subtitle, primary, secondary } = Astro.props;
+---
+
+<section class="py-20 md:py-28">
+  <div class="max-w-prose">
+    {eyebrow && (
+      <p class="font-sans text-overline-10 uppercase tracking-wider text-terracotta mb-4">
+        {eyebrow}
+      </p>
+    )}
+    <h1 class="font-serif text-section-52 md:text-hero-64 text-ink mb-6">
+      {title}
+    </h1>
+    <p class="font-sans text-lead-20 text-olive-gray mb-10">
+      {subtitle}
+    </p>
+    {(primary || secondary) && (
+      <div class="flex flex-wrap gap-3">
+        {primary && (
+          <a
+            href={primary.href}
+            class="inline-flex items-center gap-2 rounded-card bg-terracotta px-5 py-3 text-body-16 font-medium text-ivory shadow-ring-2 transition-colors hover:bg-coral focus-ring"
+          >
+            {primary.label}
+            <span aria-hidden="true">→</span>
+          </a>
+        )}
+        {secondary && (
+          <a
+            href={secondary.href}
+            class="inline-flex items-center gap-2 rounded-card bg-warm-sand px-5 py-3 text-body-16 font-medium text-charcoal-warm shadow-ring-1 transition-colors hover:bg-border-cream focus-ring"
+          >
+            {secondary.label}
+          </a>
+        )}
+      </div>
+    )}
+  </div>
+</section>

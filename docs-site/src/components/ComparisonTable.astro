@@ -1,0 +1,66 @@
+---
+// Generic 5-column comparison table: feature | selector | urltest | loadbalance | smart.
+//
+// Each row cell is either a short string, or one of the semantic markers
+// '✓', '△', '—' which we style consistently: ✓ = terracotta, △ = olive
+// (partial), — = stone (absent).
+
+export interface Row {
+  feature: string;
+  selector: string;
+  urltest: string;
+  loadbalance: string;
+  smart: string;
+  note?: string;
+}
+
+export interface Props {
+  headers: {
+    feature: string;
+    selector: string;
+    urltest: string;
+    loadbalance: string;
+    smart: string;
+  };
+  rows: Row[];
+}
+
+const { headers, rows } = Astro.props;
+
+function cellClass(value: string) {
+  if (value === '✓') return 'text-terracotta font-medium';
+  if (value === '△') return 'text-olive-gray';
+  if (value === '—') return 'text-stone-gray';
+  return 'text-charcoal-warm';
+}
+---
+
+<div class="overflow-x-auto rounded-card shadow-ring-1 bg-ivory">
+  <table class="w-full text-body-16 font-sans">
+    <thead>
+      <tr class="border-b border-border-warm text-left">
+        <th class="px-4 py-3 font-medium text-charcoal-warm">{headers.feature}</th>
+        <th class="px-4 py-3 font-medium text-stone-gray">{headers.selector}</th>
+        <th class="px-4 py-3 font-medium text-stone-gray">{headers.urltest}</th>
+        <th class="px-4 py-3 font-medium text-stone-gray">{headers.loadbalance}</th>
+        <th class="px-4 py-3 font-medium text-terracotta">{headers.smart}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {rows.map((r) => (
+        <tr class="border-b border-border-cream last:border-0 hover:bg-parchment/60">
+          <td class="px-4 py-3 align-top">
+            <div class="text-charcoal-warm font-medium">{r.feature}</div>
+            {r.note && (
+              <div class="text-caption-14 text-stone-gray mt-1">{r.note}</div>
+            )}
+          </td>
+          <td class={`px-4 py-3 align-top ${cellClass(r.selector)}`}>{r.selector}</td>
+          <td class={`px-4 py-3 align-top ${cellClass(r.urltest)}`}>{r.urltest}</td>
+          <td class={`px-4 py-3 align-top ${cellClass(r.loadbalance)}`}>{r.loadbalance}</td>
+          <td class={`px-4 py-3 align-top ${cellClass(r.smart)}`}>{r.smart}</td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+</div>

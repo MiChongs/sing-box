@@ -1,0 +1,33 @@
+---
+import CodeBlock from './CodeBlock.astro';
+import type { Endpoint } from '../data/clash-endpoints';
+
+export interface Props {
+  lang: 'zh' | 'en';
+  ep: Endpoint;
+}
+
+const { lang, ep } = Astro.props;
+const title = lang === 'zh' ? ep.zhTitle : ep.enTitle;
+const desc  = lang === 'zh' ? ep.zhDesc  : ep.enDesc;
+
+const methodColor: Record<Endpoint['method'], string> = {
+  GET:    'bg-warm-sand text-charcoal-warm',
+  POST:   'bg-terracotta text-ivory',
+  PUT:    'bg-coral text-ivory',
+  DELETE: 'bg-error-crimson text-ivory',
+  PATCH:  'bg-stone-gray text-ivory',
+};
+---
+
+<article class="rounded-card bg-ivory shadow-ring-1 p-6 my-5">
+  <header class="flex flex-wrap items-center gap-3 mb-3">
+    <span class={`font-mono text-label-12 uppercase tracking-wider px-2 py-1 rounded ${methodColor[ep.method]}`}>
+      {ep.method}
+    </span>
+    <code class="font-mono text-body-16 text-ink">{ep.path}</code>
+  </header>
+  <h3 class="font-serif text-feat-20 text-ink mb-2">{title}</h3>
+  <p class="font-sans text-body-16 text-olive-gray mb-3">{desc}</p>
+  <CodeBlock code={ep.curl} lang="bash" />
+</article>

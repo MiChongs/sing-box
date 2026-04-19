@@ -1,0 +1,53 @@
+---
+import type { FieldDef } from '../data/schema-smart-outbound';
+
+export interface Props {
+  lang: 'zh' | 'en';
+  fields: FieldDef[];
+}
+
+const { lang, fields } = Astro.props;
+
+const headers = lang === 'zh'
+  ? { name: '字段', type: '类型', default: '默认', desc: '说明' }
+  : { name: 'Field', type: 'Type', default: 'Default', desc: 'Description' };
+---
+
+<div class="overflow-x-auto rounded-card shadow-ring-1 bg-ivory my-6">
+  <table class="w-full text-small-15 font-sans">
+    <thead>
+      <tr class="border-b border-border-warm text-left">
+        <th class="px-4 py-3 font-medium text-charcoal-warm whitespace-nowrap">{headers.name}</th>
+        <th class="px-4 py-3 font-medium text-charcoal-warm whitespace-nowrap">{headers.type}</th>
+        <th class="px-4 py-3 font-medium text-charcoal-warm whitespace-nowrap">{headers.default}</th>
+        <th class="px-4 py-3 font-medium text-charcoal-warm">{headers.desc}</th>
+      </tr>
+    </thead>
+    <tbody>
+      {fields.map((f) => (
+        <tr class="border-b border-border-cream last:border-0 align-top">
+          <td class="px-4 py-3">
+            <code class="font-mono text-caption-14 text-terracotta">{f.name}</code>
+            {f.required && <span class="ml-1 text-label-12 text-error-crimson uppercase">required</span>}
+          </td>
+          <td class="px-4 py-3">
+            <code class="font-mono text-caption-14 text-olive-gray whitespace-nowrap">{f.type}</code>
+          </td>
+          <td class="px-4 py-3">
+            {f.default ? (
+              <code class="font-mono text-caption-14 text-charcoal-warm whitespace-nowrap">{f.default}</code>
+            ) : (
+              <span class="text-stone-gray">—</span>
+            )}
+          </td>
+          <td class="px-4 py-3 text-charcoal-warm">
+            <div set:html={(lang === 'zh' ? f.descZh : f.descEn).replace(/`([^`]+)`/g, '<code class="font-mono text-caption-14 text-terracotta bg-warm-sand/50 px-1 rounded">$1</code>')} />
+            {f.notes && (
+              <div class="text-label-12 uppercase tracking-wider text-stone-gray mt-1">{f.notes}</div>
+            )}
+          </td>
+        </tr>
+      ))}
+    </tbody>
+  </table>
+</div>

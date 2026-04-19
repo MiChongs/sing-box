@@ -1,0 +1,25 @@
+---
+import { zh } from '../i18n/zh';
+import { en } from '../i18n/en';
+
+export interface Props {
+  lang: 'zh' | 'en';
+}
+
+const { lang } = Astro.props;
+const t = lang === 'zh' ? zh : en;
+---
+
+<footer class="mt-24 border-t border-border-cream bg-ivory">
+  <div class="mx-auto max-w-page px-6 py-8 flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+    <div>
+      <p class="font-serif text-feat-20 text-ink">{t.site.name}</p>
+      <p class="text-caption-14 text-stone-gray mt-1">{t.site.footerNote}</p>
+    </div>
+    <div class="flex gap-4 text-caption-14 text-olive-gray">
+      <a href="https://github.com/MiChongs/sing-box" target="_blank" rel="noopener">GitHub</a>
+      <a href="https://github.com/MiChongs/sing-box/releases" target="_blank" rel="noopener">Releases</a>
+      <a href="https://github.com/reF1nd/sing-box" target="_blank" rel="noopener">Upstream</a>
+    </div>
+  </div>
+</footer>

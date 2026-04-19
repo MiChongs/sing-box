@@ -1,0 +1,13 @@
+---
+export interface Props {
+  title: string;
+  body: string;
+}
+
+const { title, body } = Astro.props;
+---
+
+<article class="rounded-card bg-ivory p-6 shadow-ring-1 transition-shadow hover:shadow-ring-2">
+  <h3 class="font-serif text-card-32 text-ink mb-3">{title}</h3>
+  <p class="font-sans text-body-17 text-olive-gray">{body}</p>
+</article>

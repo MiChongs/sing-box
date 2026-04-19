@@ -1,0 +1,33 @@
+---
+// Language switcher. Computes the "other language" URL by swapping the
+// /zh/ ↔ /en/ prefix in the current pathname, so every page transparently
+// links to its counterpart.
+//
+// Props:
+//   lang:  current page language ('zh' | 'en')
+
+export interface Props {
+  lang: 'zh' | 'en';
+}
+
+const { lang } = Astro.props;
+const otherLang = lang === 'zh' ? 'en' : 'zh';
+const label = lang === 'zh' ? 'EN' : '中';
+
+// Swap the leading locale segment. Astro serves the base (e.g. /sing-box)
+// ahead of the locale, so Astro.url.pathname already includes it. We
+// only replace the locale token itself.
+const path = Astro.url.pathname;
+const otherPath = path.replace(
+  lang === 'zh' ? /\/zh(\/|$)/ : /\/en(\/|$)/,
+  `/${otherLang}$1`,
+);
+---
+
+<a
+  href={otherPath}
+  class="inline-flex items-center gap-1 text-caption-14 text-charcoal-warm hover:text-terracotta transition-colors focus-ring rounded"
+  aria-label={lang === 'zh' ? 'Switch to English' : '切换到中文'}
+>
+  <span class="font-sans">{label}</span>
+</a>

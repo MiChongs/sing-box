@@ -1,0 +1,102 @@
+---
+import DocLayout from '../../layouts/DocLayout.astro';
+import Callout from '../../components/Callout.astro';
+import { transferFatalFamilies, excluded, constants } from '../../data/watchdog';
+---
+
+<DocLayout lang="en" title="Watchdog & RST behavior">
+  <article class="py-16 max-w-prose">
+    <h1 class="font-serif text-section-52 mb-4">Watchdog &amp; RST behavior</h1>
+    <p class="font-sans text-lead-20 text-olive-gray mb-8">
+      Smart doesn't stop at "URLTest says the node is reachable." On every real data connection it watches Read / Write / Close
+      for RST, TLS alerts, h2 stream resets, QUIC CRYPTO_ERROR, proxy-frame decode errors — <strong>22 fatal shapes</strong> total.
+      A single hit soft-bans the node for that target for 10 minutes, breaking the "re-elect the same dead node" loop.
+    </p>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">Three integration points</h2>
+    <p class="text-charcoal-warm mb-4">
+      All triggers funnel through <code class="font-mono">triggerInstantResetEviction()</code>, which CAS-guards so an event
+      caught by multiple points only runs the handler once:
+    </p>
+    <ul class="list-disc pl-6 text-body-17 text-charcoal-warm space-y-2">
+      <li>
+        <code class="font-mono">Read</code> — checked on every return. Before first byte: <code>isPreFirstByteFatal</code>
+        (any non-EOF is fatal). After first byte: <code>isTransferFatalErr</code> (the 22-shape list below).
+      </li>
+      <li>
+        <code class="font-mono">Write</code> — every return; <code>isResetErr</code> match fires instantly.
+      </li>
+      <li>
+        <code class="font-mono">Close</code> — <code>classifyStatus()</code> prefers <code class="font-mono">lastIOErr</code>
+        (where mid-transfer RSTs land), not just <code>firstReadErr</code>. This prevents the classic
+        "TLS handshake OK then mid-transfer RST → Close mis-classified as closed" leak.
+      </li>
+    </ul>
+
+    <Callout type="info" title="lastIOErr fix">
+      <p>
+        Before: <code>firstReadErr</code> was written once on the first Read only; mid-transfer errors disappeared.
+        After: <code>lastIOErr</code> is atomically overwritten on every IO failure and <code>classifyStatus</code> reads it first.
+        This was the core of watchdog fix patch A.
+      </p>
+    </Callout>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">isTransferFatalErr — the 22-shape list</h2>
+    <p class="text-charcoal-warm mb-4">
+      <code class="font-mono">isResetErr</code> only matches the clean kernel-level RST strings (ECONNRESET / EPIPE / "connection reset by peer").
+      <code class="font-mono">isTransferFatalErr</code> additionally catches mid-transfer RSTs translated by the proxy stack —
+      the common shape of GFW-style targeted blocking.
+    </p>
+
+    {transferFatalFamilies.map((f) => (
+      <section class="mt-8">
+        <h3 class="font-serif text-feat-20 text-ink mb-2">{f.enTitle}</h3>
+        <p class="text-body-16 text-olive-gray mb-3">{f.enDesc}</p>
+        <div class="rounded-card bg-ivory shadow-ring-1 p-4">
+          <ul class="text-caption-14 font-mono text-charcoal-warm space-y-1">
+            {f.patterns.map((p) => <li>{p}</li>)}
+          </ul>
+        </div>
+      </section>
+    ))}
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">Deliberately NOT matched</h2>
+    <ul class="list-disc pl-6 text-body-17 text-charcoal-warm space-y-1">
+      {excluded.en.map((item) => (
+        <li set:html={item.replace(/`([^`]+)`/g, '<code class="font-mono text-caption-14 text-terracotta">$1</code>')} />
+      ))}
+    </ul>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">Soft-ban — markDeadForTarget</h2>
+    <p class="text-charcoal-warm mb-4">
+      On the <strong>first</strong> RST, <code class="font-mono">markDeadForTarget(target, node)</code> fires immediately.
+      For the duration of <code>targetDebargoTTL</code> (10 min), all three <code>selectProxies</code> filter points skip this node
+      for this target. Global health stays intact — the node still serves other targets. TTL auto-expires. This fixes the
+      long-standing "first RST only drops unwrap cache → next dial picks the same node" issue.
+    </p>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">Thresholds &amp; constants</h2>
+    <div class="overflow-x-auto rounded-card shadow-ring-1 bg-ivory my-4">
+      <table class="w-full text-small-15 font-sans">
+        <thead>
+          <tr class="border-b border-border-warm text-left">
+            <th class="px-4 py-3 font-medium text-charcoal-warm">Constant</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm whitespace-nowrap">Value</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm">Description</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm">Source</th>
+          </tr>
+        </thead>
+        <tbody>
+          {constants.map((c) => (
+            <tr class="border-b border-border-cream last:border-0 align-top">
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-terracotta">{c.name}</code></td>
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-charcoal-warm whitespace-nowrap">{c.value}</code></td>
+              <td class="px-4 py-3 text-charcoal-warm">{c.en}</td>
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-stone-gray">{c.go}</code></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </article>
+</DocLayout>

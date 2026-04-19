@@ -1,0 +1,23 @@
+---
+export interface Props {
+  type?: 'info' | 'warn' | 'note';
+  title?: string;
+}
+
+const { type = 'info', title } = Astro.props;
+
+const palette = {
+  info: 'bg-ivory border-terracotta text-charcoal-warm',
+  warn: 'bg-ivory border-error-crimson text-charcoal-warm',
+  note: 'bg-warm-sand border-stone-gray text-charcoal-warm',
+}[type];
+---
+
+<aside class={`border-l-4 rounded-card px-5 py-4 my-6 shadow-ring-1 ${palette}`}>
+  {title && (
+    <p class="font-serif text-feat-20 text-ink mb-2">{title}</p>
+  )}
+  <div class="font-sans text-body-16 prose-sm">
+    <slot />
+  </div>
+</aside>

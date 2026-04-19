@@ -1,0 +1,41 @@
+---
+import '../styles/global.css';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+
+export interface Props {
+  lang: 'zh' | 'en';
+  title: string;
+  description?: string;
+}
+
+const { lang, title, description } = Astro.props;
+const fullTitle = title ? `${title} — sing-box Smart` : 'sing-box Smart';
+const desc =
+  description ??
+  (lang === 'zh'
+    ? 'sing-box xiaobaf14g 的 Smart 策略组文档 —— 机器学习 + ASN 感知 + Watchdog 接入。'
+    : 'Docs for sing-box xiaobaf14g Smart outbound group — ML scoring, ASN routing, RST watchdog.');
+---
+
+<!doctype html>
+<html lang={lang === 'zh' ? 'zh-CN' : 'en'}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={desc} />
+    <meta name="color-scheme" content="light" />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={desc} />
+    <meta property="og:type" content="website" />
+    <link rel="icon" href={`${import.meta.env.BASE_URL}favicon.svg`} />
+    <title>{fullTitle}</title>
+  </head>
+  <body>
+    <Header lang={lang} />
+    <main class="mx-auto max-w-page px-6">
+      <slot />
+    </main>
+    <Footer lang={lang} />
+  </body>
+</html>

@@ -1,0 +1,61 @@
+---
+import DocLayout from '../../layouts/DocLayout.astro';
+import ConfigSchema from '../../components/ConfigSchema.astro';
+import Callout from '../../components/Callout.astro';
+import { smartOutbound } from '../../data/schema-smart-outbound';
+import { smartLightgbm, smartCollector } from '../../data/schema-smart';
+import { geoxTop, geoxUrl } from '../../data/schema-geox';
+---
+
+<DocLayout lang="zh" title="配置字段">
+  <article class="py-16 max-w-prose lg:max-w-none">
+    <h1 class="font-serif text-section-52 mb-4">配置字段</h1>
+    <p class="font-sans text-lead-20 text-olive-gray mb-10 max-w-prose">
+      Smart 的配置分三块：出站组本身 (<code class="font-mono text-body-16 text-terracotta">type: "smart"</code>)、
+      全局 <code class="font-mono text-body-16 text-terracotta">experimental.smart</code>（LightGBM 模型与 CSV 收集器）、
+      全局 <code class="font-mono text-body-16 text-terracotta">experimental.geox</code>（地理数据下载与 ASN）。
+    </p>
+
+    <Callout type="info" title="最少配置">
+      <p>
+        只有 <code>outbounds</code> 是必填的，其它字段全部可省。开启 <code>use_lightgbm</code> 或 <code>use_asn</code>
+        时才需要对应填写 <code>experimental.smart</code> / <code>experimental.geox</code>。
+      </p>
+    </Callout>
+
+    <section class="mt-12">
+      <h2 class="font-serif text-card-32 mb-3" id="smart-outbound">Smart 出站组</h2>
+      <p class="text-charcoal-warm mb-2">
+        对应 Go 结构：<code class="font-mono">option.SmartOutboundOptions</code>（<code>option/group.go</code>）。
+      </p>
+      <ConfigSchema lang="zh" fields={smartOutbound} />
+    </section>
+
+    <section class="mt-16">
+      <h2 class="font-serif text-card-32 mb-3" id="experimental-smart">experimental.smart</h2>
+      <p class="text-charcoal-warm mb-2">
+        全局共享给所有 Smart 组使用的 LightGBM 模型与训练数据收集器。至少有一个 Smart 组设
+        <code class="font-mono">use_lightgbm: true</code> 或 <code class="font-mono">collect_data: true</code> 才需要配置。
+      </p>
+
+      <h3 class="font-serif text-feat-20 mt-6 mb-2">lightgbm</h3>
+      <ConfigSchema lang="zh" fields={smartLightgbm} />
+
+      <h3 class="font-serif text-feat-20 mt-6 mb-2">collector</h3>
+      <ConfigSchema lang="zh" fields={smartCollector} />
+    </section>
+
+    <section class="mt-16">
+      <h2 class="font-serif text-card-32 mb-3" id="experimental-geox">experimental.geox</h2>
+      <p class="text-charcoal-warm mb-2">
+        全局 Geo 数据管理（geoip / geosite / mmdb / ASN mmdb）。Smart 目前仅消费 ASN 列；其余字段为其他场景预留。
+      </p>
+
+      <h3 class="font-serif text-feat-20 mt-6 mb-2">顶层字段</h3>
+      <ConfigSchema lang="zh" fields={geoxTop} />
+
+      <h3 class="font-serif text-feat-20 mt-6 mb-2">url 子项</h3>
+      <ConfigSchema lang="zh" fields={geoxUrl} />
+    </section>
+  </article>
+</DocLayout>

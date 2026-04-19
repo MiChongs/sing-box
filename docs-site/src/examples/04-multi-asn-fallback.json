@@ -1,0 +1,28 @@
+{
+  "experimental": {
+    "geox": {
+      "enabled": true,
+      "auto_update": true,
+      "download_detour": "direct",
+      "url": {
+        "asn": [
+          "https://raw.githubusercontent.com/xream/geoip/lite/GeoLite2-ASN.mmdb",
+          "https://ipinfo.io/static/ipinfo_asn.mmdb",
+          "https://download.db-ip.com/free/dbip-asn-lite.mmdb.gz"
+        ]
+      }
+    }
+  },
+  "outbounds": [
+    {
+      "type": "smart",
+      "tag": "auto",
+      "providers": ["my-subscription"],
+      "use_asn": true,
+      "asn_database": [
+        "/etc/sing-box/maxmind.mmdb",
+        "/etc/sing-box/ipinfo.mmdb"
+      ]
+    }
+  ]
+}

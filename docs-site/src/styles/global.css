@@ -1,0 +1,97 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Anthropic* faces are commercial and cannot be self-hosted. We declare
+ * them via @font-face with `local()` only — if the visitor has them
+ * installed (Anthropic employees / Claude.ai regulars), they get the
+ * authentic typography. Everyone else transparently cascades down to
+ * the self-hosted OFL fonts (Inter / JetBrains Mono) or the platform
+ * Georgia serif.
+ *
+ * No `url(...)` is supplied, so there's no network fetch for the
+ * Anthropic faces and zero risk of licensing violation.
+ */
+@font-face {
+  font-family: 'Anthropic Serif';
+  src: local('Anthropic Serif'), local('AnthropicSerif');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Anthropic Sans';
+  src: local('Anthropic Sans'), local('AnthropicSans');
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Anthropic Mono';
+  src: local('Anthropic Mono'), local('AnthropicMono');
+  font-display: swap;
+}
+
+/*
+ * Inter / JetBrains Mono are NOT self-hosted in v0.1 — we rely on the
+ * local() probe plus platform fallbacks (Georgia for serif, system-ui
+ * for sans, ui-monospace for mono). Dropping the CDN avoids both the
+ * great-firewall latency tax and the CSP noise for a negligible
+ * visual compromise on this editorial-feel site. If authentic Inter
+ * becomes required, self-host woff2 in public/fonts/ and uncomment
+ * explicit @font-face blocks here.
+ */
+
+html,
+body {
+  background-color: #f5f4ed;          /* parchment */
+  color: #141413;                     /* ink */
+  font-family: 'Anthropic Sans', Inter, system-ui, sans-serif;
+  font-size: 1.06rem;
+  line-height: 1.60;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+/* Serif headings carry medium weight across all sizes (DESIGN.md §3). */
+h1, h2, h3, h4, h5, h6 {
+  font-family: 'Anthropic Serif', Georgia, 'Times New Roman', serif;
+  font-weight: 500;
+  color: #141413;
+}
+
+code, pre, kbd {
+  font-family: 'Anthropic Mono', 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.94rem;
+  letter-spacing: -0.32px;
+}
+
+a {
+  color: #c96442;                     /* terracotta brand */
+  text-decoration: none;
+  transition: color 0.12s ease;
+}
+a:hover {
+  color: #d97757;                     /* coral hover */
+}
+
+::selection {
+  background: rgba(201, 100, 66, 0.18);
+}
+
+/*
+ * Shiki outputs `<pre class="astro-code">` with its own background.
+ * Override to the warm parchment variant so code blocks don't punch
+ * holes in the editorial flow.
+ */
+.astro-code,
+.astro-code code {
+  background-color: #faf9f5 !important;  /* ivory */
+  padding: 1rem 1.25rem;
+  border-radius: 12px;
+  box-shadow: 0 0 0 1px rgb(20 20 19 / 0.08);
+  overflow-x: auto;
+}
+
+/* Utility: warm ring on focus for a11y (matches focus-blue token). */
+.focus-ring:focus-visible {
+  outline: 2px solid #3898ec;
+  outline-offset: 2px;
+}

@@ -1,0 +1,26 @@
+{
+  "experimental": {
+    "smart": {
+      "lightgbm": {
+        "auto_update": true,
+        "update_interval": "72h",
+        "model_path": "smart_lgbm_model.bin",
+        "download_detour": "direct"
+      },
+      "collector": {
+        "size_limit_mb": 100,
+        "path": "smart_weight_data.csv"
+      }
+    }
+  },
+  "outbounds": [
+    {
+      "type": "smart",
+      "tag": "auto",
+      "providers": ["my-subscription"],
+      "use_lightgbm": true,
+      "collect_data": true,
+      "sample_rate": 0.3
+    }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "outbounds": [
+    {
+      "type": "smart",
+      "tag": "smart-interactive",
+      "providers": ["my-subscription"],
+      "algorithm": "latency-banded",
+      "hysteresis": "3s",
+      "interrupt_exist_connections": false
+    },
+    {
+      "type": "smart",
+      "tag": "smart-bulk",
+      "providers": ["my-subscription"],
+      "algorithm": "least-loaded",
+      "include": "^(US|JP|SG)"
+    },
+    {
+      "type": "smart",
+      "tag": "smart-balanced",
+      "providers": ["my-subscription"],
+      "algorithm": "p2c",
+      "policy_priority": "HK:1.3;JP:1.1"
+    },
+    {
+      "type": "smart",
+      "tag": "smart-sticky",
+      "providers": ["my-subscription"],
+      "algorithm": "sticky-session",
+      "hysteresis": "5s"
+    }
+  ]
+}

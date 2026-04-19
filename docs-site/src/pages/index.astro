@@ -1,0 +1,29 @@
+---
+// Root redirect: send visitors to /zh/ or /en/ based on navigator.language.
+// We use both <meta refresh> AND a small inline script — no-JS clients
+// still get routed via the meta tag; JS-enabled clients land sooner.
+//
+// Default locale is zh (xiaobaf14g primary audience is Chinese community).
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const zhUrl = `${base}/zh/`;
+const enUrl = `${base}/en/`;
+---
+
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="refresh" content={`0;url=${zhUrl}`} />
+    <link rel="canonical" href={zhUrl} />
+    <title>sing-box Smart</title>
+    <script is:inline define:vars={{ zhUrl, enUrl }}>
+      const lang = (navigator.language || 'zh').toLowerCase();
+      const target = lang.startsWith('en') ? enUrl : zhUrl;
+      location.replace(target);
+    </script>
+  </head>
+  <body style="font-family: Inter, system-ui, sans-serif; background: #f5f4ed; color: #141413; padding: 2rem;">
+    <p>Redirecting… <a href={zhUrl}>中文</a> / <a href={enUrl}>English</a></p>
+  </body>
+</html>

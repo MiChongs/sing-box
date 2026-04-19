@@ -1,0 +1,61 @@
+---
+import LangSwitcher from './LangSwitcher.astro';
+import { zh } from '../i18n/zh';
+import { en } from '../i18n/en';
+
+export interface Props {
+  lang: 'zh' | 'en';
+}
+
+const { lang } = Astro.props;
+const t = lang === 'zh' ? zh : en;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+
+// Highlight the active nav link by matching a substring of the URL.
+const path = Astro.url.pathname;
+const navItems = [
+  { href: `${base}/${lang}/`,          key: 'home',     match: `/${lang}/` },
+  { href: `${base}/${lang}/config/`,   key: 'config',   match: `/${lang}/config` },
+  { href: `${base}/${lang}/examples/`, key: 'examples', match: `/${lang}/examples` },
+  { href: `${base}/${lang}/clash-api/`, key: 'api',     match: `/${lang}/clash-api` },
+  { href: `${base}/${lang}/watchdog/`, key: 'watchdog', match: `/${lang}/watchdog` },
+];
+
+function isActive(match: string, href: string) {
+  // Home link only matches the exact root; others match their prefix.
+  if (href.endsWith(`/${lang}/`)) return path === href || path === href.slice(0, -1);
+  return path.startsWith(match);
+}
+---
+
+<header class="sticky top-0 z-30 bg-parchment/90 backdrop-blur-sm shadow-ring-1">
+  <nav class="mx-auto max-w-page flex items-center gap-6 px-6 py-4">
+    <a href={`${base}/${lang}/`} class="font-serif text-feat-20 text-ink hover:text-terracotta">
+      {t.site.name}
+    </a>
+    <div class="hidden md:flex items-center gap-5 ml-4 flex-1">
+      {navItems.slice(1).map(item => (
+        <a
+          href={item.href}
+          class:list={[
+            'text-small-15 transition-colors',
+            isActive(item.match, item.href)
+              ? 'text-terracotta'
+              : 'text-olive-gray hover:text-ink',
+          ]}
+        >
+          {t.nav[item.key as keyof typeof t.nav]}
+        </a>
+      ))}
+    </div>
+    <a
+      href="https://github.com/MiChongs/sing-box"
+      target="_blank"
+      rel="noopener"
+      class="text-small-15 text-olive-gray hover:text-ink"
+    >
+      {t.nav.github}
+    </a>
+    <LangSwitcher lang={lang} />
+  </nav>
+</header>

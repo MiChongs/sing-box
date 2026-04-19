@@ -1,0 +1,63 @@
+---
+import DocLayout from '../../layouts/DocLayout.astro';
+import HeroSection from '../../components/HeroSection.astro';
+import FeatureCard from '../../components/FeatureCard.astro';
+import ComparisonTable from '../../components/ComparisonTable.astro';
+import { en } from '../../i18n/en';
+
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const t = en;
+
+const rows = [
+  { feature: 'Latency-based selection',     selector: '—', urltest: '✓',          loadbalance: '✓',         smart: '✓' },
+  { feature: 'History-based learning',      selector: '—', urltest: '—',          loadbalance: '△',         smart: '✓', note: 'Per (target, ASN, node) independently' },
+  { feature: 'Auto demote on failure',      selector: '—', urltest: '△',          loadbalance: '△',         smart: '✓', note: 'Linear demote + 30 min+ cooldown' },
+  { feature: 'ML-assisted ranking',         selector: '—', urltest: '—',          loadbalance: '—',         smart: '✓', note: 'LightGBM, 27+ features' },
+  { feature: 'RST / TLS-level watchdog',    selector: '—', urltest: '—',          loadbalance: '—',         smart: '✓', note: '22 error shapes recognized' },
+  { feature: 'Ranking algorithms',          selector: '—', urltest: '—',          loadbalance: '3',         smart: '11' },
+];
+---
+
+<DocLayout lang="en" title="Intelligent outbound group">
+  <HeroSection
+    eyebrow={t.hero.eyebrow}
+    title={t.hero.title}
+    subtitle={t.hero.subtitle}
+    primary={{ href: `${base}/en/examples/`, label: t.hero.primary }}
+    secondary={{ href: `${base}/en/config/`, label: t.hero.secondary }}
+  />
+
+  <section class="py-16">
+    <h2 class="font-serif text-section-52 mb-10">{t.features.title}</h2>
+    <div class="grid gap-5 md:grid-cols-2">
+      {t.features.items.map((f) => (
+        <FeatureCard title={f.title} body={f.body} />
+      ))}
+    </div>
+  </section>
+
+  <section class="py-16">
+    <h2 class="font-serif text-section-52 mb-10">{t.comparison.title}</h2>
+    <ComparisonTable headers={t.comparison.headers} rows={rows} />
+  </section>
+
+  <section class="py-16">
+    <h2 class="font-serif text-section-52 mb-10">{t.scenarios.title}</h2>
+    <div class="grid gap-5 md:grid-cols-3">
+      {t.scenarios.items.map((s) => (
+        <FeatureCard title={s.title} body={s.body} />
+      ))}
+    </div>
+  </section>
+
+  <section class="py-16">
+    <div class="rounded-card bg-deep-dark text-warm-silver p-10 md:p-14 shadow-ring-3">
+      <h2 class="font-serif text-card-32 md:text-section-52 text-ivory mb-4">{t.cta.title}</h2>
+      <p class="font-sans text-lead-20 mb-8 max-w-prose">{t.cta.body}</p>
+      <div class="flex flex-wrap gap-3">
+        <a href={`${base}/en/examples/`} class="rounded-card bg-terracotta text-ivory px-5 py-3 text-body-16 font-medium hover:bg-coral transition-colors focus-ring">{t.cta.primary}</a>
+        <a href={`${base}/en/config/`} class="rounded-card bg-dark-surface text-warm-silver px-5 py-3 text-body-16 font-medium hover:bg-charcoal-warm transition-colors focus-ring">{t.cta.secondary}</a>
+      </div>
+    </div>
+  </section>
+</DocLayout>

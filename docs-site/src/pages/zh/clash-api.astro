@@ -1,0 +1,35 @@
+---
+import DocLayout from '../../layouts/DocLayout.astro';
+import EndpointRow from '../../components/EndpointRow.astro';
+import Callout from '../../components/Callout.astro';
+import { endpoints, groupLabels, type Group } from '../../data/clash-endpoints';
+
+const ORDER: Group[] = ['inspect', 'control', 'flush'];
+---
+
+<DocLayout lang="zh" title="Clash API">
+  <article class="py-16 max-w-prose lg:max-w-none">
+    <h1 class="font-serif text-section-52 mb-4">Clash API</h1>
+    <p class="font-sans text-lead-20 text-olive-gray mb-8 max-w-prose">
+      Smart 在现有 Clash API 上扩展了 11 个端点，分布在 <code class="font-mono">/smart/*</code> /
+      <code class="font-mono">/proxies/{'{name}'}/*</code> / <code class="font-mono">/cache/smart/*</code> 三个资源路径下。
+      所有 curl 示例都假设 <code class="font-mono">external_controller: "127.0.0.1:9090"</code>，带 secret 时附 <code>Authorization: Bearer</code> 头即可。
+    </p>
+
+    <Callout type="note" title="默认端口与认证">
+      <p>
+        端口与密钥由 <code class="font-mono">experimental.clash_api.external_controller</code> 与 <code class="font-mono">secret</code> 决定。
+        所有端点遵循 CORS 与 <code>secret</code> 的默认中间件，规则与其他 Clash API 一致，此处不重复。
+      </p>
+    </Callout>
+
+    {ORDER.map((g) => (
+      <section class="mt-12">
+        <h2 class="font-serif text-card-32 mb-4">{groupLabels.zh[g]}</h2>
+        {endpoints.filter(e => e.group === g).map((ep) => (
+          <EndpointRow lang="zh" ep={ep} />
+        ))}
+      </section>
+    ))}
+  </article>
+</DocLayout>

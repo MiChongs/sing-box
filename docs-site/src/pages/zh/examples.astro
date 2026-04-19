@@ -1,0 +1,41 @@
+---
+import DocLayout from '../../layouts/DocLayout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+import { examples } from '../../data/example-metadata';
+
+// Vite raw glob import: build-time inlining of every JSON body.
+const rawFiles = import.meta.glob<string>('../../examples/*.json', {
+  eager: true,
+  query: '?raw',
+  import: 'default',
+});
+
+// Resolve a file key like 'examples/01-minimal.json' to its body.
+function bodyOf(file: string): string {
+  const key = Object.keys(rawFiles).find((k) => k.endsWith('/' + file));
+  return key ? (rawFiles[key] as string) : '';
+}
+---
+
+<DocLayout lang="zh" title="示例配置">
+  <article class="py-16 max-w-prose lg:max-w-none">
+    <h1 class="font-serif text-section-52 mb-4">示例配置</h1>
+    <p class="font-sans text-lead-20 text-olive-gray mb-10 max-w-prose">
+      5 份从简到繁的 Smart 配置，按需裁剪即可上生产。每份都是**可直接粘贴**的完整 JSON，
+      缺少的顶层字段（<code class="font-mono">inbounds</code>、<code class="font-mono">route</code>）按你现有配置保留即可。
+    </p>
+
+    {examples.map((ex) => (
+      <section class="mt-12 pt-6 border-t border-border-cream first:border-0 first:pt-0 first:mt-0">
+        <h2 class="font-serif text-card-32 mb-2" id={ex.id}>{ex.zhTitle}</h2>
+        <p class="font-sans text-body-17 text-charcoal-warm mb-4 max-w-prose">{ex.zhIntro}</p>
+        <CodeBlock code={bodyOf(ex.file)} lang="json" filename={ex.file} />
+        <ul class="mt-4 list-disc pl-6 text-body-16 text-olive-gray space-y-1 max-w-prose">
+          {ex.zhNotes.map((n) => (
+            <li set:html={n.replace(/`([^`]+)`/g, '<code class="font-mono text-caption-14 text-terracotta">$1</code>')} />
+          ))}
+        </ul>
+      </section>
+    ))}
+  </article>
+</DocLayout>
