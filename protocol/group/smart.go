@@ -3304,6 +3304,13 @@ func (s *Smart) recordStats(
 		input.DNSResolveTime = detail.DNSResolveMS
 		input.TLSHandshakeTime = detail.TLSHandshakeMS
 		input.TLSSessionResumed = detail.DidResume
+		// xiaobaf14g v3 TCP-kernel signals — filled only when the probe
+		// reached a real fd (Linux direct outbounds and similar). Zero on
+		// every other platform / wrapped proxy conn, documented as
+		// "unknown" at the ModelInput level.
+		input.TCPRetransmissions = detail.TCPRetransmissions
+		input.TCPLosses = detail.TCPLosses
+		input.PathMTU = detail.PathMTU
 	}
 	// Time-of-day signal: HourBucket lets the strategy / collector slice
 	// success/failure stats by 24 hour-of-day buckets (catches "this node
@@ -3313,6 +3320,10 @@ func (s *Smart) recordStats(
 	// is forward-compatible with the v2.1 implementation.
 	input.HourBucket = int8(time.Now().Hour())
 	input.HTTP3FallbackCount = s.http3FallbackCount(proxyTag)
+	// Long-horizon EWMA companions to ShortRTT / ShortSuccessRate. Cold-
+	// start (no samples) returns 0 — strategies must guard against that.
+	input.LongRTT = record.LongRTT()
+	input.LongSuccessRate = record.LongSuccessRate()
 	defer smart.ReleaseModelInput(input)
 
 	// ML prediction path (LightGBM) with automatic fallback to traditional algorithm.

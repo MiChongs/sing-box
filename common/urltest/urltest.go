@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/smart/tcpinfo"
 	C "github.com/sagernet/sing-box/constant"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -186,6 +187,15 @@ type URLTestDetail struct {
 	FirstByteMS    int64
 	DidResume      bool
 	DNSResolveMS   int64
+
+	// xiaobaf14g v3 — kernel TCP metrics read from the probe socket
+	// before the conn is closed. Zero on non-Linux platforms or when the
+	// outer conn is a proxy wrapper that hides its fd (common for
+	// protocol-stack conns: anytls / vmess / trojan / shadowtls / etc.).
+	// See common/smart/tcpinfo for the exact read-path semantics.
+	TCPRetransmissions uint32
+	TCPLosses          uint32
+	PathMTU            uint32
 }
 
 // URLTest probes a link through the given dialer and returns the headline
@@ -310,6 +320,19 @@ func URLTestWithDetail(ctx context.Context, link string, detour N.Dialer, detail
 	}
 	if detail != nil {
 		detail.FirstByteMS = int64(t)
+		// Read kernel TCP metrics before the deferred instance.Close() fires
+		// (tcp_info is invalidated the moment the socket closes). The
+		// instance here is the detour.DialContext return value, which is
+		// usually a proxy wrapper — tcpinfo.Read returns ok=false unless
+		// the outer type exposes syscall.Conn (direct outbound, and a
+		// handful of thin wrappers). Non-Linux builds always return
+		// ok=false. We swallow ok because zero is the documented "unknown"
+		// marker in ModelInput.
+		if tinfo, ok := tcpinfo.Read(instance); ok {
+			detail.TCPRetransmissions = tinfo.Retransmissions
+			detail.TCPLosses = tinfo.Losses
+			detail.PathMTU = tinfo.PathMTU
+		}
 	}
 	return
 }

@@ -28,6 +28,21 @@ import (
 const (
 	shortRTTEwmaAge     = 30.0
 	shortSuccessEwmaAge = 20.0
+
+	// longRTTEwmaAge / longSuccessEwmaAge are the ~10k-sample horizon
+	// companions to the short-window signals above. They give the ranking
+	// strategies a stable "lifetime" baseline to compare the short EWMA
+	// against, so a node that's been consistently fine for days doesn't
+	// get demoted by a single bad minute.
+	//
+	// Chosen as 30× the short-window horizon: that's long enough to cover
+	// a typical diurnal cycle (thousands of dials per day across a group
+	// with 20-100 proxies) without being so large that a genuine
+	// multi-day regime change (ISP re-routing, peering shift) fails to
+	// move the baseline in a reasonable time. Not persisted in v3 (matches
+	// the short-window behaviour); persistence comes in v2.1.
+	longRTTEwmaAge     = 900.0
+	longSuccessEwmaAge = 600.0
 )
 
 const (
@@ -370,6 +385,54 @@ type ModelInput struct {
 	// the most-used node in this hour". Filled from NodeState.HourCounts;
 	// 0 during cold start.
 	HourFrequency float64
+
+	// ───────────────────────────────────────────────────────────────────────
+	// xiaobaf14g v3: platform-differentiated TCP-level + long-term signals.
+	// Populated only on Linux / Android (see common/smart/tcpinfo); zero on
+	// other platforms, which the ranking strategies must interpret as
+	// "unknown" rather than "healthy". See CSV schema_version = "3".
+	// ───────────────────────────────────────────────────────────────────────
+
+	// TCPRetransmissions is the cumulative retransmit count for the last
+	// URLTest probe connection (Linux tcp_info.Total_retrans). Higher values
+	// indicate a lossy link between client and the remote server side of
+	// the proxy — the proxy itself can't hide the underlying loss, so this
+	// is a meaningful ranking signal even when the proxy protocol is
+	// encrypted. 0 on non-Linux or when the conn did not expose a raw fd.
+	TCPRetransmissions uint32
+
+	// TCPLosses is the kernel's current in-flight loss estimate (Linux
+	// tcp_info.Lost) at the moment of measurement. A healthy link has 0;
+	// persistent nonzero values on repeated probes mean the node is
+	// currently routing over a lossy segment — sticky-session should avoid,
+	// failover should kick in sooner.
+	TCPLosses uint32
+
+	// PathMTU is the discovered path MTU in bytes (Linux tcp_info.Pmtu).
+	// Anomalously low values (< 1400) signal tunnels stacked over tunnels
+	// and often correlate with fragmentation-induced tail latency on
+	// bulk transfers. 0 on non-Linux.
+	PathMTU uint32
+
+	// LongRTT is an in-memory long-horizon EWMA of first-byte latency,
+	// complementing ShortRTT (= recent ~20 samples) with a larger window
+	// (~10 000 samples). The ratio LongRTT / ShortRTT tells strategies
+	// whether the node is transiently slow vs. consistently slow:
+	//
+	//   ShortRTT >> LongRTT → node just hit a bad patch (transient)
+	//   ShortRTT ≈  LongRTT → consistent; rank by absolute value
+	//   ShortRTT <<  LongRTT → node recovering from prior slowdown
+	//
+	// Not persisted in v3 (matches existing ShortRTT semantics — resets on
+	// process restart). v2.1 will persist across restarts via a new bbolt
+	// bucket. 0 when samples < warmup threshold.
+	LongRTT float64
+
+	// LongSuccessRate is the long-horizon analogue of ShortSuccessRate.
+	// Same cold-start / non-persistence caveats as LongRTT. Useful for the
+	// circuit-breaker strategy: a short-term dip in success rate against a
+	// long-term high rate is likely a glitch, not a node-down event.
+	LongSuccessRate float64
 }
 
 type NodeState struct {
@@ -614,6 +677,20 @@ type AtomicStatsRecord struct {
 	// 20 dials shows up here long before the lifetime Success/Failure
 	// counters move the needle, so the weight function can act fast.
 	shortSuccess ewma.MovingAverage
+
+	// longRTT / longSuccess mirror the short-window EWMAs above but with
+	// a ~30× larger window (see longRTTEwmaAge / longSuccessEwmaAge).
+	// The *Delta* between short and long is the signal ranking strategies
+	// actually care about — "short >> long" means "node just got worse",
+	// "short <<  long" means "node just recovered". Both protected by
+	// ewmaMu along with the short-window pair.
+	//
+	// Not persisted in v3 (resets on process restart, same as short
+	// window). Adds one extra ewma.MovingAverage struct per record — on a
+	// 20-proxy × 50-target deployment that's ~1600 instances × ~100 bytes
+	// ≈ 160 KB, well within budget.
+	longRTT     ewma.MovingAverage
+	longSuccess ewma.MovingAverage
 }
 
 // tdigestCompression controls the centroid budget for each record's
@@ -633,6 +710,8 @@ func NewAtomicStatsRecord() *AtomicStatsRecord {
 		weights:      make(map[string]float64),
 		shortRTT:     ewma.NewMovingAverage(shortRTTEwmaAge),
 		shortSuccess: ewma.NewMovingAverage(shortSuccessEwmaAge),
+		longRTT:      ewma.NewMovingAverage(longRTTEwmaAge),
+		longSuccess:  ewma.NewMovingAverage(longSuccessEwmaAge),
 	}
 }
 
@@ -834,6 +913,9 @@ func (r *AtomicStatsRecord) UpdateLatencySample(sampleMS int64) {
 	if r.shortRTT != nil {
 		r.shortRTT.Add(x)
 	}
+	if r.longRTT != nil {
+		r.longRTT.Add(x)
+	}
 	r.ewmaMu.Unlock()
 }
 
@@ -849,6 +931,9 @@ func (r *AtomicStatsRecord) recordSuccessOutcome(delta int64, outcomeVal float64
 	r.ewmaMu.Lock()
 	for i := int64(0); i < delta; i++ {
 		r.shortSuccess.Add(outcomeVal)
+		if r.longSuccess != nil {
+			r.longSuccess.Add(outcomeVal)
+		}
 	}
 	r.ewmaMu.Unlock()
 }
@@ -876,6 +961,30 @@ func (r *AtomicStatsRecord) ShortSuccessRate() float64 {
 	r.ewmaMu.Lock()
 	defer r.ewmaMu.Unlock()
 	return r.shortSuccess.Value()
+}
+
+// LongRTT returns the long-window EWMA of first-byte latency (ms), sharing
+// the same ewmaMu critical-section semantics as ShortRTT. The value
+// stabilises across ~900 samples, giving strategies a "lifetime" baseline
+// to compare the short-window signal against. 0 before any samples arrive.
+func (r *AtomicStatsRecord) LongRTT() float64 {
+	if r == nil || r.longRTT == nil {
+		return 0
+	}
+	r.ewmaMu.Lock()
+	defer r.ewmaMu.Unlock()
+	return r.longRTT.Value()
+}
+
+// LongSuccessRate is the long-window analogue of ShortSuccessRate.
+// Same cold-start / locking semantics.
+func (r *AtomicStatsRecord) LongSuccessRate() float64 {
+	if r == nil || r.longSuccess == nil {
+		return 0
+	}
+	r.ewmaMu.Lock()
+	defer r.ewmaMu.Unlock()
+	return r.longSuccess.Value()
 }
 
 // QuantileRTT returns the estimated first-byte latency in milliseconds

@@ -19,18 +19,23 @@ const DefaultCollectorSizeMB = 100
 
 // collectorSchemaVersion stamps every row so the offline-training pipeline
 // (Python / pandas / LightGBM) can tell v1 rows (before xiaobaf14g v2) from
-// v2 rows (after) and widen the feature frame only for the latter without
-// silently mis-reading older CSVs.
+// v3 rows (after phase B TCP_INFO + long-term EWMA additions), and widen
+// the feature frame per row without silently mis-reading older CSVs.
 //
 // Bumped when the column list changes at all — new columns append to the
 // right, never insert in the middle, to keep forward-compatible string
 // parsing in downstream tools.
-const collectorSchemaVersion = "2"
+const collectorSchemaVersion = "3"
 
-// collectorV2ExtraColumns is the number of xiaobaf14g v2 extension columns
-// appended after the original 10 metadata columns: 9 ModelInput fields +
-// 1 schema version tag. See AddSample for the exact layout.
-const collectorV2ExtraColumns = 10
+// collectorV2ExtraColumns is the xiaobaf14g phase-A column count: 9
+// ModelInput dimensions appended after the original 10 metadata columns.
+const collectorV2ExtraColumns = 9
+
+// collectorV3ExtraColumns is the xiaobaf14g phase-B column count: 5
+// additional ModelInput dimensions (TCPRetransmissions, TCPLosses,
+// PathMTU, LongRTT, LongSuccessRate) + 1 schema_version tag column,
+// appended after the phase-A block. See AddSample for the layout.
+const collectorV3ExtraColumns = 6
 
 // flushInterval caps how long buffered rows may sit in memory without being
 // written to disk. Prevents data loss if the process is killed right after
@@ -228,11 +233,10 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, meta *CollectorMeta, 
 		time.Now().Format(time.RFC3339),
 	)
 
-	// xiaobaf14g v2 extension columns — appended to the tail so v1 parsers
-	// reading the first 37 columns still work, and v2-aware parsers can key
-	// off the trailing collectorSchemaVersion to widen their frame. Keep
-	// this list synchronised with ModelInput's v2 block comment — column
-	// order is the training contract and must not be reshuffled.
+	// xiaobaf14g phase-A extension columns — appended to the tail so v1
+	// parsers reading the first 37 columns still work. Keep this list
+	// synchronised with ModelInput's v2 block comment — column order is
+	// the training contract and must not be reshuffled.
 	sample = append(sample,
 		fmt.Sprintf("%.6f", input.LatencyStdDevDelta),
 		fmt.Sprintf("%.6f", input.ConnectTimeStdDevDelta),
@@ -243,10 +247,22 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, meta *CollectorMeta, 
 		fmt.Sprintf("%d", input.HTTP3FallbackCount),
 		fmt.Sprintf("%.6f", input.LightGBMConfidence),
 		fmt.Sprintf("%d", input.HourBucket),
+	)
+
+	// xiaobaf14g phase-B extension columns — kernel TCP metrics + long-
+	// term EWMA pair + schema version. Schema version sits at the very
+	// tail so parsers can find it with a stable negative index. Must
+	// stay last.
+	sample = append(sample,
+		fmt.Sprintf("%d", input.TCPRetransmissions),
+		fmt.Sprintf("%d", input.TCPLosses),
+		fmt.Sprintf("%d", input.PathMTU),
+		fmt.Sprintf("%.6f", input.LongRTT),
+		fmt.Sprintf("%.6f", input.LongSuccessRate),
 		collectorSchemaVersion,
 	)
 
-	expectedColumns := MaxFeatureSize + 10 + collectorV2ExtraColumns
+	expectedColumns := MaxFeatureSize + 10 + collectorV2ExtraColumns + collectorV3ExtraColumns
 	if len(sample) != expectedColumns {
 		c.droppedRows.Add(1)
 		c.logger.Warn("smart collector: column count mismatch (got ", len(sample), ", expected ", expectedColumns, ")")
