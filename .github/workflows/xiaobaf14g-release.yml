@@ -62,8 +62,11 @@ jobs:
           echo "skip_android=$SKIP_ANDROID" | tee -a "$GITHUB_OUTPUT"
 
   # ───────────────────────────────────────────────────────────────────
-  # 2) Desktop 多平台并行编译 (15 个 target)
-  #    所有 target CGO_ENABLED=0; tag 集合与 build-all.bat 完全一致。
+  # 2) Desktop 多平台并行编译 (16 个 target)
+  #    默认 CGO_ENABLED=0; linux-amd64-v3-glibc 例外: CGO=1 + GOAMD64=v3
+  #    走宿主 glibc 动态链接, 提供给现代 CPU + 较新 Linux 发行版用户的
+  #    优化版 (AVX/AVX2/BMI/FMA 加速 wireguard / quic-go / utls 加密路径)。
+  #    tag 集合与 build-all.bat 完全一致。
   # ───────────────────────────────────────────────────────────────────
   desktop:
     name: ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.suffix }}
@@ -79,6 +82,12 @@ jobs:
           - { goos: windows, goarch: '386',    ext: .exe, tags_src: windows, suffix: '' }
           # Linux
           - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: '' }
+          # AMD64 v3 + glibc — CGO=1 動態鏈接宿主 glibc, GOAMD64=v3 啟用
+          # AVX / AVX2 / BMI1 / BMI2 / FMA / F16C 指令。產物只能跑在 Haswell
+          # (Intel 2013+) / Excavator (AMD 2015+) 之後的 CPU。對應的 glibc
+          # 最低版本 = ubuntu-latest 上的 glibc (當前 2.39, 即 ≥ Ubuntu 24.04
+          # / Debian 13 / RHEL 10 / 同代 musl 不可用)。
+          - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: -v3-glibc, goamd64: v3, cgo: '1' }
           - { goos: linux,   goarch: arm64,    ext: '',   tags_src: others,  suffix: '' }
           - { goos: linux,   goarch: '386',    ext: '',   tags_src: others,  suffix: '' }
           - { goos: linux,   goarch: arm,      ext: '',   tags_src: others,  suffix: -v7,  goarm: '7' }
@@ -130,22 +139,31 @@ jobs:
 
       - name: Build binary
         env:
-          CGO_ENABLED: '0'
+          # Defaults to CGO=0 static; matrix.cgo override flips to dynamic
+          # for the linux-amd64-v3-glibc target.
+          CGO_ENABLED: ${{ matrix.cgo || '0' }}
           GOOS:        ${{ matrix.goos }}
           GOARCH:      ${{ matrix.goarch }}
           GOARM:       ${{ matrix.goarm }}
           GOMIPS:      ${{ matrix.gomips }}
+          GOAMD64:     ${{ matrix.goamd64 }}
         run: |
           set -euo pipefail
           VERSION='${{ needs.prepare.outputs.version }}'
           NAME="sing-box-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
           BIN="${NAME}${{ matrix.ext }}"
-          echo "Building $BIN (tags=${{ steps.tags.outputs.tags }})"
+          echo "Building $BIN (tags=${{ steps.tags.outputs.tags }}, CGO=${CGO_ENABLED}, GOAMD64=${GOAMD64:-default})"
           go build -v -trimpath -buildvcs=false \
             -tags "${{ steps.tags.outputs.tags }}" \
             -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=${VERSION} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -buildid=" \
             -o "$BIN" ./cmd/sing-box
           ls -lh "$BIN"
+          # For glibc dynamic builds, surface the runtime ELF requirements
+          # so the release notes can list the minimum supported distro.
+          if [ "${CGO_ENABLED}" = "1" ]; then
+            echo "--- ELF dynamic dependencies ---"
+            objdump -p "$BIN" | grep -E '(NEEDED|GLIBC_)' | sort -u || true
+          fi
           echo "BIN=$BIN"   >> "$GITHUB_ENV"
           echo "NAME=$NAME" >> "$GITHUB_ENV"
 
