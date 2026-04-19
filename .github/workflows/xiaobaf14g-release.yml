@@ -1,125 +1,306 @@
-name: Xiaobaf14g Testing Release
+name: xiaobaf14g release
 
 on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (不含 v 前缀, 例如 1.14.0-alpha.14-xiaobaf14g.1)'
+        required: true
+        type: string
+      prerelease:
+        description: '标记为 prerelease'
+        required: false
+        type: boolean
+        default: true
+      skip_android:
+        description: '跳过 Android 构建'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
 
 jobs:
-  calculate_version:
-    name: Calculate Release Version and Type
+  # ───────────────────────────────────────────────────────────────────
+  # 1) 解析触发源 + 决定版本 / prerelease / 是否跳过 Android
+  # ───────────────────────────────────────────────────────────────────
+  prepare:
+    name: prepare metadata
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version_calc.outputs.version }}
-      is_prerelease: ${{ steps.version_calc.outputs.is_prerelease }}
+      version:      ${{ steps.meta.outputs.version }}
+      tag:          ${{ steps.meta.outputs.tag }}
+      prerelease:   ${{ steps.meta.outputs.prerelease }}
+      skip_android: ${{ steps.meta.outputs.skip_android }}
     steps:
-      - name: Calculate version from tag
-        id: version_calc
-        run: |-
-          VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          
-          # If version contains a hyphen (e.g. v1.10.0-test), treat it as prerelease
-          if [[ "$VERSION" == *"-"* ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-            echo "Detected Prerelease version: $VERSION"
+      - name: Parse trigger
+        id: meta
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VERSION='${{ inputs.version }}'
+            TAG="v${VERSION}"
+            PRE='${{ inputs.prerelease }}'
+            SKIP_ANDROID='${{ inputs.skip_android }}'
           else
-            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
-            echo "Detected Official Release version: $VERSION"
+            TAG='${{ github.ref_name }}'
+            VERSION="${TAG#v}"
+            if [[ "$VERSION" == *"-"* ]]; then
+              PRE=true
+            else
+              PRE=false
+            fi
+            SKIP_ANDROID=false
           fi
+          echo "version=$VERSION"       | tee -a "$GITHUB_OUTPUT"
+          echo "tag=$TAG"               | tee -a "$GITHUB_OUTPUT"
+          echo "prerelease=$PRE"        | tee -a "$GITHUB_OUTPUT"
+          echo "skip_android=$SKIP_ANDROID" | tee -a "$GITHUB_OUTPUT"
 
-  build:
-    name: Build Core Binaries
+  # ───────────────────────────────────────────────────────────────────
+  # 2) Desktop 多平台并行编译 (15 个 target)
+  #    所有 target CGO_ENABLED=0; tag 集合与 build-all.bat 完全一致。
+  # ───────────────────────────────────────────────────────────────────
+  desktop:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.suffix }}
     runs-on: ubuntu-latest
-    needs:
-      - calculate_version
+    needs: prepare
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - { os: linux, arch: amd64 }
-          - { os: linux, arch: arm64 }
-          - { os: windows, arch: amd64 }
-          - { os: windows, arch: arm64 }
-          - { os: darwin, arch: amd64 }
-          - { os: darwin, arch: arm64 }
+          # Windows
+          - { goos: windows, goarch: amd64,    ext: .exe, tags_src: windows, suffix: '' }
+          - { goos: windows, goarch: arm64,    ext: .exe, tags_src: windows, suffix: '' }
+          - { goos: windows, goarch: '386',    ext: .exe, tags_src: windows, suffix: '' }
+          # Linux
+          - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: '' }
+          - { goos: linux,   goarch: arm64,    ext: '',   tags_src: others,  suffix: '' }
+          - { goos: linux,   goarch: '386',    ext: '',   tags_src: others,  suffix: '' }
+          - { goos: linux,   goarch: arm,      ext: '',   tags_src: others,  suffix: -v7,  goarm: '7' }
+          - { goos: linux,   goarch: mipsle,   ext: '',   tags_src: others,  suffix: -softfloat, gomips: softfloat }
+          - { goos: linux,   goarch: mips64le, ext: '',   tags_src: others,  suffix: -softfloat, gomips: softfloat }
+          - { goos: linux,   goarch: riscv64,  ext: '',   tags_src: others,  suffix: '' }
+          - { goos: linux,   goarch: loong64,  ext: '',   tags_src: others,  suffix: '' }
+          # macOS
+          - { goos: darwin,  goarch: amd64,    ext: '',   tags_src: others,  suffix: '' }
+          - { goos: darwin,  goarch: arm64,    ext: '',   tags_src: others,  suffix: '' }
+          # FreeBSD (drop with_tailscale — sing-box/tailscale fork 在 freebsd 有构建问题)
+          - { goos: freebsd, goarch: amd64,    ext: '',   tags_src: freebsd, suffix: '' }
+          - { goos: freebsd, goarch: arm64,    ext: '',   tags_src: freebsd, suffix: '' }
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: ~1.25.8
+          go-version: '1.25'
+          check-latest: true
 
-      - name: Set Build Tags and Ldflags
+      - name: Install 7z
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+
+      - name: Resolve build tags
+        id: tags
         run: |
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            TAGS=$(cat release/DEFAULT_BUILD_TAGS_WINDOWS)
-          else
-            TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
-          fi
-          LDFLAGS_SHARED=$(cat release/LDFLAGS)
-          echo "BUILD_TAGS=${TAGS}" >> "${GITHUB_ENV}"
-          echo "LDFLAGS_SHARED=${LDFLAGS_SHARED}" >> "${GITHUB_ENV}"
+          set -euo pipefail
+          case "${{ matrix.tags_src }}" in
+            windows)
+              # NOTE: with_naive_outbound 被有意省略——它依赖 cronet-go 预编译的 C 库，
+              # 只在 CGO_ENABLED=1 + 目标平台交叉工具链齐备时才能链接成功。
+              # 这里走纯 Go 跨编译路径（CGO=0），因此和 build-all.bat 保持一致：不带 naive。
+              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_purego,badlinkname,tfogo_checklinkname0'
+              ;;
+            freebsd)
+              # drop with_tailscale: sing-box/tailscale fork 有 wgengine/router/osrouter 编译错误
+              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_ccm,with_ocm,with_cloudflared,badlinkname,tfogo_checklinkname0'
+              ;;
+            others)
+              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,badlinkname,tfogo_checklinkname0'
+              ;;
+          esac
+          echo "tags=$TAGS" | tee -a "$GITHUB_OUTPUT"
 
-      - name: Build Binary
+      - name: Build binary
+        env:
+          CGO_ENABLED: '0'
+          GOOS:        ${{ matrix.goos }}
+          GOARCH:      ${{ matrix.goarch }}
+          GOARM:       ${{ matrix.goarm }}
+          GOMIPS:      ${{ matrix.gomips }}
         run: |
-          mkdir -p dist
-          BIN_NAME="sing-box"
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            BIN_NAME="sing-box.exe"
-          fi
-          CGO_ENABLED=0 GOOS=${{ matrix.os }} GOARCH=${{ matrix.arch }} go build -v -trimpath -o "dist/${BIN_NAME}" -tags "${BUILD_TAGS}" \
-          -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=${{ needs.calculate_version.outputs.version }}' ${LDFLAGS_SHARED} -s -w -buildid=" \
-          ./cmd/sing-box
+          set -euo pipefail
+          VERSION='${{ needs.prepare.outputs.version }}'
+          NAME="sing-box-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
+          BIN="${NAME}${{ matrix.ext }}"
+          echo "Building $BIN (tags=${{ steps.tags.outputs.tags }})"
+          go build -v -trimpath -buildvcs=false \
+            -tags "${{ steps.tags.outputs.tags }}" \
+            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=${VERSION} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -buildid=" \
+            -o "$BIN" ./cmd/sing-box
+          ls -lh "$BIN"
+          echo "BIN=$BIN"   >> "$GITHUB_ENV"
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
 
-      - name: Archive Binary
+      - name: Pack with 7z (LZMA2 ultra)
         run: |
-          cd dist
-          DIR_NAME="sing-box-${{ needs.calculate_version.outputs.version }}-${{ matrix.os }}-${{ matrix.arch }}"
-          mkdir -p "${DIR_NAME}"
-          cp ../LICENSE "${DIR_NAME}/"
-          
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            mv sing-box.exe "${DIR_NAME}/"
-            zip -r "${DIR_NAME}.zip" "${DIR_NAME}"
-            rm -r "${DIR_NAME}"
-          else
-            mv sing-box "${DIR_NAME}/"
-            tar -czvf "${DIR_NAME}.tar.gz" "${DIR_NAME}"
-            rm -r "${DIR_NAME}"
-          fi
+          set -euo pipefail
+          # 与 build-all.bat 同参：t7z + 最高压缩 + 256M 字典 + solid + 多线程
+          7z a -t7z -mx=9 -m0=lzma2:d=256m:fb=273 -ms=on -mmt=on "${NAME}.7z" "${BIN}"
+          ls -lh "${NAME}.7z"
 
-      - name: Upload Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.os }}_${{ matrix.arch }}
-          path: dist/*.*
+          name: desktop-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          path: sing-box-*.7z
+          if-no-files-found: error
+          retention-days: 7
 
-  publish:
-    name: Publish Github Release
-    needs:
-      - calculate_version
-      - build
+  # ───────────────────────────────────────────────────────────────────
+  # 3) Android arm64-v8a (CGO + NDK，走 cmd/internal/build_libbox 入口)
+  #    continue-on-error 让 Android 失败不阻塞 desktop 的发布。
+  # ───────────────────────────────────────────────────────────────────
+  android:
+    name: android/arm64-v8a
     runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.skip_android != 'true'
+    continue-on-error: true
     steps:
-      - name: Download all core builds
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+
+      - name: Setup NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: true
+
+      - name: Install 7z
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+
+      - name: Build via build_libbox
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          VERSION='${{ needs.prepare.outputs.version }}'
+          go run ./cmd/internal/build_libbox -target android-bin -platform android/arm64
+          ls -lh sing-box-android-arm64-v8a
+          # NDK strip 减体积（约 -30%）
+          STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          if [ -x "$STRIP" ]; then
+            "$STRIP" --strip-all sing-box-android-arm64-v8a || true
+            ls -lh sing-box-android-arm64-v8a
+          fi
+          NAME="sing-box-${VERSION}-android-arm64-v8a"
+          # 归档内用无后缀名字（build-all.bat 同行为）
+          cp sing-box-android-arm64-v8a sing-box
+          7z a -t7z -mx=9 -m0=lzma2:d=256m:fb=273 -ms=on -mmt=on "${NAME}.7z" sing-box
+          ls -lh "${NAME}.7z"
+          rm -f sing-box sing-box-android-arm64-v8a
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-arm64-v8a
+          path: sing-box-*.7z
+          if-no-files-found: error
+          retention-days: 7
+
+  # ───────────────────────────────────────────────────────────────────
+  # 4) 收集所有 artifact + 生成 changelog + 创建 / 更新 Release
+  #    android 失败或被跳过时只要 desktop 成功就发布。
+  # ───────────────────────────────────────────────────────────────────
+  publish:
+    name: publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - desktop
+      - android
+    if: always() && needs.desktop.result == 'success'
+    steps:
+      - name: Checkout (全量历史用于 changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: builds/
           merge-multiple: true
 
+      - name: Inspect artifacts
+        run: |
+          set -euo pipefail
+          ls -lh builds/
+          echo "---"
+          echo "total artifacts: $(ls builds/ | wc -l)"
+
+      - name: Build changelog
+        run: |
+          set -euo pipefail
+          TAG='${{ needs.prepare.outputs.tag }}'
+          # 找到上一个 tag (按创建时间降序)，跳过正在发布的 TAG 本身
+          PREV=$(git tag --sort=-creatordate | grep -v -F -x "$TAG" | head -n1 || true)
+          {
+            if [ -n "$PREV" ]; then
+              echo "## Changes since \`$PREV\`"
+              echo ""
+              git log --no-merges --pretty='- %s (`%h`)' "${PREV}..HEAD" | head -n 100
+            else
+              echo "## Initial xiaobaf14g release"
+              echo ""
+              git log --no-merges --pretty='- %s (`%h`)' HEAD | head -n 30
+            fi
+            echo ""
+            echo "## Artifacts"
+            echo ""
+            for f in builds/*.7z; do
+              [ -e "$f" ] || continue
+              SIZE=$(du -h "$f" | cut -f1)
+              echo "- \`$(basename "$f")\` — ${SIZE}"
+            done
+            echo ""
+            echo "## Android"
+            echo ""
+            if [ '${{ needs.prepare.outputs.skip_android }}' = 'true' ]; then
+              echo "_Skipped (manually disabled via workflow input)._"
+            elif [ '${{ needs.android.result }}' = 'success' ]; then
+              echo "Built successfully."
+            else
+              echo "_Build failed — see [Actions run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details._"
+            fi
+          } > CHANGELOG_RELEASE.md
+          echo "--- CHANGELOG_RELEASE.md ---"
+          cat CHANGELOG_RELEASE.md
+
       - name: Create or Update Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: Sing-box Xiaobaf14g ${{ github.ref_name }}
-          prerelease: ${{ needs.calculate_version.outputs.is_prerelease == 'true' }}
-          draft: false
-          files: |
-            builds/*.*
+          tag_name:   ${{ needs.prepare.outputs.tag }}
+          name:       sing-box xiaobaf14g ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          draft:      false
+          body_path:  CHANGELOG_RELEASE.md
+          files:      builds/*.7z
+          fail_on_unmatched_files: true
