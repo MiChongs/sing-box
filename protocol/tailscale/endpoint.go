@@ -119,6 +119,7 @@ type Endpoint struct {
 	systemInterfaceName string
 	systemInterfaceGSO  bool
 	systemInterfaceMTU  uint32
+	serverStarted       bool
 	systemTun           tun.Tun
 	systemDialer        *dialer.DefaultDialer
 	fallbackTCPCloser   func()
@@ -540,6 +541,7 @@ func (t *Endpoint) Close() error {
 			}()
 			err = common.Close(common.PtrOrNil(t.server))
 		}()
+		t.serverStarted.Store(false)
 	}
 	netmon.RegisterInterfaceGetter(nil)
 	netns.SetControlFunc(nil)
