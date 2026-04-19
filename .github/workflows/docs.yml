@@ -10,7 +10,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # contents:write is required for configure-pages `enablement: true` to
+  # turn Pages on for the first run without manual settings toggling.
+  # Once Pages is enabled we could downgrade to contents:read, but keeping
+  # write is harmless and survives repos that disable then re-enable Pages.
+  contents: write
   pages: write
   id-token: write
 
@@ -52,6 +56,11 @@ jobs:
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
+        with:
+          # enablement=true auto-activates Pages on first run. Requires
+          # contents:write at the workflow level (see `permissions:` above).
+          # On subsequent runs it's a no-op; safe to leave enabled forever.
+          enablement: true
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
