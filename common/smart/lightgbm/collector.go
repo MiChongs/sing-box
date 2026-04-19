@@ -17,6 +17,21 @@ import (
 // DefaultCollectorSizeMB is the default training-data file cap (100 MB).
 const DefaultCollectorSizeMB = 100
 
+// collectorSchemaVersion stamps every row so the offline-training pipeline
+// (Python / pandas / LightGBM) can tell v1 rows (before xiaobaf14g v2) from
+// v2 rows (after) and widen the feature frame only for the latter without
+// silently mis-reading older CSVs.
+//
+// Bumped when the column list changes at all — new columns append to the
+// right, never insert in the middle, to keep forward-compatible string
+// parsing in downstream tools.
+const collectorSchemaVersion = "2"
+
+// collectorV2ExtraColumns is the number of xiaobaf14g v2 extension columns
+// appended after the original 10 metadata columns: 9 ModelInput fields +
+// 1 schema version tag. See AddSample for the exact layout.
+const collectorV2ExtraColumns = 10
+
 // flushInterval caps how long buffered rows may sit in memory without being
 // written to disk. Prevents data loss if the process is killed right after
 // starting — the previous "flush every 100 rows" rule could keep ~100 samples
@@ -213,7 +228,25 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, meta *CollectorMeta, 
 		time.Now().Format(time.RFC3339),
 	)
 
-	expectedColumns := MaxFeatureSize + 10
+	// xiaobaf14g v2 extension columns — appended to the tail so v1 parsers
+	// reading the first 37 columns still work, and v2-aware parsers can key
+	// off the trailing collectorSchemaVersion to widen their frame. Keep
+	// this list synchronised with ModelInput's v2 block comment — column
+	// order is the training contract and must not be reshuffled.
+	sample = append(sample,
+		fmt.Sprintf("%.6f", input.LatencyStdDevDelta),
+		fmt.Sprintf("%.6f", input.ConnectTimeStdDevDelta),
+		fmt.Sprintf("%d", input.ActiveConns),
+		boolCSV(input.TLSSessionResumed),
+		fmt.Sprintf("%d", input.DNSResolveTime),
+		fmt.Sprintf("%d", input.TLSHandshakeTime),
+		fmt.Sprintf("%d", input.HTTP3FallbackCount),
+		fmt.Sprintf("%.6f", input.LightGBMConfidence),
+		fmt.Sprintf("%d", input.HourBucket),
+		collectorSchemaVersion,
+	)
+
+	expectedColumns := MaxFeatureSize + 10 + collectorV2ExtraColumns
 	if len(sample) != expectedColumns {
 		c.droppedRows.Add(1)
 		c.logger.Warn("smart collector: column count mismatch (got ", len(sample), ", expected ", expectedColumns, ")")
@@ -371,6 +404,15 @@ func (c *DataCollector) Close() error {
 		return err
 	}
 	return nil
+}
+
+// boolCSV renders a bool as "1"/"0" rather than "true"/"false" so pandas
+// read_csv with dtype={col: int} just works for the TLSSessionResumed column.
+func boolCSV(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
 }
 
 // nopLogger is a minimal fallback when no logger is provided to NewDataCollector.

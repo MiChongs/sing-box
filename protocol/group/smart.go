@@ -399,6 +399,17 @@ type Smart struct {
 	// smartTrackedConn so the read path is one xsync load per node.
 	nodeLoad *nodeLoadCounter
 
+	// nodeHTTP3Fallbacks counts HTTP/3 → HTTP/2 fallback events per node tag,
+	// surfaced into ModelInput.HTTP3FallbackCount for v2 strategies and the
+	// retraining CSV. Updated externally via RecordHTTP3Fallback (xiaobaf14g
+	// v2.1 work item: wire from sing-quic's "HTTP/3 broken authority"
+	// detection per the upstream "Scope HTTP/2 fallback per authority"
+	// commit). Counter never decrements — it is a lifetime indicator of
+	// QUIC instability for that node, which is what the model wants to
+	// learn from. Lazily allocated to avoid the xsync.MapOf cost on groups
+	// that never see QUIC traffic.
+	nodeHTTP3Fallbacks atomic.Pointer[xsync.MapOf[string, *atomic.Int32]]
+
 	// stickyByTarget remembers the last successfully-dialled node for
 	// each target so the sticky-session algorithm can prefer it on the
 	// next request to the same target. Lazily allocated when algorithm
@@ -3241,14 +3252,20 @@ func (s *Smart) recordStats(
 	// Pool-acquired ModelInput — eliminates ~512-byte allocation per
 	// closed connection. Released at end of recordStats; the async
 	// dataCollector path takes a stack-local copy before submit.
+	// Snapshot std-dev + first-difference together so the trend signal is
+	// taken at the same instant as the absolute value (avoids torn reads
+	// when another goroutine updates the variance between two RPCs).
+	ctStdDev, ctStdDevDelta := record.ConnectTimeStdDevAndDelta()
+	latStdDev, latStdDevDelta := record.LatencyStdDevAndDelta()
+
 	input := smart.AcquireModelInput()
 	*input = smart.ModelInput{
 		Success:                record.GetInt64("success"),
 		Failure:                record.GetInt64("failure"),
 		ConnectTime:            record.GetInt64("connectTime"),
 		Latency:                record.GetInt64("latency"),
-		ConnectTimeStdDev:      record.ConnectTimeStdDev(),
-		LatencyStdDev:          record.LatencyStdDev(),
+		ConnectTimeStdDev:      ctStdDev,
+		LatencyStdDev:          latStdDev,
 		FirstByteLatency:       latency,
 		ShortRTT:               record.ShortRTT(),
 		ShortSuccessRate:       record.ShortSuccessRate(),
@@ -3271,14 +3288,42 @@ func (s *Smart) recordStats(
 		DestGeoIP:              meta.destGeoIP,
 		GroupName:              s.Tag(),
 		NodeName:               proxyTag,
+
+		// xiaobaf14g v2 extended dimensions — strategy / collector only.
+		LatencyStdDevDelta:     latStdDevDelta,
+		ConnectTimeStdDevDelta: ctStdDevDelta,
+		ActiveConns:            int32(s.nodeLoad.get(proxyTag)),
+		// HTTP3FallbackCount / LightGBMConfidence / HourBucket / HourFrequency
+		// are filled in by their respective subsystems below — left zero here
+		// so the assignment above remains a single self-contained literal.
 	}
+	// Enrich with the last URLTest phase-timing detail cached by
+	// smartSharedWorker (see smart_shared.go LastProbeDetail). Cold-start
+	// and probe-failure paths return ok=false → fields stay zero.
+	if detail, ok := getSmartWorker().LastProbeDetail(proxyTag); ok {
+		input.DNSResolveTime = detail.DNSResolveMS
+		input.TLSHandshakeTime = detail.TLSHandshakeMS
+		input.TLSSessionResumed = detail.DidResume
+	}
+	// Time-of-day signal: HourBucket lets the strategy / collector slice
+	// success/failure stats by 24 hour-of-day buckets (catches "this node
+	// is great off-peak but melts during local rush hour" patterns).
+	// HourFrequency stays 0 in v2 because that needs a per-group cross-node
+	// comparison cache; the field is shipped now so the v2 collector CSV
+	// is forward-compatible with the v2.1 implementation.
+	input.HourBucket = int8(time.Now().Hour())
+	input.HTTP3FallbackCount = s.http3FallbackCount(proxyTag)
 	defer smart.ReleaseModelInput(input)
 
 	// ML prediction path (LightGBM) with automatic fallback to traditional algorithm.
 	var calculatedWeight float64
 	var mlPredicted bool
 	if s.useLightGBM && s.weightModel != nil && s.weightModel.IsLoaded() {
-		calculatedWeight, mlPredicted = s.weightModel.PredictWeight(input, priorityFactor)
+		var conf float64
+		calculatedWeight, mlPredicted, conf = s.weightModel.PredictWeight(input, priorityFactor)
+		// Surface inter-tree agreement to strategies (and the v2 collector
+		// CSV) so downstream code can decide whether to trust this weight.
+		input.LightGBMConfidence = conf
 	} else {
 		calculatedWeight, _ = smart.CalculateWeight(input, priorityFactor)
 	}

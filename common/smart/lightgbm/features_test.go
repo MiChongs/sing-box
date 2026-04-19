@@ -98,9 +98,12 @@ func TestPredictWeightFallback(t *testing.T) {
 	// nil model must fall back to CalculateWeight without panicking
 	var m *WeightModel
 	input := &smart.ModelInput{Success: 10, Failure: 2, ConnectTime: 100, Latency: 50}
-	_, predicted := m.PredictWeight(input, 1.0)
+	_, predicted, conf := m.PredictWeight(input, 1.0)
 	if predicted {
 		t.Errorf("nil model should not return predicted=true")
+	}
+	if conf != 0 {
+		t.Errorf("nil model should report confidence=0, got %f", conf)
 	}
 }
 

@@ -105,18 +105,32 @@ func (m *WeightModel) Reload() error {
 }
 
 // PredictWeight runs inference: ModelInput → features → transforms → model.
-// Returns (weight, true) on successful ML prediction; on any failure (nil
-// model, NaN, panic, insufficient samples), falls back to
-// smart.CalculateWeight(input, priorityFactor) and returns its (weight, false).
-func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor float64) (float64, bool) {
+// Returns:
+//
+//	weight     — final weight (= prediction * priorityFactor), or the
+//	             non-ML fallback weight when prediction is unavailable.
+//	predicted  — true ⇔ the value came from the LightGBM model;
+//	             false ⇔ it came from smart.CalculateWeight fallback.
+//	confidence — inter-iteration agreement of the ensemble for this input,
+//	             in the range [0, 1]. Computed as 1/(1+|predFull−predHalf|),
+//	             where predHalf uses only the first n/2 trees and predFull
+//	             uses all trees. High confidence ⇒ the back half of the
+//	             ensemble barely shifted the prediction (input lies in a
+//	             region the early trees already classified well). Low
+//	             confidence ⇒ the late trees made large corrections, hinting
+//	             the input is in a noisy / under-trained region; callers
+//	             may down-weight the prediction or fall back to delay-based
+//	             ranking. Returns 0 when no prediction was made.
+func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor float64) (weight float64, predicted bool, confidence float64) {
 	if m == nil {
-		return smart.CalculateWeight(input, priorityFactor)
+		w, p := smart.CalculateWeight(input, priorityFactor)
+		return w, p, 0
 	}
 
 	// Minimum sample gate: mihomo parity
 	total := input.Success + input.Failure
 	if total < smart.DefaultMinSampleCount {
-		return 0, false
+		return 0, false, 0
 	}
 
 	m.mu.RLock()
@@ -125,20 +139,24 @@ func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor floa
 	m.mu.RUnlock()
 
 	if model == nil {
-		return smart.CalculateWeight(input, priorityFactor)
+		w, p := smart.CalculateWeight(input, priorityFactor)
+		return w, p, 0
 	}
 
 	features := PrepareFeatures(input)
 	if len(features) == 0 {
-		return smart.CalculateWeight(input, priorityFactor)
+		w, p := smart.CalculateWeight(input, priorityFactor)
+		return w, p, 0
 	}
 
 	if transforms != nil && transforms.TransformsEnabled {
 		features = transforms.ApplyTransforms(features)
 	}
 
-	var prediction float64
-	var panicked bool
+	var (
+		predFull, predHalf float64
+		panicked           bool
+	)
 
 	func() {
 		defer func() {
@@ -146,12 +164,25 @@ func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor floa
 				panicked = true
 			}
 		}()
-		prediction = model.PredictSingle(features, 0)
+		predFull = model.PredictSingle(features, 0)
+		// Half-ensemble probe — guarded against degenerate models with
+		// fewer than 2 trees (computing |full−half| over the same tree
+		// set would always yield 0 confidence which is misleading).
+		if nTrees := model.NEstimators(); nTrees >= 2 {
+			predHalf = model.PredictSingle(features, nTrees/2)
+		} else {
+			predHalf = predFull
+		}
 	}()
 
-	if panicked || math.IsNaN(prediction) || prediction <= 0 {
-		return smart.CalculateWeight(input, priorityFactor)
+	if panicked || math.IsNaN(predFull) || predFull <= 0 {
+		w, p := smart.CalculateWeight(input, priorityFactor)
+		return w, p, 0
 	}
 
-	return prediction * priorityFactor, true
+	// Confidence collapses to 1.0 when the back half of the ensemble does
+	// not move the prediction at all, and approaches 0 as the correction
+	// magnitude grows. Bounded in (0, 1]; never NaN.
+	confidence = 1.0 / (1.0 + math.Abs(predFull-predHalf))
+	return predFull * priorityFactor, true, confidence
 }

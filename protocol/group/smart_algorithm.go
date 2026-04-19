@@ -190,6 +190,48 @@ func (s *Smart) CurrentAlgorithm() string { return s.currentAlgorithm() }
 // dashboard display. Zero means hysteresis is disabled.
 func (s *Smart) HysteresisDuration() time.Duration { return s.hysteresisWindow }
 
+// RecordHTTP3Fallback bumps the per-node HTTP/3 → HTTP/2 fallback counter,
+// to be called from sing-quic when it detects a broken-authority condition
+// for the given node tag. Surfaces as ModelInput.HTTP3FallbackCount for the
+// non-ML strategies and the v2 collector CSV. Safe to call from any
+// goroutine — the counter map is lazily allocated under atomic CAS, and
+// the per-tag atomic.Int32 absorbs concurrent increments lock-free.
+//
+// No-op when tag == "". The map allocation is amortised across the lifetime
+// of the Smart instance, so call rate is not a concern.
+func (s *Smart) RecordHTTP3Fallback(tag string) {
+	if s == nil || tag == "" {
+		return
+	}
+	m := s.nodeHTTP3Fallbacks.Load()
+	if m == nil {
+		fresh := xsync.NewMapOf[string, *atomic.Int32]()
+		if !s.nodeHTTP3Fallbacks.CompareAndSwap(nil, fresh) {
+			m = s.nodeHTTP3Fallbacks.Load()
+		} else {
+			m = fresh
+		}
+	}
+	c, _ := m.LoadOrCompute(tag, func() *atomic.Int32 { return new(atomic.Int32) })
+	c.Add(1)
+}
+
+// http3FallbackCount returns the cumulative HTTP/3 → HTTP/2 fallback count
+// for the given node tag, or 0 if no fallbacks have been recorded.
+func (s *Smart) http3FallbackCount(tag string) int32 {
+	if s == nil || tag == "" {
+		return 0
+	}
+	m := s.nodeHTTP3Fallbacks.Load()
+	if m == nil {
+		return 0
+	}
+	if c, ok := m.Load(tag); ok {
+		return c.Load()
+	}
+	return 0
+}
+
 // nodeLoadCounter is the global "active connections per node tag"
 // counter consulted by the least-loaded algorithm. xsync.MapOf gives
 // us zero-alloc atomic increments without a fat lock.

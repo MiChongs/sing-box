@@ -285,6 +285,91 @@ type ModelInput struct {
 
 	GroupName string
 	NodeName  string
+
+	// ───────────────────────────────────────────────────────────────────────
+	// Extended dimensions (xiaobaf14g v2 — strategy / collector use ONLY).
+	//
+	// CRITICAL: these fields are appended *after* GroupName/NodeName and are
+	// NOT consumed by lightgbm.PrepareFeatures (which is frozen at the 27-dim
+	// mihomo-parity schema for backward-compatible model `.bin` loading).
+	// They are read by:
+	//   * smart_algorithm{,_ext}.go strategies (weighted-rr / p2c / sticky /
+	//     latency-banded / least-loaded — for richer ranking)
+	//   * lightgbm.DataCollector for v2 CSV samples (offline retraining)
+	//   * ClashAPI /smart/* endpoints (operator visibility)
+	//
+	// Adding a new ML feature later means: bump MaxFeatureSize, append to
+	// PrepareFeatures, retrain the model, and ship a new bundled `.bin`.
+	// ───────────────────────────────────────────────────────────────────────
+
+	// LatencyStdDevDelta is (current LatencyStdDev) - (previous snapshot's
+	// LatencyStdDev), in milliseconds. Sign carries direction:
+	//   > 0  jitter rising  (link degrading)
+	//   = 0  stable
+	//   < 0  jitter falling (link recovering)
+	// Source: AtomicStatsRecord tracks the last snapshot value internally.
+	LatencyStdDevDelta float64
+
+	// ConnectTimeStdDevDelta is the same first-difference signal applied to
+	// connect-time jitter (handshake stability trend). Same sign semantics.
+	ConnectTimeStdDevDelta float64
+
+	// ActiveConns is the number of currently-open connections this node owns
+	// at the moment of the snapshot. Mirrors the value the least-loaded
+	// strategy reads from atomicCounter; surfacing it lets *every* strategy
+	// (and the collector) reason about real-time load, not just least-loaded.
+	// Negative or zero means "no live conn" (idle node).
+	ActiveConns int32
+
+	// TLSSessionResumed is true when the most recent URLTest probe completed
+	// the TLS handshake via session resumption (tls.ConnectionState.DidResume).
+	// Resumed handshakes are ~1-RTT cheaper, so two nodes with identical
+	// observed RTT but different DidResume rates are NOT equally fast under
+	// real-world cold connections — sticky-session strategy prefers Resumed=true.
+	TLSSessionResumed bool
+
+	// DNSResolveTime is the DNS resolution leg of the URLTest probe in
+	// milliseconds (httptrace.ClientTrace.DNSStart→DNSDone). 0 when the probe
+	// dialed an IP literal (no DNS step). Splitting this out of ConnectTime
+	// lets strategies attribute slowness: a node with high DNSResolveTime but
+	// low TLSHandshakeTime is bottlenecked by its upstream resolver, not the
+	// proxy hop itself.
+	DNSResolveTime int64
+
+	// TLSHandshakeTime is the TLS leg in milliseconds (TLSHandshakeStart→
+	// TLSHandshakeDone). 0 when the link is plain HTTP. Combined with
+	// ConnectTime - DNSResolveTime - TLSHandshakeTime ≈ TCP-only handshake,
+	// strategies can detect TLS-stack issues (e.g. utls fingerprint mismatch
+	// causing slow handshake even though TCP is fast).
+	TLSHandshakeTime int64
+
+	// HTTP3FallbackCount is the cumulative count of HTTP/3 → HTTP/2 fallback
+	// events attributed to this node since process start. Stays at 0 until
+	// sing-quic exposes a fallback hook (xiaobaf14g v2.1 work item) — kept
+	// in the schema now so v2 collector CSVs are forward-compatible.
+	HTTP3FallbackCount int32
+
+	// LightGBMConfidence is the inter-tree agreement of the WeightModel's
+	// most recent prediction for this (node, target) pair. Computed as
+	// 1 / (1 + std-dev of per-tree predictions); 0 means "no prediction yet"
+	// (cold-start) or model not loaded. Strategies use this to decide whether
+	// to trust the ML weight or fall back to delay-based ordering: low
+	// confidence → fall back, high confidence → trust the ranking.
+	LightGBMConfidence float64
+
+	// HourBucket is the 0-23 hour-of-day at which this snapshot was taken
+	// (local time, see option.SmartOptions). Together with the per-node
+	// HourFrequency map maintained in NodeState, strategies can detect
+	// "this node is great during local off-peak but flaky at peak hours"
+	// and steer dials toward nodes with strong recent same-hour history.
+	HourBucket int8
+
+	// HourFrequency is the relative frequency (0..1) at which this node
+	// has been used in the *current* hour bucket vs. the group max in that
+	// same hour bucket. 0 means "never used in this hour", 1 means "this is
+	// the most-used node in this hour". Filled from NodeState.HourCounts;
+	// 0 during cold start.
+	HourFrequency float64
 }
 
 type NodeState struct {
@@ -479,13 +564,21 @@ type AtomicStatsRecord struct {
 	// Welford online variance for connectTime and latency.
 	// Protected together by varianceMu because each Update needs all three
 	// fields consistent.
-	varianceMu     sync.Mutex
-	ctMean         float64 // running mean of connect time (ms)
-	ctM2           float64 // sum of squared deviations
-	ctN            int64
-	latMean        float64
-	latM2          float64
-	latN           int64
+	varianceMu sync.Mutex
+	ctMean     float64 // running mean of connect time (ms)
+	ctM2       float64 // sum of squared deviations
+	ctN        int64
+	latMean    float64
+	latM2      float64
+	latN       int64
+
+	// prevCtStdDev / prevLatStdDev hold the std-dev value emitted at the
+	// last call to ConnectTimeStdDevAndDelta / LatencyStdDevAndDelta. The
+	// per-call delta = current - prev signals jitter trend (positive →
+	// degrading, negative → recovering). Guarded by varianceMu because
+	// they're updated in lockstep with ctM2/latM2 reads.
+	prevCtStdDev  float64
+	prevLatStdDev float64
 
 	weightsMu sync.Mutex
 	weights   map[string]float64
@@ -870,6 +963,47 @@ func (r *AtomicStatsRecord) LatencyStdDev() float64 {
 		return 0
 	}
 	return math.Sqrt(variance)
+}
+
+// ConnectTimeStdDevAndDelta returns the current connect-time std-dev (ms)
+// AND the signed first-difference vs the value emitted at the previous call.
+// The previous-value bookkeeping is updated atomically with the read so
+// successive callers each see *their own* delta from the last sampling
+// instant — interleaving Smart groups can both consume the trend signal
+// without one overwriting the other's reference point. n < 2 returns
+// (0, 0) — undefined variance produces no usable trend.
+func (r *AtomicStatsRecord) ConnectTimeStdDevAndDelta() (current, delta float64) {
+	r.varianceMu.Lock()
+	defer r.varianceMu.Unlock()
+	if r.ctN < 2 {
+		return 0, 0
+	}
+	variance := r.ctM2 / float64(r.ctN-1)
+	if variance <= 0 {
+		return 0, 0
+	}
+	current = math.Sqrt(variance)
+	delta = current - r.prevCtStdDev
+	r.prevCtStdDev = current
+	return
+}
+
+// LatencyStdDevAndDelta is the latency-jitter analogue of
+// ConnectTimeStdDevAndDelta. See that doc for semantics.
+func (r *AtomicStatsRecord) LatencyStdDevAndDelta() (current, delta float64) {
+	r.varianceMu.Lock()
+	defer r.varianceMu.Unlock()
+	if r.latN < 2 {
+		return 0, 0
+	}
+	variance := r.latM2 / float64(r.latN-1)
+	if variance <= 0 {
+		return 0, 0
+	}
+	current = math.Sqrt(variance)
+	delta = current - r.prevLatStdDev
+	r.prevLatStdDev = current
+	return
 }
 
 func (r *AtomicStatsRecord) GetWeight(weightType string) float64 {

@@ -160,7 +160,48 @@ func buildDynamicRequest(linkURL *url.URL, hostname string) *requestPayloads {
 //   - shadowtls / naive：HTTP/2 代理层透明
 //   - chunked / gzip / 无 Content-Length 响应：交由 http.ReadResponse 处理
 //   - 2xx/3xx 均视可达（仅 4xx/5xx 判失败）
+// URLTestDetail is the optional per-probe phase-timing detail structure.
+// Passed by pointer to URLTestWithDetail; any phase that is not applicable
+// (e.g. TLSHandshakeMS for a plain HTTP link) remains 0.
+//
+// Field semantics:
+//
+//	TCPConnectMS   — time to establish the transport instance via detour.DialContext.
+//	                 Includes proxy-handshake cost when the detour is a proxy chain.
+//	                 Does NOT include DNS resolution when the proxy resolves the
+//	                 remote name internally (which is the common case); set by the
+//	                 dialer stack, not by URLTest.
+//	TLSHandshakeMS — wall clock from tls.Client to HandshakeContext-return.
+//	                 Excludes TCP/proxy connect; 0 for HTTP and for failed dials.
+//	FirstByteMS    — the headline delay number returned as the uint16 result.
+//	DidResume      — true when the TLS handshake reused a cached session
+//	                 (tls.ConnectionState.DidResume). Meaningful only for HTTPS
+//	                 probes that actually completed the handshake.
+//	DNSResolveMS   — reserved: 0 in v2 because URLTest does not own the DNS
+//	                 resolver (proxy chains resolve internally). Populated by a
+//	                 future sing-dialer hook without an API break.
+type URLTestDetail struct {
+	TCPConnectMS   int64
+	TLSHandshakeMS int64
+	FirstByteMS    int64
+	DidResume      bool
+	DNSResolveMS   int64
+}
+
+// URLTest probes a link through the given dialer and returns the headline
+// first-byte RTT in milliseconds. This wrapper preserves the legacy two-value
+// return signature used by every callsite that does NOT need phase timings.
 func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err error) {
+	return URLTestWithDetail(ctx, link, detour, nil)
+}
+
+// URLTestWithDetail is the full-fidelity probe. When detail is non-nil, the
+// caller receives per-phase timings alongside the RTT — used by Smart groups
+// to split TCP vs TLS latency and detect session-resumption signals for
+// sticky-session / least-loaded routing strategies. Pass nil detail to get
+// the same behaviour as URLTest (no measurement overhead besides the existing
+// wall-clock reads).
+func URLTestWithDetail(ctx context.Context, link string, detour N.Dialer, detail *URLTestDetail) (t uint16, err error) {
 	dialStart := time.Now()
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
@@ -186,6 +227,9 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 		return
 	}
 	defer instance.Close()
+	if detail != nil {
+		detail.TCPConnectMS = time.Since(dialStart).Milliseconds()
+	}
 
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = instance.SetDeadline(deadline)
@@ -203,8 +247,13 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 			Time:       ntp.TimeFuncFromContext(ctx),
 			RootCAs:    adapter.RootPoolFromContext(ctx),
 		})
+		tlsStart := time.Now()
 		if err = tlsConn.HandshakeContext(ctx); err != nil {
 			return
+		}
+		if detail != nil {
+			detail.TLSHandshakeMS = time.Since(tlsStart).Milliseconds()
+			detail.DidResume = tlsConn.ConnectionState().DidResume
 		}
 		conn = tlsConn
 	}
@@ -258,6 +307,9 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 	// 亚毫秒级响应提升到 1ms，避免 0 被上层判为失败
 	if t == 0 && totalDelay > 0 {
 		t = 1
+	}
+	if detail != nil {
+		detail.FirstByteMS = int64(t)
 	}
 	return
 }

@@ -83,9 +83,27 @@ type smartSharedWorker struct {
 }
 
 type probeResult struct {
-	at    time.Time
-	delay uint16
-	err   error
+	at     time.Time
+	delay  uint16
+	err    error
+	detail urltest.URLTestDetail // phase timings; zero when the probe errored out early
+}
+
+// LastProbeDetail returns the most recent URLTest phase-timing detail for
+// the given node tag, or a zero-value detail + ok=false when no cached probe
+// exists. Used by recordStats to enrich ModelInput with TLSHandshakeTime /
+// TLSSessionResumed / DNSResolveTime dimensions without paying an extra
+// probe — the singleflight cache already amortised the measurement across
+// all interested Smart groups.
+func (w *smartSharedWorker) LastProbeDetail(tag string) (urltest.URLTestDetail, bool) {
+	if w == nil || w.freshnessCache == nil {
+		return urltest.URLTestDetail{}, false
+	}
+	v, ok := w.freshnessCache.Load(tag)
+	if !ok {
+		return urltest.URLTestDetail{}, false
+	}
+	return v.detail, true
 }
 
 var (
@@ -285,11 +303,13 @@ func (w *smartSharedWorker) probeOnce(
 		36,
 	)
 	v, err, _ := w.probeGroup.Do(key, func() (interface{}, error) {
-		d, perr := urltest.URLTest(ctx, testURL, ob)
+		var detail urltest.URLTestDetail
+		d, perr := urltest.URLTestWithDetail(ctx, testURL, ob, &detail)
 		w.freshnessCache.Store(tag, probeResult{
-			at:    time.Now(),
-			delay: d,
-			err:   perr,
+			at:     time.Now(),
+			delay:  d,
+			err:    perr,
+			detail: detail,
 		})
 		return d, perr
 	})
