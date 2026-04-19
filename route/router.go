@@ -33,6 +33,7 @@ type Router struct {
 	dnsTransport      adapter.DNSTransportManager
 	connection        adapter.ConnectionManager
 	network           adapter.NetworkManager
+	httpClientManager adapter.HTTPClientManager
 	rules             []adapter.Rule
 	ruleByUUID        map[string]adapter.Rule
 	needFindProcess   bool
@@ -62,6 +63,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 		dnsTransport:      service.FromContext[adapter.DNSTransportManager](ctx),
 		connection:        service.FromContext[adapter.ConnectionManager](ctx),
 		network:           service.FromContext[adapter.NetworkManager](ctx),
+		httpClientManager: service.FromContext[adapter.HTTPClientManager](ctx),
 		rules:             make([]adapter.Rule, 0, len(options.Rules)),
 		ruleByUUID:        make(map[string]adapter.Rule),
 		ruleSetMap:        make(map[string]adapter.RuleSet),
@@ -111,22 +113,22 @@ func (r *Router) Start(stage adapter.StartStage) error {
 	monitor := taskmonitor.New(r.logger, C.StartTimeout)
 	switch stage {
 	case adapter.StartStateStart:
-		var cacheContext *adapter.HTTPStartContext
+		var startContext *adapter.HTTPStartContext
 		if len(r.ruleSets) > 0 {
 			monitor.Start("initialize rule-set")
-			cacheContext = adapter.NewHTTPStartContext(r.ctx)
+			startContext = adapter.NewHTTPStartContext()
 			var ruleSetStartGroup task.Group
 			for i, ruleSet := range r.ruleSets {
 				ruleSetInPlace := ruleSet
 				ruleSetStartGroup.Append0(func(ctx context.Context) error {
-					err := ruleSetInPlace.StartContext(ctx, cacheContext)
+					err := ruleSetInPlace.StartContext(ctx, startContext)
 					if err != nil {
 						return E.Cause(err, "initialize rule-set[", i, "]")
 					}
 					return nil
 				})
 			}
-			ruleSetStartGroup.Concurrency(20)
+			ruleSetStartGroup.Concurrency(5)
 			ruleSetStartGroup.FastFail()
 			err := ruleSetStartGroup.Run(r.ctx)
 			monitor.Finish()
@@ -134,8 +136,8 @@ func (r *Router) Start(stage adapter.StartStage) error {
 				return err
 			}
 		}
-		if cacheContext != nil {
-			cacheContext.Close()
+		if startContext != nil {
+			startContext.Close()
 		}
 		r.network.Initialize(r.ruleSets)
 		r.network.RegisterNetworkResetCallback(r.dns.ResetNetwork)
@@ -206,26 +208,12 @@ func (r *Router) Start(stage adapter.StartStage) error {
 			}
 		}
 	case adapter.StartStatePostStart:
-		if len(r.rules) > 0 {
-			var ruleStartGroup task.Group
-			for i, rule := range r.rules {
-				ruleInPlace := rule
-				ruleIndex := i
-				ruleStartGroup.Append0(func(ctx context.Context) error {
-					err := ruleInPlace.Start()
-					if err != nil {
-						return E.Cause(err, "initialize rule[", ruleIndex, "]")
-					}
-					return nil
-				})
-			}
-			ruleStartGroup.Concurrency(20)
-			ruleStartGroup.FastFail()
-			monitor.Start("initialize rules")
-			err := ruleStartGroup.Run(r.ctx)
+		for i, rule := range r.rules {
+			monitor.Start("initialize rule[", i, "]")
+			err := rule.Start()
 			monitor.Finish()
 			if err != nil {
-				return err
+				return E.Cause(err, "initialize rule[", i, "]")
 			}
 		}
 		for _, ruleSet := range r.ruleSets {
@@ -312,6 +300,7 @@ func (r *Router) NeighborResolver() adapter.NeighborResolver {
 
 func (r *Router) ResetNetwork() {
 	r.network.ResetNetwork()
+	r.httpClientManager.ResetNetwork()
 }
 
 func (r *Router) DefaultDomainMatchStrategy() C.DomainMatchStrategy {

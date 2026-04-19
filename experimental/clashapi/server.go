@@ -18,6 +18,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental"
 	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
+	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -60,6 +61,7 @@ type Server struct {
 	externalController       bool
 	externalUI               string
 	externalUIDownloadURL    string
+	externalUIHTTPClient     *option.HTTPClientOptions
 	externalUIDownloadDetour string
 	externalUIUpdateInterval time.Duration
 	cacheFile                adapter.CacheFile
@@ -95,6 +97,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		modeList:                 options.ModeList,
 		externalController:       options.ExternalController != "",
 		externalUIDownloadURL:    options.ExternalUIDownloadURL,
+		externalUIHTTPClient:     options.ExternalUIHTTPClient,
 		externalUIDownloadDetour: options.ExternalUIDownloadDetour,
 		externalUIUpdateInterval: updateInterval,
 		cacheFile:                service.FromContext[adapter.CacheFile](ctx),
@@ -150,10 +153,6 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 			r.Mount("/restart", restartRouter(ctx, logFactory))
 		}
 
-		if service.FromContext[adapter.PlatformInterface](ctx) == nil {
-			r.Mount("/restart", restartRouter(ctx, logFactory))
-		}
-
 		s.setupMetaAPI(r)
 	})
 	if options.ExternalUI != "" {
@@ -173,6 +172,9 @@ func (s *Server) Name() string {
 func (s *Server) Start(stage adapter.StartStage) error {
 	switch stage {
 	case adapter.StartStateStart:
+		if s.externalUIDownloadDetour != "" && (s.externalUIHTTPClient == nil || s.externalUIHTTPClient.IsEmpty()) {
+			deprecated.Report(s.ctx, deprecated.OptionLegacyClashAPIExternalUIDownloadDetour)
+		}
 		if s.cacheFile != nil {
 			mode := s.cacheFile.LoadMode()
 			if common.Any(s.modeList, func(it string) bool {

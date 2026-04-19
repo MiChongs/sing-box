@@ -119,8 +119,10 @@ func ruleSetDefaultFormat(path string) string {
 
 type RemoteRuleSet struct {
 	URL            string             `json:"url"`
-	DownloadDetour string             `json:"download_detour,omitempty"`
+	HTTPClient     *HTTPClientOptions `json:"http_client,omitempty"`
 	UpdateInterval badoption.Duration `json:"update_interval,omitempty"`
+	// Deprecated: use http_client instead
+	DownloadDetour string `json:"download_detour,omitempty"`
 }
 
 type _HeadlessRule struct {

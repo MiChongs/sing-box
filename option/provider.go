@@ -58,7 +58,7 @@ type ProviderRemoteOptions struct {
 	URL            string             `json:"url"`
 	Path           string             `json:"path,omitempty"`
 	UserAgent      string             `json:"user_agent,omitempty"`
-	DownloadDetour string             `json:"download_detour,omitempty"`
+	HTTPClient     *HTTPClientOptions `json:"http_client,omitempty"`
 	UpdateInterval badoption.Duration `json:"update_interval,omitempty"`
 
 	Exclude     *badoption.Regexp          `json:"exclude,omitempty"`
@@ -67,6 +67,9 @@ type ProviderRemoteOptions struct {
 
 	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
 	OverrideTLS    *OverrideTLSOptions    `json:"override_tls,omitempty"`
+
+	// Deprecated: use http_client instead
+	DownloadDetour string `json:"download_detour,omitempty"`
 }
 
 type ProviderInlineOptions struct {

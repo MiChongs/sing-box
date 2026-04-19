@@ -52,6 +52,10 @@ func (c *CacheFile) LoadDNSCache(transportName string, qName string, qType uint1
 }
 
 func (c *CacheFile) SaveDNSCache(transportName string, qName string, qType uint16, rawMessage []byte, expireAt time.Time) error {
+	value := buf.Get(8 + len(rawMessage))
+	defer buf.Put(value)
+	binary.BigEndian.PutUint64(value[:8], uint64(expireAt.Unix()))
+	copy(value[8:], rawMessage)
 	return c.batch(func(tx *bbolt.Tx) error {
 		bucket, err := c.createBucket(tx, bucketDNSCache)
 		if err != nil {
@@ -65,12 +69,37 @@ func (c *CacheFile) SaveDNSCache(transportName string, qName string, qType uint1
 		binary.BigEndian.PutUint16(key, qType)
 		copy(key[2:], qName)
 		defer buf.Put(key)
-		value := buf.Get(8 + len(rawMessage))
-		defer buf.Put(value)
-		binary.BigEndian.PutUint64(value[:8], uint64(expireAt.Unix()))
-		copy(value[8:], rawMessage)
 		return bucket.Put(key, value)
 	})
+}
+
+func (c *CacheFile) DeleteDNSCache(transportName string, qName string, qType uint16) {
+	saveKey := saveCacheKey{transportName, qName, qType}
+	c.saveDNSCacheAccess.Lock()
+	_, hasPending := c.saveDNSCache[saveKey]
+	if !hasPending {
+		delete(c.saveDNSCache, saveKey)
+	}
+	c.saveDNSCacheAccess.Unlock()
+	if hasPending {
+		return
+	}
+	go func() {
+		key := make([]byte, 2+len(qName))
+		binary.BigEndian.PutUint16(key, qType)
+		copy(key[2:], qName)
+		c.batch(func(tx *bbolt.Tx) error {
+			bucket := c.bucket(tx, bucketDNSCache)
+			if bucket == nil {
+				return nil
+			}
+			bucket = bucket.Bucket([]byte(transportName))
+			if bucket == nil {
+				return nil
+			}
+			return bucket.Delete(key)
+		})
+	}()
 }
 
 func (c *CacheFile) SaveDNSCacheAsync(transportName string, qName string, qType uint16, rawMessage []byte, expireAt time.Time, logger logger.Logger) {
@@ -109,19 +138,19 @@ func (c *CacheFile) flushPendingDNSCacheWith(saveKey saveCacheKey, logger logger
 			return
 		}
 		err := save(entry)
+		c.saveDNSCacheAccess.Lock()
+		currentEntry, loaded := c.saveDNSCache[saveKey]
 		if err != nil {
 			logger.Warn("save DNS cache: ", err)
-			c.saveDNSCacheAccess.Lock()
-			currentEntry, loaded := c.saveDNSCache[saveKey]
 			if loaded && currentEntry.sequence == entry.sequence {
 				currentEntry.saving = false
 				c.saveDNSCache[saveKey] = currentEntry
+				c.saveDNSCacheAccess.Unlock()
+				return
 			}
 			c.saveDNSCacheAccess.Unlock()
-			return
+			continue
 		}
-		c.saveDNSCacheAccess.Lock()
-		currentEntry, loaded := c.saveDNSCache[saveKey]
 		if !loaded {
 			c.saveDNSCacheAccess.Unlock()
 			return

@@ -49,7 +49,7 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	providers := m.providers
 	m.access.Unlock()
 	if stage == adapter.StartStateStart && len(providers) > 0 {
-		startContext := adapter.NewHTTPStartContext(context.Background())
+		startContext := adapter.NewHTTPStartContext()
 		defer startContext.Close()
 		var wg sync.WaitGroup
 		var startErr error
