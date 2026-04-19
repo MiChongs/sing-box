@@ -77,17 +77,73 @@ a:hover {
 }
 
 /*
- * Shiki outputs `<pre class="astro-code">` with its own background.
- * Override to the warm parchment variant so code blocks don't punch
- * holes in the editorial flow.
+ * Shiki outputs `<pre class="astro-code">` with its own bg/padding.
+ * The `<CodeBlock>` component wraps it with a figure that owns
+ * background, rounding, ring and overflow — so here we strip the
+ * pre's own chrome (no rounded corners, no inline background, no
+ * extra shadow) and just keep the typography + padding tuned for
+ * reading. Without this override the pre would stack its own ring
+ * inside the figure's ring, which looked like a double outline.
  */
-.astro-code,
+.astro-code {
+  margin: 0 !important;
+  padding: 1.4rem 1.6rem !important;
+  background: transparent !important;
+  border-radius: 0 !important;
+  box-shadow: none !important;
+  overflow: visible !important;
+  font-size: 0.9rem;
+  line-height: 1.72;
+  tab-size: 2;
+}
 .astro-code code {
-  background-color: #faf9f5 !important;  /* ivory */
-  padding: 1rem 1.25rem;
-  border-radius: 12px;
-  box-shadow: 0 0 0 1px rgb(20 20 19 / 0.08);
-  overflow-x: auto;
+  background: transparent !important;
+}
+
+/*
+ * Custom scrollbar for code blocks — thin warm-toned rail that
+ * blends into the parchment rather than WebKit's default slate gray.
+ * Applied to .code-scroll inside CodeBlock.astro.
+ */
+.code-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.code-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.code-scroll::-webkit-scrollbar-thumb {
+  background: #d1cfc5;                    /* ring-warm */
+  border: 2px solid #faf9f5;              /* ivory inset — gives thumb air on both sides */
+  border-radius: 999px;
+  background-clip: padding-box;
+}
+.code-scroll::-webkit-scrollbar-thumb:hover {
+  background: #b0aea5;                    /* warm-silver */
+  background-clip: padding-box;
+}
+.code-scroll::-webkit-scrollbar-corner {
+  background: transparent;
+}
+/* Firefox */
+.code-scroll {
+  scrollbar-width: thin;
+  scrollbar-color: #d1cfc5 transparent;
+}
+
+/*
+ * Inline <code> inside prose (not a child of <pre>) gets a subtle
+ * warm chip so code-in-text reads as code without shouting. Skips
+ * nodes that already have an author-defined class — those carry
+ * their own intentional styling (see ConfigSchema / EndpointRow).
+ */
+:not(pre) > code:not([class]) {
+  background: #f0eee6;                     /* border-cream */
+  color: #4d4c48;                          /* charcoal-warm */
+  padding: 0.12em 0.4em;
+  border-radius: 6px;
+  font-size: 0.88em;
+  letter-spacing: -0.2px;
 }
 
 /* Utility: warm ring on focus for a11y (matches focus-blue token). */
