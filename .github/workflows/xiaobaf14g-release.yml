@@ -113,8 +113,6 @@ jobs:
           go-version: '1.25'
           check-latest: true
 
-      - name: Install 7z
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
 
       - name: Resolve build tags
         id: tags
@@ -167,18 +165,19 @@ jobs:
           echo "BIN=$BIN"   >> "$GITHUB_ENV"
           echo "NAME=$NAME" >> "$GITHUB_ENV"
 
-      - name: Pack with 7z (LZMA2 ultra)
+      - name: Pack with tar.gz
         run: |
           set -euo pipefail
-          # 与 build-all.bat 同参：t7z + 最高压缩 + 256M 字典 + solid + 多线程
-          7z a -t7z -mx=9 -m0=lzma2:d=256m:fb=273 -ms=on -mmt=on "${NAME}.7z" "${BIN}"
-          ls -lh "${NAME}.7z"
+          # gzip -9 最大压缩；bin 只有一个文件不需要 solid. tar 保留
+          # Unix 权限 (775) 方便 Linux/BSD 用户直接 tar xzf && ./sing-box.
+          tar czf "${NAME}.tar.gz" "${BIN}"
+          ls -lh "${NAME}.tar.gz"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: desktop-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
-          path: sing-box-*.7z
+          path: sing-box-*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -217,8 +216,6 @@ jobs:
           ndk-version: r28c
           add-to-path: true
 
-      - name: Install 7z
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
 
       - name: Build via build_libbox
         env:
@@ -237,15 +234,15 @@ jobs:
           NAME="sing-box-${VERSION}-android-arm64-v8a"
           # 归档内用无后缀名字（build-all.bat 同行为）
           cp sing-box-android-arm64-v8a sing-box
-          7z a -t7z -mx=9 -m0=lzma2:d=256m:fb=273 -ms=on -mmt=on "${NAME}.7z" sing-box
-          ls -lh "${NAME}.7z"
+          tar czf "${NAME}.tar.gz" sing-box
+          ls -lh "${NAME}.tar.gz"
           rm -f sing-box sing-box-android-arm64-v8a
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: android-arm64-v8a
-          path: sing-box-*.7z
+          path: sing-box-*.tar.gz
           if-no-files-found: error
           retention-days: 7
 
@@ -299,7 +296,7 @@ jobs:
             echo ""
             echo "## Artifacts"
             echo ""
-            for f in builds/*.7z; do
+            for f in builds/*.tar.gz; do
               [ -e "$f" ] || continue
               SIZE=$(du -h "$f" | cut -f1)
               echo "- \`$(basename "$f")\` — ${SIZE}"
@@ -326,5 +323,5 @@ jobs:
           prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
           draft:      false
           body_path:  CHANGELOG_RELEASE.md
-          files:      builds/*.7z
+          files:      builds/*.tar.gz
           fail_on_unmatched_files: true
