@@ -73,6 +73,7 @@ type InboundContext struct {
 	// 分配新切片。调用方均为同步、立即消费，不持有跨作用域引用，因此复用安全。
 	dnsResponseAddrCache []netip.Addr
 
+
 	// Deprecated: implement in rule action
 	InboundDetour             string
 	LastInbound               string
