@@ -154,3 +154,113 @@ func isResetErr(err error) bool {
 	}
 	return false
 }
+
+// isTransferFatalErr returns true when err observed on a conn that has
+// ALREADY produced its first byte indicates the remote (or an in-path
+// adversary like the GFW) tore the stream down in an unrecoverable way.
+// Superset of isResetErr that additionally catches the "dirty" error
+// shapes proxy protocol stacks produce when the real TCP RST arrives
+// through a mux/TLS/QUIC/h2 wrapper and the raw errno is lost.
+//
+// Concrete coverage beyond isResetErr:
+//
+//   TLS alerts / record-layer damage — a GFW-style in-path RST on an
+//     ongoing TLS session typically surfaces to the Go stack as
+//     "remote error: tls: ..." or "tls: bad record MAC" / "tls:
+//     unexpected message" because the truncated stream fails MAC
+//     verification. These are UNRECOVERABLE mid-stream — dropping
+//     the node for this target is correct.
+//
+//   HTTP/2 stream termination — h2 transports translate the underlying
+//     RST into "http2: stream error", "stream closed", or a
+//     "server sent GOAWAY" frame. The GOAWAY case is only fatal when
+//     the error code is non-zero (GRACEFUL=NO_ERROR is normal shutdown
+//     and we must NOT misclassify it); we match "goaway" only when
+//     combined with a non-NO_ERROR code token.
+//
+//   QUIC-based outbounds (hysteria2 / tuic) — the stream layer
+//     surfaces "CRYPTO_ERROR", "CONNECTION_CLOSE", "stream reset",
+//     "application error". All three mean the node's upstream hop
+//     tore the tunnel down, not a local timeout.
+//
+//   Proxy-protocol framing damage — vmess / trojan / shadowsocks
+//     decoders commonly report "invalid", "short read",
+//     "authentication failed", "frame too large", "protocol error"
+//     when their streams are truncated by an upstream RST. We match
+//     a small whitelist of substrings known to correlate strongly
+//     with upstream-initiated disruption. Individual matches may
+//     false-positive on rare transient errors; the follow-on
+//     debargo TTL (see markDeadForTarget) expires in 60 s so the
+//     cost of a false positive is bounded.
+//
+// Deliberately NOT matched (would over-trigger):
+//   - io.EOF / io.ErrUnexpectedEOF: clean half-close or legitimate
+//     Content-Length < actual. Callers decide whether those are
+//     "bad enough" at their layer.
+//   - context.Canceled / context.DeadlineExceeded: caller-initiated.
+//   - "closed network connection": normally emitted when downstream
+//     code closed the conn itself.
+//
+// Callers: smart_watchdog's mid-transfer Read/Write paths. First-byte
+// and close paths continue to use isResetErr for stability.
+func isTransferFatalErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isResetErr(err) {
+		return true
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+
+	// GOAWAY: only fatal when the remote reported a real error code.
+	// Common benign shape: "http2: server sent goaway and closed the
+	// connection; last stream id ... error code no_error". We match on
+	// "goaway" AND a non-"no_error" error-code token.
+	if strings.Contains(msg, "goaway") && !strings.Contains(msg, "no_error") {
+		return true
+	}
+
+	// Substring markers with strong correlation to upstream-initiated
+	// disruption. Ordered roughly by expected frequency so the common
+	// case returns early.
+	for _, marker := range []string{
+		// TLS layer
+		"remote error: tls:",
+		"tls: bad record mac",
+		"tls: unexpected message",
+		"tls: internal error",
+		"tls: protocol version not supported",
+		"tls: handshake failure",
+		"tls: alert",
+		// HTTP/2 layer (non-GOAWAY cases)
+		"http2: stream error",
+		"http2: server closed",
+		"stream closed",
+		"stream terminated",
+		// QUIC layer (quic-go / hysteria / tuic)
+		"crypto_error",
+		"connection_close",
+		"connection closed",
+		"stream reset",
+		"stream was reset",
+		"application error",
+		// Proxy-protocol framing damage
+		"protocol error",
+		"invalid frame",
+		"frame too large",
+		"short read",
+		"authentication failed",
+		"mux: invalid",
+		"vmess: invalid",
+		"trojan: invalid",
+		"shadowsocks: ",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}

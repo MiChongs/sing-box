@@ -200,13 +200,33 @@ func (s *Smart) triggerInstantResetEviction(c *smartTrackedConn, op string, err 
 			c.proxyTag, "] target=[", c.meta.smartTarget, "] err=", err)
 		if s.resetEvents.record(c.meta.smartTarget, c.proxyTag) {
 			s.handleResetThresholdCrossed(c.meta, c.proxyTag)
-		} else if s.store != nil && c.meta.smartTarget != "" {
-			// Below threshold: still drop the unwrap cache so the very
-			// next dial re-evaluates candidates and avoids repicking
-			// the same node by stickiness. Same policy as the Close()
-			// path's below-threshold branch — keep them in lock-step.
-			s.store.DeleteUnwrapResult(s.Tag(), smartConfigName,
-				c.meta.smartTarget, c.meta.asnCode, c.meta.isUDP)
+		} else if c.meta.smartTarget != "" {
+			// Below the global (target, node) threshold but we still
+			// observed a real RST — so this specific target on this
+			// specific node is untrustworthy RIGHT NOW even though
+			// the node itself may be globally healthy (classic GFW
+			// pattern: selective per-SNI / per-domain blocking).
+			//
+			// Combine two cheap responses:
+			//
+			//   1. Drop the unwrap cache so the next dial re-evaluates
+			//      candidates (prevents "stickiness repicks same node
+			//      immediately" — this was the pre-existing policy).
+			//
+			//   2. Install a per-(target, proxy) debargo via
+			//      markDeadForTarget. selectProxies already filters
+			//      against isTargetDebargoed so the node is pulled
+			//      from THIS target's candidate list for targetDebargoTTL,
+			//      WITHOUT affecting its weight on other targets. The
+			//      debargo auto-expires — no manual recovery needed.
+			//      This closes the gap the user hit: single-RST nodes
+			//      that previously kept being re-elected because the
+			//      global breaker only trips at 2 events.
+			if s.store != nil {
+				s.store.DeleteUnwrapResult(s.Tag(), smartConfigName,
+					c.meta.smartTarget, c.meta.asnCode, c.meta.isUDP)
+			}
+			s.markDeadForTarget(c.meta.smartTarget, c.proxyTag)
 		}
 	}
 	return true

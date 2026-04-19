@@ -2581,6 +2581,21 @@ type smartTrackedConn struct {
 	firstWriteOnce atomic.Bool
 	firstWriteErr  atomic.Pointer[error]
 
+	// lastIOErr is the most recent non-nil error observed on Read or
+	// Write, regardless of whether the conn had already produced bytes.
+	// Fills the gap firstReadErr/firstWriteErr leave open: once the
+	// conn produces its first byte, firstReadOnce flips to true and
+	// firstReadErr is never written again — so a mid-transfer
+	// ECONNRESET after a successful TLS ServerHello wouldn't be seen
+	// by classifyStatus and Close would mis-classify the conn as
+	// "closed" (clean) instead of "failed" (RST). Updating lastIOErr
+	// on every error surfaces the truth to the Close path.
+	//
+	// Stored as *error (atomic.Pointer) so the read side can do one
+	// Load without taking a mutex on the hot IO path. Load returns nil
+	// when no error has ever been observed.
+	lastIOErr atomic.Pointer[error]
+
 	// lastReadAt is the unix-nano timestamp of the most recent successful
 	// Read (n > 0). Drives the stalled-transfer watchdog: when a conn
 	// has data but stops moving for stalledTransferTimeout the watchdog
@@ -2629,28 +2644,39 @@ func (c *smartTrackedConn) Read(b []byte) (int, error) {
 			firstByteJustNow = true
 		}
 	}
-	// Real-time RST detection. Two complementary triggers:
+	// Always surface the latest error to lastIOErr — firstReadErr only
+	// captures the first-byte instant; mid-transfer errors land here so
+	// classifyStatus can see them at Close.
+	if err != nil {
+		e := err
+		c.lastIOErr.Store(&e)
+	}
+	// Real-time RST detection. Three layered triggers:
 	//
-	//   - isResetErr matches the kernel-level error directly (TCP
-	//     RST / EPIPE / "forcibly closed") for transports that
-	//     surface the syscall verbatim.
+	//   - isPreFirstByteFatal: the conn NEVER produced a payload byte
+	//     and Read returned a non-EOF error. Pre-first-byte semantics
+	//     let us be aggressive — we already waited firstByteWatchdog
+	//     for a byte, anything other than clean EOF means the node
+	//     didn't deliver.
 	//
-	//   - isPreFirstByteFatal catches the case where mux / QUIC-based
-	//     outbounds (hysteria2 / tuic / shadow-tls) translate the
-	//     underlying RST into their own framing error that no string
-	//     match recognises. If the conn never produced a payload byte
-	//     and Read returned ANY non-EOF error, the node didn't
-	//     deliver — same eviction sequence as a kernel-level RST.
+	//   - isTransferFatalErr: after first-byte, the conn got a wider
+	//     set of "dirty RST" errors — TLS record-layer damage, h2
+	//     stream reset / non-graceful GOAWAY, QUIC CRYPTO_ERROR /
+	//     CONNECTION_CLOSE, mux protocol framing errors. These all
+	//     signal upstream disruption at the proxy-stack layer when
+	//     the raw syscall errno is lost in translation. isTransferFatalErr
+	//     includes isResetErr so the classic kernel-level RST path
+	//     is still covered when it reaches mid-transfer.
 	//
-	// Both triggers funnel through the CAS-guarded
+	// All triggers funnel through the CAS-guarded
 	// triggerInstantResetEviction so a follow-up Write(EPIPE) or
 	// Close(reset) can't double-handle the same conn.
 	if err != nil {
 		switch {
-		case isResetErr(err):
-			c.s.triggerInstantResetEviction(c, "read", err)
 		case wasPreFirstByte && isPreFirstByteFatal(err):
 			c.s.triggerInstantResetEviction(c, "read-prefirst", err)
+		case isTransferFatalErr(err):
+			c.s.triggerInstantResetEviction(c, "read", err)
 		}
 	}
 	// Kernel-driven watchdog: Read returned a deadline-style timeout.
@@ -2703,6 +2729,12 @@ func (c *smartTrackedConn) Write(b []byte) (int, error) {
 			c.firstWriteErr.Store(&e)
 		}
 	}
+	// Mirror Read: every Write error (not only the first) must surface
+	// to lastIOErr so classifyStatus sees the real reason on Close.
+	if err != nil {
+		e := err
+		c.lastIOErr.Store(&e)
+	}
 	// Symmetric to Read: a Write returning EPIPE / ECONNRESET / etc
 	// means the kernel has already torn down the socket on its end.
 	// Fire the same instant-eviction path so the next dial sees the
@@ -2750,6 +2782,24 @@ func (c *smartTrackedConn) sampleRate() {
 // server-initiated close; any other read error, or EOF-with-write-error,
 // signals a broken node.
 func (c *smartTrackedConn) classifyStatus() (string, error) {
+	// Priority: the latest mid-transfer error beats the first-byte
+	// snapshot. A conn that produced bytes cleanly and then hit RST at
+	// byte 500k must NOT be reported as "closed" — that's how broken
+	// nodes leak past the eviction path.
+	if p := c.lastIOErr.Load(); p != nil {
+		e := *p
+		// io.EOF / io.ErrUnexpectedEOF are clean half-closes — well,
+		// EOF is. ErrUnexpectedEOF on upstream can mean "RST cut the
+		// stream", but since downstream libraries routinely paper
+		// over it we keep the older semantics: treat as "closed" here
+		// so we don't over-trigger on legitimate stream ends.
+		if errors.Is(e, io.EOF) {
+			// Fall through to first-byte-snapshot logic so a clean
+			// EOF with an earlier firstWriteErr still surfaces.
+		} else {
+			return "failed", e
+		}
+	}
 	var rErr, wErr error
 	if p := c.firstReadErr.Load(); p != nil {
 		rErr = *p
@@ -2758,6 +2808,9 @@ func (c *smartTrackedConn) classifyStatus() (string, error) {
 		wErr = *p
 	}
 	if rErr == nil {
+		if wErr != nil && !errors.Is(wErr, io.EOF) {
+			return "failed", wErr
+		}
 		return "closed", nil
 	}
 	if errors.Is(rErr, io.EOF) {
@@ -2808,7 +2861,10 @@ func (c *smartTrackedConn) Close() error {
 			// via CAS, so this Close-time call is just a safety net
 			// for transports that surface RST only at close (rare:
 			// some mux layers buffer the error until session cleanup).
-			if c.meta != nil && isResetErr(reason) {
+			// Use the wider isTransferFatalErr here so TLS / h2 /
+			// QUIC / protocol-framing errors that the narrower
+			// isResetErr misses still get caught at close.
+			if c.meta != nil && isTransferFatalErr(reason) {
 				c.s.triggerInstantResetEviction(c, "close", reason)
 			}
 		}

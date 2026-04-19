@@ -135,3 +135,64 @@ func TestResetEventTracker_ResetForNode(t *testing.T) {
 		t.Errorf("T1|B should still be present (different node)")
 	}
 }
+
+// TestIsTransferFatalErr_ClassificationMatrix locks down the wider
+// mid-transfer error shapes that must evict the proxy node. Covers
+// the three pillars the original isResetErr missed: TLS record-layer
+// damage, h2 / QUIC stream termination, proxy-protocol framing errors.
+// Also pins the FALSE-POSITIVE guardrails — h2 graceful GOAWAY with
+// NO_ERROR, EOF, and io.ErrUnexpectedEOF must NOT trigger.
+func TestIsTransferFatalErr_ClassificationMatrix(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		// Negative controls — MUST NOT trigger.
+		{"nil", nil, false},
+		{"clean EOF", io.EOF, false},
+		{"unexpected EOF", io.ErrUnexpectedEOF, false},
+		{"h2 graceful GOAWAY", errors.New("http2: server sent GOAWAY and closed the connection; LastStreamID=3, ErrCode=NO_ERROR, debug=\"\""), false},
+		{"context cancelled", errors.New("context canceled"), false},
+		{"use of closed network", errors.New("use of closed network connection"), false},
+
+		// Pre-existing RST paths — must still trigger (inherited from isResetErr).
+		{"ECONNRESET", syscall.ECONNRESET, true},
+		{"EPIPE", syscall.EPIPE, true},
+		{"connection reset substring", errors.New("read: connection reset by peer"), true},
+		{"windows forcibly closed", errors.New("forcibly closed by the remote host"), true},
+
+		// TLS-layer damage — new coverage.
+		{"tls bad mac", errors.New("tls: bad record MAC"), true},
+		{"tls unexpected message", errors.New("tls: unexpected message"), true},
+		{"tls internal error", errors.New("remote error: tls: internal error"), true},
+		{"tls handshake failure", errors.New("remote error: tls: handshake failure"), true},
+		{"tls alert", errors.New("tls: alert(10): unexpected_message"), true},
+
+		// HTTP/2 termination with non-NO_ERROR code — new coverage.
+		{"h2 stream error", errors.New("http2: stream error: stream ID 7; INTERNAL_ERROR"), true},
+		{"h2 GOAWAY INTERNAL_ERROR", errors.New("http2: server sent GOAWAY and closed the connection; LastStreamID=5, ErrCode=INTERNAL_ERROR, debug=\"\""), true},
+		{"stream closed", errors.New("stream closed"), true},
+
+		// QUIC / mux — new coverage.
+		{"quic CRYPTO_ERROR", errors.New("CRYPTO_ERROR (0x10a): tls handshake failed"), true},
+		{"quic CONNECTION_CLOSE", errors.New("received CONNECTION_CLOSE: frame encoding error"), true},
+		{"quic stream reset", errors.New("stream was reset: 0x10c"), true},
+		{"quic application error", errors.New("application error 0x42: server shutting down"), true},
+
+		// Proxy-protocol framing — new coverage.
+		{"vmess invalid", errors.New("vmess: invalid response header length"), true},
+		{"trojan invalid", errors.New("trojan: invalid authentication"), true},
+		{"short read", errors.New("short read while parsing frame"), true},
+		{"frame too large", errors.New("frame too large: max 65535 got 131072"), true},
+		{"protocol error", errors.New("protocol error: unexpected command byte"), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isTransferFatalErr(tc.err)
+			if got != tc.want {
+				t.Errorf("isTransferFatalErr(%v) = %v; want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
