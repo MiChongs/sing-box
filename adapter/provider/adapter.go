@@ -11,12 +11,62 @@ import (
 	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing/common/batch"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
+
+	"github.com/panjf2000/ants/v2"
 )
+
+// providerSnapshot 是 Provider 出站列表的不可变快照。
+// 写路径在 writeAccess 锁下构造一个全新的 snapshot 后
+// 原子 Store 到 Adapter.snapshot，读路径通过 Load() 拿到
+// 当时的快照后即可零锁访问，UpdateOutbounds 再怎么并发也
+// 不会破坏读者持有的切片/map 内容。
+//
+// 不变量：
+//   - byTag[tag] == all[i] 对任意某个 i 成立（两个视图一致）
+//   - all 和 byTag 都是只读的，写路径永远构造新的而不是原地改
+type providerSnapshot struct {
+	all   []adapter.Outbound
+	byTag map[string]adapter.Outbound
+}
+
+var emptySnapshot = &providerSnapshot{byTag: map[string]adapter.Outbound{}}
+
+// getProviderHealthcheckPool 懒初始化进程级共享的 healthcheck worker pool。
+//
+// 为什么共享：
+//   - 多 provider 订阅时每个都有自己的 healthcheck 循环，用户场景里 8 个 provider
+//     × 每个 50-200 节点 = 数百个 URLTest 并发。原实现 batch.New(concurrency=10)
+//     虽然单个 provider 限到 10，但 8 个 provider 同时跑就是 80 并发，超出很多家宽
+//     出口的 NAT 会话表 / 防火墙状态表容量。
+//   - 共享一个 64-worker pool 把总并发封顶，避免 goroutine/fd 爆炸。
+//   - ants.WithNonblocking(false) → Submit 在满载时阻塞（预期的反压）。
+//   - 空闲 worker 30s 回收，低流量场景内存常驻接近零。
+//
+// 失败降级：ants.NewPool 只在配置非法时返回 error，理论上不会发生；
+// 万一失败则返回 nil，调用方检查到 nil 会退到 go func{} 兜底。
+var (
+	providerWorkerPoolOnce sync.Once
+	providerWorkerPool     *ants.Pool
+)
+
+func getProviderWorkerPool() *ants.Pool {
+	providerWorkerPoolOnce.Do(func() {
+		pool, err := ants.NewPool(64,
+			ants.WithExpiryDuration(30*time.Second),
+			ants.WithNonblocking(false),
+			ants.WithPreAlloc(false),
+		)
+		if err != nil {
+			return
+		}
+		providerWorkerPool = pool
+	})
+	return providerWorkerPool
+}
 
 type Adapter struct {
 	ctx          context.Context
@@ -27,20 +77,31 @@ type Adapter struct {
 	logger       log.ContextLogger
 	providerType string
 	providerTag  string
-	// outbounds / outboundsByTag 受 outboundsAccess 保护。写入发生在
-	// 订阅下载后的 UpdateOutbounds / UpdateEndpoints / RemoveEndpoints，
-	// 读取发生在 clash API (/providers/proxies/{tag} 等)、healthcheck
-	// 循环、以及 smart/urltest 组内的 Outbounds() 遍历。无锁时
-	// concurrent map read+write 会被 Go runtime 立刻 fatal，
-	// dashboard 侧表现为 "Network Error" — 就是 sing-box 崩掉了。
-	outboundsAccess sync.RWMutex
-	outbounds       []adapter.Outbound
-	outboundsByTag  map[string]adapter.Outbound
-	ticker          *time.Ticker
-	checking        atomic.Bool
-	history         adapter.URLTestHistoryStorage
-	callbackAccess  sync.Mutex
-	callbacks       list.List[adapter.ProviderUpdateCallback]
+
+	// snapshot 持有当前出站列表的不可变快照。读路径（Outbounds / Outbound /
+	// healthcheck / clash API 所有 /providers/proxies/*）通过 Load() 零锁访问。
+	// 写路径（UpdateOutbounds / UpdateEndpoints / Close）在 writeAccess 下
+	// 构造新 snapshot 后 Store。
+	//
+	// 字段是指针而非值：atomic.Pointer 嵌入 noCopy，Adapter 按值返回 (NewAdapter)
+	// 会触发 vet 警告。通过 *atomic.Pointer 持有，Adapter 本身只复制一个指针，
+	// 两个指针副本指向同一个 atomic.Pointer 对象，语义等价。
+	snapshot *atomic.Pointer[providerSnapshot]
+
+	// writeAccess 串行化 UpdateOutbounds / UpdateEndpoints / Close 之间的并发写，
+	// 防止两个订阅同时回来时互相覆盖（覆盖会导致 outbound manager 里的
+	// Create/Remove 失去配对）。读路径完全不持有此锁。
+	//
+	// 和 snapshot 字段同理：指针持有以规避 atomic.Pointer noCopy 触发的 vet 警告
+	// 扩散到 sync.Mutex — 一旦结构体里有任何 noCopy 字段，vet 对其他非 noCopy
+	// 锁字段的复制也会报警。
+	writeAccess *sync.Mutex
+
+	ticker         *time.Ticker
+	checking       *atomic.Bool
+	history        adapter.URLTestHistoryStorage
+	callbackAccess *sync.Mutex
+	callbacks      list.List[adapter.ProviderUpdateCallback]
 
 	link     string
 	enabled  bool
@@ -60,7 +121,7 @@ func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.Out
 	if interval < time.Minute {
 		interval = time.Minute
 	}
-	return Adapter{
+	a := Adapter{
 		ctx:          ctx,
 		outbound:     outbound,
 		endpoint:     endpoint,
@@ -69,12 +130,18 @@ func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.Out
 		logger:       logger,
 		providerType: providerType,
 		providerTag:  providerTag,
+		snapshot:       &atomic.Pointer[providerSnapshot]{},
+		writeAccess:    &sync.Mutex{},
+		callbackAccess: &sync.Mutex{},
+		checking:       &atomic.Bool{},
 
 		enabled:  options.Enabled,
 		link:     options.URL,
 		timeout:  timeout,
 		interval: interval,
 	}
+	a.snapshot.Store(emptySnapshot)
+	return a
 }
 
 func (a *Adapter) Start() error {
@@ -98,27 +165,27 @@ func (a *Adapter) Tag() string {
 	return a.providerTag
 }
 
+// loadSnapshot 读当前 snapshot；保证非 nil（Adapter 构造时总是 Store emptySnapshot）。
+func (a *Adapter) loadSnapshot() *providerSnapshot {
+	snap := a.snapshot.Load()
+	if snap == nil {
+		return emptySnapshot
+	}
+	return snap
+}
+
 func (a *Adapter) Outbounds() []adapter.Outbound {
-	a.outboundsAccess.RLock()
-	defer a.outboundsAccess.RUnlock()
-	// 返回切片快照（slice header 值复制），调用方遍历期间 UpdateOutbounds
-	// 重新赋值不会影响这里持有的底层数组 — 订阅更新时会 append 进 NEW 切片。
-	return a.outbounds
+	return a.loadSnapshot().all
 }
 
 func (a *Adapter) Outbound(tag string) (adapter.Outbound, bool) {
-	a.outboundsAccess.RLock()
-	defer a.outboundsAccess.RUnlock()
-	if a.outboundsByTag == nil {
-		return nil, false
-	}
-	detour, ok := a.outboundsByTag[tag]
-	return detour, ok
+	ob, ok := a.loadSnapshot().byTag[tag]
+	return ob, ok
 }
 
 func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 	tags := make([]string, len(newOpts))
-	seen := make(map[string]bool)
+	seen := make(map[string]struct{}, len(newOpts))
 	for i, opt := range newOpts {
 		var baseTag string
 		if opt.Tag != "" {
@@ -127,29 +194,73 @@ func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 			baseTag = F.ToString(a.providerTag, "/", i)
 		}
 		tag := baseTag
-		for n := 2; seen[tag]; n++ {
+		for n := 2; ; n++ {
+			if _, dup := seen[tag]; !dup {
+				break
+			}
 			tag = F.ToString(baseTag, " (", n, ")")
 		}
 		if tag != baseTag {
 			a.logger.Warn("duplicate outbound tag ", baseTag, " in provider, renamed to ", tag)
 		}
-		seen[tag] = true
+		seen[tag] = struct{}{}
 		tags[i] = tag
 	}
 	return tags
 }
 
+// UpdateOutbounds 接收订阅最新的 outbound 列表（newOpts），替换当前
+// provider 持有的整套出站。整体步骤：
+//  1. 为每个 newOpt 解析唯一 tag
+//  2. 删除不在 newOpts 里的老 outbound（outbound.Remove）
+//  3. 对每个 newOpt：如果已存在且 opts 未变则复用，否则 Create
+//  4. 原子 Store 构造好的新 snapshot
+//  5. 异步触发一次 HealthCheck（让 clash API 立刻看到新节点的延迟）
+//
+// 所有 snapshot 构造完成前旧 snapshot 始终有效，读路径不会看到中间态。
 func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Outbound) {
+	a.writeAccess.Lock()
+	defer a.writeAccess.Unlock()
+
 	newTags := a.resolveOutboundTags(newOpts)
-	a.removeUseless(newTags)
-	var (
-		oldOptByTag    = make(map[string]option.Outbound)
-		outbounds      = make([]adapter.Outbound, 0, len(newOpts))
-		outboundsByTag = make(map[string]adapter.Outbound)
-	)
+	wanted := make(map[string]struct{}, len(newTags))
+	for _, tag := range newTags {
+		wanted[tag] = struct{}{}
+	}
+
+	// 1. 删除老 outbound 里已不在新列表里的节点
+	//    只清理 "非 endpoint" 的部分，endpoint 由 UpdateEndpoints 负责
+	oldSnap := a.loadSnapshot()
+	for _, ob := range oldSnap.all {
+		if _, keep := wanted[ob.Tag()]; keep {
+			continue
+		}
+		if _, isEndpoint := a.endpoint.Get(ob.Tag()); isEndpoint {
+			// endpoint 归 UpdateEndpoints 管，这里跳过，避免误删
+			continue
+		}
+		if err := a.outbound.Remove(ob.Tag()); err != nil {
+			a.logger.Error(err, "close outbound [", ob.Tag(), "]")
+		}
+	}
+
+	// 2. 建 old tag→opts 的索引用于 DeepEqual 判变
+	oldOptByTag := make(map[string]option.Outbound, len(oldOpts))
 	for _, opt := range oldOpts {
 		oldOptByTag[opt.Tag] = opt
 	}
+
+	// 3. 创建/复用 newOpts 里的每一个出站
+	newAll := make([]adapter.Outbound, 0, len(newOpts))
+	newByTag := make(map[string]adapter.Outbound, len(newOpts))
+	// 保留 old snapshot 里的 endpoint（它们的生命周期由 UpdateEndpoints 管）
+	for _, ob := range oldSnap.all {
+		if _, isEndpoint := a.endpoint.Get(ob.Tag()); isEndpoint {
+			newAll = append(newAll, ob)
+			newByTag[ob.Tag()] = ob
+		}
+	}
+
 	for i, opt := range newOpts {
 		tag := newTags[i]
 		outbound, exist := a.outbound.Outbound(tag)
@@ -170,16 +281,17 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 			}
 			outbound, _ = a.outbound.Outbound(tag)
 		}
-		outbounds = append(outbounds, outbound)
-		outboundsByTag[tag] = outbound
+		newAll = append(newAll, outbound)
+		newByTag[tag] = outbound
 	}
+
+	// 4. 原子发布新 snapshot；读端在此刻之前仍然看到老 snapshot
+	a.snapshot.Store(&providerSnapshot{all: newAll, byTag: newByTag})
+
+	// 5. 触发一次 healthcheck 让新节点立刻有延迟数据
 	if a.enabled && a.history != nil {
 		go a.HealthCheck(a.ctx)
 	}
-	a.outboundsAccess.Lock()
-	a.outbounds = outbounds
-	a.outboundsByTag = outboundsByTag
-	a.outboundsAccess.Unlock()
 }
 
 func (a *Adapter) HealthCheck(ctx context.Context) (map[string]uint16, error) {
@@ -202,8 +314,15 @@ func (a *Adapter) UnregisterCallback(element *list.Element[adapter.ProviderUpdat
 }
 
 func (a *Adapter) UpdateGroups() {
+	a.callbackAccess.Lock()
+	callbacks := make([]adapter.ProviderUpdateCallback, 0, a.callbacks.Len())
 	for element := a.callbacks.Front(); element != nil; element = element.Next() {
-		element.Value(a.providerTag)
+		callbacks = append(callbacks, element.Value)
+	}
+	a.callbackAccess.Unlock()
+	// 在锁外调用，避免 callback 若回调到 Register/Unregister 造成死锁
+	for _, cb := range callbacks {
+		cb(a.providerTag)
 	}
 }
 
@@ -211,13 +330,13 @@ func (a *Adapter) Close() error {
 	if a.ticker != nil {
 		a.ticker.Stop()
 	}
-	a.outboundsAccess.Lock()
-	outbounds := a.outbounds
-	a.outbounds = nil
-	a.outboundsByTag = nil
-	a.outboundsAccess.Unlock()
+	a.writeAccess.Lock()
+	oldSnap := a.loadSnapshot()
+	a.snapshot.Store(emptySnapshot)
+	a.writeAccess.Unlock()
+
 	var err error
-	for _, ob := range outbounds {
+	for _, ob := range oldSnap.all {
 		if _, isEndpoint := a.endpoint.Get(ob.Tag()); isEndpoint {
 			if err2 := a.endpoint.Remove(ob.Tag()); err2 != nil {
 				err = E.Append(err, err2, func(err error) error {
@@ -251,50 +370,85 @@ func (a *Adapter) loopCheck() {
 	}
 }
 
+// healthcheck 对当前 snapshot 里的每个出站并发探测延迟。
+//
+//   - checking 原子位防止重入（loopCheck 和 clash API 可能同时触发）
+//   - 读 snapshot 零锁，拿到的切片是不可变快照，探测期间 UpdateOutbounds
+//     并发来一次也不会影响当前这轮
+//   - 通过进程级共享 ants pool 控制总并发（64 workers，满载时 Submit 阻塞）
+//   - 去重：同 tag 只探测一次（shadowsocks/hysteria 允许多 outbound 共享 tag？
+//     实际 resolveOutboundTags 会保证唯一，这里是多余保险）
 func (a *Adapter) healthcheck(ctx context.Context) (map[string]uint16, error) {
-	result := make(map[string]uint16)
 	if a.checking.Swap(true) {
-		return result, nil
+		return map[string]uint16{}, nil
 	}
 	defer a.checking.Store(false)
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
+
+	outbounds := a.loadSnapshot().all
+	if len(outbounds) == 0 {
+		return map[string]uint16{}, nil
+	}
+
+	pool := getProviderWorkerPool()
+	result := make(map[string]uint16, len(outbounds))
 	var resultAccess sync.Mutex
-	checked := make(map[string]bool)
-	a.outboundsAccess.RLock()
-	outbounds := a.outbounds
-	a.outboundsAccess.RUnlock()
+	checked := make(map[string]struct{}, len(outbounds))
+
+	var wg sync.WaitGroup
 	for _, detour := range outbounds {
 		tag := detour.Tag()
-		if checked[tag] {
+		if _, dup := checked[tag]; dup {
 			continue
 		}
-		checked[tag] = true
-		b.Go(tag, func() (any, error) {
-			ctx, cancel := context.WithTimeout(a.ctx, a.timeout)
+		checked[tag] = struct{}{}
+
+		probe := func() {
+			probeCtx, cancel := context.WithTimeout(a.ctx, a.timeout)
 			defer cancel()
-			t, err := urltest.URLTest(ctx, a.link, detour)
+			t, err := urltest.URLTest(probeCtx, a.link, detour)
 			if err != nil {
 				a.logger.Debug("outbound ", tag, " unavailable: ", err)
 				a.history.DeleteURLTestHistory(tag)
-			} else {
-				a.logger.Debug("outbound ", tag, " available: ", t, "ms")
-				a.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
-					Time:  time.Now(),
-					Delay: t,
-				})
-				resultAccess.Lock()
-				result[tag] = t
-				resultAccess.Unlock()
+				return
 			}
-			return nil, nil
-		})
+			a.logger.Debug("outbound ", tag, " available: ", t, "ms")
+			a.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+				Time:  time.Now(),
+				Delay: t,
+			})
+			resultAccess.Lock()
+			result[tag] = t
+			resultAccess.Unlock()
+		}
+
+		wg.Add(1)
+		if pool != nil {
+			if err := pool.Submit(func() {
+				defer wg.Done()
+				probe()
+			}); err != nil {
+				// Submit 只在 pool 已关闭或参数错误时返回错误，
+				// 这种情况下降级到直接起 goroutine 确保不漏探测
+				go func() {
+					defer wg.Done()
+					probe()
+				}()
+			}
+		} else {
+			go func() {
+				defer wg.Done()
+				probe()
+			}()
+		}
 	}
-	b.Wait()
+	wg.Wait()
+
+	_ = ctx // 调用方的 ctx 取消不打断已提交任务（与原 batch 语义一致）
 	return result, nil
 }
 
 func (a *Adapter) RewriteDetourForProvider(opts []option.Outbound) {
-	tagMapping := make(map[string]string)
+	tagMapping := make(map[string]string, len(opts))
 	for _, opt := range opts {
 		if opt.Tag != "" {
 			tagMapping[opt.Tag] = F.ToString(a.providerTag, "/", opt.Tag)
@@ -312,7 +466,7 @@ func (a *Adapter) RewriteDetourForProvider(opts []option.Outbound) {
 }
 
 func (a *Adapter) RewriteDetourForProviderEndpoints(opts []option.Endpoint) {
-	tagMapping := make(map[string]string)
+	tagMapping := make(map[string]string, len(opts))
 	for _, opt := range opts {
 		if opt.Tag != "" {
 			tagMapping[opt.Tag] = F.ToString(a.providerTag, "/", opt.Tag)
@@ -331,7 +485,7 @@ func (a *Adapter) RewriteDetourForProviderEndpoints(opts []option.Endpoint) {
 
 func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
 	tags := make([]string, len(newOpts))
-	seen := make(map[string]bool)
+	seen := make(map[string]struct{}, len(newOpts))
 	for i, opt := range newOpts {
 		var baseTag string
 		if opt.Tag != "" {
@@ -340,28 +494,54 @@ func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
 			baseTag = F.ToString(a.providerTag, "/endpoint-", i)
 		}
 		tag := baseTag
-		for n := 2; seen[tag]; n++ {
+		for n := 2; ; n++ {
+			if _, dup := seen[tag]; !dup {
+				break
+			}
 			tag = F.ToString(baseTag, " (", n, ")")
 		}
 		if tag != baseTag {
 			a.logger.Warn("duplicate endpoint tag ", baseTag, " in provider, renamed to ", tag)
 		}
-		seen[tag] = true
+		seen[tag] = struct{}{}
 		tags[i] = tag
 	}
 	return tags
 }
 
+// UpdateEndpoints 与 UpdateOutbounds 的设计对称：把 endpoint 部分和 outbound
+// 部分在同一个 snapshot 里统一管理，一次 atomic Store 原子切换。
 func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.Endpoint) {
+	a.writeAccess.Lock()
+	defer a.writeAccess.Unlock()
+
 	newTags := a.resolveEndpointTags(newOpts)
-	a.removeUselessEndpoints(newTags)
-	var (
-		oldOptByTag = make(map[string]option.Endpoint)
-		endpoints   []adapter.Outbound
-	)
+	wanted := make(map[string]struct{}, len(newTags))
+	for _, tag := range newTags {
+		wanted[tag] = struct{}{}
+	}
+
+	// 1. 删除老 endpoint 里不再需要的，并保留所有非 endpoint 出站
+	oldSnap := a.loadSnapshot()
+	keptNonEndpoint := make([]adapter.Outbound, 0, len(oldSnap.all))
+	for _, ob := range oldSnap.all {
+		if _, isEndpoint := a.endpoint.Get(ob.Tag()); isEndpoint {
+			if _, keep := wanted[ob.Tag()]; !keep {
+				if err := a.endpoint.Remove(ob.Tag()); err != nil {
+					a.logger.Error(err, "close endpoint [", ob.Tag(), "]")
+				}
+			}
+			continue
+		}
+		keptNonEndpoint = append(keptNonEndpoint, ob)
+	}
+
+	// 2. 对每个 newOpt 创建或复用 endpoint
+	oldOptByTag := make(map[string]option.Endpoint, len(oldOpts))
 	for _, opt := range oldOpts {
 		oldOptByTag[opt.Tag] = opt
 	}
+	endpoints := make([]adapter.Outbound, 0, len(newOpts))
 	for i, opt := range newOpts {
 		tag := newTags[i]
 		ep, exist := a.endpoint.Get(tag)
@@ -384,54 +564,16 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 		}
 		endpoints = append(endpoints, ep)
 	}
-	a.outboundsAccess.Lock()
-	a.outbounds = append(a.outbounds, endpoints...)
-	if a.outboundsByTag == nil {
-		a.outboundsByTag = make(map[string]adapter.Outbound)
-	}
-	for _, ep := range endpoints {
-		a.outboundsByTag[ep.Tag()] = ep
-	}
-	a.outboundsAccess.Unlock()
-}
 
-func (a *Adapter) removeUselessEndpoints(newTags []string) {
-	exists := make(map[string]bool)
-	for _, tag := range newTags {
-		exists[tag] = true
+	// 3. 拼装最终 snapshot: 非 endpoint 部分 + 新 endpoints
+	newAll := make([]adapter.Outbound, 0, len(keptNonEndpoint)+len(endpoints))
+	newAll = append(newAll, keptNonEndpoint...)
+	newAll = append(newAll, endpoints...)
+	newByTag := make(map[string]adapter.Outbound, len(newAll))
+	for _, ob := range newAll {
+		newByTag[ob.Tag()] = ob
 	}
-	a.outboundsAccess.Lock()
-	defer a.outboundsAccess.Unlock()
-	var remaining []adapter.Outbound
-	for _, ob := range a.outbounds {
-		if _, isEndpoint := a.endpoint.Get(ob.Tag()); isEndpoint && !exists[ob.Tag()] {
-			if err := a.endpoint.Remove(ob.Tag()); err != nil {
-				a.logger.Error(err, "close endpoint [", ob.Tag(), "]")
-			}
-			delete(a.outboundsByTag, ob.Tag())
-			continue
-		}
-		remaining = append(remaining, ob)
-	}
-	a.outbounds = remaining
-}
 
-func (a *Adapter) removeUseless(newTags []string) {
-	a.outboundsAccess.RLock()
-	outbounds := a.outbounds
-	a.outboundsAccess.RUnlock()
-	if len(outbounds) == 0 {
-		return
-	}
-	exists := make(map[string]bool)
-	for _, tag := range newTags {
-		exists[tag] = true
-	}
-	for _, opt := range outbounds {
-		if !exists[opt.Tag()] {
-			if err := a.outbound.Remove(opt.Tag()); err != nil {
-				a.logger.Error(err, "close outbound [", opt.Tag(), "]")
-			}
-		}
-	}
+	// 4. 原子发布
+	a.snapshot.Store(&providerSnapshot{all: newAll, byTag: newByTag})
 }
