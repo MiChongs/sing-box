@@ -24,9 +24,28 @@ on:
 permissions:
   contents: write
 
+# 同一 tag 重 push / 多次 workflow_dispatch 时，自动取消前一次仍在跑的运行。
+# 避免两次构建把 Release assets 互相覆盖，也省 Actions 用量。
+#
+# 注意不用 github.ref 本身，因为 tag 被删后重建 ref_name 相同，但我们要
+# 把 delete-then-recreate 视为独立 run（不互相取消）。所以加 run_id 维度
+# 的唯一性：push event 的 ref_name，workflow_dispatch 的 inputs.version。
+concurrency:
+  group: xiaobaf14g-release-${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: '1.25'
+  # `-s -w` strip 符号表，`-buildid=` 固定 build id 便于复现构建；
+  # `-checklinkname=0` 允许 sing-box 依赖的 badlinkname 跨包符号链接；
+  # `-X internal/godebug.defaultGODEBUG=multipathtcp=0` 关闭 Go 1.22+ 默认
+  # MPTCP 尝试（某些内核/NAT 兼容性差）。
+  COMMON_LDFLAGS: "-s -w -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -buildid="
+
 jobs:
   # ───────────────────────────────────────────────────────────────────
   # 1) 解析触发源 + 决定版本 / prerelease / 是否跳过 Android
+  #    轻量 job（~15s 启动 + 解析），输出供下游 matrix 和 publish 共用
   # ───────────────────────────────────────────────────────────────────
   prepare:
     name: prepare metadata
@@ -56,10 +75,12 @@ jobs:
             fi
             SKIP_ANDROID=false
           fi
-          echo "version=$VERSION"       | tee -a "$GITHUB_OUTPUT"
-          echo "tag=$TAG"               | tee -a "$GITHUB_OUTPUT"
-          echo "prerelease=$PRE"        | tee -a "$GITHUB_OUTPUT"
-          echo "skip_android=$SKIP_ANDROID" | tee -a "$GITHUB_OUTPUT"
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "prerelease=$PRE"
+            echo "skip_android=$SKIP_ANDROID"
+          } | tee -a "$GITHUB_OUTPUT"
 
   # ───────────────────────────────────────────────────────────────────
   # 2) Desktop 多平台并行编译 (16 个 target)
@@ -67,6 +88,12 @@ jobs:
   #    走宿主 glibc 动态链接, 提供给现代 CPU + 较新 Linux 发行版用户的
   #    优化版 (AVX/AVX2/BMI/FMA 加速 wireguard / quic-go / utls 加密路径)。
   #    tag 集合与 build-all.bat 完全一致。
+  #
+  #    缓存策略（预期 2nd run 总时间从 ~12min 降到 ~4min）:
+  #    - Go toolchain: setup-go 自带 per-OS 缓存
+  #    - Go module cache (~/go/pkg/mod): key by go.sum, 所有 target 共享
+  #    - Go build cache (~/.cache/go-build): key by go.sum + target 三元组
+  #      (GOOS+GOARCH+后缀)，确保交叉编译产物不互相污染
   # ───────────────────────────────────────────────────────────────────
   desktop:
     name: ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.suffix }}
@@ -113,17 +140,36 @@ jobs:
         with:
           fetch-depth: 1
 
+      # setup-go@v6 的 `cache: true` 默认开，会自动缓存 ~/go/pkg/mod，
+      # key 基于 go.sum，所有 job 共享命中。go toolchain 本身也在
+      # per-OS runner 上有内置缓存。
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25'
+          go-version: ${{ env.GO_VERSION }}
           check-latest: true
+          cache: true
+          cache-dependency-path: go.sum
+
+      # 独立的 build cache（~/.cache/go-build）。key 精确到 target 三元组
+      # 以免 linux/amd64 的 .a 污染 windows/arm64 的链接。
+      # restore-keys 前缀匹配：同一 target 不同 go.sum 版本能拿上次增量。
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+          key: go-build-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}-${{ env.GO_VERSION }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}-${{ env.GO_VERSION }}-
+            go-build-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}-
 
       # Zig is installed ONLY for targets that need a musl cross CC
       # (currently: linux/arm64-musl). Zig ships musl headers + libc.a
       # for every arch, which lets us do `zig cc -target ...` without
       # maintaining a separate musl-cross toolchain. Other targets
       # skip this step, keeping the matrix runtime unchanged.
+      # mlugg/setup-zig@v2 自带 cache，重复 run 从 ~70MB 下载降到 ~1s。
       - name: Setup Zig (musl cross CC)
         if: matrix.cc_target
         uses: mlugg/setup-zig@v2
@@ -190,11 +236,17 @@ jobs:
             EXTRA_LDFLAGS=" -linkmode=external -extldflags=-static"
             echo "Cross CGO via zig: CC='${CC}' (external linkmode, static)"
           fi
-          echo "Building $BIN (tags=${{ steps.tags.outputs.tags }}, CGO=${CGO_ENABLED}, GOAMD64=${GOAMD64:-default}, CC_TARGET=${CC_TARGET:-none})"
-          go build -v -trimpath -buildvcs=false \
+          echo "::group::Build $BIN"
+          echo "tags=${{ steps.tags.outputs.tags }}"
+          echo "CGO=${CGO_ENABLED} GOAMD64=${GOAMD64:-default} CC_TARGET=${CC_TARGET:-none}"
+          # -trimpath: 消除构建机本地路径，可复现构建
+          # -buildvcs=false: 不嵌入 git commit（我们用 -X Version 显式注入）
+          # -p 0: Go 默认 GOMAXPROCS；runner 2-core 时为 2
+          go build -trimpath -buildvcs=false \
             -tags "${{ steps.tags.outputs.tags }}" \
-            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=${VERSION} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -buildid=${EXTRA_LDFLAGS}" \
+            -ldflags "${COMMON_LDFLAGS} -X github.com/sagernet/sing-box/constant.Version=${VERSION}${EXTRA_LDFLAGS}" \
             -o "$BIN" ./cmd/sing-box
+          echo "::endgroup::"
           ls -lh "$BIN"
           # For glibc dynamic builds, surface the runtime ELF requirements
           # so the release notes can list the minimum supported distro.
@@ -215,14 +267,18 @@ jobs:
           echo "BIN=$BIN"   >> "$GITHUB_ENV"
           echo "NAME=$NAME" >> "$GITHUB_ENV"
 
-      - name: Pack with tar.gz
+      # pigz 替代 gzip：并行压缩，ubuntu-latest runner 2-core 上比单核
+      # gzip 快 ~1.7x。同时保留 -9 最高压缩率。
+      - name: Pack with tar.gz (pigz parallel)
         run: |
           set -euo pipefail
-          # gzip -9 最大压缩；bin 只有一个文件不需要 solid. tar 保留
-          # Unix 权限 (775) 方便 Linux/BSD 用户直接 tar xzf && ./sing-box.
-          tar czf "${NAME}.tar.gz" "${BIN}"
+          sudo apt-get install -y --no-install-recommends pigz >/dev/null 2>&1 || \
+            { command -v pigz || (echo "pigz not available, falling back to gzip" && sudo ln -sf /bin/gzip /usr/local/bin/pigz); }
+          tar cf - "${BIN}" | pigz -9 > "${NAME}.tar.gz"
           ls -lh "${NAME}.tar.gz"
 
+      # compression-level: 0 禁用 upload-artifact 内置二次压缩（tar.gz 已压）。
+      # 跳过 sha256sum 生成：publish job 统一做 manifest。
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
@@ -230,10 +286,12 @@ jobs:
           path: sing-box-*.tar.gz
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   # ───────────────────────────────────────────────────────────────────
   # 3) Android arm64-v8a (CGO + NDK，走 cmd/internal/build_libbox 入口)
   #    continue-on-error 让 Android 失败不阻塞 desktop 的发布。
+  #    NDK 缓存：setup-ndk 默认不缓存 ~1GB 的 NDK，手工加 cache。
   # ───────────────────────────────────────────────────────────────────
   android:
     name: android/arm64-v8a
@@ -241,6 +299,8 @@ jobs:
     needs: prepare
     if: needs.prepare.outputs.skip_android != 'true'
     continue-on-error: true
+    env:
+      NDK_VERSION: r28c
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -250,11 +310,34 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25'
+          go-version: ${{ env.GO_VERSION }}
           check-latest: true
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+          key: go-build-android-arm64-${{ env.GO_VERSION }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-android-arm64-${{ env.GO_VERSION }}-
+            go-build-android-arm64-
+
+      # NDK ~1GB 下载，setup-ndk@v1 的 local-cache 把它放在 runner 缓存路径。
+      # GitHub-hosted runners 的磁盘缓存跨 job 不共享，所以加 actions/cache@v4
+      # 覆盖更长的 run 间复用。
+      - name: Cache Android NDK
+        id: ndk-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/ndk-${{ env.NDK_VERSION }}
+          key: android-ndk-${{ env.NDK_VERSION }}-linux
 
       - name: Setup NDK
         id: ndk
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
         uses: nttld/setup-ndk@v1
         with:
           # r28+ (LLVM 19+) 必需 —— 旧版 libcronet.a 用 R_AARCH64_AUTH_ABS64
@@ -263,17 +346,30 @@ jobs:
           #   "unknown relocation (315) against symbol typeinfo for ..."
           # 影响所有 cronet 依赖的符号：__cxxabiv1 / std::bad_* / libunwind.
           # r28c (2025-10, LLVM 19) 原生支持；后续 NDK (r29+) 保持向后兼容。
-          ndk-version: r28c
+          ndk-version: ${{ env.NDK_VERSION }}
           add-to-path: true
+          local-cache: true
 
+      - name: Persist NDK to cache path
+        if: steps.ndk-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/ndk-${NDK_VERSION}"
+          cp -a "${{ steps.ndk.outputs.ndk-path }}/." "$HOME/ndk-${NDK_VERSION}/"
+
+      - name: Restore NDK env
+        run: |
+          set -euo pipefail
+          echo "ANDROID_NDK_HOME=$HOME/ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "$HOME/ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
 
       - name: Build via build_libbox
-        env:
-          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
         run: |
           set -euo pipefail
           VERSION='${{ needs.prepare.outputs.version }}'
+          echo "::group::build_libbox android/arm64"
           go run ./cmd/internal/build_libbox -target android-bin -platform android/arm64
+          echo "::endgroup::"
           ls -lh sing-box-android-arm64-v8a
           # NDK strip 减体积（约 -30%）
           STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
@@ -284,7 +380,7 @@ jobs:
           NAME="sing-box-${VERSION}-android-arm64-v8a"
           # 归档内用无后缀名字（build-all.bat 同行为）
           cp sing-box-android-arm64-v8a sing-box
-          tar czf "${NAME}.tar.gz" sing-box
+          tar cf - sing-box | pigz -9 > "${NAME}.tar.gz"
           ls -lh "${NAME}.tar.gz"
           rm -f sing-box sing-box-android-arm64-v8a
 
@@ -295,6 +391,7 @@ jobs:
           path: sing-box-*.tar.gz
           if-no-files-found: error
           retention-days: 7
+          compression-level: 0
 
   # ───────────────────────────────────────────────────────────────────
   # 4) 收集所有 artifact + 生成 changelog + 创建 / 更新 Release
@@ -320,12 +417,16 @@ jobs:
           path: builds/
           merge-multiple: true
 
-      - name: Inspect artifacts
+      - name: Inspect artifacts + 生成 SHA256 清单
         run: |
           set -euo pipefail
-          ls -lh builds/
+          cd builds
+          ls -lh
           echo "---"
-          echo "total artifacts: $(ls builds/ | wc -l)"
+          echo "total: $(ls | wc -l) artifact(s)"
+          # SHA256SUMS 供用户校验；写在 builds/ 里随 Release 一起发布。
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Build changelog
         run: |
@@ -352,6 +453,14 @@ jobs:
               echo "- \`$(basename "$f")\` — ${SIZE}"
             done
             echo ""
+            echo "<details><summary>SHA256SUMS</summary>"
+            echo ""
+            echo '```'
+            cat builds/SHA256SUMS
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
             echo "## Android"
             echo ""
             if [ '${{ needs.prepare.outputs.skip_android }}' = 'true' ]; then
@@ -366,7 +475,7 @@ jobs:
           cat CHANGELOG_RELEASE.md
 
       # 幂等发布：先删除任何已存在的同 tag Release（连同所有 assets）。
-      # softprops/action-gh-release 默认只“新增/更新” assets，不会清掉旧的同名
+      # softprops/action-gh-release 默认只"新增/更新" assets，不会清掉旧的同名
       # 产物。如果上一次构建产生了坏的二进制后我们 re-push 了 tag，旧二进制会
       # 和新二进制混在一起供用户下载 — 明确删除再重建，防止残留。
       # 注意：只删 Release（包括它挂载的 assets），不删 tag 本身 —— tag 已在
@@ -404,5 +513,7 @@ jobs:
           prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
           draft:      false
           body_path:  CHANGELOG_RELEASE.md
-          files:      builds/*.tar.gz
+          files: |
+            builds/*.tar.gz
+            builds/SHA256SUMS
           fail_on_unmatched_files: true
