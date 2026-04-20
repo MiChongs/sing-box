@@ -24,15 +24,6 @@ on:
 permissions:
   contents: write
 
-# Opt into Node.js 24 runtime for all JavaScript actions.
-# Node 20 is deprecated (removed 2026-09-16); this env forces
-# v4-pinned actions (checkout/upload-artifact/download-artifact,
-# setup-go@v5) to run on Node 24 without bumping versions. Safe
-# because the actions themselves support both runtimes — only the
-# GitHub runner's default bundled Node version is switching.
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-
 jobs:
   # ───────────────────────────────────────────────────────────────────
   # 1) 解析触发源 + 决定版本 / prerelease / 是否跳过 Android
@@ -118,12 +109,12 @@ jobs:
           - { goos: freebsd, goarch: arm64,    ext: '',   tags_src: freebsd, suffix: '' }
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.25'
           check-latest: true
@@ -233,7 +224,7 @@ jobs:
           ls -lh "${NAME}.tar.gz"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: desktop-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
           path: sing-box-*.tar.gz
@@ -252,12 +243,12 @@ jobs:
     continue-on-error: true
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: '1.25'
           check-latest: true
@@ -298,7 +289,7 @@ jobs:
           rm -f sing-box sing-box-android-arm64-v8a
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: android-arm64-v8a
           path: sing-box-*.tar.gz
@@ -319,12 +310,12 @@ jobs:
     if: always() && needs.desktop.result == 'success'
     steps:
       - name: Checkout (全量历史用于 changelog)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: builds/
           merge-multiple: true
