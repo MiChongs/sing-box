@@ -169,17 +169,26 @@ jobs:
           VERSION='${{ needs.prepare.outputs.version }}'
           NAME="sing-box-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
           BIN="${NAME}${{ matrix.ext }}"
-          # Cross-CGO via zig. For -musl targets we also pass
-          # -extldflags=-static so the final ELF has zero runtime libc
-          # dependency — this is the whole point of shipping a musl
-          # build (Alpine/OpenWrt/scratch containers can run it
-          # directly without adding glibc).
+          # Cross-CGO via zig. Musl static builds need THREE things:
+          #   1. CC/CXX pointing at zig cc -target <triple> so C
+          #      headers + libc.a come from zig's musl bundle
+          #   2. -linkmode=external — Go's internal linker doesn't
+          #      know how to emit musl-compatible dynsym entries;
+          #      leaving it on produces errors like
+          #      "runtime.gcdata: missing Go type information for
+          #       global symbol .dynsym" and floods of unresolved
+          #      getgrgid_r / getaddrinfo / malloc relocations
+          #      because the internal linker tries to do static
+          #      static merging itself instead of deferring to $CC
+          #   3. -extldflags=-static — tells the now-external zig
+          #      linker to emit a fully-static ELF (no dynamic
+          #      dependencies). Only effective when linkmode=external.
           EXTRA_LDFLAGS=""
           if [ -n "${CC_TARGET}" ]; then
             export CC="zig cc -target ${CC_TARGET}"
             export CXX="zig c++ -target ${CC_TARGET}"
-            EXTRA_LDFLAGS=" -extldflags=-static"
-            echo "Cross CGO via zig: CC='${CC}'"
+            EXTRA_LDFLAGS=" -linkmode=external -extldflags=-static"
+            echo "Cross CGO via zig: CC='${CC}' (external linkmode, static)"
           fi
           echo "Building $BIN (tags=${{ steps.tags.outputs.tags }}, CGO=${CGO_ENABLED}, GOAMD64=${GOAMD64:-default}, CC_TARGET=${CC_TARGET:-none})"
           go build -v -trimpath -buildvcs=false \
