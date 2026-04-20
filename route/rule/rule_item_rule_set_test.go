@@ -9,7 +9,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
-	tun "github.com/sagernet/sing-tun"
+	"github.com/sagernet/sing-tun"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
 
@@ -46,6 +46,7 @@ func (r *ruleSetItemTestRouter) RuleSet(tag string) (adapter.RuleSet, bool) {
 	return ruleSet, loaded
 }
 func (r *ruleSetItemTestRouter) Rules() []adapter.Rule                      { return nil }
+func (r *ruleSetItemTestRouter) RuleSets() []adapter.RuleSet                { return nil }
 func (r *ruleSetItemTestRouter) Rule(string) (adapter.Rule, bool)           { return nil, false }
 func (r *ruleSetItemTestRouter) NeedFindProcess() bool                      { return false }
 func (r *ruleSetItemTestRouter) NeedFindNeighbor() bool                     { return false }
@@ -53,16 +54,9 @@ func (r *ruleSetItemTestRouter) NeighborResolver() adapter.NeighborResolver { re
 func (r *ruleSetItemTestRouter) AppendTracker(adapter.ConnectionTracker)    {}
 func (r *ruleSetItemTestRouter) ResetNetwork()                              {}
 func (r *ruleSetItemTestRouter) DefaultDomainMatchStrategy() C.DomainMatchStrategy {
-	return 0
+	return C.DomainMatchStrategyAsIS
 }
 func (r *ruleSetItemTestRouter) Reload() {}
-func (r *ruleSetItemTestRouter) RuleSets() []adapter.RuleSet {
-	var result []adapter.RuleSet
-	for _, rs := range r.ruleSets {
-		result = append(result, rs)
-	}
-	return result
-}
 
 type countingRuleSet struct {
 	name string
@@ -70,8 +64,8 @@ type countingRuleSet struct {
 }
 
 func (s *countingRuleSet) Name() string                                                  { return s.name }
-func (s *countingRuleSet) Type() string                                                  { return "local" }
-func (s *countingRuleSet) Format() string                                                { return "source" }
+func (s *countingRuleSet) Type() string                                                  { return "" }
+func (s *countingRuleSet) Format() string                                                { return "" }
 func (s *countingRuleSet) UpdatedTime() time.Time                                        { return time.Time{} }
 func (s *countingRuleSet) Update(context.Context) error                                  { return nil }
 func (s *countingRuleSet) StartContext(context.Context, *adapter.HTTPStartContext) error { return nil }
@@ -90,9 +84,9 @@ func (s *countingRuleSet) RegisterCallback(adapter.RuleSetUpdateCallback) *list.
 }
 func (s *countingRuleSet) UnregisterCallback(*list.Element[adapter.RuleSetUpdateCallback]) {}
 func (s *countingRuleSet) Close() error                                                    { return nil }
-func (s *countingRuleSet) RuleCount() uint64                                               { return 0 }
 func (s *countingRuleSet) Match(*adapter.InboundContext) bool                              { return true }
 func (s *countingRuleSet) String() string                                                  { return s.name }
+func (s *countingRuleSet) RuleCount() uint64                                               { return 0 }
 func (s *countingRuleSet) RefCount() int32                                                 { return s.refs.Load() }
 
 func TestRuleSetItemCloseReleasesRefs(t *testing.T) {

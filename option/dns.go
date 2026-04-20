@@ -61,28 +61,6 @@ type DNSClientOptions struct {
 	ClientSubnet     *badoption.Prefixable `json:"client_subnet,omitempty"`
 }
 
-type _OptimisticDNSOptions struct {
-	Enabled bool               `json:"enabled,omitempty"`
-	Timeout badoption.Duration `json:"timeout,omitempty"`
-}
-
-type OptimisticDNSOptions _OptimisticDNSOptions
-
-func (o OptimisticDNSOptions) MarshalJSON() ([]byte, error) {
-	if o.Timeout == 0 {
-		return json.Marshal(o.Enabled)
-	}
-	return json.Marshal((_OptimisticDNSOptions)(o))
-}
-
-func (o *OptimisticDNSOptions) UnmarshalJSON(bytes []byte) error {
-	err := json.Unmarshal(bytes, &o.Enabled)
-	if err == nil {
-		return nil
-	}
-	return json.UnmarshalDisallowUnknownFields(bytes, (*_OptimisticDNSOptions)(o))
-}
-
 type DNSTransportOptionsRegistry interface {
 	CreateOptions(transportType string) (any, bool)
 }
@@ -225,4 +203,26 @@ type FakeIPDNSServerOptions struct {
 type DHCPDNSServerOptions struct {
 	LocalDNSServerOptions
 	Interface string `json:"interface,omitempty"`
+}
+
+type _OptimisticDNSOptions struct {
+	Enabled bool               `json:"enabled,omitempty"`
+	Timeout badoption.Duration `json:"timeout,omitempty"`
+}
+
+type OptimisticDNSOptions _OptimisticDNSOptions
+
+func (o OptimisticDNSOptions) MarshalJSON() ([]byte, error) {
+	if o.Timeout == 0 {
+		return json.Marshal(o.Enabled)
+	}
+	return json.Marshal((_OptimisticDNSOptions)(o))
+}
+
+func (o *OptimisticDNSOptions) UnmarshalJSON(bytes []byte) error {
+	err := json.Unmarshal(bytes, &o.Enabled)
+	if err == nil {
+		return nil
+	}
+	return json.UnmarshalDisallowUnknownFields(bytes, (*_OptimisticDNSOptions)(o))
 }

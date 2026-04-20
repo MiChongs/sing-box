@@ -44,13 +44,13 @@ type Router struct {
 	rules                 []adapter.DNSRule
 	ruleByUUID            map[string]adapter.DNSRule
 	defaultDomainStrategy C.DomainStrategy
+	defaultRejectRcode    int
 	dnsReverseMapping     freelru.Cache[netip.Addr, string]
 	platformInterface     adapter.PlatformInterface
 	legacyDNSMode         bool
 	rulesAccess           sync.RWMutex
 	started               bool
 	closing               bool
-	defaultRejectRcode    int
 }
 
 func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOptions) (*Router, error) {
@@ -153,10 +153,6 @@ func (r *Router) Start(stage adapter.StartStage) error {
 			return nil
 		}
 		r.rules = newRules
-		r.ruleByUUID = make(map[string]adapter.DNSRule)
-		for _, rule := range newRules {
-			r.ruleByUUID[rule.UUID()] = rule
-		}
 		r.legacyDNSMode = legacyDNSMode
 		r.started = true
 		r.rulesAccess.Unlock()
@@ -197,7 +193,7 @@ func (r *Router) buildRules(startRules bool) ([]adapter.DNSRule, bool, dnsRuleMo
 		return nil, false, dnsRuleModeFlags{}, err
 	}
 	if !legacyDNSMode {
-		err = validateLegacyDNSModeDisabledRules(router, r.rawRules, nil)
+		err = validateLegacyDNSModeDisabledRules(r.rawRules)
 		if err != nil {
 			return nil, false, dnsRuleModeFlags{}, err
 		}
@@ -259,7 +255,7 @@ func (r *Router) ValidateRuleSetMetadataUpdate(tag string, metadata adapter.Rule
 			return err
 		}
 		if !candidateLegacyDNSMode {
-			return validateLegacyDNSModeDisabledRules(router, r.rawRules, overrides)
+			return validateLegacyDNSModeDisabledRules(r.rawRules)
 		}
 		return nil
 	}
@@ -269,7 +265,7 @@ func (r *Router) ValidateRuleSetMetadataUpdate(tag string, metadata adapter.Rule
 	}
 	if legacyDNSMode {
 		if !candidateLegacyDNSMode && flags.disabled {
-			err := validateLegacyDNSModeDisabledRules(router, r.rawRules, overrides)
+			err := validateLegacyDNSModeDisabledRules(r.rawRules)
 			if err != nil {
 				return err
 			}
@@ -280,7 +276,7 @@ func (r *Router) ValidateRuleSetMetadataUpdate(tag string, metadata adapter.Rule
 	if candidateLegacyDNSMode {
 		return E.New(deprecated.OptionLegacyDNSAddressFilter.MessageWithLink())
 	}
-	return validateLegacyDNSModeDisabledRules(router, r.rawRules, overrides)
+	return nil
 }
 
 func (r *Router) matchDNS(ctx context.Context, rules []adapter.DNSRule, allowFakeIP bool, ruleIndex int, isAddressQuery bool, options *adapter.DNSQueryOptions) (adapter.DNSTransport, adapter.DNSRule, int) {
@@ -294,9 +290,6 @@ func (r *Router) matchDNS(ctx context.Context, rules []adapter.DNSRule, allowFak
 	}
 	for ; currentRuleIndex < len(rules); currentRuleIndex++ {
 		currentRule := rules[currentRuleIndex]
-		if currentRule.Disabled() {
-			continue
-		}
 		if currentRule.WithAddressLimit() && !isAddressQuery {
 			continue
 		}
@@ -362,9 +355,6 @@ func (r *Router) applyDNSRouteOptions(options *adapter.DNSQueryOptions, routeOpt
 	// when strategy remains at its default value.
 	if routeOptions.DisableCache {
 		options.DisableCache = true
-	}
-	if routeOptions.DisableOptimisticCache {
-		options.DisableOptimisticCache = true
 	}
 	if routeOptions.RewriteTTL != nil {
 		options.RewriteTTL = routeOptions.RewriteTTL
@@ -636,13 +626,12 @@ func (r *Router) Exchange(ctx context.Context, message *mDNS.Msg, options adapte
 		return &responseMessage, nil
 	}
 	r.rulesAccess.RLock()
+	defer r.rulesAccess.RUnlock()
 	if r.closing {
-		r.rulesAccess.RUnlock()
 		return nil, E.New("dns router closed")
 	}
 	rules := r.rules
 	legacyDNSMode := r.legacyDNSMode
-	r.rulesAccess.RUnlock()
 	r.logger.DebugContext(ctx, "exchange ", FormatQuestion(message.Question[0].String()))
 	var (
 		response  *mDNS.Msg
@@ -759,13 +748,12 @@ done:
 
 func (r *Router) Lookup(ctx context.Context, domain string, options adapter.DNSQueryOptions) ([]netip.Addr, error) {
 	r.rulesAccess.RLock()
+	defer r.rulesAccess.RUnlock()
 	if r.closing {
-		r.rulesAccess.RUnlock()
 		return nil, E.New("dns router closed")
 	}
 	rules := r.rules
 	legacyDNSMode := r.legacyDNSMode
-	r.rulesAccess.RUnlock()
 	var (
 		responseAddrs []netip.Addr
 		err           error
@@ -907,10 +895,10 @@ func (r *Router) ResetNetwork() {
 }
 
 func defaultRuleNeedsLegacyDNSModeFromAddressFilter(rule option.DefaultDNSRule) bool {
-	if rule.RuleSetIPCIDRAcceptEmpty { //nolint:staticcheck
+	if rule.IPAcceptAny || rule.RuleSetIPCIDRAcceptEmpty { //nolint:staticcheck
 		return true
 	}
-	return !rule.MatchResponse && (rule.IPAcceptAny || len(rule.IPCIDR) > 0 || rule.IPIsPrivate)
+	return !rule.MatchResponse && (len(rule.IPCIDR) > 0 || rule.IPIsPrivate)
 }
 
 func hasResponseMatchFields(rule option.DefaultDNSRule) bool {
@@ -973,9 +961,7 @@ func dnsRuleModeRequirementsInRule(router adapter.Router, rule option.DNSRule, m
 		return dnsRuleModeRequirementsInDefaultRule(router, rule.DefaultOptions, metadataOverrides)
 	case C.RuleTypeLogical:
 		flags := dnsRuleModeFlags{
-			disabled: dnsRuleActionType(rule) == C.RuleActionTypeEvaluate ||
-				dnsRuleActionType(rule) == C.RuleActionTypeRespond ||
-				dnsRuleActionDisablesLegacyDNSMode(rule.LogicalOptions.DNSRuleAction),
+			disabled:           dnsRuleActionType(rule) == C.RuleActionTypeEvaluate || dnsRuleActionType(rule) == C.RuleActionTypeRespond,
 			neededFromStrategy: dnsRuleActionHasStrategy(rule.LogicalOptions.DNSRuleAction),
 		}
 		flags.needed = flags.neededFromStrategy
@@ -994,7 +980,7 @@ func dnsRuleModeRequirementsInRule(router adapter.Router, rule option.DNSRule, m
 
 func dnsRuleModeRequirementsInDefaultRule(router adapter.Router, rule option.DefaultDNSRule, metadataOverrides map[string]adapter.RuleSetMetadata) (dnsRuleModeFlags, error) {
 	flags := dnsRuleModeFlags{
-		disabled:           defaultRuleDisablesLegacyDNSMode(rule) || dnsRuleActionDisablesLegacyDNSMode(rule.DNSRuleAction),
+		disabled:           defaultRuleDisablesLegacyDNSMode(rule),
 		neededFromStrategy: dnsRuleActionHasStrategy(rule.DNSRuleAction),
 	}
 	flags.needed = defaultRuleNeedsLegacyDNSModeFromAddressFilter(rule) || flags.neededFromStrategy
@@ -1058,10 +1044,10 @@ func referencedDNSRuleSetTags(rules []option.DNSRule) []string {
 	return tags
 }
 
-func validateLegacyDNSModeDisabledRules(router adapter.Router, rules []option.DNSRule, metadataOverrides map[string]adapter.RuleSetMetadata) error {
+func validateLegacyDNSModeDisabledRules(rules []option.DNSRule) error {
 	var seenEvaluate bool
 	for i, rule := range rules {
-		requiresPriorEvaluate, err := validateLegacyDNSModeDisabledRuleTree(router, rule, metadataOverrides)
+		requiresPriorEvaluate, err := validateLegacyDNSModeDisabledRuleTree(rule)
 		if err != nil {
 			return E.Cause(err, "validate dns rule[", i, "]")
 		}
@@ -1096,14 +1082,14 @@ func validateEvaluateFakeIPRules(rules []option.DNSRule, transportManager adapte
 	return nil
 }
 
-func validateLegacyDNSModeDisabledRuleTree(router adapter.Router, rule option.DNSRule, metadataOverrides map[string]adapter.RuleSetMetadata) (bool, error) {
+func validateLegacyDNSModeDisabledRuleTree(rule option.DNSRule) (bool, error) {
 	switch rule.Type {
 	case "", C.RuleTypeDefault:
-		return validateLegacyDNSModeDisabledDefaultRule(router, rule.DefaultOptions, metadataOverrides)
+		return validateLegacyDNSModeDisabledDefaultRule(rule.DefaultOptions)
 	case C.RuleTypeLogical:
 		requiresPriorEvaluate := dnsRuleActionType(rule) == C.RuleActionTypeRespond
 		for i, subRule := range rule.LogicalOptions.Rules {
-			subRequiresPriorEvaluate, err := validateLegacyDNSModeDisabledRuleTree(router, subRule, metadataOverrides)
+			subRequiresPriorEvaluate, err := validateLegacyDNSModeDisabledRuleTree(subRule)
 			if err != nil {
 				return false, E.Cause(err, "sub rule[", i, "]")
 			}
@@ -1115,43 +1101,23 @@ func validateLegacyDNSModeDisabledRuleTree(router adapter.Router, rule option.DN
 	}
 }
 
-func validateLegacyDNSModeDisabledDefaultRule(router adapter.Router, rule option.DefaultDNSRule, metadataOverrides map[string]adapter.RuleSetMetadata) (bool, error) {
+func validateLegacyDNSModeDisabledDefaultRule(rule option.DefaultDNSRule) (bool, error) {
 	hasResponseRecords := hasResponseMatchFields(rule)
-	if (hasResponseRecords || len(rule.IPCIDR) > 0 || rule.IPIsPrivate || rule.IPAcceptAny) && !rule.MatchResponse {
-		return false, E.New("Response Match Fields (ip_cidr, ip_is_private, ip_accept_any, response_rcode, response_answer, response_ns, response_extra) require match_response to be enabled")
+	if (hasResponseRecords || len(rule.IPCIDR) > 0 || rule.IPIsPrivate) && !rule.MatchResponse {
+		return false, E.New("Response Match Fields (ip_cidr, ip_is_private, response_rcode, response_answer, response_ns, response_extra) require match_response to be enabled")
 	}
-	// rule_set entries are only rejected when every referenced set is pure-IP;
-	// mixed sets still fall through because their non-IP branches remain matchable
-	// before a DNS response is available. (Stricter than upstream's
-	// "never reject rule_set" stance — keeps users from silently accepting a
-	// pure-IP rule-set under match_response=false.)
-	if !rule.MatchResponse && len(rule.RuleSet) > 0 {
-		for _, tag := range rule.RuleSet {
-			metadata, err := lookupDNSRuleSetMetadata(router, tag, metadataOverrides)
-			if err != nil {
-				return false, err
-			}
-			if metadata.ContainsIPCIDRRule && !metadata.ContainsNonIPCIDRRule {
-				return false, E.New(deprecated.OptionLegacyDNSAddressFilter.MessageWithLink())
-			}
-		}
+	// Intentionally do not reject rule_set here. A referenced rule set may mix
+	// destination-IP predicates with pre-response predicates such as domain items.
+	// When match_response is false, those destination-IP branches fail closed during
+	// pre-response evaluation instead of consuming DNS response state, while sibling
+	// non-response branches remain matchable.
+	if rule.IPAcceptAny { //nolint:staticcheck
+		return false, E.New(deprecated.OptionIPAcceptAny.MessageWithLink())
 	}
-	// upstream 523ed6e49: ip_accept_any is no longer deprecated.
 	if rule.RuleSetIPCIDRAcceptEmpty { //nolint:staticcheck
 		return false, E.New(deprecated.OptionRuleSetIPCIDRAcceptEmpty.MessageWithLink())
 	}
 	return rule.MatchResponse || rule.Action == C.RuleActionTypeRespond, nil
-}
-
-func dnsRuleActionDisablesLegacyDNSMode(action option.DNSRuleAction) bool {
-	switch action.Action {
-	case "", C.RuleActionTypeRoute, C.RuleActionTypeEvaluate:
-		return action.RouteOptions.DisableOptimisticCache
-	case C.RuleActionTypeRouteOptions:
-		return action.RouteOptionsOptions.DisableOptimisticCache
-	default:
-		return false
-	}
 }
 
 func dnsRuleActionHasStrategy(action option.DNSRuleAction) bool {

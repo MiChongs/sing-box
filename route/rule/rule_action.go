@@ -141,11 +141,10 @@ func NewDNSRuleAction(logger logger.ContextLogger, action option.DNSRuleAction) 
 		return &RuleActionEvaluate{
 			Server: action.RouteOptions.Server,
 			RuleActionDNSRouteOptions: RuleActionDNSRouteOptions{
-				Strategy:               C.DomainStrategy(action.RouteOptions.Strategy),
-				DisableCache:           action.RouteOptions.DisableCache,
-				DisableOptimisticCache: action.RouteOptions.DisableOptimisticCache,
-				RewriteTTL:             action.RouteOptions.RewriteTTL,
-				ClientSubnet:           netip.Prefix(common.PtrValueOrDefault(action.RouteOptions.ClientSubnet)),
+				Strategy:     C.DomainStrategy(action.RouteOptions.Strategy),
+				DisableCache: action.RouteOptions.DisableCache,
+				RewriteTTL:   action.RouteOptions.RewriteTTL,
+				ClientSubnet: netip.Prefix(common.PtrValueOrDefault(action.RouteOptions.ClientSubnet)),
 			},
 		}
 	case C.RuleActionTypeRespond:
@@ -317,9 +316,6 @@ func formatDNSRouteAction(action string, server string, options RuleActionDNSRou
 	descriptions = append(descriptions, server)
 	if options.DisableCache {
 		descriptions = append(descriptions, "disable-cache")
-	}
-	if options.DisableOptimisticCache {
-		descriptions = append(descriptions, "disable-optimistic-cache")
 	}
 	if options.RewriteTTL != nil {
 		descriptions = append(descriptions, F.ToString("rewrite-ttl=", *options.RewriteTTL))

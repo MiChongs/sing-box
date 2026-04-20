@@ -8,13 +8,11 @@ icon: material/alert-decagram
     :material-plus: [source_hostname](#source_hostname)  
     :material-plus: [match_response](#match_response)  
     :material-delete-clock: [rule_set_ip_cidr_accept_empty](#rule_set_ip_cidr_accept_empty)  
+    :material-delete-clock: [ip_accept_any](#ip_accept_any)  
     :material-plus: [response_rcode](#response_rcode)  
     :material-plus: [response_answer](#response_answer)  
     :material-plus: [response_ns](#response_ns)  
-    :material-plus: [response_extra](#response_extra)  
-    :material-plus: [package_name_regex](#package_name_regex)  
-    :material-alert: [ip_version](#ip_version)  
-    :material-alert: [query_type](#query_type)
+    :material-plus: [response_extra](#response_extra)
 
 !!! quote "Changes in sing-box 1.13.0"
 
@@ -185,7 +183,6 @@ icon: material/alert-decagram
           "192.168.0.1"
         ],
         "ip_is_private": false,
-        "ip_accept_any": false,
         "response_rcode": "",
         "response_answer": [],
         "response_ns": [],
@@ -199,6 +196,7 @@ icon: material/alert-decagram
 
         // Deprecated
 
+        "ip_accept_any": false,
         "rule_set_ip_cidr_accept_empty": false,
         "rule_set_ipcidr_match_source": false,
         "geosite": [
@@ -547,13 +545,7 @@ instead of only matching the original query.
 The evaluated response can also be returned directly by a later [`respond`](/configuration/dns/rule_action/#respond) action.
 
 Required for Response Match Fields (`response_rcode`, `response_answer`, `response_ns`, `response_extra`).
-Also required for `ip_cidr`, `ip_is_private`, and `ip_accept_any` when used with `evaluate` or Response Match Fields.
-
-#### ip_accept_any
-
-!!! question "Since sing-box 1.12.0"
-
-Match when the DNS query response contains at least one address.
+Also required for `ip_cidr` and `ip_is_private` when used with `evaluate` or Response Match Fields.
 
 #### invert
 
@@ -652,6 +644,17 @@ check [Migration](/migration/#migrate-address-filter-fields-to-response-matching
     check [Migration](/migration/#migrate-address-filter-fields-to-response-matching).
 
 Make `ip_cidr` rules in rule-sets accept empty query response.
+
+### Response Match Fields
+
+!!! question "Since sing-box 1.14.0"
+
+!!! failure "Deprecated in sing-box 1.14.0"
+
+    `ip_accept_any` is deprecated and will be removed in sing-box 1.16.0,
+    check [Migration](/migration/#migrate-address-filter-fields-to-response-matching).
+
+Match any IP with query response.
 
 ### Response Match Fields
 
