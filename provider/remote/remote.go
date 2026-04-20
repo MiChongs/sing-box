@@ -124,9 +124,11 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 
 func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
 	s.cacheFile = service.FromContext[adapter.CacheFile](s.ctx)
-	err := s.loadCacheFile()
-	if err != nil {
-		return E.Cause(err, "restore cached outbound provider")
+	// loadCacheFile 失败只 warn。cache 坏了视为 "无 cache"，后面初次 fetch 兜底；
+	// 强行 fatal 会把"本机 cache 损坏 + 订阅服务器临时挂"这种可恢复故障扩大成
+	// 无法启动。
+	if err := s.loadCacheFile(); err != nil {
+		s.logger.Warn("restore cached outbound provider: ", err)
 	}
 	transport, err := s.resolveTransport()
 	if err != nil {
@@ -134,11 +136,19 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
+	// 初次 fetch 失败不再 fatal。场景:
+	//   - 订阅服务端 5xx 临时故障
+	//   - DNS 解析失败（机器刚开机网卡还没拿到地址）
+	//   - detour 出站自身还没就绪
+	// 这些都是可恢复的，不应该阻止 sing-box 启动。
+	// 节点列表保持为空（或 cache 里的旧值），Smart / urltest 组会看到 0 个
+	// 可用节点，route 层面走 fallback / default outbound。
+	// loopUpdate 会按 update_interval 周期性重试，恢复后自动上线。
 	if s.lastUpdated.IsZero() {
 		ctx = interrupt.ContextWithIsProviderConnection(ctx)
-		err := s.fetch(ctx, true)
-		if err != nil {
-			return E.Cause(err, "initial outbound provider: ", s.Tag())
+		if err := s.fetch(ctx, true); err != nil {
+			s.logger.Warn("initial fetch for outbound provider [", s.Tag(),
+				"] failed, will retry in background every ", s.updateInterval, ": ", err)
 		}
 	}
 	go s.loopUpdate()
