@@ -85,7 +85,16 @@ type Endpoint struct {
 	network           adapter.NetworkManager
 	platformInterface adapter.PlatformInterface
 	server            *tsnet.Server
-	stack             *stack.Stack
+	// serverStarted flips to true AFTER tsnet.Server.Start() returns
+	// nil. Close() reads this to decide whether to invoke
+	// tsnet.Server.Close — the upstream library's Close panics with
+	// a nil-deref when the server was allocated but never fully
+	// Started (some inner fields — LocalBackend / ipnlocal — stay
+	// nil through a partial init). Without this gate, a Box.Start
+	// failure that unwinds into Box.Close crashes the whole process
+	// instead of surfacing a clean error to the CLI.
+	serverStarted atomic.Bool
+	stack         *stack.Stack
 	icmpForwarder     *tun.ICMPForwarder
 	filter            *atomic.Pointer[filter.Filter]
 	onReconfigHook    wgengine.ReconfigListener
@@ -388,6 +397,11 @@ func (t *Endpoint) postStart() error {
 		}
 		return err
 	}
+	// Mark as fully started; Close() will now invoke tsnet.Close
+	// safely. Before this flag flips, tsnet.Server's inner fields
+	// (LocalBackend / ipnlocal / netstack) may still be nil and a
+	// direct Close would panic at tsnet.go:455.
+	t.serverStarted.Store(true)
 	if t.fallbackTCPCloser == nil {
 		t.fallbackTCPCloser = t.server.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (handler func(net.Conn), intercept bool) {
 			return func(conn net.Conn) {
@@ -505,7 +519,28 @@ func (t *Endpoint) watchState() {
 }
 
 func (t *Endpoint) Close() error {
-	err := common.Close(common.PtrOrNil(t.server))
+	// tsnet.Server.Close is not safe to call on a partially-built
+	// Server (Start() never ran or ran and errored). The upstream
+	// library panics with a nil-deref at tsnet.go:455 accessing
+	// LocalBackend / ipnlocal fields that a half-init skipped. We
+	// gate the call on serverStarted (set only after Start returned
+	// nil) AND wrap it in a recover as a belt-and-suspenders defence
+	// — the upstream bug might surface in other code paths as the
+	// tailscale fork evolves.
+	var err error
+	if t.serverStarted.Load() && t.server != nil {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					if t.logger != nil {
+						t.logger.Warn("tsnet.Server.Close panicked during endpoint shutdown: ", r,
+							" — proceeding with graceful endpoint teardown")
+					}
+				}
+			}()
+			err = common.Close(common.PtrOrNil(t.server))
+		}()
+	}
 	netmon.RegisterInterfaceGetter(nil)
 	netns.SetControlFunc(nil)
 	if t.fallbackTCPCloser != nil {
