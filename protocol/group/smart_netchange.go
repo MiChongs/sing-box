@@ -312,6 +312,12 @@ func (s *Smart) preWarmPriorityNodes() {
 				Delay: delay,
 			})
 			s.markAlive(tag)
+			// Probe succeeded for what may be the user's pin — if so,
+			// clear the suspended flag pro-actively so the Clash API
+			// reports the pin healthy without waiting for the next
+			// actual user dial. Cheap no-op when tag isn't the pin
+			// or suspended isn't set.
+			s.maybeResumePin(tag)
 			s.logger.Info("smart[", s.Tag(), "] priority warm [",
 				tag, "] ready in ", delay, "ms")
 		})

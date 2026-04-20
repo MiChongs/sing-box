@@ -228,6 +228,22 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 			info.Put("useLightGBM", sg.UseLightGBM())
 			info.Put("collectData", sg.CollectData())
 			info.Put("fixed", sg.Selected())
+			// pin suspension state — true when Smart had to fall back
+			// to an algorithm-selected node because the user's pin
+			// just failed a dial (and the breaker hasn't tripped
+			// yet). The pin tag stays in `fixed` so UIs can render
+			// "pinned to A (currently unavailable, traffic on B)";
+			// `fixedActive` exposes the node traffic is actually
+			// flowing through during the suspension. When not
+			// suspended, `fixedActive` echoes `fixed` for a uniform
+			// client-side render.
+			suspended := sg.PinSuspended()
+			info.Put("fixedSuspended", suspended)
+			if suspended {
+				info.Put("fixedActive", groupOutbound.Now())
+			} else {
+				info.Put("fixedActive", sg.Selected())
+			}
 			// Live algorithm + anti-flap window so /proxies dashboards
 			// can verify what's actually in effect (especially after a
 			// runtime PUT /groups/{name}/algorithm swap). Always-output

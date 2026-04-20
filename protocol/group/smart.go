@@ -355,6 +355,24 @@ type Smart struct {
 	// Smart algorithm is bypassed entirely (mihomo parity: Set/ForceSet).
 	manualSelected atomic.Value // string
 
+	// pinSuspended flips to true when dialWithRetry had to fall back
+	// off the user's pin (because the pin just failed a dial and the
+	// breaker hasn't tripped yet). The pin TAG is left intact in
+	// manualSelected so the group re-elects the pin the moment it
+	// recovers, but the UX + Clash API need to tell the user "the pin
+	// is currently not what traffic is flowing through" so they don't
+	// stare at `fixed=A, now=A` while packets go via B.
+	//
+	// Cleared on:
+	//   - a successful dial THROUGH the pin (DialContext / ListenPacket)
+	//   - an explicit SelectOutbound / ClearSelection call
+	//   - runHealthCheck / preWarmPriorityNodes marking the pin alive
+	//   - SelectOutbound setting a different pin (fresh state)
+	// Set on:
+	//   - dialWithRetry's pin-fallback path successfully dialing a
+	//     non-pin candidate while the user's pin is still in place
+	pinSuspended atomic.Bool
+
 	// Per-group ML/collector opt-in flags. The actual model, downloader and
 	// collector are owned by the shared SmartService (experimental.smart);
 	// we only hold references here for zero-lookup on the hot path.
@@ -955,6 +973,44 @@ func (s *Smart) getManualSelected() string {
 	return ""
 }
 
+// PinSuspended reports whether the user's pin is currently being
+// bypassed by dialWithRetry's fallback path. Visible through the
+// Clash API so dashboards can render "pin A unavailable — traffic on
+// B" instead of the misleading "fixed=A, now=A" the user would
+// otherwise see while the pin is down.
+func (s *Smart) PinSuspended() bool { return s.pinSuspended.Load() }
+
+// setPinSuspended transitions the suspended flag. Logs the edges so
+// operators can correlate fallback events with dial failures. Returns
+// the prior value.
+func (s *Smart) setPinSuspended(v bool) bool {
+	prev := s.pinSuspended.Swap(v)
+	if prev != v && s.logger != nil {
+		pin := s.getManualSelected()
+		switch {
+		case v:
+			s.logger.Warn("smart[", s.Tag(), "] pin [", pin,
+				"] suspended — traffic falling back to algorithm-selected node; pin will auto-restore when it recovers")
+		default:
+			s.logger.Info("smart[", s.Tag(), "] pin [", pin,
+				"] resumed — traffic back on the pinned node")
+		}
+	}
+	return prev
+}
+
+// maybeResumePin clears the suspended flag IFF tag matches the
+// current pin AND suspended is actually set. Cheap no-op otherwise
+// so the caller (every successful dial) doesn't need a branch.
+func (s *Smart) maybeResumePin(tag string) {
+	if tag == "" || !s.pinSuspended.Load() {
+		return
+	}
+	if pin := s.getManualSelected(); pin != "" && pin == tag {
+		s.setPinSuspended(false)
+	}
+}
+
 // SelectOutbound pins a specific node as the only one Smart will use. Pass
 // empty name to clear the pin and resume automatic selection. Returns false
 // only if the name is non-empty and does not match any current outbound.
@@ -964,6 +1020,7 @@ func (s *Smart) getManualSelected() string {
 func (s *Smart) SelectOutbound(tag string) bool {
 	if tag == "" {
 		s.manualSelected.Store("")
+		s.pinSuspended.Store(false)
 		s.persistManualPinDelete()
 		// Drop the unwrap cache unconditionally — this is an
 		// in-memory routing-table invariant, not an active-
@@ -992,6 +1049,9 @@ func (s *Smart) SelectOutbound(tag string) bool {
 	for _, ob := range snap.outbounds {
 		if ob.Tag() == tag {
 			s.manualSelected.Store(tag)
+			// Fresh pin → clear any lingering suspended state from a
+			// previously-failed different pin.
+			s.pinSuspended.Store(false)
 			s.setLastSelected(tag)
 			s.persistManualPin(tag)
 			// Mirror Selector.SelectOutbound — writing the pin alone
@@ -1396,6 +1456,7 @@ func (s *Smart) FlushStore() (smart.FlushStats, error) {
 	}
 	// In-process runtime reset
 	s.manualSelected.Store("")
+	s.pinSuspended.Store(false)
 	s.lastSelectedTag.Store("")
 	s.coldStartLogged.Store(false)
 
@@ -1465,6 +1526,7 @@ func (s *Smart) ClearSelection() ClearSelectionResult {
 	res := ClearSelectionResult{Group: s.Tag(), PreviousPin: prev}
 
 	s.manualSelected.Store("")
+	s.pinSuspended.Store(false)
 	s.lastSelectedTag.Store("")
 	s.persistManualPinDelete()
 
@@ -1575,7 +1637,14 @@ func (s *Smart) MarkBlocked(nodeTag string, duration time.Duration) error {
 //  5. First outbound in the snapshot (best-effort guess).
 //  6. Empty string — OutboundGroup helpers fall back to the group's own tag.
 func (s *Smart) Now() string {
-	if pinned := s.getManualSelected(); pinned != "" {
+	// When a pin is set AND not currently suspended, report the pin
+	// as the "now" node. When suspended (pin just failed to dial and
+	// we fell back), return the LAST SUCCESSFULLY DIALLED node so
+	// the Clash API surfaces the real current traffic path instead
+	// of the user's intention. The user's pin is preserved in
+	// Selected() / `fixed` and will be reinstated once the pin
+	// recovers — see maybeResumePin.
+	if pinned := s.getManualSelected(); pinned != "" && !s.pinSuspended.Load() {
 		return pinned
 	}
 	if v, ok := s.lastSelectedTag.Load().(string); ok && v != "" {
@@ -1967,6 +2036,10 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	s.rememberStickyChoice(meta.smartTarget, proxyTag, isUDP)
 	s.rememberHysteresisChoice(meta.smartTarget, proxyTag, isUDP)
 	s.markAlive(proxyTag) // successful dial = confirmed alive; clears knownDead
+	// Auto-resume pin: if the just-succeeded node IS the user's pin,
+	// the pin is healthy again — clear the suspended flag so the
+	// Clash API stops showing "pin unavailable".
+	s.maybeResumePin(proxyTag)
 	s.logger.InfoContext(ctx, "smart[", s.Tag(), "] ", network, " → ", destination,
 		" via [", proxyTag, "] in ", connectTime, "ms (target=",
 		displayTarget(meta, destination), " asn=", displayASN(meta), " source=", source, ")")
@@ -2031,6 +2104,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 			s.rememberStickyChoice(meta.smartTarget, ob.Tag(), true)
 			s.rememberHysteresisChoice(meta.smartTarget, ob.Tag(), true)
 			s.markAlive(ob.Tag())
+			s.maybeResumePin(ob.Tag())
 			s.logger.InfoContext(ctx, "smart[", s.Tag(), "] UDP → ", destination,
 				" via [", ob.Tag(), "] in ", connectTime, "ms (target=",
 				displayTarget(meta, destination), " asn=", displayASN(meta),
@@ -2501,6 +2575,14 @@ func (s *Smart) dialWithRetry(ctx context.Context, network string, dest M.Socksa
 								"] failed; temporarily falling back to algorithm-selected candidates (source=",
 								source, ", fresh=", proxyTagsPreview(fresh, 5),
 								"); pin state preserved for future dials")
+							// Clash API-visible signal that pin is
+							// currently bypassed. Cleared when the
+							// pin next dials successfully or a health
+							// probe marks it alive. The pin tag stays
+							// in manualSelected so recovery is
+							// automatic — this flag just changes what
+							// the UI reports meanwhile.
+							s.setPinSuspended(true)
 						} else {
 							s.logger.DebugContext(ctx, "smart[", s.Tag(),
 								"] hot re-selection after all candidates failed; fresh=",
@@ -4616,6 +4698,12 @@ func (s *Smart) markAlive(tag string) {
 	if s.resetEvents != nil {
 		s.resetEvents.resetForNode(tag)
 	}
+	// Pin auto-resume: a successful dial or probe on the pin node is
+	// the authoritative signal that the pin is healthy again. Clears
+	// pinSuspended so downstream Clash API consumers stop reporting
+	// "pin unavailable" immediately, without having to wait for the
+	// next user dial to observe the pin working.
+	s.maybeResumePin(tag)
 }
 
 // ─── runtime-state persistence helpers ────────────────────────────────────────
