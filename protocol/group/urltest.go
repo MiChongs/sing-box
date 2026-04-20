@@ -82,6 +82,9 @@ type URLTest struct {
 	fallback                     URLTestFallback
 	group                        *URLTestGroup
 	interruptExternalConnections bool
+	// expectedStatus mihomo 对齐的状态码 matcher。nil = 旧启发式。
+	// NewURLTest 时 Parse，失败阻断启动；loopCheckOutbounds 里每次探测透传。
+	expectedStatus *urltest.StatusMatcher
 
 	provider         adapter.ProviderManager
 	providers        map[string]adapter.Provider
@@ -134,6 +137,12 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 			maxDelay: uint16(time.Duration(options.Fallback.MaxDelay).Milliseconds()),
 		}
 	}
+	// 解析 expected_status。用户写错立即报错，避免启动后每次探测才发现。
+	matcher, err := urltest.ParseExpectedStatus(options.ExpectedStatus)
+	if err != nil {
+		return nil, err
+	}
+	outbound.expectedStatus = matcher
 	return outbound, nil
 }
 
@@ -179,7 +188,7 @@ func (s *URLTest) Start() error {
 		tags = append(tags, detour.Tag())
 		outbounds = append(outbounds, detour)
 	}
-	group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, tags, s.link, s.interval, s.tolerance, s.idleTimeout, s.fallback, s.interruptExternalConnections)
+	group, err := NewURLTestGroup(s.ctx, s.outbound, s.logger, outbounds, tags, s.link, s.interval, s.tolerance, s.idleTimeout, s.fallback, s.interruptExternalConnections, s.expectedStatus)
 	if err != nil {
 		return err
 	}
@@ -451,9 +460,13 @@ type URLTestGroup struct {
 	reusableResult  map[string]uint16
 
 	fallback URLTestFallback
+
+	// expectedStatus: 上层 URLTest.NewURLTest 在构造 group 之前解析好
+	// 再传进来；每次 URL 探测透传给 urltest.URLTestWithStatus。nil = 旧启发式。
+	expectedStatus *urltest.StatusMatcher
 }
 
-func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, tags []string, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, fallback URLTestFallback, interruptExternalConnections bool) (*URLTestGroup, error) {
+func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, tags []string, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, fallback URLTestFallback, interruptExternalConnections bool, expectedStatus *urltest.StatusMatcher) (*URLTestGroup, error) {
 	if interval == 0 {
 		interval = C.DefaultURLTestInterval
 	}
@@ -492,6 +505,7 @@ func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManage
 		dialFailureCount:             make(map[string]int32),
 		reusableChecked:              make(map[string]bool, len(outbounds)),
 		reusableResult:               make(map[string]uint16, len(outbounds)),
+		expectedStatus:               expectedStatus,
 	}
 	group.state.Store(&groupState{outbounds: outbounds, tags: tags})
 	return group, nil
@@ -862,7 +876,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 		b.Go(realTag, func() (any, error) {
 			testCtx, cancel := context.WithTimeout(screenCtx, C.TCPTimeout)
 			defer cancel()
-			t, err := urltest.URLTest(testCtx, g.link, p)
+			t, err := urltest.URLTestWithStatus(testCtx, g.link, p, g.expectedStatus)
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
 				// DO NOT delete history on failure — mihomo never does this, and deleting
@@ -920,7 +934,7 @@ func (g *URLTestGroup) urlTest(ctx context.Context, force bool) (map[string]uint
 				pb.Go(realTag, func() (any, error) {
 					testCtx, cancel := context.WithTimeout(precisionCtx, C.TCPTimeout)
 					defer cancel()
-					t, err := urltest.URLTest(testCtx, g.link, p)
+					t, err := urltest.URLTestWithStatus(testCtx, g.link, p, g.expectedStatus)
 					if err != nil {
 						return nil, nil
 					}

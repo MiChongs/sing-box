@@ -70,6 +70,7 @@ type LoadBalance struct {
 	group                        *LoadBalanceGroup
 	interruptExternalConnections bool
 	strategy                     string
+	expectedStatus               *urltest.StatusMatcher
 
 	provider         adapter.ProviderManager
 	providers        map[string]adapter.Provider
@@ -121,6 +122,11 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		hidden:          options.Hidden,
 		icon:            options.Icon,
 	}
+	matcher, err := urltest.ParseExpectedStatus(options.ExpectedStatus)
+	if err != nil {
+		return nil, err
+	}
+	outbound.expectedStatus = matcher
 	return outbound, nil
 }
 
@@ -166,7 +172,7 @@ func (s *LoadBalance) Start() error {
 		tags = append(tags, detour.Tag())
 		outbounds = append(outbounds, detour)
 	}
-	group, err := NewLoadBalanceGroup(s.ctx, s.outbound, s.logger, outbounds, tags, s.link, s.interval, s.idleTimeout, s.ttl, s.interruptExternalConnections, s.strategy)
+	group, err := NewLoadBalanceGroup(s.ctx, s.outbound, s.logger, outbounds, tags, s.link, s.interval, s.idleTimeout, s.ttl, s.interruptExternalConnections, s.strategy, s.expectedStatus)
 	if err != nil {
 		return err
 	}
@@ -439,10 +445,11 @@ type LoadBalanceGroup struct {
 	dialFailureAt    time.Time
 	dialRecheckOnce  atomic.Bool
 
-	strategyFn strategyFn
+	strategyFn     strategyFn
+	expectedStatus *urltest.StatusMatcher
 }
 
-func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, tags []string, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, interruptExternalConnections bool, strategy string) (*LoadBalanceGroup, error) {
+func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, tags []string, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, interruptExternalConnections bool, strategy string, expectedStatus *urltest.StatusMatcher) (*LoadBalanceGroup, error) {
 	if interval == 0 {
 		interval = C.DefaultURLTestInterval
 	}
@@ -481,6 +488,7 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 		interruptExternalConnections: interruptExternalConnections,
 		failureCount:                 make(map[string]int32),
 		dialFailureCount:             make(map[string]int32),
+		expectedStatus:               expectedStatus,
 	}
 	index := make(map[string]adapter.Outbound, len(outbounds))
 	for _, o := range outbounds {
@@ -779,7 +787,7 @@ func (g *LoadBalanceGroup) urlTest(ctx context.Context, force bool) (map[string]
 		b.Go(realTag, func() (any, error) {
 			testCtx, cancel := context.WithTimeout(batchCtx, C.TCPTimeout)
 			defer cancel()
-			t, err := urltest.URLTest(testCtx, g.link, p)
+			t, err := urltest.URLTestWithStatus(testCtx, g.link, p, g.expectedStatus)
 			if err != nil {
 				g.logger.Debug("outbound ", tag, " unavailable: ", err)
 				// DO NOT delete history — preserve mihomo-parity resilience.

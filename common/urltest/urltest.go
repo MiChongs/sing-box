@@ -191,6 +191,14 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 	return URLTestWithDetail(ctx, link, detour, nil)
 }
 
+// URLTestWithStatus 对齐 URLTest 的签名但额外接 expected-status matcher。
+// matcher == nil 等同于旧行为（generate_204 必须 204，其他 link < 400 即可）。
+// matcher 不为 nil 时，只用 matcher 做通过判定，旧的 generate_204 + <400
+// 启发式被完全绕过（用户显式声明 expected-status 就是在告诉我们"别猜，用这个"）。
+func URLTestWithStatus(ctx context.Context, link string, detour N.Dialer, matcher *StatusMatcher) (t uint16, err error) {
+	return URLTestWithDetailAndStatus(ctx, link, detour, nil, matcher)
+}
+
 // URLTestWithDetail is the full-fidelity probe. When detail is non-
 // nil, the caller receives per-phase timings plus TLS-resume signal
 // plus kernel TCP metrics alongside the headline delay. Pass nil
@@ -239,6 +247,13 @@ func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err e
 // the same number); what we gain is correct semantics, half the
 // bandwidth, and protocol-agnostic behaviour.
 func URLTestWithDetail(ctx context.Context, link string, detour N.Dialer, detail *URLTestDetail) (t uint16, err error) {
+	return URLTestWithDetailAndStatus(ctx, link, detour, detail, nil)
+}
+
+// URLTestWithDetailAndStatus 是最底层的探测函数，所有其他 URLTest / URLTestWithDetail
+// / URLTestWithStatus 都委托到这里。matcher == nil 时保留历史启发式
+// （generate_204 require-204, 其他 link <400）；非 nil 时 matcher 说了算。
+func URLTestWithDetailAndStatus(ctx context.Context, link string, detour N.Dialer, detail *URLTestDetail, matcher *StatusMatcher) (t uint16, err error) {
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
 	}
@@ -321,8 +336,10 @@ func URLTestWithDetail(ctx context.Context, link string, detour N.Dialer, detail
 		peekDeadline = d
 	}
 
-	req204 := isGenerate204(linkURL)
-	rtt, reqErr := probeHTTP(conn, reader, linkURL, hostname, peekDeadline, req204)
+	// matcher != nil → 用户显式声明 expected-status，忽略 req204 启发式
+	// matcher == nil → 回落到旧规则：gstatic.com/generate_204 强制 204，其他 link <400
+	req204 := matcher == nil && isGenerate204(linkURL)
+	rtt, reqErr := probeHTTP(conn, reader, linkURL, hostname, peekDeadline, req204, matcher)
 	if reqErr != nil {
 		return 0, reqErr
 	}
@@ -399,7 +416,7 @@ func isGenerate204(u *url.URL) bool {
 // The conn+reader pair is reused across HEAD→GET to measure
 // comparable RTT and to avoid re-paying dial/TLS costs on the
 // fallback.
-func probeHTTP(conn net.Conn, reader *bufio.Reader, linkURL *url.URL, hostname string, peekDeadline time.Time, req204 bool) (time.Duration, error) {
+func probeHTTP(conn net.Conn, reader *bufio.Reader, linkURL *url.URL, hostname string, peekDeadline time.Time, req204 bool, matcher *StatusMatcher) (time.Duration, error) {
 	// Anti-spoofing nonce in the query string defeats aggressive
 	// ISP / airport caches that might short-circuit generate_204.
 	b := make([]byte, 4)
@@ -422,7 +439,7 @@ func probeHTTP(conn net.Conn, reader *bufio.Reader, linkURL *url.URL, hostname s
 	// Round 1: HEAD
 	rtt, err := measureRequest(conn, reader,
 		[]byte("HEAD "+uri+" HTTP/1.1\r\n"+commonHeaders),
-		req, peekDeadline, req204)
+		req, peekDeadline, req204, matcher)
 	if err == nil {
 		return rtt, nil
 	}
@@ -442,7 +459,7 @@ func probeHTTP(conn net.Conn, reader *bufio.Reader, linkURL *url.URL, hostname s
 	req.Method = http.MethodGet
 	rtt2, err2 := measureRequest(conn, reader,
 		[]byte("GET "+uri+" HTTP/1.1\r\n"+commonHeaders),
-		req, peekDeadline, req204)
+		req, peekDeadline, req204, matcher)
 	if err2 == nil {
 		return rtt2, nil
 	}
@@ -472,7 +489,7 @@ func isHEADRejected(err error) bool {
 //
 // peekDeadline upper-bounds how long Peek(1) will wait. Callers
 // derive it from ctx.Deadline or peekHardLimit.
-func measureRequest(conn net.Conn, reader *bufio.Reader, reqBytes []byte, req *http.Request, peekDeadline time.Time, req204 bool) (time.Duration, error) {
+func measureRequest(conn net.Conn, reader *bufio.Reader, reqBytes []byte, req *http.Request, peekDeadline time.Time, req204 bool, matcher *StatusMatcher) (time.Duration, error) {
 	_ = conn.SetReadDeadline(peekDeadline)
 	defer conn.SetReadDeadline(time.Time{})
 
@@ -491,7 +508,7 @@ func measureRequest(conn net.Conn, reader *bufio.Reader, reqBytes []byte, req *h
 	// clean state for any follow-up request (e.g. GET fallback).
 	// Even when drainResponse returns an error we've already
 	// captured the valid rtt value.
-	if err := drainResponse(reader, req, req204); err != nil {
+	if err := drainResponse(reader, req, req204, matcher); err != nil {
 		return rtt, err
 	}
 	return rtt, nil
@@ -523,7 +540,7 @@ func measureRequest(conn net.Conn, reader *bufio.Reader, reqBytes []byte, req *h
 // Content-Length from the bufio.Reader so the next request sees a
 // clean byte stream, capped at maxResidualBody to avoid
 // unbounded-read attacks.
-func drainResponse(reader *bufio.Reader, req *http.Request, require204 bool) error {
+func drainResponse(reader *bufio.Reader, req *http.Request, require204 bool, matcher *StatusMatcher) error {
 	resp, err := http.ReadResponse(reader, req)
 	if err != nil {
 		return err
@@ -543,6 +560,19 @@ func drainResponse(reader *bufio.Reader, req *http.Request, require204 bool) err
 	// when Body is http.NoBody; otherwise drains to EOF.
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
+
+	// matcher 语义：用户显式 expected-status 优先，绕过 require204 启发式。
+	// 三种情形:
+	//   - matcher != nil 且匹配    → 通过
+	//   - matcher != nil 但不匹配  → 报错（带 expected-status 字符串供排障）
+	//   - matcher == nil           → 退回 captive-portal + <400 启发式
+	if matcher != nil {
+		if matcher.Match(resp.StatusCode) {
+			return nil
+		}
+		return errors.New("urltest: status " + strconv.Itoa(resp.StatusCode) +
+			" not in expected-status=" + matcher.String())
+	}
 
 	// Captive-portal / hijack detection. /generate_204 that returns
 	// anything other than 204 is almost certainly a MITM login page

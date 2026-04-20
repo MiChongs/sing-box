@@ -368,7 +368,7 @@ func (s *Smart) preWarmPriorityNodes() {
 		ob := ob
 		tag := ob.Tag()
 		worker.submit(func() {
-			delay, err := worker.probeOnce(probeCtx, s.testURL, ob)
+			delay, err := worker.probeOnce(probeCtx, s.testURL, ob, s.expectedStatus)
 			if err != nil || delay == 0 {
 				s.history.DeleteURLTestHistory(tag)
 				s.markDead(tag)

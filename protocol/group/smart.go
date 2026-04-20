@@ -23,6 +23,7 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/smart"
+	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/common/smart/lightgbm"
 	smartservice "github.com/sagernet/sing-box/experimental/smart"
 	C "github.com/sagernet/sing-box/constant"
@@ -186,6 +187,9 @@ type Smart struct {
 	interruptExternalConnections bool
 
 	testURL            string
+	// expectedStatus: mihomo 对齐的状态码 matcher，nil = 旧启发式。
+	// NewSmart 时解析，probe 链路透传给 urltest.URLTestWithDetailAndStatus。
+	expectedStatus     *urltest.StatusMatcher
 	interval           time.Duration
 	disableUDP         bool
 	policyPriority     []priorityRule
@@ -502,6 +506,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 
 		testURL:    options.URL,
 		interval:   time.Duration(options.Interval),
+		// expectedStatus 在下面解析后赋值；options.ExpectedStatus 写错立即报错。
 		disableUDP: options.DisableUDP,
 		useASN:     options.UseASN,
 
@@ -536,6 +541,12 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 	if s.testURL == "" {
 		s.testURL = "https://www.gstatic.com/generate_204"
 	}
+	// 解析 expected_status mihomo 对齐字段；用户语法错误立即反馈。
+	matcher, err := urltest.ParseExpectedStatus(options.ExpectedStatus)
+	if err != nil {
+		return nil, err
+	}
+	s.expectedStatus = matcher
 	if s.interval <= 0 {
 		s.interval = 3 * time.Minute
 	}
@@ -4143,7 +4154,7 @@ func (s *Smart) runHealthCheck() {
 		dispatched.Add(1)
 		worker.submit(func() {
 			probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
-			delay, err := worker.probeOnce(probeCtx, s.testURL, ob)
+			delay, err := worker.probeOnce(probeCtx, s.testURL, ob, s.expectedStatus)
 			probeCancel()
 
 			if err != nil || delay == 0 {

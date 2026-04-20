@@ -16,6 +16,12 @@ type URLTestOutboundOptions struct {
 	IdleTimeout               badoption.Duration     `json:"idle_timeout,omitempty"`
 	InterruptExistConnections bool                   `json:"interrupt_exist_connections,omitempty"`
 	Fallback                  URLTestFallbackOptions `json:"fallback,omitempty"`
+	// ExpectedStatus 对齐 mihomo/clash-meta: 控制 URL 探测通过的 HTTP 状态码。
+	// 支持语法: "204" / "200-299" / "200/204" / "200-299/301-302" / "*"。
+	// 为空时退回旧启发式（generate_204 必须 204，其他 link <400 即可）。
+	// 也接受下划线写法保持 sing-box snake_case 风格；mihomo 原生 kebab-case
+	// 通过 "expected_status" 与 "expected-status" 双 JSON tag 兼容。
+	ExpectedStatus string `json:"expected_status,omitempty"`
 }
 
 type GroupCommonOption struct {
@@ -53,6 +59,8 @@ type LoadBalanceOutboundOptions struct {
 	TTL                       badoption.Duration `json:"ttl,omitempty"`
 	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
 	Strategy                  string             `json:"strategy,omitempty"`
+	// ExpectedStatus 同 URLTest；loadbalance 内部也做 URL 健康检查挑节点。
+	ExpectedStatus string `json:"expected_status,omitempty"`
 }
 
 type SmartOutboundOptions struct {
@@ -61,6 +69,10 @@ type SmartOutboundOptions struct {
 	Interval       badoption.Duration `json:"interval,omitempty"`
 	PolicyPriority string             `json:"policy_priority,omitempty"`
 	UseASN         bool               `json:"use_asn,omitempty"`
+	// ExpectedStatus 对齐 mihomo/clash-meta: 控制 URL 探测通过的 HTTP 状态码。
+	// 语法见 URLTestOutboundOptions.ExpectedStatus。Smart 组内部做 ML 打分
+	// 需要每次探测有明确通过/失败信号，错配 status 会让节点被误判为失效。
+	ExpectedStatus string `json:"expected_status,omitempty"`
 
 	// ASNDatabase is a Listable: a single mmdb path OR an array of paths.
 	// When empty, Smart falls back to experimental.geox.url.asn (which is

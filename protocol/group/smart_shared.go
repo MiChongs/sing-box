@@ -325,6 +325,7 @@ func (w *smartSharedWorker) probeOnce(
 	ctx context.Context,
 	testURL string,
 	ob adapter.Outbound,
+	matcher *urltest.StatusMatcher,
 ) (uint16, error) {
 	tag := ob.Tag()
 	if hit, ok := w.freshnessCache.Load(tag); ok {
@@ -332,15 +333,20 @@ func (w *smartSharedWorker) probeOnce(
 			return hit.delay, hit.err
 		}
 	}
-	// Key includes testURL so different groups probing different URLs
-	// don't collapse onto each other's result. We hash (testURL, tag) to
-	// a 64-bit fingerprint instead of concatenating: string concat on the
-	// hot path used to allocate per call, and a NUL-delimited key still
-	// has a theoretical collision if any field contained a literal NUL.
-	// xxhash.Sum64String is allocation-free; XOR-rotating the two hashes
-	// preserves a collision-resistant pair key while staying cheap.
+	// Key 里除了 (testURL, tag) 还要混入 matcher.String() —— 不同 Smart 组
+	// 可能对同一节点、同一 URL 用不同 expected-status。若 key 里不区分，
+	// singleflight 会把探测结果互相覆盖，一个组的 200-299 结果被另一个
+	// 组的 204-only 结果污染。matcher.String() 是规范化后的字符串（见
+	// expected_status.go），MatchAny 的 matcher 输出 "*"，相同配置
+	// 的组共享一个 key 保持性能优势。
+	matcherKey := ""
+	if matcher != nil {
+		matcherKey = matcher.String()
+	}
 	key := strconv.FormatUint(
-		xxhash.Sum64String(testURL)^bits.RotateLeft64(xxhash.Sum64String(tag), 31),
+		xxhash.Sum64String(testURL)^
+			bits.RotateLeft64(xxhash.Sum64String(tag), 31)^
+			bits.RotateLeft64(xxhash.Sum64String(matcherKey), 17),
 		36,
 	)
 	v, err, _ := w.probeGroup.Do(key, func() (interface{}, error) {
@@ -357,7 +363,7 @@ func (w *smartSharedWorker) probeOnce(
 			return uint16(0), ctx.Err()
 		}
 		var detail urltest.URLTestDetail
-		d, perr := urltest.URLTestWithDetail(ctx, testURL, ob, &detail)
+		d, perr := urltest.URLTestWithDetailAndStatus(ctx, testURL, ob, &detail, matcher)
 		w.freshnessCache.Store(tag, probeResult{
 			at:     time.Now(),
 			delay:  d,
