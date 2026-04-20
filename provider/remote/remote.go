@@ -205,6 +205,14 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 		return E.New("provider is updating")
 	}
 	defer s.updating.Store(false)
+	// 防御：httpClient 是 StartContext 里懒初始化的。如果因 upstream 阶段编排
+	// 变动导致 StartContext 没跑（Manager.Start 已修，但保留此兜底），直接
+	// 返回清晰错误而不是让调用方吞下一个 NPE panic。
+	// 典型触发：clash API /providers/proxies/{tag}/update 在 Box.Start 完全
+	// 完成之前被调用，此时 provider 可能还没走完 StartContext。
+	if s.httpClient == nil {
+		return E.New("provider http client not initialized (startup not complete)")
+	}
 	s.logger.Debug("updating outbound provider ", s.Tag(), " from URL: ", s.url)
 	req, err := http.NewRequest(http.MethodGet, s.url, nil)
 	if err != nil {
