@@ -165,6 +165,56 @@ func TestPinBypass_RecoverySnapBack(t *testing.T) {
 	}
 }
 
+// TestPinBypass_OptsExplicitBypass validates the opt-in bypass flag:
+// pin is set and healthy, breaker closed — normally pin path returns
+// the pinned single-element list. With bypassManualPin=true the flag
+// MUST short-circuit past pin and return the tier-based result so
+// dialWithRetry's hot-reselect can fall back when the pin just
+// failed its first dial but the breaker hasn't tripped yet. Critical:
+// pin state (manualSelected) must remain intact for the next call.
+func TestPinBypass_OptsExplicitBypass(t *testing.T) {
+	s, obs := selectProxiesStub(t, []string{"A", "B", "C"}, "A")
+	// A is healthy — pin path would normally return [A].
+	s.history.StoreURLTestHistory("A", &adapter.URLTestHistory{
+		Time: time.Now(), Delay: 100,
+	})
+	// B is also alive so tier logic has something to return.
+	s.history.StoreURLTestHistory("B", &adapter.URLTestHistory{
+		Time: time.Now(), Delay: 80,
+	})
+
+	// Sanity: default call (bypassManualPin=false) returns pin [A].
+	got, _, src := s.selectProxiesTraced(nil, obs, false)
+	if src != "manual" || len(got) != 1 || got[0].Tag() != "A" {
+		t.Fatalf("pre-check: default call should return pin; got src=%q result=%+v",
+			src, tagsOf(got))
+	}
+
+	// Now with bypass=true: MUST skip manual branch, fall through to
+	// tier path. With only URLTest history available (no store),
+	// result comes from "delay" tier.
+	got2, _, src2 := s.selectProxiesTracedOpts(nil, obs, false, true)
+	if src2 == "manual" {
+		t.Fatalf("bypassManualPin=true must skip manual branch; got src=%q", src2)
+	}
+	if len(got2) == 0 {
+		t.Fatalf("bypass returned empty candidate list: src=%q", src2)
+	}
+	// Critical invariant: pin state preserved across the bypass call
+	// so the NEXT user request goes through the pin path again.
+	if pin := s.getManualSelected(); pin != "A" {
+		t.Fatalf("bypassManualPin leaked into pin state: got pin=%q, want A", pin)
+	}
+
+	// Post-check: another normal call returns pin [A] again — bypass
+	// was single-shot, not sticky.
+	got3, _, src3 := s.selectProxiesTraced(nil, obs, false)
+	if src3 != "manual" || len(got3) != 1 || got3[0].Tag() != "A" {
+		t.Fatalf("post-bypass default call regressed: src=%q result=%+v",
+			src3, tagsOf(got3))
+	}
+}
+
 // TestPinBypass_NonExistentPinCleared: pinned tag that no longer
 // matches any outbound gets cleared automatically.
 func TestPinBypass_NonExistentPinCleared(t *testing.T) {

@@ -2059,7 +2059,27 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 //   - "delay"    : URLTest-latency-based ordering (cold-start fallback so we
 //                  still bias toward fast nodes before any stats accumulate)
 //   - "fallback" : no signal at all; random pick filtered by alive/blocked
+// selectProxiesTraced's bypassManualPin parameter asks the function to
+// skip the manual-pin short-circuit and fall through to the normal
+// tier logic (unwrap / prefetch / weight / delay / fallback). Used by
+// dialWithRetry's hot-reselect path when the pin node just failed to
+// dial but its breaker hasn't tripped yet (cbMaxConsecFail=2 means
+// ONE failure leaves the breaker closed). Without bypassing, the hot
+// reselect would keep returning the same single-element pin list, the
+// sameOutboundSet check would declare "nothing fresh" and the whole
+// DialContext would fail back to the caller — the user experiences
+// "pin node is dead and Smart doesn't try anything else" until they
+// manually retry. With bypassManualPin=true on the fallback pass, we
+// get algorithm-selected candidates this one dial; the pin is NOT
+// cleared, so the NEXT user request still enters the pin path first.
 func (s *Smart) selectProxiesTraced(meta *smartDialMeta, all []adapter.Outbound, isUDP bool) ([]adapter.Outbound, bool, string) {
+	return s.selectProxiesTracedOpts(meta, all, isUDP, false)
+}
+
+// selectProxiesTracedOpts is the full-option form. Keep the public
+// zero-arg selectProxiesTraced for every existing caller; only
+// dialWithRetry's pin-fallback path needs to opt in.
+func (s *Smart) selectProxiesTracedOpts(meta *smartDialMeta, all []adapter.Outbound, isUDP bool, bypassManualPin bool) ([]adapter.Outbound, bool, string) {
 	// Manual selection short-circuit — respects the user's pin.
 	//
 	// Three cases:
@@ -2091,7 +2111,7 @@ func (s *Smart) selectProxiesTraced(meta *smartDialMeta, all []adapter.Outbound,
 	//   c) Pin points at a non-existent node (provider reloaded,
 	//      subscription refreshed) → clear the pin outright and
 	//      fall through; the pin has no meaning any more.
-	if selected := s.getManualSelected(); selected != "" {
+	if selected := s.getManualSelected(); selected != "" && !bypassManualPin {
 		var pinnedOb adapter.Outbound
 		for _, ob := range all {
 			if ob.Tag() == selected {
@@ -2444,11 +2464,48 @@ func (s *Smart) dialWithRetry(ctx context.Context, network string, dest M.Socksa
 				reselectTried = true
 				snap := s.state.Load()
 				if snap != nil && len(snap.outbounds) > 0 {
-					fresh, _, _ := s.selectProxiesTraced(meta, snap.outbounds, N.NetworkName(network) == N.NetworkUDP)
+					// Pin-fallback detection: when the initial candidate
+					// list is a SINGLE node matching the user's manual
+					// pin AND it just failed to dial, we MUST escape the
+					// pin short-circuit on this retry. Otherwise:
+					//   - cbMaxConsecFail=2 means ONE failure leaves the
+					//     breaker closed, so selectProxiesTraced keeps
+					//     returning [pin]
+					//   - sameOutboundSet sees identical list, declares
+					//     "nothing fresh", breaks the retry loop
+					//   - user sees "dial failed" on a truly-dead pin
+					//     until they manually retry enough times to
+					//     accumulate 2 failures and trip the breaker
+					// Passing bypassManualPin=true for THIS dial only
+					// sidesteps the pin path and gives the algorithm a
+					// chance to surface alive nodes. The pin state is
+					// untouched — the next user request still enters
+					// the pin path first and snaps back the moment A
+					// recovers. This complements (not conflicts with)
+					// the breaker-based bypass: breakers catch repeated
+					// failures for long-term pin unhealth; this catches
+					// the FIRST failure on a newly-dead pin so the user
+					// gets immediate service instead of a raw error.
+					bypassPin := false
+					if len(outbounds) == 1 {
+						if pin := s.getManualSelected(); pin != "" && outbounds[0].Tag() == pin {
+							bypassPin = true
+						}
+					}
+					fresh, _, source := s.selectProxiesTracedOpts(meta, snap.outbounds,
+						N.NetworkName(network) == N.NetworkUDP, bypassPin)
 					if len(fresh) > 0 && !sameOutboundSet(outbounds, fresh) {
-						s.logger.DebugContext(ctx, "smart[", s.Tag(),
-							"] hot re-selection after all candidates failed; fresh=",
-							proxyTagsPreview(fresh, 5))
+						if bypassPin {
+							s.logger.InfoContext(ctx, "smart[", s.Tag(),
+								"] pin [", outbounds[0].Tag(),
+								"] failed; temporarily falling back to algorithm-selected candidates (source=",
+								source, ", fresh=", proxyTagsPreview(fresh, 5),
+								"); pin state preserved for future dials")
+						} else {
+							s.logger.DebugContext(ctx, "smart[", s.Tag(),
+								"] hot re-selection after all candidates failed; fresh=",
+								proxyTagsPreview(fresh, 5))
+						}
 						outbounds = fresh
 						i = -1 // restart loop, round 0 on fresh set
 						continue
