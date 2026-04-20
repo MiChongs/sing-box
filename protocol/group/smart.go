@@ -2026,22 +2026,33 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 //                  still bias toward fast nodes before any stats accumulate)
 //   - "fallback" : no signal at all; random pick filtered by alive/blocked
 func (s *Smart) selectProxiesTraced(meta *smartDialMeta, all []adapter.Outbound, isUDP bool) ([]adapter.Outbound, bool, string) {
-	// Manual selection short-circuit — respects the user's pin while
-	// refusing to be trapped by a dead node.
+	// Manual selection short-circuit — respects the user's pin.
 	//
 	// Three cases:
 	//
-	//   a) Pin points at an existing node AND the node is currently
-	//      healthy (isAlive && breaker closed) → honour the pin,
-	//      exclusive dial. Matches mihomo Set/ForceSet semantics.
+	//   a) Pin points at an existing node AND the breaker is closed →
+	//      honour the pin, exclusive dial. Matches mihomo Set/ForceSet
+	//      semantics.
 	//
-	//   b) Pin points at an existing node BUT the node is currently
-	//      dead or its breaker has tripped → temporarily bypass to
-	//      the algorithm path so the user's request still completes.
-	//      The pin state is LEFT INTACT, so the moment markAlive
-	//      clears knownDead / resets the breaker, the next dial
-	//      snaps back to the pin automatically. This is what "user
-	//      pinned 10x JP but it's broken right now" should feel like.
+	//   b) Pin points at an existing node BUT its circuit breaker has
+	//      tripped → temporarily bypass to the algorithm path so the
+	//      user's request still completes. The pin state is LEFT
+	//      INTACT — the moment the breaker cools down, the next dial
+	//      snaps back to the pin automatically. "User pinned JP but
+	//      it literally can't dial right now" should feel like this.
+	//
+	//      NOTE: we deliberately do NOT gate on isAlive() here (unlike
+	//      earlier versions). isAlive tests URLTestHistory + knownDead
+	//      + breaker, and the first two are INDIRECT probe-layer
+	//      signals — the pin's testURL could be unreachable (Google-
+	//      block, captive portal) even while the pin CAN route real
+	//      user traffic. Using isAlive here meant a single failed
+	//      urltest OR a warmup probe after a network switch would
+	//      silently bypass the pin for up to knownDeadTTL (5 min),
+	//      completely contradicting the "it's pinned, use it" intent.
+	//      Only the circuit breaker — which trips on actual dial
+	//      failures observed by Smart itself — is strong enough
+	//      evidence to override the user's explicit pin.
 	//
 	//   c) Pin points at a non-existent node (provider reloaded,
 	//      subscription refreshed) → clear the pin outright and
@@ -2060,17 +2071,15 @@ func (s *Smart) selectProxiesTraced(meta *smartDialMeta, all []adapter.Outbound,
 			s.persistManualPinDelete()
 			s.logger.Warn("smart[", s.Tag(), "] pinned node [", selected,
 				"] no longer exists, clearing pin")
-		case !s.isAlive(selected) || s.isBreakerOpen(selected):
+		case s.isBreakerOpen(selected):
 			// Log once-per-event so operators see the bypass happen
 			// without spamming on every dial to a still-broken pin.
 			if s.pinBypassLogged.CompareAndSwap(false, true) {
 				s.logger.Warn("smart[", s.Tag(), "] pinned node [", selected,
-					"] unhealthy (alive=", s.isAlive(selected),
-					" breaker-open=", s.isBreakerOpen(selected),
-					"); bypassing to algorithm until it recovers")
+					"] circuit breaker OPEN; bypassing to algorithm until it recovers")
 			}
 		default:
-			// Pin healthy — reset the bypass-log latch so the NEXT
+			// Pin honoured — reset the bypass-log latch so the NEXT
 			// outage gets its own log line.
 			s.pinBypassLogged.Store(false)
 			return []adapter.Outbound{pinnedOb}, true, "manual"

@@ -80,24 +80,31 @@ func TestPinBypass_HealthyPinReturned(t *testing.T) {
 	}
 }
 
-// TestPinBypass_DeadPinBypasses: pinned node in knownDead → path
-// falls through to algorithm, pin state stays intact for recovery.
-func TestPinBypass_DeadPinBypasses(t *testing.T) {
+// TestPinBypass_KnownDeadStillHonoured: pinned node in knownDead but
+// breaker CLOSED → pin STILL returned. This is the regression test
+// for the "pin failed silently after a single probe miss" bug: the
+// user's explicit pin intent must not be overridden by URLTest-layer
+// or warmup-probe signals that might have wrongly declared the node
+// dead. Only actual dial failures (breaker) should bypass the pin.
+func TestPinBypass_KnownDeadStillHonoured(t *testing.T) {
 	s, obs := selectProxiesStub(t, []string{"A", "B", "C"}, "A")
-	s.knownDead.Store("A", time.Now()) // A is marked dead
-	// B has fresh URLTest data → alive; delay ranking prefers it.
+	s.knownDead.Store("A", time.Now()) // A marked dead by urltest/warmup
+	// B has fresh URLTest data → alive; would win delay ranking if bypassed.
 	s.history.StoreURLTestHistory("B", &adapter.URLTestHistory{
 		Time: time.Now(), Delay: 80,
 	})
 
 	got, _, source := s.selectProxiesTraced(nil, obs, false)
-	if source == "manual" {
-		t.Fatalf("should have bypassed manual, got source=%q result=%+v",
-			source, tagsOf(got))
+	if source != "manual" {
+		t.Fatalf("knownDead pin must still be honoured (breaker closed); "+
+			"got source=%q result=%+v", source, tagsOf(got))
 	}
-	// The pin state must be preserved so a later recovery snaps back.
+	if len(got) != 1 || got[0].Tag() != "A" {
+		t.Fatalf("knownDead pin returned %+v, want [A]", tagsOf(got))
+	}
+	// Pin state preserved regardless.
 	if pin := s.getManualSelected(); pin != "A" {
-		t.Fatalf("pin lost during bypass: %q, want A", pin)
+		t.Fatalf("pin lost: %q, want A", pin)
 	}
 }
 
@@ -124,30 +131,34 @@ func TestPinBypass_BreakerOpenBypasses(t *testing.T) {
 	}
 }
 
-// TestPinBypass_RecoverySnapBack: pin briefly bypassed due to
-// knownDead → node recovers (entry cleared) → next selectProxiesTraced
-// honours the pin again.
+// TestPinBypass_RecoverySnapBack: pin briefly bypassed due to a
+// tripped breaker → breaker cools down → next selectProxiesTraced
+// honours the pin again. Validates the "pin preserved during bypass"
+// contract: state never gets cleared just because the node misbehaved.
 func TestPinBypass_RecoverySnapBack(t *testing.T) {
 	s, obs := selectProxiesStub(t, []string{"A", "B"}, "A")
-	s.knownDead.Store("A", time.Now())
+	// Trip A's breaker.
+	cb := &circuitBreakerState{}
+	cb.openUntil.Store(time.Now().Add(15 * time.Second).UnixNano())
+	s.breakers.Store("A", cb)
 	s.history.StoreURLTestHistory("B", &adapter.URLTestHistory{
 		Time: time.Now(), Delay: 80,
 	})
 
-	// First selection: bypass.
+	// First selection: bypass because breaker is open.
 	_, _, srcBypass := s.selectProxiesTraced(nil, obs, false)
 	if srcBypass == "manual" {
-		t.Fatal("expected bypass on dead pin")
+		t.Fatal("expected bypass on open-breaker pin")
 	}
-	// Simulate recovery: clear knownDead + register URLTest history.
-	s.knownDead.Delete("A")
+	// Simulate breaker cooldown + pin recovery.
+	cb.openUntil.Store(0)
 	s.history.StoreURLTestHistory("A", &adapter.URLTestHistory{
 		Time: time.Now(), Delay: 100,
 	})
 
 	got, _, srcRecover := s.selectProxiesTraced(nil, obs, false)
 	if srcRecover != "manual" {
-		t.Fatalf("expected snap-back to manual after recovery; got %q", srcRecover)
+		t.Fatalf("expected snap-back to manual after breaker recovery; got %q", srcRecover)
 	}
 	if len(got) != 1 || got[0].Tag() != "A" {
 		t.Fatalf("snap-back returned %+v, want [A]", tagsOf(got))
