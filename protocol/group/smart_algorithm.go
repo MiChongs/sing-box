@@ -70,6 +70,8 @@ func normalizeAlgorithm(raw string) string {
 		return smartAlgoP2C
 	case smartAlgoLatencyBanded, "banded", "latency-bands":
 		return smartAlgoLatencyBanded
+	case smartAlgoConsistentHashing, "consistent-hash", "chash", "ch", "consistent", "jump-hash":
+		return smartAlgoConsistentHashing
 	}
 	return smartAlgoStrictBest
 }
@@ -95,7 +97,12 @@ func (s *Smart) algoRound0Width() int {
 		smartAlgoRoundRobin,
 		smartAlgoWeightedRR,
 		smartAlgoP2C,
-		smartAlgoWeightedRandom:
+		smartAlgoWeightedRandom,
+		// consistent-hashing deterministically nails a single node for
+		// a given key; racing a second would defeat the stability
+		// contract by giving the "wrong" node a chance to win. Stays
+		// in the selection-style (width=1) group.
+		smartAlgoConsistentHashing:
 		return 1
 	default:
 		return smartRound0Parallel
@@ -161,7 +168,7 @@ func (s *Smart) SetAlgorithm(raw string) string {
 			"] was not recognised — falling back to ", canon,
 			"; accepted values: strict-best / weighted-random / least-loaded /",
 			" fastest-recent / sticky-session / round-robin / weighted-rr /",
-			" p2c / latency-banded")
+			" p2c / latency-banded / consistent-hashing")
 	default:
 		s.logger.Info("smart[", s.Tag(), "] algorithm: ", canon, " (from config=[", raw, "])")
 	}
@@ -296,6 +303,8 @@ func (s *Smart) reorderForAlgorithm(candidates []adapter.Outbound, target string
 		return s.reorderP2C(candidates)
 	case smartAlgoLatencyBanded:
 		return s.reorderLatencyBanded(candidates)
+	case smartAlgoConsistentHashing:
+		return s.reorderConsistentHashing(candidates, target, isUDP)
 	}
 	return candidates
 }

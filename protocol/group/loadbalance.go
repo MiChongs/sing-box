@@ -906,32 +906,84 @@ func strategyRoundRobin(g *LoadBalanceGroup) strategyFn {
 	}
 }
 
+// strategyConsistentHashing implements Google's jump-consistent-hashing
+// on the FULL outbound list (not the alive subset). This is the key to
+// actually getting "consistent" behaviour:
+//
+//   - The bucket count seen by jumpHash is len(outbounds), which stays
+//     stable while nodes flap up/down. A key deterministically maps to
+//     the same slot every call.
+//
+//   - When the slot's node is currently dead, we ring-probe forward
+//     until we find an alive one. Only keys whose home slot is the
+//     dead node get reassigned — the other (N-1)/N of keys keep their
+//     original binding. When the node recovers, the next dial for any
+//     affected key hashes back to the home slot and picks it again
+//     automatically.
+//
+// The previous implementation hashed against len(alive), so a single
+// dead node shrunk the bucket space by 1 and reshuffled effectively
+// every key onto a different node. That violated the "consistent"
+// contract in the only scenario that matters — node churn — and
+// defeated any downstream session affinity the caller relied on.
+//
+// Bucket stability note: if the operator reloads the config or a
+// provider adds/removes outbounds, len(outbounds) changes and jump
+// hash by design remaps ~1/N of keys (on growth) or up to all keys
+// (on shrink). That is the fundamental trade-off of jump hashing and
+// applies to ALL consistent-hashing load balancers at runtime. If
+// bucket stability under provider churn becomes a real pain point,
+// the replacement is a hash ring with virtual nodes — much more
+// code, strictly a future concern.
 func strategyConsistentHashing(g *LoadBalanceGroup) strategyFn {
 	hash := maphash.NewHasher[string]()
 	return func(metadata *adapter.InboundContext, touch bool) adapter.Outbound {
-		alive := g.getAlive()
-		if len(alive) == 0 {
-			snap := g.state.Load()
-			if snap != nil && len(snap.outbounds) > 0 {
-				return snap.outbounds[0]
-			}
+		snap := g.state.Load()
+		if snap == nil || len(snap.outbounds) == 0 {
 			return nil
 		}
-		key := hash.Hash(getKey(metadata))
-		buckets := int32(len(alive))
-		// Adaptive retry: min(alive count, 32)
-		maxRetry := len(alive)
-		if maxRetry > 32 {
-			maxRetry = 32
+		all := snap.outbounds
+		n := len(all)
+
+		keyStr := getKey(metadata)
+		if keyStr == "" {
+			// No routable key signal (e.g. UDP direct-IP with no sniff).
+			// Fall back to "first alive" so we still return *something*
+			// usable; the caller would otherwise hit a nil outbound.
+			for _, ob := range all {
+				if g.IsAlive(ob) {
+					return ob
+				}
+			}
+			return all[0]
 		}
-		for i := 0; i < maxRetry; i++ {
-			idx := jumpHash(key+uint64(i), buckets)
-			return alive[idx]
+
+		start := int(jumpHash(hash.Hash(keyStr), int32(n)))
+		// Ring probe for the first alive node. Deterministic and
+		// locality-preserving: a given key always inspects the same
+		// slot sequence, so repeat calls converge on the same choice
+		// even when the alive set is churning.
+		for i := 0; i < n; i++ {
+			idx := (start + i) % n
+			ob := all[idx]
+			if g.IsAlive(ob) {
+				return ob
+			}
 		}
-		return alive[0]
+		// No alive nodes in the whole list — mirror the fallback used
+		// by the other strategies so callers see identical failure
+		// semantics regardless of strategy choice.
+		return all[0]
 	}
 }
 
+// strategyStickySessions pins a (src, dst) tuple to one outbound for
+// the session's lifetime, with LRU caching so the pin survives short
+// dips in node health. On a cache miss we fall back to the same
+// consistent-hashing pick used by strategyConsistentHashing, ensuring
+// that even the first dial for an (src, dst) tuple is stable across
+// multiple Smart/LoadBalance nodes in a cluster (they'd all compute
+// the same hash).
 func strategyStickySessions(g *LoadBalanceGroup, lruSize uint32) strategyFn {
 	// LRU stores outbound TAG (string), not index — survives provider updates
 	lruCache := common.Must1(freelru.NewSharded[uint64, string](lruSize, maphash.NewHasher[uint64]().Hash32))
@@ -939,42 +991,50 @@ func strategyStickySessions(g *LoadBalanceGroup, lruSize uint32) strategyFn {
 	hash := maphash.NewHasher[string]()
 
 	return func(metadata *adapter.InboundContext, touch bool) adapter.Outbound {
-		alive := g.getAlive()
-		if len(alive) == 0 {
-			snap := g.state.Load()
-			if snap != nil && len(snap.outbounds) > 0 {
-				return snap.outbounds[0]
-			}
+		snap := g.state.Load()
+		if snap == nil || len(snap.outbounds) == 0 {
 			return nil
 		}
+		all := snap.outbounds
+		n := len(all)
 
-		key := hash.Hash(getKeyWithSrcAndDst(metadata))
+		keyStr := getKeyWithSrcAndDst(metadata)
+		key := hash.Hash(keyStr)
 
-		// Check LRU: if cached tag still alive, use it
+		// Cache hit: if the pinned tag still exists in the current
+		// outbound set AND is alive, reuse it.
 		if cachedTag, has := lruCache.Get(key); has {
-			st := g.state.Load()
-			if st != nil && st.outboundByTag != nil {
-				if outbound, ok := st.outboundByTag[cachedTag]; ok && g.IsAlive(outbound) {
-					return outbound
+			if ob, ok := snap.outboundByTag[cachedTag]; ok && g.IsAlive(ob) {
+				return ob
+			}
+		}
+
+		// Cache miss (or cached target died): consistent-hash over the
+		// FULL outbound list so (src, dst) → slot is stable, then
+		// ring-probe forward to the first alive. See
+		// strategyConsistentHashing for why we hash on full N rather
+		// than len(alive).
+		if keyStr != "" {
+			start := int(jumpHash(key, int32(n)))
+			for i := 0; i < n; i++ {
+				idx := (start + i) % n
+				ob := all[idx]
+				if g.IsAlive(ob) {
+					lruCache.Add(key, ob.Tag())
+					return ob
+				}
+			}
+		} else {
+			for _, ob := range all {
+				if g.IsAlive(ob) {
+					lruCache.Add(key, ob.Tag())
+					return ob
 				}
 			}
 		}
 
-		// Deterministic probing on alive list
-		buckets := int32(len(alive))
-		maxRetry := len(alive)
-		if maxRetry > 32 {
-			maxRetry = 32
-		}
-		for i := 0; i < maxRetry; i++ {
-			idx := jumpHash(key+uint64(i), buckets)
-			proxy := alive[idx]
-			lruCache.Add(key, proxy.Tag())
-			return proxy
-		}
-
-		selected := alive[0]
-		lruCache.Add(key, selected.Tag())
-		return selected
+		// No alive nodes anywhere — fall back without polluting the
+		// LRU (don't want to cache a known-bad pick).
+		return all[0]
 	}
 }

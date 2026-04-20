@@ -23,10 +23,11 @@ import (
 // per dial; the cache line is shared with sticky-session.
 
 const (
-	smartAlgoRoundRobin    = "round-robin"
-	smartAlgoWeightedRR    = "weighted-rr"
-	smartAlgoP2C           = "p2c"
-	smartAlgoLatencyBanded = "latency-banded"
+	smartAlgoRoundRobin        = "round-robin"
+	smartAlgoWeightedRR        = "weighted-rr"
+	smartAlgoP2C               = "p2c"
+	smartAlgoLatencyBanded     = "latency-banded"
+	smartAlgoConsistentHashing = "consistent-hashing"
 
 	// p2cTopK is the candidate window from which we sample two for
 	// comparison. 5 mirrors weightedRandomTopK so all "sample within
