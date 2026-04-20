@@ -3,12 +3,14 @@ package deprecated
 import (
 	"os"
 	"strconv"
+	"sync"
 
 	"github.com/sagernet/sing/common/logger"
 )
 
 type stderrManager struct {
 	logger   logger.Logger
+	access   sync.Mutex
 	reported map[string]bool
 }
 
@@ -20,10 +22,13 @@ func NewStderrManager(logger logger.Logger) Manager {
 }
 
 func (f *stderrManager) ReportDeprecated(feature Note) {
+	f.access.Lock()
 	if f.reported[feature.Name] {
+		f.access.Unlock()
 		return
 	}
 	f.reported[feature.Name] = true
+	f.access.Unlock()
 	if !feature.Impending() {
 		f.logger.Warn(feature.MessageWithLink())
 		return
