@@ -1915,6 +1915,14 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		s.store.StoreUnwrapResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP, names)
 	}
 
+	// Request-level scene rerank: reorder the top few candidates by
+	// what THIS request actually needs (streaming → peak bandwidth,
+	// realtime → lowest latency) rather than just the historical
+	// node-level score. Cached unwrap result is persisted BEFORE
+	// this rerank so the cache stays stable; the rerank only biases
+	// dial order on this specific attempt.
+	selectedOutbounds = s.reorderForRequestScene(selectedOutbounds, meta)
+
 	conn, proxyTag, connectTime, err := s.dialWithRetry(ctx, network, destination, selectedOutbounds, meta)
 	if err != nil {
 		s.logger.WarnContext(ctx, "smart[", s.Tag(), "] dial failed to ", destination,
@@ -1964,6 +1972,10 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 		names := outboundNames(selectedOutbounds)
 		s.store.StoreUnwrapResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, true, names)
 	}
+
+	// Request-level scene rerank — same contract as DialContext,
+	// biases top-K dial order by what THIS request needs.
+	selectedOutbounds = s.reorderForRequestScene(selectedOutbounds, meta)
 
 	var finalErr error
 	for i := 0; i < len(selectedOutbounds) && i < 3; i++ {
@@ -2469,6 +2481,22 @@ func (s *Smart) getBatch(outbounds []adapter.Outbound, meta *smartDialMeta, roun
 		// that choice on the loser dial. Ranking-style algorithms
 		// keep the legacy 2-wide race for fast-failover.
 		n := s.algoRound0Width()
+		// Adaptive narrowing: when the ranking algorithm picked a
+		// top candidate with a VERY high short-window success rate,
+		// spend only one dial slot on it — the parallel race buys
+		// almost nothing when the lead is reliable, and the wasted
+		// concurrent dial on position 1 burns CPU / battery and
+		// pollutes upstream stats with loser failures. Below 95%
+		// short success rate we keep the original race width.
+		//
+		// Only applied to ranking-style algos (width > 1); selection
+		// algos already return 1 from algoRound0Width.
+		if n > 1 && len(outbounds) > 0 {
+			sr := s.shortSuccessRateFor(outbounds[0].Tag())
+			if sr >= 0.95 {
+				n = 1
+			}
+		}
 		if n > len(outbounds) {
 			n = len(outbounds)
 		}
