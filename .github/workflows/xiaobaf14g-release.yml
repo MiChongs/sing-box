@@ -185,14 +185,14 @@ jobs:
               # NOTE: with_naive_outbound 被有意省略——它依赖 cronet-go 预编译的 C 库，
               # 只在 CGO_ENABLED=1 + 目标平台交叉工具链齐备时才能链接成功。
               # 这里走纯 Go 跨编译路径（CGO=0），因此和 build-all.bat 保持一致：不带 naive。
-              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_purego,badlinkname,tfogo_checklinkname0'
+              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_purego,with_xhttp,badlinkname,tfogo_checklinkname0'
               ;;
             freebsd)
               # drop with_tailscale: sing-box/tailscale fork 有 wgengine/router/osrouter 编译错误
-              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_ccm,with_ocm,with_cloudflared,badlinkname,tfogo_checklinkname0'
+              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_ccm,with_ocm,with_cloudflared,with_xhttp,badlinkname,tfogo_checklinkname0'
               ;;
             others)
-              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,badlinkname,tfogo_checklinkname0'
+              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_xhttp,badlinkname,tfogo_checklinkname0'
               ;;
           esac
           echo "tags=$TAGS" | tee -a "$GITHUB_OUTPUT"

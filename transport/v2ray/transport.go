@@ -40,6 +40,11 @@ func NewServerTransport(ctx context.Context, logger logger.ContextLogger, option
 	case C.V2RayTransportTypeHTTPUpgrade:
 		return v2rayhttpupgrade.NewServer(ctx, logger, options.HTTPUpgradeOptions, tlsConfig, handler)
 	default:
+		// Fallback 到 plugin registry（见 plugin.go）。XHTTP 等外挂 transport
+		// 在 init 时注册构造器。未知 type 且未注册时才报错。
+		if plugin, ok := LookupPlugin(options.Type); ok && plugin.Server != nil {
+			return plugin.Server(ctx, logger, options.Extra, tlsConfig, handler)
+		}
 		return nil, E.New("unknown transport type: " + options.Type)
 	}
 }
@@ -63,6 +68,9 @@ func NewClientTransport(ctx context.Context, dialer N.Dialer, serverAddr M.Socks
 	case C.V2RayTransportTypeHTTPUpgrade:
 		return v2rayhttpupgrade.NewClient(ctx, dialer, serverAddr, options.HTTPUpgradeOptions, tlsConfig)
 	default:
+		if plugin, ok := LookupPlugin(options.Type); ok && plugin.Client != nil {
+			return plugin.Client(ctx, dialer, serverAddr, options.Extra, tlsConfig)
+		}
 		return nil, E.New("unknown transport type: " + options.Type)
 	}
 }

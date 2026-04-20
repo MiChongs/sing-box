@@ -15,6 +15,10 @@ type _V2RayTransportOptions struct {
 	QUICOptions        V2RayQUICOptions        `json:"-"`
 	GRPCOptions        V2RayGRPCOptions        `json:"-"`
 	HTTPUpgradeOptions V2RayHTTPUpgradeOptions `json:"-"`
+	// Extra 给外挂 transport 用（XHTTP 等）。对应的具体 options 类型由
+	// v2rayTransportOptionFactory 里注册的工厂函数决定，UnmarshalJSON
+	// 检测到未知 type 时会 factory() 分配实例再用 badjson 填充。
+	Extra any `json:"-"`
 }
 
 type V2RayTransportOptions _V2RayTransportOptions
@@ -35,6 +39,11 @@ func (o V2RayTransportOptions) MarshalJSON() ([]byte, error) {
 	case "":
 		return nil, E.New("missing transport type")
 	default:
+		// Plugin transports (e.g. XHTTP) 的 options 存在 Extra 里
+		if _, ok := lookupV2RayTransportOptionFactory(o.Type); ok && o.Extra != nil {
+			v = o.Extra
+			break
+		}
 		return nil, E.New("unknown transport type: " + o.Type)
 	}
 	return badjson.MarshallObjects((_V2RayTransportOptions)(o), v)
@@ -58,6 +67,11 @@ func (o *V2RayTransportOptions) UnmarshalJSON(bytes []byte) error {
 	case C.V2RayTransportTypeHTTPUpgrade:
 		v = &o.HTTPUpgradeOptions
 	default:
+		if factory, ok := lookupV2RayTransportOptionFactory(o.Type); ok {
+			o.Extra = factory()
+			v = o.Extra
+			break
+		}
 		return E.New("unknown transport type: " + o.Type)
 	}
 	err = badjson.UnmarshallExcluded(bytes, (*_V2RayTransportOptions)(o), v)
