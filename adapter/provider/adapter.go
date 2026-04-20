@@ -19,21 +19,28 @@ import (
 )
 
 type Adapter struct {
-	ctx            context.Context
-	outbound       adapter.OutboundManager
-	endpoint       adapter.EndpointManager
-	router         adapter.Router
-	logFactory     log.Factory
-	logger         log.ContextLogger
-	providerType   string
-	providerTag    string
-	outbounds      []adapter.Outbound
-	outboundsByTag map[string]adapter.Outbound
-	ticker         *time.Ticker
-	checking       atomic.Bool
-	history        adapter.URLTestHistoryStorage
-	callbackAccess sync.Mutex
-	callbacks      list.List[adapter.ProviderUpdateCallback]
+	ctx          context.Context
+	outbound     adapter.OutboundManager
+	endpoint     adapter.EndpointManager
+	router       adapter.Router
+	logFactory   log.Factory
+	logger       log.ContextLogger
+	providerType string
+	providerTag  string
+	// outbounds / outboundsByTag 受 outboundsAccess 保护。写入发生在
+	// 订阅下载后的 UpdateOutbounds / UpdateEndpoints / RemoveEndpoints，
+	// 读取发生在 clash API (/providers/proxies/{tag} 等)、healthcheck
+	// 循环、以及 smart/urltest 组内的 Outbounds() 遍历。无锁时
+	// concurrent map read+write 会被 Go runtime 立刻 fatal，
+	// dashboard 侧表现为 "Network Error" — 就是 sing-box 崩掉了。
+	outboundsAccess sync.RWMutex
+	outbounds       []adapter.Outbound
+	outboundsByTag  map[string]adapter.Outbound
+	ticker          *time.Ticker
+	checking        atomic.Bool
+	history         adapter.URLTestHistoryStorage
+	callbackAccess  sync.Mutex
+	callbacks       list.List[adapter.ProviderUpdateCallback]
 
 	link     string
 	enabled  bool
@@ -92,10 +99,16 @@ func (a *Adapter) Tag() string {
 }
 
 func (a *Adapter) Outbounds() []adapter.Outbound {
+	a.outboundsAccess.RLock()
+	defer a.outboundsAccess.RUnlock()
+	// 返回切片快照（slice header 值复制），调用方遍历期间 UpdateOutbounds
+	// 重新赋值不会影响这里持有的底层数组 — 订阅更新时会 append 进 NEW 切片。
 	return a.outbounds
 }
 
 func (a *Adapter) Outbound(tag string) (adapter.Outbound, bool) {
+	a.outboundsAccess.RLock()
+	defer a.outboundsAccess.RUnlock()
 	if a.outboundsByTag == nil {
 		return nil, false
 	}
@@ -163,8 +176,10 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 	if a.enabled && a.history != nil {
 		go a.HealthCheck(a.ctx)
 	}
+	a.outboundsAccess.Lock()
 	a.outbounds = outbounds
 	a.outboundsByTag = outboundsByTag
+	a.outboundsAccess.Unlock()
 }
 
 func (a *Adapter) HealthCheck(ctx context.Context) (map[string]uint16, error) {
@@ -196,8 +211,11 @@ func (a *Adapter) Close() error {
 	if a.ticker != nil {
 		a.ticker.Stop()
 	}
+	a.outboundsAccess.Lock()
 	outbounds := a.outbounds
 	a.outbounds = nil
+	a.outboundsByTag = nil
+	a.outboundsAccess.Unlock()
 	var err error
 	for _, ob := range outbounds {
 		if _, isEndpoint := a.endpoint.Get(ob.Tag()); isEndpoint {
@@ -242,7 +260,10 @@ func (a *Adapter) healthcheck(ctx context.Context) (map[string]uint16, error) {
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
 	var resultAccess sync.Mutex
 	checked := make(map[string]bool)
-	for _, detour := range a.outbounds {
+	a.outboundsAccess.RLock()
+	outbounds := a.outbounds
+	a.outboundsAccess.RUnlock()
+	for _, detour := range outbounds {
 		tag := detour.Tag()
 		if checked[tag] {
 			continue
@@ -363,6 +384,7 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 		}
 		endpoints = append(endpoints, ep)
 	}
+	a.outboundsAccess.Lock()
 	a.outbounds = append(a.outbounds, endpoints...)
 	if a.outboundsByTag == nil {
 		a.outboundsByTag = make(map[string]adapter.Outbound)
@@ -370,6 +392,7 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 	for _, ep := range endpoints {
 		a.outboundsByTag[ep.Tag()] = ep
 	}
+	a.outboundsAccess.Unlock()
 }
 
 func (a *Adapter) removeUselessEndpoints(newTags []string) {
@@ -377,6 +400,8 @@ func (a *Adapter) removeUselessEndpoints(newTags []string) {
 	for _, tag := range newTags {
 		exists[tag] = true
 	}
+	a.outboundsAccess.Lock()
+	defer a.outboundsAccess.Unlock()
 	var remaining []adapter.Outbound
 	for _, ob := range a.outbounds {
 		if _, isEndpoint := a.endpoint.Get(ob.Tag()); isEndpoint && !exists[ob.Tag()] {
@@ -392,14 +417,17 @@ func (a *Adapter) removeUselessEndpoints(newTags []string) {
 }
 
 func (a *Adapter) removeUseless(newTags []string) {
-	if len(a.outbounds) == 0 {
+	a.outboundsAccess.RLock()
+	outbounds := a.outbounds
+	a.outboundsAccess.RUnlock()
+	if len(outbounds) == 0 {
 		return
 	}
 	exists := make(map[string]bool)
 	for _, tag := range newTags {
 		exists[tag] = true
 	}
-	for _, opt := range a.outbounds {
+	for _, opt := range outbounds {
 		if !exists[opt.Tag()] {
 			if err := a.outbound.Remove(opt.Tag()); err != nil {
 				a.logger.Error(err, "close outbound [", opt.Tag(), "]")
