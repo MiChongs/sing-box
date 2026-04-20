@@ -965,14 +965,21 @@ func (s *Smart) SelectOutbound(tag string) bool {
 	if tag == "" {
 		s.manualSelected.Store("")
 		s.persistManualPinDelete()
-		// Clear unwrap cache so target→old-pin mappings don't keep
-		// routing around the fresh pin-less state, and interrupt
-		// active conns so they re-dial through the new auto path —
-		// symmetric with the non-empty-tag branch below.
+		// Drop the unwrap cache unconditionally — this is an
+		// in-memory routing-table invariant, not an active-
+		// connection signal; stale (target → old-pin) mappings
+		// would let downstream queries see ghost state even when
+		// the user asked to preserve existing conns.
 		if s.store != nil {
 			s.store.ClearUnwrapByGroup(s.Tag(), smartConfigName)
 		}
-		if s.interruptGroup != nil {
+		// Interrupt existing connections ONLY when the user opted
+		// into that via interrupt_exist_connections=true. Smart's
+		// pin switching is often exploratory; many users want
+		// "new dials go to the new pin, existing downloads/streams
+		// keep running on the old node" — forcibly interrupting
+		// there breaks long transfers mid-flight.
+		if s.interruptExternalConnections && s.interruptGroup != nil {
 			s.interruptGroup.Interrupt(s.interruptExternalConnections)
 		}
 		s.logger.Info("smart[", s.Tag(), "] manual pin cleared, automatic selection resumed")
@@ -987,32 +994,21 @@ func (s *Smart) SelectOutbound(tag string) bool {
 			s.manualSelected.Store(tag)
 			s.setLastSelected(tag)
 			s.persistManualPin(tag)
-			// CRITICAL: mirror Selector.SelectOutbound — writing the
-			// pin is not enough on its own. Two things must happen
-			// for the user to actually observe "pin took effect":
+			// Mirror Selector.SelectOutbound — writing the pin alone
+			// wasn't enough; users experienced "pin doesn't take
+			// effect" because ALREADY-OPEN mux / HTTP2 / QUIC
+			// streams kept flowing through the prior node. Pin
+			// only gates NEW dials.
 			//
-			//   1) Drop the unwrap cache. It holds (target → last
-			//      chosen node) mappings populated by previous dials.
-			//      Without clearing, DialContext's hot path hits the
-			//      unwrap tier BEFORE the manual-pin short-circuit in
-			//      selectProxiesTraced? Actually the pin path runs
-			//      first, BUT the unwrap cache is also used by
-			//      WeightRanking / Now-display / peer Smart groups
-			//      that share nodes. Clearing gives a clean slate so
-			//      every downstream query sees the new pin without
-			//      stale bypasses.
-			//
-			//   2) Interrupt active connections. Mux / HTTP/2 / long-
-			//      running streams that are ALREADY open keep flowing
-			//      through the previous node indefinitely — the pin
-			//      only affects NEW dials. Without Interrupt, the user
-			//      who just pinned JP stares at a page still loading
-			//      via the old HK node and concludes the pin failed.
-			//      This mirrors Selector.SelectOutbound byte-for-byte.
+			// Unwrap cache is dropped unconditionally: it's a stale
+			// in-memory map, not an active connection. Interrupt on
+			// live connections is conditional on
+			// interrupt_exist_connections so the "preserve running
+			// transfers" preference is honoured.
 			if s.store != nil {
 				s.store.ClearUnwrapByGroup(s.Tag(), smartConfigName)
 			}
-			if s.interruptGroup != nil {
+			if s.interruptExternalConnections && s.interruptGroup != nil {
 				s.interruptGroup.Interrupt(s.interruptExternalConnections)
 			}
 			s.logger.Info("smart[", s.Tag(), "] manually pinned to [", tag, "]")
