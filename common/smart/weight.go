@@ -291,6 +291,53 @@ func CalculateWeight(input *ModelInput, priorityFactor float64) (float64, bool) 
 		quality*params.qualityWeight +
 		asnBonus) * efficiencyFactor * priorityFactor
 
+	// ─── BANDWIDTH BONUS ─────────────────────────────────────────────────
+	// Traffic-sensitive scenes (streaming / transfer) should reward nodes
+	// that demonstrably PEAK HIGH, not just nodes that moved a lot of
+	// total bytes. The existing trafficFactor captures "did this node
+	// handle a lot" and efficiencyFactor captures "how sustained the
+	// rate was vs peak", but neither gives a high-throughput node an
+	// independent boost over a low-throughput node that happened to
+	// transfer the same total. For downloading a 4K stream or pulling
+	// a Docker image, peak BPS is exactly what the user cares about.
+	//
+	// Gated by:
+	//   - Scene: only streaming / transfer. web/api/interactive users
+	//     care about latency, not throughput — amplifying bandwidth
+	//     there would shove a "slow but fat pipe" node past a fast
+	//     responsive one.
+	//   - Confidence: total observed bytes must exceed a floor so
+	//     short-burst bps measurements (eg a 50KB image happened to
+	//     land in a fast TCP window) don't trick us. Ramps 0→1 in
+	//     log-space between 1MB and 10MB observed.
+	//   - Magnitude: bps floor of 100 KB/s — below that we're well
+	//     within normal home-broadband territory and the bonus would
+	//     be noise. Ramps 0→1 between 100 KB/s and 5 MB/s on a log
+	//     curve so a 50 MB/s peak doesn't dwarf a 10 MB/s peak.
+	//
+	// Cap at +20% multiplicative (max composite boost). Any higher
+	// and a single bandwidth-fat node would pin top rank for all
+	// streaming targets regardless of success rate — we still want
+	// Wilson-lower-bound success to dominate.
+	var bandwidthBonus float64
+	if scene == "streaming" || scene == "transfer" {
+		totalMB := input.UploadTotal + input.DownloadTotal
+		peakKBps := math.Max(input.MaxdownloadRate, input.MaxuploadRate)
+		if totalMB >= 1.0 && peakKBps > 100 {
+			// Confidence 0→1 between 1MB and 10MB total traffic.
+			conf := clamp(math.Log1p(totalMB)/math.Log1p(10), 0, 1)
+			// BPS scale 0→1 between 100 KB/s and 5 MB/s (log-spaced).
+			bpsScale := clamp(
+				(math.Log1p(peakKBps)-math.Log1p(100))/
+					(math.Log1p(5000)-math.Log1p(100)),
+				0, 1)
+			bandwidthBonus = 0.20 * conf * bpsScale
+		}
+	}
+	if bandwidthBonus > 0 {
+		composite *= 1.0 + bandwidthBonus
+	}
+
 	// ─── RECENT-WINDOW PENALTY (VividCortex/ewma signals) ────────────────
 	// Short-horizon moving averages maintained by AtomicStatsRecord catch
 	// "just got worse" before the lifetime Welford mean has enough weight
