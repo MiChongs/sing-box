@@ -365,6 +365,25 @@ jobs:
           echo "--- CHANGELOG_RELEASE.md ---"
           cat CHANGELOG_RELEASE.md
 
+      # 幂等发布：先删除任何已存在的同 tag Release（连同所有 assets）。
+      # softprops/action-gh-release 默认只“新增/更新” assets，不会清掉旧的同名
+      # 产物。如果上一次构建产生了坏的二进制后我们 re-push 了 tag，旧二进制会
+      # 和新二进制混在一起供用户下载 — 明确删除再重建，防止残留。
+      # 注意：只删 Release（包括它挂载的 assets），不删 tag 本身 —— tag 已在
+      # trigger 时被 GitHub 创建，softprops 会在下一步重新关联。
+      - name: Delete existing Release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG:      ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "::notice::Deleting existing Release $TAG"
+            gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag=false
+          else
+            echo "No existing Release for $TAG, nothing to delete."
+          fi
+
       - name: Create or Update Release
         uses: softprops/action-gh-release@v2
         with:
