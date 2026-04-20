@@ -63,6 +63,16 @@ export const endpoints: Endpoint[] = [
     enDesc: 'NodeRank list for group {name}. `?refresh=true` recomputes synchronously (slower than cached, always fresh).',
     curl: `curl "${B}/proxies/auto/weights?refresh=true"`,
   },
+  {
+    method: 'GET',
+    path: '/proxies/{name}',
+    group: 'inspect',
+    zhTitle: 'Smart 组详情（含 pin 挂起状态）',
+    enTitle: 'Smart group detail (pin suspend state)',
+    zhDesc: '通用 Clash 代理详情端点。Smart 组在 mihomo 字段基础上追加 `fixed`（用户 pin 的 tag）/ `fixedSuspended`（pin 当前是否被 bypass，true 表示"节点死了自动 fallback 中"）/ `fixedActive`（实际在用的节点 tag，未挂起时等于 fixed）/ `algorithm` / `hysteresis` / `policyPriority` / `pinEndorsements`。UI 推荐：`fixedSuspended=true` 时展示"固定 A（暂不可用，当前走 B）"，`fixed==""` 表示自动模式。',
+    enDesc: 'Standard Clash proxy-detail endpoint. Smart groups add: `fixed` (user pin tag), `fixedSuspended` (true ⇒ pin currently bypassed, auto-fallback in effect), `fixedActive` (the node actually carrying traffic; equals fixed when not suspended), plus `algorithm` / `hysteresis` / `policyPriority` / `pinEndorsements`. UI hint: render "pinned A (currently unavailable, routing via B)" when `fixedSuspended=true`; `fixed==""` means auto mode.',
+    curl: `curl ${B}/proxies/auto`,
+  },
 
   // Control ----------------------------------------------------------------
   {
@@ -81,9 +91,29 @@ export const endpoints: Endpoint[] = [
     group: 'control',
     zhTitle: '热切换算法',
     enTitle: 'Hot-swap algorithm',
-    zhDesc: '运行时把 {name} 组的 algorithm 改成另一种。请求体是纯字符串，在 11 种枚举中取一个。无需重启。',
-    enDesc: 'Change the running algorithm of {name} at runtime. Body is a bare string, one of the 11 valid algorithm names. No restart.',
-    curl: `curl -X PUT -d 'p2c' ${B}/smart/groups/auto/algorithm`,
+    zhDesc: '运行时把 {name} 组的 algorithm 改成另一种。请求体是纯字符串，支持 10 种枚举：`strict-best` / `weighted-random` / `least-loaded` / `fastest-recent` / `sticky-session` / `round-robin` / `weighted-rr` / `p2c` / `latency-banded` / `consistent-hashing`。无需重启。',
+    enDesc: 'Change the running algorithm of {name} at runtime. Body is a bare string, one of 10 names: `strict-best` / `weighted-random` / `least-loaded` / `fastest-recent` / `sticky-session` / `round-robin` / `weighted-rr` / `p2c` / `latency-banded` / `consistent-hashing`. No restart.',
+    curl: `curl -X PUT -d 'consistent-hashing' ${B}/smart/groups/auto/algorithm`,
+  },
+  {
+    method: 'PUT',
+    path: '/proxies/{name}',
+    group: 'control',
+    zhTitle: '手动固定 / 解除节点',
+    enTitle: 'Pin / unpin a node',
+    zhDesc: '在 {name} 组内强制使用指定节点（mihomo 兼容的 SelectOutbound）。请求体 `{"name": "tag"}` 固定，`{"name": ""}` 解除。Smart 组 pin 有三层保护：(1) 若该节点 circuit breaker 开启则暂时 bypass，恢复后自动回归；(2) pin 节点首次 dial 失败时（breaker 未开）本次自动 fallback 到算法候选，pin 状态保留；(3) fallback 发生时 `fixedSuspended` 同步为 true，UI 可立即显示"暂不可用"。切换行为是否同时中断已建立连接由 `interrupt_exist_connections` 决定。',
+    enDesc: 'Pin a specific node in {name} (mihomo-compatible SelectOutbound). Body `{"name": "tag"}` pins, `{"name": ""}` clears. Smart pin has three safeties: (1) when the pinned node\'s circuit breaker is open it is temporarily bypassed and auto-restored on recovery; (2) on first-dial failure (breaker not yet tripped), THIS dial silently falls back to algorithm candidates while the pin tag is retained; (3) during a fallback `fixedSuspended` flips to true so UIs render "currently unavailable". Whether to also interrupt existing conns is controlled by `interrupt_exist_connections`.',
+    curl: `curl -X PUT -H 'Content-Type: application/json' -d '{"name":"HK-01"}' ${B}/proxies/auto`,
+  },
+  {
+    method: 'DELETE',
+    path: '/proxies/{name}',
+    group: 'control',
+    zhTitle: '清除 pin（Smart 专用 verbose 响应）',
+    enTitle: 'Clear pin (Smart verbose response)',
+    zhDesc: 'Smart 组的 "取消固定" 动词入口。响应体镜像 mihomo 风格：`{group, previous_pin, now, interrupted_mux, unwrap_cleared}`。Selector 请改用 `PUT` 传 `{"name":""}`。',
+    enDesc: 'Smart-only "release pin" verb. Response mirrors mihomo: `{group, previous_pin, now, interrupted_mux, unwrap_cleared}`. For Selector groups use `PUT` with `{"name":""}` instead.',
+    curl: `curl -X DELETE ${B}/proxies/auto`,
   },
 
   // Flush / cache reset ----------------------------------------------------

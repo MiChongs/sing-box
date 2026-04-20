@@ -107,9 +107,9 @@ export const smartOutbound: FieldDef[] = [
     name: 'algorithm',
     type: 'enum',
     default: 'strict-best',
-    descZh: '候选节点最终重排策略：`strict-best` / `weighted-random` / `least-loaded` / `fastest-recent` / `sticky-session` / `round-robin` / `weighted-rr` / `p2c` / `latency-banded`。',
-    descEn: 'Candidate re-ranking strategy: `strict-best` / `weighted-random` / `least-loaded` / `fastest-recent` / `sticky-session` / `round-robin` / `weighted-rr` / `p2c` / `latency-banded`.',
-    notes: '11 choices; hot-swappable via Clash API PUT /smart/groups/{name}/algorithm',
+    descZh: '候选节点最终重排策略：`strict-best` / `weighted-random` / `least-loaded` / `fastest-recent` / `sticky-session` / `round-robin` / `weighted-rr` / `p2c` / `latency-banded` / `consistent-hashing`。其中 `consistent-hashing` 按目标域名做 jumpHash 到确定的候选槽位（同 target 总到同节点），是 selection-style 算法 —— 下次 dial 会把它 promote 到 position 0。',
+    descEn: 'Candidate re-ranking strategy: `strict-best` / `weighted-random` / `least-loaded` / `fastest-recent` / `sticky-session` / `round-robin` / `weighted-rr` / `p2c` / `latency-banded` / `consistent-hashing`. `consistent-hashing` jumpHashes by target into a deterministic slot (same target → same node); selection-style — promotes its pick to position 0 on the next dial.',
+    notes: '10 choices; hot-swappable via Clash API PUT /smart/groups/{name}/algorithm',
   },
   {
     name: 'hysteresis',

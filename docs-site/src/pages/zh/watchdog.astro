@@ -1,7 +1,7 @@
 ---
 import DocLayout from '../../layouts/DocLayout.astro';
 import Callout from '../../components/Callout.astro';
-import { transferFatalFamilies, excluded, constants } from '../../data/watchdog';
+import { transferFatalFamilies, excluded, constants, runtimeBehaviours, runtimeConstants } from '../../data/watchdog';
 ---
 
 <DocLayout lang="zh" title="Watchdog / RST 行为">
@@ -72,7 +72,45 @@ import { transferFatalFamilies, excluded, constants } from '../../data/watchdog'
       这修复了"单次 RST 阈值未达 → 只 drop unwrap cache → 下次 dial 仍可能重选同一节点"的顽疾。
     </p>
 
-    <h2 class="font-serif text-card-32 mt-12 mb-4">阈值 / 常量</h2>
+    <h2 class="font-serif text-card-32 mt-12 mb-4">运行时行为</h2>
+    <p class="text-charcoal-warm mb-4">
+      以下行为和 watchdog 同处 dial-time 热路径，但各自独立。遇到"pin 突然不生效"、"切网后首包卡 5s"这类症状前先读这个列表。
+    </p>
+    <div class="space-y-6">
+      {runtimeBehaviours.map((b) => (
+        <section class="rounded-card bg-ivory shadow-ring-1 p-5">
+          <h3 class="font-serif text-feat-20 text-ink mb-2">{b.zhTitle}</h3>
+          <p class="text-body-16 text-charcoal-warm mb-2">{b.zhDesc}</p>
+          <p class="text-caption-14 text-stone-gray font-mono">{b.file}</p>
+        </section>
+      ))}
+    </div>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">运行时常量</h2>
+    <div class="overflow-x-auto rounded-card shadow-ring-1 bg-ivory my-4">
+      <table class="w-full text-small-15 font-sans">
+        <thead>
+          <tr class="border-b border-border-warm text-left">
+            <th class="px-4 py-3 font-medium text-charcoal-warm">常量</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm whitespace-nowrap">值</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm">说明</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm">文件</th>
+          </tr>
+        </thead>
+        <tbody>
+          {runtimeConstants.map((c) => (
+            <tr class="border-b border-border-cream last:border-0 align-top">
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-terracotta">{c.name}</code></td>
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-charcoal-warm whitespace-nowrap">{c.value}</code></td>
+              <td class="px-4 py-3 text-charcoal-warm">{c.zh}</td>
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-stone-gray">{c.go}</code></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">RST 阈值 / 常量</h2>
     <div class="overflow-x-auto rounded-card shadow-ring-1 bg-ivory my-4">
       <table class="w-full text-small-15 font-sans">
         <thead>

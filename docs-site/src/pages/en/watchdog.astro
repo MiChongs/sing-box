@@ -1,7 +1,7 @@
 ---
 import DocLayout from '../../layouts/DocLayout.astro';
 import Callout from '../../components/Callout.astro';
-import { transferFatalFamilies, excluded, constants } from '../../data/watchdog';
+import { transferFatalFamilies, excluded, constants, runtimeBehaviours, runtimeConstants } from '../../data/watchdog';
 ---
 
 <DocLayout lang="en" title="Watchdog & RST behavior">
@@ -75,7 +75,46 @@ import { transferFatalFamilies, excluded, constants } from '../../data/watchdog'
       long-standing "first RST only drops unwrap cache → next dial picks the same node" issue.
     </p>
 
-    <h2 class="font-serif text-card-32 mt-12 mb-4">Thresholds &amp; constants</h2>
+    <h2 class="font-serif text-card-32 mt-12 mb-4">Runtime behaviours</h2>
+    <p class="text-charcoal-warm mb-4">
+      These live on the same dial-time hot path as the watchdog but each has its own story. Skim this list when you see
+      "pin suddenly inactive" or "first packet stalls 5s after a network switch" before diving into source.
+    </p>
+    <div class="space-y-6">
+      {runtimeBehaviours.map((b) => (
+        <section class="rounded-card bg-ivory shadow-ring-1 p-5">
+          <h3 class="font-serif text-feat-20 text-ink mb-2">{b.enTitle}</h3>
+          <p class="text-body-16 text-charcoal-warm mb-2">{b.enDesc}</p>
+          <p class="text-caption-14 text-stone-gray font-mono">{b.file}</p>
+        </section>
+      ))}
+    </div>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">Runtime constants</h2>
+    <div class="overflow-x-auto rounded-card shadow-ring-1 bg-ivory my-4">
+      <table class="w-full text-small-15 font-sans">
+        <thead>
+          <tr class="border-b border-border-warm text-left">
+            <th class="px-4 py-3 font-medium text-charcoal-warm">Constant</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm whitespace-nowrap">Value</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm">Meaning</th>
+            <th class="px-4 py-3 font-medium text-charcoal-warm">File</th>
+          </tr>
+        </thead>
+        <tbody>
+          {runtimeConstants.map((c) => (
+            <tr class="border-b border-border-cream last:border-0 align-top">
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-terracotta">{c.name}</code></td>
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-charcoal-warm whitespace-nowrap">{c.value}</code></td>
+              <td class="px-4 py-3 text-charcoal-warm">{c.en}</td>
+              <td class="px-4 py-3"><code class="font-mono text-caption-14 text-stone-gray">{c.go}</code></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+
+    <h2 class="font-serif text-card-32 mt-12 mb-4">RST thresholds &amp; constants</h2>
     <div class="overflow-x-auto rounded-card shadow-ring-1 bg-ivory my-4">
       <table class="w-full text-small-15 font-sans">
         <thead>
