@@ -965,6 +965,16 @@ func (s *Smart) SelectOutbound(tag string) bool {
 	if tag == "" {
 		s.manualSelected.Store("")
 		s.persistManualPinDelete()
+		// Clear unwrap cache so target→old-pin mappings don't keep
+		// routing around the fresh pin-less state, and interrupt
+		// active conns so they re-dial through the new auto path —
+		// symmetric with the non-empty-tag branch below.
+		if s.store != nil {
+			s.store.ClearUnwrapByGroup(s.Tag(), smartConfigName)
+		}
+		if s.interruptGroup != nil {
+			s.interruptGroup.Interrupt(s.interruptExternalConnections)
+		}
 		s.logger.Info("smart[", s.Tag(), "] manual pin cleared, automatic selection resumed")
 		return true
 	}
@@ -977,6 +987,34 @@ func (s *Smart) SelectOutbound(tag string) bool {
 			s.manualSelected.Store(tag)
 			s.setLastSelected(tag)
 			s.persistManualPin(tag)
+			// CRITICAL: mirror Selector.SelectOutbound — writing the
+			// pin is not enough on its own. Two things must happen
+			// for the user to actually observe "pin took effect":
+			//
+			//   1) Drop the unwrap cache. It holds (target → last
+			//      chosen node) mappings populated by previous dials.
+			//      Without clearing, DialContext's hot path hits the
+			//      unwrap tier BEFORE the manual-pin short-circuit in
+			//      selectProxiesTraced? Actually the pin path runs
+			//      first, BUT the unwrap cache is also used by
+			//      WeightRanking / Now-display / peer Smart groups
+			//      that share nodes. Clearing gives a clean slate so
+			//      every downstream query sees the new pin without
+			//      stale bypasses.
+			//
+			//   2) Interrupt active connections. Mux / HTTP/2 / long-
+			//      running streams that are ALREADY open keep flowing
+			//      through the previous node indefinitely — the pin
+			//      only affects NEW dials. Without Interrupt, the user
+			//      who just pinned JP stares at a page still loading
+			//      via the old HK node and concludes the pin failed.
+			//      This mirrors Selector.SelectOutbound byte-for-byte.
+			if s.store != nil {
+				s.store.ClearUnwrapByGroup(s.Tag(), smartConfigName)
+			}
+			if s.interruptGroup != nil {
+				s.interruptGroup.Interrupt(s.interruptExternalConnections)
+			}
 			s.logger.Info("smart[", s.Tag(), "] manually pinned to [", tag, "]")
 			return true
 		}
