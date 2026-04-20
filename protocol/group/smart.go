@@ -1865,6 +1865,15 @@ func (s *Smart) metaFromDestination(existing *smartDialMeta, destination M.Socks
 func (s *Smart) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	isUDP := N.NetworkName(network) == N.NetworkUDP
 
+	// Register with the network-change dial cancel set so a
+	// mid-dial InterfaceUpdated aborts us instead of letting the
+	// dial sit on the old interface until its natural timeout. The
+	// caller (upstream client) will see ErrNetworkChanged and retry
+	// immediately against the new interface — smoother than a 10s
+	// stall the user would otherwise perceive as "stuck loading".
+	ctx, cleanup := s.registerDial(ctx)
+	defer cleanup()
+
 	// Recover meta from ctx (set by NewConnectionEx) OR synthesize from
 	// the raw destination when this Smart group is dialed directly by an
 	// upper-level group (Selector / URLTest / LoadBalance). The previous
@@ -1928,6 +1937,12 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	if s.disableUDP {
 		return nil, E.New("smart: UDP disabled")
 	}
+
+	// Same cancel-set registration as DialContext — a UDP "dial"
+	// (ListenPacket + probe) stuck on the old interface is aborted
+	// by InterfaceUpdated so the caller can retry cleanly.
+	ctx, cleanup := s.registerDial(ctx)
+	defer cleanup()
 
 	meta, _ := ctx.Value(smartMetaCtxKey{}).(*smartDialMeta)
 	if meta == nil || meta.smartTarget == "" {

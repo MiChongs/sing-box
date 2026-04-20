@@ -1,9 +1,28 @@
 package group
 
 import (
+	"context"
+	"errors"
+	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sagernet/sing-box/adapter"
 )
+
+// ErrNetworkChanged is the cancel cause for dials interrupted by a
+// default-interface switch. Surfaced to the caller so it can choose to
+// retry immediately on the new interface instead of waiting for the
+// natural dial timeout (5-15s per candidate).
+var ErrNetworkChanged = errors.New("smart: network changed, dial aborted")
+
+// dialHandle is a void-pointer used only for its address identity in
+// the dialCancels sync.Map. Must have non-zero size — Go coalesces
+// zero-sized struct pointers to a single runtime-wide address, which
+// would cause sync.Map to see all dials as the same key and silently
+// collapse cancel registrations. The 1-byte pad guarantees each
+// &dialHandle{} gets its own heap address.
+type dialHandle struct{ _ byte }
 
 // Network-change hook.
 //
@@ -73,6 +92,47 @@ type netChangeState struct {
 	// an atomic CAS loop here because contention is near-zero (callbacks
 	// arrive in tens of ms, not microseconds).
 	inFlight atomic.Bool
+	// dialCancels tracks every in-flight Dial/ListenPacket originated
+	// by this Smart group. Key is a distinct *dialHandle (address
+	// identity, never compared), value is the context.CancelCauseFunc.
+	// On InterfaceUpdated we cancel every entry so dials stuck on the
+	// old interface (which would otherwise sit on a 5-15s per-candidate
+	// timeout) fail fast and let the caller retry on the new interface.
+	// sync.Map chosen over RWMutex+map because the access pattern is
+	// "insert + delete by unique key, occasional global range" — the
+	// exact sweet spot for sync.Map.
+	dialCancels sync.Map
+}
+
+// registerDial enrols a dial ctx into the cancel set. Returns the
+// derived ctx + a teardown func the caller MUST defer. Cheap: one sync
+// map insert and one map delete per dial, dominated by the alloc of
+// the handle.
+func (s *Smart) registerDial(parent context.Context) (context.Context, func()) {
+	ctx, cancel := context.WithCancelCause(parent)
+	h := &dialHandle{}
+	s.netChange.dialCancels.Store(h, cancel)
+	return ctx, func() {
+		s.netChange.dialCancels.Delete(h)
+		// Discharge the cancel so the context goroutine exits even if
+		// we weren't the one who caused the cancellation.
+		cancel(nil)
+	}
+}
+
+// cancelInFlightDials cancels every registered dial with
+// ErrNetworkChanged. Idempotent: dials already finished will have
+// removed themselves from the map.
+func (s *Smart) cancelInFlightDials() int {
+	var n int
+	s.netChange.dialCancels.Range(func(k, v any) bool {
+		if cancel, ok := v.(context.CancelCauseFunc); ok {
+			cancel(ErrNetworkChanged)
+			n++
+		}
+		return true
+	})
+	return n
 }
 
 // InterfaceUpdated is invoked by route.NetworkManager whenever the
@@ -130,16 +190,38 @@ func (s *Smart) InterfaceUpdated() {
 		}
 	}
 
+	// Cancel every dial stuck on the old interface. A TCP SYN that
+	// left via Wi-Fi will sit until the OS-level timeout (usually
+	// tens of seconds on Android after a carrier switch); canceling
+	// the ctx immediately aborts the dial, the caller sees
+	// ErrNetworkChanged, and the app retries against the new
+	// interface within milliseconds instead of seconds.
+	if n := s.cancelInFlightDials(); n > 0 {
+		s.logger.Info("smart[", s.Tag(), "] network changed — cancelled ",
+			n, " in-flight dial(s) on the old interface")
+	}
+
 	s.logger.Info("smart[", s.Tag(), "] network changed — scheduling warmup probe in ",
 		netChangeWarmupDelay)
 
-	// Schedule a single one-shot runHealthCheck through the shared
-	// wheel. The small positive delay lets the OS finish routing-table
+	// Schedule a single one-shot warmup through the shared wheel. The
+	// small positive delay lets the OS finish routing-table
 	// adjustments before probes race out on the new interface.
+	//
+	// Two phases:
+	//   Phase 1 — priority probe: pin / lastSelected nodes first,
+	//             because those are the ones the NEXT user dial is
+	//             likely to request. Ready-first node > ready-in-N-ms
+	//             is the whole reason we warm at all.
+	//   Phase 2 — full runHealthCheck: covers every remaining node
+	//             (Phase-1 results are cached, so they're skipped
+	//             via the freshness window — singleflight prevents
+	//             redundant work).
 	worker.scheduleTask(netChangeWarmupDelay, 0, func() {
 		if !s.started.Load() {
 			return
 		}
+		s.preWarmPriorityNodes()
 		// Explicitly bypass isGroupIdle: after a network change even an
 		// idle group should re-validate its nodes so the next user
 		// request doesn't sit on a 5s timeout. isGroupIdle-gated tasks
@@ -147,4 +229,92 @@ func (s *Smart) InterfaceUpdated() {
 		// on the next natural tick.
 		s.runHealthCheck()
 	}, true, s.taskCtx)
+}
+
+// preWarmPriorityNodes probes the "most likely to be used next" nodes
+// first so the very next user dial lands on a freshly-warmed candidate.
+// Runs in the same goroutine as the full health-check but FINISHES
+// before the full sweep starts — callers may observe a pin/lastSelected
+// node become ready within a few hundred ms of InterfaceUpdated, while
+// the broader sweep continues in the background.
+//
+// Idempotent with runHealthCheck: the shared worker's singleflight
+// coalesces any concurrent probe for the same tag, and the freshness
+// cache keeps the follow-up sweep from re-probing the same nodes.
+func (s *Smart) preWarmPriorityNodes() {
+	if s == nil || s.history == nil {
+		return
+	}
+	snap := s.state.Load()
+	if snap == nil || len(snap.outbounds) == 0 {
+		return
+	}
+
+	// Build priority set: manual pin > lastSelected > stop. Both are
+	// best-effort — empty strings mean "no signal", skip.
+	priority := make([]string, 0, 2)
+	if pin := s.getManualSelected(); pin != "" {
+		priority = append(priority, pin)
+	}
+	if v, ok := s.lastSelectedTag.Load().(string); ok && v != "" {
+		// Avoid probing the same node twice when pin == lastSelected.
+		if len(priority) == 0 || priority[0] != v {
+			priority = append(priority, v)
+		}
+	}
+	if len(priority) == 0 {
+		return
+	}
+
+	// Look up outbound objects for the priority tags.
+	tagSet := make(map[string]struct{}, len(priority))
+	for _, t := range priority {
+		tagSet[t] = struct{}{}
+	}
+	var targets []adapter.Outbound
+	for _, ob := range snap.outbounds {
+		if _, ok := tagSet[ob.Tag()]; !ok {
+			continue
+		}
+		if smartSkipType(ob.Type()) {
+			continue
+		}
+		targets = append(targets, ob)
+	}
+	if len(targets) == 0 {
+		return
+	}
+
+	worker := getSmartWorker()
+	// 3s per-probe budget — shorter than runHealthCheck's 5s because
+	// this is the "get the first candidate ready fast" path; broken
+	// nodes yield quickly to the broader sweep.
+	probeCtx, cancel := context.WithTimeout(s.taskCtx, 3*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	for _, ob := range targets {
+		ob := ob
+		tag := ob.Tag()
+		wg.Add(1)
+		worker.submit(func() {
+			defer wg.Done()
+			delay, err := worker.probeOnce(probeCtx, s.testURL, ob)
+			if err != nil || delay == 0 {
+				s.history.DeleteURLTestHistory(tag)
+				s.markDead(tag)
+				s.logger.Debug("smart[", s.Tag(), "] priority warm [",
+					tag, "] failed: ", err)
+				return
+			}
+			s.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+				Time:  time.Now(),
+				Delay: delay,
+			})
+			s.markAlive(tag)
+			s.logger.Info("smart[", s.Tag(), "] priority warm [",
+				tag, "] ready in ", delay, "ms")
+		})
+	}
+	wg.Wait()
 }

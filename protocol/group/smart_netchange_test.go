@@ -98,3 +98,84 @@ func TestInterfaceUpdatedNotStarted(t *testing.T) {
 		t.Fatal("inFlight was left set after started=false early return")
 	}
 }
+
+// TestRegisterDialCancelOnNetChange verifies a dial registered via
+// registerDial gets cancelled when cancelInFlightDials fires, with
+// ErrNetworkChanged surfaced through context.Cause.
+func TestRegisterDialCancelOnNetChange(t *testing.T) {
+	s := &Smart{
+		logger: log.NewNOPFactory().NewLogger(""),
+	}
+
+	parent := context.Background()
+	dialCtx, cleanup := s.registerDial(parent)
+	defer cleanup()
+
+	// Before cancellation: ctx alive.
+	select {
+	case <-dialCtx.Done():
+		t.Fatal("dialCtx unexpectedly cancelled before InterfaceUpdated")
+	default:
+	}
+
+	n := s.cancelInFlightDials()
+	if n != 1 {
+		t.Fatalf("cancelInFlightDials: got n=%d, want 1", n)
+	}
+
+	// After cancellation: ctx done, cause is ErrNetworkChanged.
+	select {
+	case <-dialCtx.Done():
+	case <-time.After(50 * time.Millisecond):
+		t.Fatal("dialCtx not cancelled within 50ms")
+	}
+	if cause := context.Cause(dialCtx); cause != ErrNetworkChanged {
+		t.Fatalf("cause = %v, want ErrNetworkChanged", cause)
+	}
+}
+
+// TestRegisterDialCleanup verifies cleanup removes the entry so a
+// subsequent cancelInFlightDials doesn't touch a finished dial.
+func TestRegisterDialCleanup(t *testing.T) {
+	s := &Smart{
+		logger: log.NewNOPFactory().NewLogger(""),
+	}
+
+	_, cleanup := s.registerDial(context.Background())
+	cleanup()
+
+	if n := s.cancelInFlightDials(); n != 0 {
+		t.Fatalf("after cleanup, cancel touched %d stale entries", n)
+	}
+}
+
+// TestRegisterDialMultipleCancels verifies concurrent dials all get
+// a single cancel signal from one InterfaceUpdated.
+func TestRegisterDialMultipleCancels(t *testing.T) {
+	s := &Smart{
+		logger: log.NewNOPFactory().NewLogger(""),
+	}
+
+	const concurrent = 8
+	ctxs := make([]context.Context, concurrent)
+	cleanups := make([]func(), concurrent)
+	for i := 0; i < concurrent; i++ {
+		ctxs[i], cleanups[i] = s.registerDial(context.Background())
+	}
+	defer func() {
+		for _, c := range cleanups {
+			c()
+		}
+	}()
+
+	if n := s.cancelInFlightDials(); n != concurrent {
+		t.Fatalf("cancelled %d, want %d", n, concurrent)
+	}
+	for i, c := range ctxs {
+		select {
+		case <-c.Done():
+		case <-time.After(50 * time.Millisecond):
+			t.Fatalf("ctx[%d] not cancelled", i)
+		}
+	}
+}
