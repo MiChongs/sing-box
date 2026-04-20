@@ -347,13 +347,31 @@ jobs:
           #   "unknown relocation (315) against symbol typeinfo for ..."
           # 影响所有 cronet 依赖的符号：__cxxabiv1 / std::bad_* / libunwind.
           # r28c (2025-10, LLVM 19) 原生支持；后续 NDK (r29+) 保持向后兼容。
+          #
+          # 不开 local-cache / add-to-path —— local-cache: true 会把 NDK
+          # 拷到 ~/.setup-ndk/<ver>/，复制过程会把 toolchain 里 clang →
+          # clang-19 的软链 target 固化成绝对路径，二次 run 时 wrapper
+          # 脚本找不到 clang binary 构建失败。upstream build.yml 原始配置
+          # 也只用默认路径 /opt/hostedtoolcache/ndk/... 不走 local-cache，
+          # 与此保持一致，NDK 解压在 runner tool cache 区而不是 home。
           ndk-version: ${{ env.NDK_VERSION }}
-          add-to-path: true
-          local-cache: true
 
-      - name: Export NDK env
+      - name: Verify NDK toolchain (sanity check)
         run: |
           set -euo pipefail
+          NDK_BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "ndk-path=${{ steps.ndk.outputs.ndk-path }}"
+          echo "--- NDK bin layout (clang 链路) ---"
+          ls -la "$NDK_BIN/aarch64-linux-android24-clang" "$NDK_BIN/clang"* 2>&1 | head -15
+          # wrapper 脚本应该能找到真实的 clang binary
+          "$NDK_BIN/aarch64-linux-android24-clang" --version || {
+            echo "::error::NDK clang wrapper cannot resolve its target clang binary"
+            echo "--- wrapper content ---"
+            cat "$NDK_BIN/aarch64-linux-android24-clang"
+            echo "--- clang symlink target ---"
+            readlink -f "$NDK_BIN/clang" || echo "clang missing"
+            exit 1
+          }
           echo "ANDROID_NDK_HOME=${{ steps.ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       - name: Build via build_libbox
