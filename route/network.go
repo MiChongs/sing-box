@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -57,7 +58,24 @@ type NetworkManager struct {
 	wifiStateMutex         sync.RWMutex
 	resetCallbackAccess    sync.Mutex
 	resetCallbacks         []func()
-	started                bool
+	// resetLastFireNS debounces rapid-fire notifyInterfaceUpdate
+	// callbacks. Android's ConnectivityManager during a Wi-Fi ↔
+	// cellular handoff emits a burst of 5-15 callbacks within
+	// ~200ms-2s (interface add / default changed / linkProperties /
+	// IP change / route table update ...). Each previously kicked
+	// a full ResetNetwork: connectionManager.CloseAll() + every
+	// endpoint/inbound/outbound's InterfaceUpdated + resetCallbacks.
+	// On a config with 15 Smart groups and ~1000 active conns this
+	// pegged CPU at 100% and grew memory rapidly (close storm
+	// + recordStats bbolt writes + QUIC session tears + probe bursts).
+	//
+	// Debounce collapses the burst: the first callback within a
+	// quiet window fires ResetNetwork; subsequent callbacks within
+	// resetDebounce window just refresh state and skip the heavy
+	// reset. The final settle always gets served because the last
+	// callback starts a new quiet window.
+	resetLastFireNS atomic.Int64
+	started         bool
 }
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
@@ -533,7 +551,40 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 	if !r.started {
 		return
 	}
+	// Debounce. Without this, an Android WiFi↔cellular handoff's
+	// 5-15 callback burst issues 5-15 ResetNetwork calls within
+	// ~2s. Each Reset closes all active conns, tears every QUIC
+	// session, probe-storms every Smart group — compounding into
+	// CPU 100% + memory growth. Fire once per quiet window and let
+	// subsequent bursts within the window no-op; the final settle
+	// always triggers because the last callback in a burst resets
+	// the window for the next change.
+	if !r.shouldFireReset() {
+		r.logger.Debug("interface update debounced — prior ResetNetwork within ", resetDebounce)
+		return
+	}
 	r.ResetNetwork()
+}
+
+// resetDebounce is the quiet window after a ResetNetwork during
+// which further notifyInterfaceUpdate callbacks are coalesced. The
+// empirical burst duration on Android WiFi↔cellular handoff is
+// 200ms-2s; 1.5s gives us comfortable headroom while still letting
+// a genuine second-change event fire within ~2s.
+const resetDebounce = 1500 * time.Millisecond
+
+// shouldFireReset returns true when the caller should invoke
+// ResetNetwork — i.e. no ResetNetwork has fired within resetDebounce.
+// Lock-free via atomic CAS: only one racer within the debounce
+// window wins, the rest return false.
+func (r *NetworkManager) shouldFireReset() bool {
+	nowNS := time.Now().UnixNano()
+	last := r.resetLastFireNS.Load()
+	if last != 0 && nowNS-last < int64(resetDebounce) {
+		return false
+	}
+	// CAS so two concurrent callbacks don't both fire.
+	return r.resetLastFireNS.CompareAndSwap(last, nowNS)
 }
 
 func (r *NetworkManager) notifyWindowsPowerEvent(event int) {
