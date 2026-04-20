@@ -54,15 +54,15 @@ func BenchmarkDrainResponse_HEADWithBody(b *testing.B) {
 	}
 }
 
-// BenchmarkBuildDynamicRequest 验证缓存命中路径零分配
-func BenchmarkBuildDynamicRequest(b *testing.B) {
+// BenchmarkIsGenerate204 verifies the captive-portal detection
+// check stays O(1) and alloc-free. Called once per probe on the
+// hot path — regressions here multiply across every probe.
+func BenchmarkIsGenerate204(b *testing.B) {
 	u, _ := url.Parse("https://www.gstatic.com/generate_204")
-	_ = buildDynamicRequest(u, u.Hostname()) // 预热
-
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = buildDynamicRequest(u, u.Hostname())
+		_ = isGenerate204(u)
 	}
 }
 
@@ -181,6 +181,10 @@ func (c *mockConn) SetDeadline(t time.Time) error      { return nil }
 func (c *mockConn) SetReadDeadline(t time.Time) error  { return nil }
 func (c *mockConn) SetWriteDeadline(t time.Time) error { return nil }
 
+// farDeadline is a timestamp safely past any test's wall-clock RTT,
+// so the Peek deadline doesn't interfere with the intended behaviour.
+func farDeadline() time.Time { return time.Now().Add(10 * time.Second) }
+
 // TestMeasureRequest_FirstByteRTT 验证 first-byte 计时精度
 func TestMeasureRequest_FirstByteRTT(t *testing.T) {
 	resp := "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n"
@@ -188,7 +192,7 @@ func TestMeasureRequest_FirstByteRTT(t *testing.T) {
 	reader := bufio.NewReader(mc)
 	req, _ := http.NewRequest(http.MethodHead, "http://x/", nil)
 
-	rtt, err := measureRequest(mc, reader, req, []byte("HEAD / HTTP/1.1\r\n\r\n"), false)
+	rtt, err := measureRequest(mc, reader, []byte("HEAD / HTTP/1.1\r\n\r\n"), req, farDeadline(), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +208,7 @@ func TestMeasureRequest_WriteError(t *testing.T) {
 	reader := bufio.NewReader(strings.NewReader(""))
 	req, _ := http.NewRequest(http.MethodHead, "http://x/", nil)
 
-	_, err := measureRequest(mc, reader, req, []byte("HEAD / HTTP/1.1\r\n\r\n"), false)
+	_, err := measureRequest(mc, reader, []byte("HEAD / HTTP/1.1\r\n\r\n"), req, farDeadline(), false)
 	if err != io.ErrUnexpectedEOF {
 		t.Fatalf("expected write error, got %v", err)
 	}
@@ -217,7 +221,7 @@ func TestMeasureRequest_ResponseError(t *testing.T) {
 	reader := bufio.NewReader(mc)
 	req, _ := http.NewRequest(http.MethodHead, "http://x/", nil)
 
-	rtt, err := measureRequest(mc, reader, req, []byte("HEAD / HTTP/1.1\r\n\r\n"), false)
+	rtt, err := measureRequest(mc, reader, []byte("HEAD / HTTP/1.1\r\n\r\n"), req, farDeadline(), false)
 	if err == nil {
 		t.Fatal("expected error for 5xx")
 	}
@@ -239,8 +243,79 @@ func BenchmarkMeasureRequest(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		mc := &mockConn{readSrc: strings.NewReader(resp)}
 		reader.Reset(mc)
-		if _, err := measureRequest(mc, reader, req, reqBytes, false); err != nil {
+		if _, err := measureRequest(mc, reader, reqBytes, req, farDeadline(), false); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// TestIsGenerate204 pin-points the captive-portal-detection criteria.
+// The previous contains-based check false-positived on IPs / paths
+// that merely contained "204" as a substring; the new check should
+// only accept canonical generate_204 / gen_204 paths.
+func TestIsGenerate204(t *testing.T) {
+	cases := []struct {
+		url  string
+		want bool
+	}{
+		{"https://www.gstatic.com/generate_204", true},
+		{"https://clients3.google.com/generate_204", true},
+		{"http://connectivitycheck.gstatic.com/generate_204", true},
+		{"https://www.google.com/gen_204", true},
+		{"https://cdn.example.com/api/v1/generate_204", true},  // suffix match
+		// Previously false-positive cases — must return false now.
+		{"http://204.1.2.3/", false},
+		{"https://example.com/docs/204-error", false},
+		{"https://204foo.example.com/", false},
+		{"https://example.com/?redirect=generate_204", false}, // query not path
+		{"", false},
+	}
+	for _, c := range cases {
+		u, _ := url.Parse(c.url)
+		if got := isGenerate204(u); got != c.want {
+			t.Errorf("isGenerate204(%q) = %v, want %v", c.url, got, c.want)
+		}
+	}
+	// nil URL must not panic.
+	if isGenerate204(nil) {
+		t.Fatal("isGenerate204(nil) must be false")
+	}
+}
+
+// TestIsHEADRejected validates the HEAD→GET fallback trigger: only
+// a 405 status error from our own httpStatusError type counts.
+// Transport errors (nil / write error / generic error) must not
+// trigger the fallback — the conn is unusable for a second try.
+func TestIsHEADRejected(t *testing.T) {
+	if isHEADRejected(nil) {
+		t.Fatal("nil error should not trigger GET fallback")
+	}
+	if isHEADRejected(io.ErrUnexpectedEOF) {
+		t.Fatal("transport error should not trigger GET fallback")
+	}
+	if !isHEADRejected(&httpStatusError{code: 405}) {
+		t.Fatal("405 should trigger GET fallback")
+	}
+	if isHEADRejected(&httpStatusError{code: 500}) {
+		t.Fatal("500 should NOT trigger GET fallback (conn may be bad)")
+	}
+	if isHEADRejected(&httpStatusError{code: 404}) {
+		t.Fatal("404 should NOT trigger GET fallback")
+	}
+}
+
+// TestSessionCacheFor_SameHost covers the session-cache hot path:
+// repeated lookups for the same hostname hit the cached instance;
+// distinct hosts get distinct caches. This is what enables
+// back-to-back TLS-resume on probe bursts.
+func TestSessionCacheFor_SameHost(t *testing.T) {
+	a1 := sessionCacheFor("www.gstatic.com")
+	a2 := sessionCacheFor("www.gstatic.com")
+	if a1 != a2 {
+		t.Fatal("sessionCacheFor should reuse per-host cache instance")
+	}
+	b := sessionCacheFor("cp.cloudflare.com")
+	if a1 == b {
+		t.Fatal("different hosts must get distinct session caches")
 	}
 }
