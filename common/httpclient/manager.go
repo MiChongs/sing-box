@@ -140,7 +140,16 @@ func (m *Manager) resolveShared(tag string) (*sharedManagedTransport, error) {
 	if !loaded {
 		return nil, E.New("http_client not found: ", tag)
 	}
-	transport, err := NewTransport(m.ctx, m.logger, tag, define.Options())
+	// User explicitly declared a shared http_client with a specific detour.
+	// Upstream's "detour to an empty direct outbound makes no sense" check
+	// is a safeguard against misconfiguration in outbound chains, but for
+	// http_clients the detour is the whole point — if the user pointed at
+	// a bare `direct` outbound they are declaring "download via direct",
+	// which is the documented replacement for the legacy `download_detour`
+	// field (which itself auto-set this flag; the tag path lost it).
+	sharedOptions := define.Options()
+	sharedOptions.DisableEmptyDirectCheck = true
+	transport, err := NewTransport(m.ctx, m.logger, tag, sharedOptions)
 	if err != nil {
 		return nil, E.Cause(err, "create shared http_client[", tag, "]")
 	}
