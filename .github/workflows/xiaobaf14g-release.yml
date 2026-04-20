@@ -325,19 +325,20 @@ jobs:
             go-build-android-arm64-${{ env.GO_VERSION }}-
             go-build-android-arm64-
 
-      # NDK ~1GB 下载，setup-ndk@v1 的 local-cache 把它放在 runner 缓存路径。
-      # GitHub-hosted runners 的磁盘缓存跨 job 不共享，所以加 actions/cache@v4
-      # 覆盖更长的 run 间复用。
-      - name: Cache Android NDK
-        id: ndk-cache
-        uses: actions/cache@v4
-        with:
-          path: ~/ndk-${{ env.NDK_VERSION }}
-          key: android-ndk-${{ env.NDK_VERSION }}-linux
-
+      # NDK ~1GB 每次下载需 3min。之前尝试 actions/cache + cp -a 副本的方案
+      # 失败：NDK 的 aarch64-linux-android24-clang 是 shell wrapper，内部用
+      # `dirname $0`/clang 引用邻近的 clang binary；clang 本身又是指向
+      # `/opt/hostedtoolcache/ndk/r28c/.../clang-19` 的软链。cp -a 或
+      # actions/cache 保存时会把软链的 target 固化成绝对路径，恢复到新 runner
+      # 后 /opt/hostedtoolcache 是空的，wrapper 找不到 clang → 构建失败:
+      #   /home/runner/ndk-r28c/.../aarch64-linux-android24-clang: line 4:
+      #   /home/runner/ndk-r28c/.../clang: No such file or directory
+      #
+      # 结论：NDK 不缓存，接受每次 3min 下载开销换取稳定。setup-ndk@v1 的
+      # local-cache:true 仍然开着，单个 runner 连续跑同一 workflow 时它可能
+      # 自行复用（但跨 runner 不共享）。
       - name: Setup NDK
         id: ndk
-        if: steps.ndk-cache.outputs.cache-hit != 'true'
         uses: nttld/setup-ndk@v1
         with:
           # r28+ (LLVM 19+) 必需 —— 旧版 libcronet.a 用 R_AARCH64_AUTH_ABS64
@@ -350,18 +351,10 @@ jobs:
           add-to-path: true
           local-cache: true
 
-      - name: Persist NDK to cache path
-        if: steps.ndk-cache.outputs.cache-hit != 'true'
+      - name: Export NDK env
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/ndk-${NDK_VERSION}"
-          cp -a "${{ steps.ndk.outputs.ndk-path }}/." "$HOME/ndk-${NDK_VERSION}/"
-
-      - name: Restore NDK env
-        run: |
-          set -euo pipefail
-          echo "ANDROID_NDK_HOME=$HOME/ndk-${NDK_VERSION}" >> "$GITHUB_ENV"
-          echo "$HOME/ndk-${NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin" >> "$GITHUB_PATH"
+          echo "ANDROID_NDK_HOME=${{ steps.ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
 
       - name: Build via build_libbox
         run: |
