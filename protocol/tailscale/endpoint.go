@@ -119,7 +119,6 @@ type Endpoint struct {
 	systemInterfaceName string
 	systemInterfaceGSO  bool
 	systemInterfaceMTU  uint32
-	serverStarted       bool
 	systemTun           tun.Tun
 	systemDialer        *dialer.DefaultDialer
 	fallbackTCPCloser   func()
