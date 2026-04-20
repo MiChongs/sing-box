@@ -218,6 +218,12 @@ type Smart struct {
 	// Android builds (15 groups * 24/min = 360 waste acquires/min).
 	targetConnsCount atomic.Int32
 
+	// netChange holds debounce/scheduling state for the
+	// InterfaceUpdateListener hook — see smart_netchange.go. Zero-value
+	// is safe to use; declared inline (not a pointer) so it doesn't
+	// need explicit initialisation in NewSmart.
+	netChange netChangeState
+
 	// Dial-failure tracking at the group level. Same idea as URLTest's
 	// reportDialFailure — accumulated failures across the group trigger an
 	// immediate async health re-evaluation (mihomo onDialFailed/Success).
