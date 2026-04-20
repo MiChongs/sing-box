@@ -77,7 +77,26 @@ const (
 	// interface has a beat to stabilise before probes hit the wire —
 	// otherwise the probes themselves fail and mark every node dead.
 	netChangeWarmupDelay = 300 * time.Millisecond
+
+	// globalWarmupDebounce is the PROCESS-WIDE cooldown for scheduling
+	// the heavy warmup (preWarmPriorityNodes + runHealthCheck). Without
+	// this, a config with N Smart groups fires N parallel warmup
+	// storms on every Wi-Fi ↔ cellular handoff — on a 15-group setup
+	// that means ~450 TLS handshakes inside a few hundred ms, which
+	// pegs Android CPUs at 100% and grows the heap by tens of MB
+	// before the dust settles. Only the FIRST group to observe a
+	// network change within this window schedules the heavy work; the
+	// rest still run light per-group cleanup (cancelInFlightDials,
+	// aliveAt.Clear, freshnessCache.Delete) since those are O(1) or
+	// O(small-N) and semantically required per group.
+	globalWarmupDebounce = 5 * time.Second
 )
+
+// globalWarmupLastNS is the shared timestamp used by every Smart
+// group to coordinate the heavy warmup. Reads are cheap (one
+// atomic.Int64 load), writes go through CompareAndSwap so only the
+// first racer within a debounce window wins.
+var globalWarmupLastNS atomic.Int64
 
 // netChangeState holds the debounce/scheduling state for a Smart group.
 // Inline on *Smart would also work, but a separate struct keeps Smart's
@@ -201,32 +220,50 @@ func (s *Smart) InterfaceUpdated() {
 			n, " in-flight dial(s) on the old interface")
 	}
 
+	// Process-wide warmup debounce. The per-group block above
+	// handles cheap state cleanup (aliveAt.Clear, freshnessCache
+	// delete, cancelInFlightDials) — all O(1) or O(small-N) — and
+	// every Smart group MUST do that part. But the heavy warmup
+	// (preWarmPriorityNodes + runHealthCheck) is what used to
+	// stampede: 15 groups each dispatching probes for 30 nodes
+	// during a single Wi-Fi↔cellular handoff turned into hundreds
+	// of parallel TLS handshakes plus an ants.Pool deadlock
+	// (see the comment in runHealthCheck for the deadlock mechanics).
+	//
+	// We now serialise warmup across ALL Smart groups with a
+	// process-global atomic CAS. The first group to observe a
+	// network change within globalWarmupDebounce schedules the
+	// heavy work; every subsequent group within that window logs
+	// a skip and returns. The single warmup still uses singleflight
+	// in probeOnce to fan out across all groups' node tags, so no
+	// group is actually "missed" — it just doesn't pay the per-
+	// group scheduling cost on top.
+	globalLast := globalWarmupLastNS.Load()
+	if globalLast != 0 && nowNS-globalLast < int64(globalWarmupDebounce) {
+		s.logger.Debug("smart[", s.Tag(),
+			"] network changed — skipping warmup (another group fired within ",
+			globalWarmupDebounce, ")")
+		return
+	}
+	if !globalWarmupLastNS.CompareAndSwap(globalLast, nowNS) {
+		// Another group won the race within the same nanosecond —
+		// treat as if we were the second caller.
+		s.logger.Debug("smart[", s.Tag(),
+			"] network changed — lost the warmup CAS race to a peer group")
+		return
+	}
+
 	s.logger.Info("smart[", s.Tag(), "] network changed — scheduling warmup probe in ",
 		netChangeWarmupDelay)
 
-	// Schedule a single one-shot warmup through the shared wheel. The
-	// small positive delay lets the OS finish routing-table
+	// Schedule the single one-shot warmup through the shared wheel.
+	// The small positive delay lets the OS finish routing-table
 	// adjustments before probes race out on the new interface.
-	//
-	// Two phases:
-	//   Phase 1 — priority probe: pin / lastSelected nodes first,
-	//             because those are the ones the NEXT user dial is
-	//             likely to request. Ready-first node > ready-in-N-ms
-	//             is the whole reason we warm at all.
-	//   Phase 2 — full runHealthCheck: covers every remaining node
-	//             (Phase-1 results are cached, so they're skipped
-	//             via the freshness window — singleflight prevents
-	//             redundant work).
 	worker.scheduleTask(netChangeWarmupDelay, 0, func() {
 		if !s.started.Load() {
 			return
 		}
 		s.preWarmPriorityNodes()
-		// Explicitly bypass isGroupIdle: after a network change even an
-		// idle group should re-validate its nodes so the next user
-		// request doesn't sit on a 5s timeout. isGroupIdle-gated tasks
-		// on the normal schedule will resume their own skip behaviour
-		// on the next natural tick.
 		s.runHealthCheck()
 	}, true, s.taskCtx)
 }
@@ -286,19 +323,19 @@ func (s *Smart) preWarmPriorityNodes() {
 	}
 
 	worker := getSmartWorker()
-	// 3s per-probe budget — shorter than runHealthCheck's 5s because
-	// this is the "get the first candidate ready fast" path; broken
-	// nodes yield quickly to the broader sweep.
+	// 3s per-probe budget on a standalone timer — was previously
+	// scoped with `defer cancel()` tied to this function, but since
+	// we've switched to fire-and-forget (no wg.Wait) the cancel
+	// would fire BEFORE any probe starts. ctx.WithTimeout + drop
+	// the cancel handle: the internal timer will release resources
+	// at deadline expiry regardless.
 	probeCtx, cancel := context.WithTimeout(s.taskCtx, 3*time.Second)
-	defer cancel()
+	_ = cancel // timer-driven expiry; explicit cancel not required
 
-	var wg sync.WaitGroup
 	for _, ob := range targets {
 		ob := ob
 		tag := ob.Tag()
-		wg.Add(1)
 		worker.submit(func() {
-			defer wg.Done()
 			delay, err := worker.probeOnce(probeCtx, s.testURL, ob)
 			if err != nil || delay == 0 {
 				s.history.DeleteURLTestHistory(tag)
@@ -312,15 +349,13 @@ func (s *Smart) preWarmPriorityNodes() {
 				Delay: delay,
 			})
 			s.markAlive(tag)
-			// Probe succeeded for what may be the user's pin — if so,
-			// clear the suspended flag pro-actively so the Clash API
-			// reports the pin healthy without waiting for the next
-			// actual user dial. Cheap no-op when tag isn't the pin
-			// or suspended isn't set.
 			s.maybeResumePin(tag)
 			s.logger.Info("smart[", s.Tag(), "] priority warm [",
 				tag, "] ready in ", delay, "ms")
 		})
 	}
-	wg.Wait()
+	// Fire-and-forget: dropping the wg.Wait that used to block here
+	// is what unblocks the ants.Pool during a network-switch storm.
+	// See the equivalent note in runHealthCheck for the full
+	// deadlock explanation.
 }

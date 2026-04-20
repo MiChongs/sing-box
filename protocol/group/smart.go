@@ -4089,13 +4089,21 @@ func (s *Smart) runHealthCheck() {
 	}
 
 	worker := getSmartWorker()
-	ctx, cancel := context.WithTimeout(s.taskCtx, s.interval)
-	defer cancel()
+	// NOTE: ctx lifetime is no longer bounded by this function's
+	// scope (we've dropped wg.Wait below to avoid an ants.Pool
+	// deadlock — see large comment further down). Instead, derive
+	// the probe ctx from s.taskCtx with a 30s hard cap which is
+	// longer than any single probe but short enough that stale
+	// contexts don't accumulate across repeated health checks.
+	// The old `defer cancel()` would fire BEFORE any probe finished
+	// once we go fire-and-forget, invalidating probes in-flight.
+	ctx, cancel := context.WithTimeout(s.taskCtx, 30*time.Second)
+	_ = cancel // released by time-based expiry; explicit cancel not tied to this frame
 
-	var wg sync.WaitGroup
 	start := time.Now()
 
 	var alive, dead, skipped atomic.Int32
+	var dispatched atomic.Int32
 	// Freshness window = max(configured interval, 5 min). A node is
 	// considered fresh if EITHER:
 	//   1. URLTestHistory has a recent probe entry (real measured latency
@@ -4132,10 +4140,8 @@ func (s *Smart) runHealthCheck() {
 			continue
 		}
 
-		wg.Add(1)
+		dispatched.Add(1)
 		worker.submit(func() {
-			defer wg.Done()
-
 			probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
 			delay, err := worker.probeOnce(probeCtx, s.testURL, ob)
 			probeCancel()
@@ -4154,12 +4160,26 @@ func (s *Smart) runHealthCheck() {
 			alive.Add(1)
 		})
 	}
-	wg.Wait()
-
-	s.logger.Info("smart[", s.Tag(), "] health-check in ",
-		time.Since(start).Round(time.Millisecond), ": ",
-		alive.Load(), " alive, ", dead.Load(), " dead, ",
-		skipped.Load(), " skipped (fresh via recent dial)")
+	// Fire-and-forget: NO wg.Wait here. The previous wg.Wait caused
+	// a fatal ants.Pool deadlock during Wi-Fi ↔ cellular handoff
+	// when 15+ Smart groups fired runHealthCheck simultaneously:
+	// each parent runHealthCheck goroutine held one pool worker
+	// slot while waiting on its children; the children needed pool
+	// slots to run; the pool caps at 64 workers. Once ≥64 parents
+	// were suspended, no child could progress and wg.Wait hung
+	// forever, piling up goroutines (CPU 100%) and heap (memory
+	// growth) for every subsequent warmup attempt.
+	//
+	// Removing wg.Wait lets the parent slot release immediately
+	// after dispatching all probe submissions. The probes still
+	// run, their results still land in URLTestHistory / aliveAt via
+	// markAlive/markDead, but the statistics log loses its synchronous
+	// alive/dead breakdown — we log the dispatched count instead.
+	// Accurate per-probe success is still observable through the
+	// Clash API / Smart weights endpoint moments later.
+	s.logger.Info("smart[", s.Tag(), "] health-check dispatched ",
+		dispatched.Load(), " probes (skipped ", skipped.Load(),
+		" via fresh cache) in ", time.Since(start).Round(time.Millisecond))
 }
 
 // cleanupOrphanedGroups removes Smart store data for group tags that no

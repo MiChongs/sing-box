@@ -3,6 +3,7 @@ package group
 import (
 	"context"
 	"math/bits"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,46 @@ import (
 	"github.com/sagernet/sing-box/common/urltest"
 	"golang.org/x/sync/singleflight"
 )
+
+// probeSem caps the number of concurrently in-flight URLTest
+// probes process-wide. Sized at NumCPU*2 with a conservative
+// [8, 32] clamp so low-end Android handsets (2-4 cores) stay around
+// 8, while a 16-core desktop lets 32 probes race.
+//
+// Why we need this on TOP of ants.Pool(64) + singleflight:
+//
+//   ants.Pool limits total goroutines but doesn't know a probe
+//   does a TLS handshake under the hood. A network-switch event
+//   where 15 Smart groups each fire runHealthCheck + preWarm at
+//   once used to spawn HUNDREDS of TLS handshakes in a few hundred
+//   ms, which on Android cellular hand-off would peg CPU at 100%
+//   and grow heap by tens of MBs before the dust settled.
+//
+//   singleflight collapses by TAG, not by concurrency count —
+//   different tags still fan out unrestricted. The semaphore
+//   gates the actual handshake regardless of tag identity.
+//
+// Initialised lazily so test builds that don't touch Smart never
+// pay the channel alloc cost.
+var (
+	probeSem     chan struct{}
+	probeSemOnce sync.Once
+)
+
+// ensureProbeSem lazy-initialises the global probe semaphore.
+// Cheap to call on every probe (one atomic load via sync.Once).
+func ensureProbeSem() {
+	probeSemOnce.Do(func() {
+		n := runtime.NumCPU() * 2
+		if n < 8 {
+			n = 8
+		}
+		if n > 32 {
+			n = 32
+		}
+		probeSem = make(chan struct{}, n)
+	})
+}
 
 // internTag dedupes a node-tag string against a process-wide pool so
 // N Smart groups referencing the same outbound hold pointers to ONE
@@ -303,6 +344,18 @@ func (w *smartSharedWorker) probeOnce(
 		36,
 	)
 	v, err, _ := w.probeGroup.Do(key, func() (interface{}, error) {
+		// Gate the actual handshake on the global probe semaphore.
+		// Only the singleflight LEADER reaches this — followers
+		// for the same tag wait at w.probeGroup.Do and share the
+		// result, so the sem cap counts distinct in-flight probes
+		// regardless of how many Smart groups asked for them.
+		ensureProbeSem()
+		select {
+		case probeSem <- struct{}{}:
+			defer func() { <-probeSem }()
+		case <-ctx.Done():
+			return uint16(0), ctx.Err()
+		}
 		var detail urltest.URLTestDetail
 		d, perr := urltest.URLTestWithDetail(ctx, testURL, ob, &detail)
 		w.freshnessCache.Store(tag, probeResult{
