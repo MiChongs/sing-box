@@ -2084,9 +2084,65 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	// biases top-K dial order by what THIS request needs.
 	selectedOutbounds = s.reorderForRequestScene(selectedOutbounds, meta)
 
+	// Two-pass UDP race: primary list first; if ALL entries fail AND
+	// the primary list is a single-node pin, fall back to the
+	// algorithm-selected candidates (same contract as dialWithRetry's
+	// TCP pin-fallback path — keeps the "pin really died, auto-switch"
+	// experience consistent across TCP and UDP).
+	pc, tag, connectTime, err, finalErr := s.racePacketCandidates(ctx, destination, selectedOutbounds, meta, source)
+	if err == nil {
+		return s.wrapPacketConn(pc, tag, meta, connectTime), nil
+	}
+
+	// Pin-fallback: primary was [pin], all failed, breaker probably
+	// hasn't tripped yet. Re-select bypassing the manual pin, then
+	// race the algorithm candidates. The user experiences a single
+	// UDP ListenPacket call that eventually succeeds on a non-pin
+	// node instead of surfacing the pin error.
+	if len(selectedOutbounds) == 1 {
+		if pin := s.getManualSelected(); pin != "" && selectedOutbounds[0].Tag() == pin {
+			fresh, _, fallbackSrc := s.selectProxiesTracedOpts(meta, snap.outbounds, true, true)
+			if len(fresh) > 0 && !sameOutboundSet(selectedOutbounds, fresh) {
+				s.logger.InfoContext(ctx, "smart[", s.Tag(),
+					"] UDP pin [", pin,
+					"] failed; temporarily falling back to algorithm-selected candidates (source=",
+					fallbackSrc, ", fresh=", proxyTagsPreview(fresh, 5),
+					"); pin state preserved for future dials")
+				s.setPinSuspended(true)
+				fresh = s.reorderForRequestScene(fresh, meta)
+
+				pc2, tag2, ct2, err2, finalErr2 := s.racePacketCandidates(ctx, destination, fresh, meta, fallbackSrc)
+				if err2 == nil {
+					return s.wrapPacketConn(pc2, tag2, meta, ct2), nil
+				}
+				if finalErr2 != nil {
+					finalErr = finalErr2
+				}
+			}
+		}
+	}
+
+	return nil, finalErr
+}
+
+// racePacketCandidates probes the first up-to-3 candidates serially
+// and returns the first successful PacketConn. Shared between the
+// primary ListenPacket loop and its pin-fallback retry so the
+// success/failure bookkeeping (markAlive / markDead / recordStats /
+// logging) stays identical across both passes. Returns (pc, tag,
+// connectTime, err, finalErr): err is the success/failure of the
+// overall race; finalErr is the last per-candidate error (for
+// surfacing to the caller when the race exhausted the list).
+func (s *Smart) racePacketCandidates(
+	ctx context.Context,
+	destination M.Socksaddr,
+	candidates []adapter.Outbound,
+	meta *smartDialMeta,
+	source string,
+) (net.PacketConn, string, int64, error, error) {
 	var finalErr error
-	for i := 0; i < len(selectedOutbounds) && i < 3; i++ {
-		ob := selectedOutbounds[i]
+	for i := 0; i < len(candidates) && i < 3; i++ {
+		ob := candidates[i]
 		histCT := s.getHistoryConnectTime(meta, ob.Tag())
 		timeout := time.Duration(float64(histCT)*smartConnThreshold) * time.Millisecond
 		if timeout <= 0 || timeout > 10*time.Second {
@@ -2109,7 +2165,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 				" via [", ob.Tag(), "] in ", connectTime, "ms (target=",
 				displayTarget(meta, destination), " asn=", displayASN(meta),
 				" source=", source, ")")
-			return s.wrapPacketConn(pc, ob.Tag(), meta, connectTime), nil
+			return pc, ob.Tag(), connectTime, nil, nil
 		}
 		finalErr = err
 		s.markDead(ob.Tag())
@@ -2120,8 +2176,10 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 			s.recordStats("failed", m, tag, ct, 0, 0, 0, 0, 0, 0)
 		})
 	}
-
-	return nil, finalErr
+	if finalErr == nil {
+		finalErr = E.New("smart: UDP race exhausted with no error — candidate list was empty")
+	}
+	return nil, "", 0, finalErr, finalErr
 }
 
 // selectProxiesTraced performs the tiered selection and returns which tier
@@ -2588,6 +2646,17 @@ func (s *Smart) dialWithRetry(ctx context.Context, network string, dest M.Socksa
 								"] hot re-selection after all candidates failed; fresh=",
 								proxyTagsPreview(fresh, 5))
 						}
+						// Run the SAME post-selection pass DialContext
+						// applies to its initial list. Without this the
+						// fallback list skips the request-scene rerank
+						// (streaming → prefer high maxDownloadRate,
+						// realtime → prefer low shortRTT) that the tier
+						// pipeline would otherwise apply to the primary
+						// choice. The reorderForAlgorithm smart-algo
+						// pass has already run inside selectProxiesTraced
+						// — we're only topping up the request-level
+						// signal that lives outside the tier code.
+						fresh = s.reorderForRequestScene(fresh, meta)
 						outbounds = fresh
 						i = -1 // restart loop, round 0 on fresh set
 						continue
