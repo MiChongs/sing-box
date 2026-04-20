@@ -250,6 +250,7 @@ func stageStalledConn(s *Smart, target, tag string, age time.Duration, hadFirstB
 		c.lastReadAt.Store(now.Add(-lastReadAge).UnixNano())
 	}
 	s.targetConns[target] = map[*smartTrackedConn]struct{}{c: {}}
+	s.targetConnsCount.Add(1)
 	return c, fake
 }
 

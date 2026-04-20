@@ -250,6 +250,14 @@ func (s *Smart) runStalledConnWatchdog() {
 	if s == nil {
 		return
 	}
+	// Lock-free fast-path: when the per-group atomic counter reports
+	// zero active conns, skip the mutex acquire + map iteration
+	// entirely. Watchdog runs every watchdogScanInterval for every
+	// Smart group; on an idle phone this used to burn 24 mutex
+	// acquires/minute * N groups for no work.
+	if s.targetConnsCount.Load() == 0 {
+		return
+	}
 	type victim struct {
 		c        *smartTrackedConn
 		target   string
