@@ -224,6 +224,14 @@ type Smart struct {
 	// need explicit initialisation in NewSmart.
 	netChange netChangeState
 
+	// targetLiveness holds per-target hit counters + active SNI-probe
+	// history used to distinguish "true-alive" nodes from "fake-alive"
+	// nodes whose URLTest probe passes but whose real traffic to the
+	// user's target gets SNI-blocked. See smart_target_liveness.go.
+	// Zero value means "not yet initialised" — helpers guard against
+	// nil maps, so no eager construction is required.
+	targetLiveness targetLivenessState
+
 	// Dial-failure tracking at the group level. Same idea as URLTest's
 	// reportDialFailure — accumulated failures across the group trigger an
 	// immediate async health re-evaluation (mihomo onDialFailed/Success).
@@ -724,6 +732,12 @@ func (s *Smart) PostStart() error {
 	s.hydratePersistedState()
 	s.restorePinEndorsements()
 
+	// Per-(target, node) liveness bookkeeping — used by
+	// deprioritiseSuspicious and the SNI-probe periodic task to tell
+	// "URLTest says alive but real target is SNI-blocked" apart from
+	// healthy nodes.
+	s.initTargetLiveness()
+
 	// Start background tasks
 	s.taskCtx, s.taskCancel = context.WithCancel(context.Background())
 
@@ -764,6 +778,13 @@ func (s *Smart) PostStart() error {
 		// from the final pre-idle dials actually land on disk.
 		{"flush-queue", 5 * time.Second, 5 * time.Minute, s.flushQueue, false, false},
 		{"cache-adjust", 5 * time.Second, 5 * time.Minute, s.adjustCache, false, false},
+		// Target-liveness active SNI probing: pick top-K most-dialed
+		// targets and TLS-handshake them through a few alive nodes so
+		// per-target-blocked nodes get flagged before the user's
+		// NEXT dial hits them. Internal isGroupIdle check prevents
+		// the probe from running on a sleeping phone. See
+		// smart_target_liveness.go for the policy details.
+		{"target-liveness", sniProbeInitialDelay, sniProbeInterval, s.runTargetLivenessProbes, false, true},
 	}
 
 	for _, t := range tasks {
@@ -2026,6 +2047,18 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	// dial order on this specific attempt.
 	selectedOutbounds = s.reorderForRequestScene(selectedOutbounds, meta)
 
+	// True-alive check: push nodes whose recent stats OR active SNI
+	// probes say they're broken for THIS target to the tail of the
+	// list. Never hard-removes (so a broad outage still has a
+	// last-resort candidate), only deprioritises. Done AFTER the
+	// scene rerank so a scene-preferred-but-target-broken node
+	// doesn't stay at position 0. See smart_target_liveness.go.
+	selectedOutbounds = s.deprioritiseSuspicious(selectedOutbounds, meta.smartTarget)
+
+	// Record the target hit so the periodic SNI probe task knows
+	// which targets are worth actively verifying.
+	s.recordTargetHit(meta.smartTarget)
+
 	conn, proxyTag, connectTime, err := s.dialWithRetry(ctx, network, destination, selectedOutbounds, meta)
 	if err != nil {
 		s.logger.WarnContext(ctx, "smart[", s.Tag(), "] dial failed to ", destination,
@@ -2083,6 +2116,15 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	// Request-level scene rerank — same contract as DialContext,
 	// biases top-K dial order by what THIS request needs.
 	selectedOutbounds = s.reorderForRequestScene(selectedOutbounds, meta)
+
+	// Per-target liveness deprioritisation — same contract as
+	// DialContext. Pushes nodes known to be broken for meta.smartTarget
+	// to the tail so the UDP race picks a trusted candidate first.
+	selectedOutbounds = s.deprioritiseSuspicious(selectedOutbounds, meta.smartTarget)
+
+	// Record the target hit so the periodic SNI probe task knows
+	// which targets are worth actively verifying.
+	s.recordTargetHit(meta.smartTarget)
 
 	// Two-pass UDP race: primary list first; if ALL entries fail AND
 	// the primary list is a single-node pin, fall back to the

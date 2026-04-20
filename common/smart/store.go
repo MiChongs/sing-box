@@ -818,6 +818,23 @@ func (s *Store) LookupAnyAtomicRecord(group, config, proxy string) *AtomicStatsR
 	return found
 }
 
+// LookupAtomicRecord returns the in-memory AtomicStatsRecord for the
+// exact cacheKey, or nil if absent. Unlike GetOrCreateAtomicRecord
+// this does NOT hydrate from bbolt and does NOT allocate — it's a
+// strict steady-state cache peek. Callers that merely need to CHECK
+// per-(target, node) health without creating ghost records use this.
+// Expected to be called from hot-path filter code (selectProxies)
+// hundreds of times per second, so it must stay O(1) and alloc-free.
+func (s *Store) LookupAtomicRecord(cacheKey string) *AtomicStatsRecord {
+	if recordCache == nil || cacheKey == "" {
+		return nil
+	}
+	if r, ok := recordCache.Get(cacheKey); ok {
+		return r
+	}
+	return nil
+}
+
 // GetOrCreateAtomicRecord fetches or creates an in-memory AtomicStatsRecord,
 // seeding it from bbolt if available.
 func (s *Store) GetOrCreateAtomicRecord(cacheKey, group, config, target, proxy string) *AtomicStatsRecord {
