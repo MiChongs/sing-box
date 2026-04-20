@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -37,6 +38,10 @@ type Outbound struct {
 	logger    logger.ContextLogger
 	client    *tuic.Client
 	udpStream bool
+	// interfaceUpdateAt — see Hysteria2.Outbound for rationale.
+	// 1s idempotency gate against duplicate CloseWithError under a
+	// network-switch callback storm.
+	interfaceUpdateAt atomic.Int64
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TUICOutboundOptions) (adapter.Outbound, error) {
@@ -143,6 +148,14 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 }
 
 func (h *Outbound) InterfaceUpdated() {
+	nowNS := time.Now().UnixNano()
+	last := h.interfaceUpdateAt.Load()
+	if last != 0 && nowNS-last < int64(time.Second) {
+		return
+	}
+	if !h.interfaceUpdateAt.CompareAndSwap(last, nowNS) {
+		return
+	}
 	_ = h.client.CloseWithError(E.New("network changed"))
 }
 

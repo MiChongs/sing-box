@@ -69,6 +69,22 @@ func (m *ConnectionManager) Count() int {
 	return m.connections.Len()
 }
 
+// CloseAll evicts every tracked connection and asks each to Close
+// asynchronously. Callers no longer block on the per-conn close
+// cost — critical on a network switch where N × Close() recurses
+// into Smart.recordStats + bbolt writes + QUIC session teardown,
+// serialised under this function's scope. For a busy config that
+// can mean thousands of close()s in a tight loop, pegging CPU and
+// holding the caller (ResetNetwork) for seconds.
+//
+// Semantics preserved: we still remove every tracked entry under
+// the list lock before returning (so a subsequent TrackConn
+// observes the list as empty). What changes is that the actual
+// Close() of each evicted closer happens on a separate goroutine.
+// If the caller needs synchronous completion, that contract was
+// never advertised — Close() can take arbitrary time per conn,
+// and no existing caller inspects post-return state beyond the
+// fact that the tracker emptied.
 func (m *ConnectionManager) CloseAll() {
 	m.access.Lock()
 	var closers []io.Closer
@@ -79,9 +95,18 @@ func (m *ConnectionManager) CloseAll() {
 		element = nextElement
 	}
 	m.access.Unlock()
-	for _, closer := range closers {
-		common.Close(closer)
+	if len(closers) == 0 {
+		return
 	}
+	// Fire-and-forget: one dedicated goroutine serialises the
+	// closes (preserves original per-close ordering) so we don't
+	// spawn N goroutines for N conns under a network-switch
+	// storm. The caller returns the moment the tracker is empty.
+	go func() {
+		for _, closer := range closers {
+			common.Close(closer)
+		}
+	}()
 }
 
 func (m *ConnectionManager) Close() error {

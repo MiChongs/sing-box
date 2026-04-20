@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -58,24 +57,36 @@ type NetworkManager struct {
 	wifiStateMutex         sync.RWMutex
 	resetCallbackAccess    sync.Mutex
 	resetCallbacks         []func()
-	// resetLastFireNS debounces rapid-fire notifyInterfaceUpdate
-	// callbacks. Android's ConnectivityManager during a Wi-Fi ↔
-	// cellular handoff emits a burst of 5-15 callbacks within
-	// ~200ms-2s (interface add / default changed / linkProperties /
-	// IP change / route table update ...). Each previously kicked
-	// a full ResetNetwork: connectionManager.CloseAll() + every
-	// endpoint/inbound/outbound's InterfaceUpdated + resetCallbacks.
-	// On a config with 15 Smart groups and ~1000 active conns this
-	// pegged CPU at 100% and grew memory rapidly (close storm
-	// + recordStats bbolt writes + QUIC session tears + probe bursts).
+
+	// Reset-coalescence state. Android's ConnectivityManager fires
+	// 5-15 callbacks during a single Wi-Fi ↔ cellular handoff (burst
+	// window ~200ms-2s: interfaceAdded / defaultChanged /
+	// linkProperties / IP change / route-table update ...). Firing a
+	// full ResetNetwork per callback means:
 	//
-	// Debounce collapses the burst: the first callback within a
-	// quiet window fires ResetNetwork; subsequent callbacks within
-	// resetDebounce window just refresh state and skip the heavy
-	// reset. The final settle always gets served because the last
-	// callback starts a new quiet window.
-	resetLastFireNS atomic.Int64
-	started         bool
+	//   - connectionManager.CloseAll() × N → thousands of conn
+	//     Close() each recursing into recordStats + bbolt writes
+	//   - every QUIC outbound's CloseWithError × N → tearing sessions
+	//     that were re-dialed between callbacks
+	//   - every Smart group's InterfaceUpdated × N → warm-up storm
+	//
+	// The net effect on a 15-group / 1000-conn config: CPU 100% for
+	// several seconds, heap growth tens of MBs, UI freeze.
+	//
+	// Timer coalescence is strictly better than a fire-on-first CAS
+	// window:
+	//   CAS-window:  first callback wins, rest swallowed. Issue: first
+	//                callback is "WiFi lost" — routing table is mid-
+	//                transition and the Reset often rebuilds against
+	//                a not-yet-valid new default interface.
+	//   Timer-coalesce: every callback resets a timer; Reset fires
+	//                only after all callbacks have been quiet for
+	//                resetCoalesceDelay — by then the OS has settled
+	//                on the new interface. The burst triggers exactly
+	//                one Reset, always, against the final state.
+	resetCoalesceMu    sync.Mutex
+	resetCoalesceTimer *time.Timer
+	started            bool
 }
 
 func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options option.RouteOptions, dnsOptions option.DNSOptions) (*NetworkManager, error) {
@@ -551,40 +562,46 @@ func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interfa
 	if !r.started {
 		return
 	}
-	// Debounce. Without this, an Android WiFi↔cellular handoff's
-	// 5-15 callback burst issues 5-15 ResetNetwork calls within
-	// ~2s. Each Reset closes all active conns, tears every QUIC
-	// session, probe-storms every Smart group — compounding into
-	// CPU 100% + memory growth. Fire once per quiet window and let
-	// subsequent bursts within the window no-op; the final settle
-	// always triggers because the last callback in a burst resets
-	// the window for the next change.
-	if !r.shouldFireReset() {
-		r.logger.Debug("interface update debounced — prior ResetNetwork within ", resetDebounce)
-		return
-	}
-	r.ResetNetwork()
+	// Coalesce into a single deferred ResetNetwork. Callback returns
+	// immediately; a background timer will fire the actual reset
+	// resetCoalesceDelay after the LAST callback in a burst.
+	r.scheduleReset()
 }
 
-// resetDebounce is the quiet window after a ResetNetwork during
-// which further notifyInterfaceUpdate callbacks are coalesced. The
-// empirical burst duration on Android WiFi↔cellular handoff is
-// 200ms-2s; 1.5s gives us comfortable headroom while still letting
-// a genuine second-change event fire within ~2s.
-const resetDebounce = 1500 * time.Millisecond
+// resetCoalesceDelay is the quiet-window length after the last
+// notifyInterfaceUpdate callback before ResetNetwork actually
+// fires. Android WiFi↔cellular handoff empirical burst is
+// 200ms-2s; 1.5s gives us headroom while keeping end-to-end
+// recovery snappy.
+const resetCoalesceDelay = 1500 * time.Millisecond
 
-// shouldFireReset returns true when the caller should invoke
-// ResetNetwork — i.e. no ResetNetwork has fired within resetDebounce.
-// Lock-free via atomic CAS: only one racer within the debounce
-// window wins, the rest return false.
-func (r *NetworkManager) shouldFireReset() bool {
-	nowNS := time.Now().UnixNano()
-	last := r.resetLastFireNS.Load()
-	if last != 0 && nowNS-last < int64(resetDebounce) {
-		return false
+// scheduleReset arms (or re-arms) the coalescence timer. Runs on
+// whatever goroutine delivered the callback; holds the coalescence
+// mutex for microseconds. The timer's AfterFunc callback executes
+// on its own goroutine so ResetNetwork doesn't block the callback
+// delivery path.
+//
+// Semantics: every call pushes the fire moment out by
+// resetCoalesceDelay. Once the burst is quiet for the delay, one
+// Reset fires. Guaranteed to produce EXACTLY ONE Reset per burst,
+// against the settled post-burst state.
+func (r *NetworkManager) scheduleReset() {
+	r.resetCoalesceMu.Lock()
+	defer r.resetCoalesceMu.Unlock()
+	if r.resetCoalesceTimer != nil {
+		// Active pending reset — just push it further out.
+		if r.resetCoalesceTimer.Reset(resetCoalesceDelay) {
+			return
+		}
+		// Reset returned false → timer already fired or was
+		// stopped; fall through to create a fresh one below.
 	}
-	// CAS so two concurrent callbacks don't both fire.
-	return r.resetLastFireNS.CompareAndSwap(last, nowNS)
+	r.resetCoalesceTimer = time.AfterFunc(resetCoalesceDelay, func() {
+		r.resetCoalesceMu.Lock()
+		r.resetCoalesceTimer = nil
+		r.resetCoalesceMu.Unlock()
+		r.ResetNetwork()
+	})
 }
 
 func (r *NetworkManager) notifyWindowsPowerEvent(event int) {

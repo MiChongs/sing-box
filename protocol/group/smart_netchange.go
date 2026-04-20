@@ -121,14 +121,42 @@ type netChangeState struct {
 	// "insert + delete by unique key, occasional global range" — the
 	// exact sweet spot for sync.Map.
 	dialCancels sync.Map
+	// lastCancelNS records the most recent cancelInFlightDials trigger.
+	// During the cancelCooldown window that follows, DialContext's
+	// registerDial bypasses the cancel-set — new dials kicked off in
+	// response to the freshly-cancelled ones won't themselves be
+	// cancelled by a spurious second callback inside the same burst.
+	// Without this, Android's callback cascade produced an amplifying
+	// retry loop: cancel → caller retries → new registerDial → next
+	// callback cancels that → caller retries → ...
+	lastCancelNS atomic.Int64
 }
 
-// registerDial enrols a dial ctx into the cancel set. Returns the
-// derived ctx + a teardown func the caller MUST defer. Cheap: one sync
-// map insert and one map delete per dial, dominated by the alloc of
-// the handle.
+// cancelCooldown is the quiet window after cancelInFlightDials
+// during which new dials stay OUT of the cancel set. Without this,
+// a repeat InterfaceUpdated callback inside a burst would cancel
+// freshly-retried dials in flight, feeding a ping-pong: cancel →
+// caller retries → new dial registered → next callback cancels it
+// again → retry. Pick > route.resetCoalesceDelay so a coalesced
+// second reset doesn't happen inside this window.
+const cancelCooldown = 2 * time.Second
+
+// registerDial enrols a dial ctx into the cancel set UNLESS we're
+// inside the cooldown window following a cancelInFlightDials. During
+// cooldown the dial still gets a derived ctx (so callers keep a
+// clean shutdown signal via parent cancellation), but it's not in
+// the cancel-set — so a second InterfaceUpdated within the window
+// won't pull the rug out from under this dial.
 func (s *Smart) registerDial(parent context.Context) (context.Context, func()) {
 	ctx, cancel := context.WithCancelCause(parent)
+	nowNS := time.Now().UnixNano()
+	last := s.netChange.lastCancelNS.Load()
+	if last != 0 && nowNS-last < int64(cancelCooldown) {
+		// Cooldown active: do NOT insert into cancelables. Still
+		// return a working ctx/teardown pair so callers don't know
+		// the difference.
+		return ctx, func() { cancel(nil) }
+	}
 	h := &dialHandle{}
 	s.netChange.dialCancels.Store(h, cancel)
 	return ctx, func() {
@@ -140,8 +168,8 @@ func (s *Smart) registerDial(parent context.Context) (context.Context, func()) {
 }
 
 // cancelInFlightDials cancels every registered dial with
-// ErrNetworkChanged. Idempotent: dials already finished will have
-// removed themselves from the map.
+// ErrNetworkChanged and stamps the cooldown start. Idempotent:
+// dials already finished will have removed themselves from the map.
 func (s *Smart) cancelInFlightDials() int {
 	var n int
 	s.netChange.dialCancels.Range(func(k, v any) bool {
@@ -151,6 +179,10 @@ func (s *Smart) cancelInFlightDials() int {
 		}
 		return true
 	})
+	// Stamp the cooldown window start AFTER cancelling so any dial
+	// that registered during Range() is still cancelled, but
+	// registerDial calls past this moment bypass the set.
+	s.netChange.lastCancelNS.Store(time.Now().UnixNano())
 	return n
 }
 

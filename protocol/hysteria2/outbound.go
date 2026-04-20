@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -38,6 +39,15 @@ type Outbound struct {
 	outbound.Adapter
 	logger logger.ContextLogger
 	client *hysteria2.Client
+	// interfaceUpdateAt guards against duplicate CloseWithError
+	// calls during an Android WiFi↔cellular handoff callback
+	// burst. Even after route-layer coalescence, a stray second
+	// update (e.g. delayed callback arriving just outside the
+	// coalescence window) could double-close the underlying QUIC
+	// client while the first close is still draining. The unix-
+	// nano timestamp records the last successful invocation; a
+	// 1s window gates re-entry.
+	interfaceUpdateAt atomic.Int64
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2OutboundOptions) (adapter.Outbound, error) {
@@ -124,6 +134,20 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 }
 
 func (h *Outbound) InterfaceUpdated() {
+	// Idempotency gate: collapse duplicate InterfaceUpdated calls
+	// delivered within 1s. The upstream route layer coalesces to
+	// one Reset per burst, but stray late callbacks + any external
+	// caller of InterfaceUpdated could still double-fire — and
+	// hysteria2.Client.CloseWithError on an already-closing
+	// session acquires upstream locks that compound under storm.
+	nowNS := time.Now().UnixNano()
+	last := h.interfaceUpdateAt.Load()
+	if last != 0 && nowNS-last < int64(time.Second) {
+		return
+	}
+	if !h.interfaceUpdateAt.CompareAndSwap(last, nowNS) {
+		return
+	}
 	h.client.CloseWithError(E.New("network changed"))
 }
 
