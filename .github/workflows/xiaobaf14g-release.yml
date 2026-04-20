@@ -89,6 +89,12 @@ jobs:
           # / Debian 13 / RHEL 10 / 同代 musl 不可用)。
           - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: -v3-glibc, goamd64: v3, cgo: '1' }
           - { goos: linux,   goarch: arm64,    ext: '',   tags_src: others,  suffix: '' }
+          # ARM64 + musl — CGO=1 交叉到 aarch64-linux-musl，-extldflags=-static
+          # 链出完全静态产物（无 glibc/musl 动态依赖）。适合 Alpine /
+          # OpenWrt / 容器 / 嵌入式这种"宿主 libc 不可用"或小体积场景。
+          # 使用 zig 作为 CC —— zig cc -target aarch64-linux-musl 自带
+          # musl headers + libc.a，不需要维护 musl-cross 工具链。
+          - { goos: linux,   goarch: arm64,    ext: '',   tags_src: others,  suffix: -musl, cgo: '1', cc_target: aarch64-linux-musl }
           - { goos: linux,   goarch: '386',    ext: '',   tags_src: others,  suffix: '' }
           - { goos: linux,   goarch: arm,      ext: '',   tags_src: others,  suffix: -v7,  goarm: '7' }
           - { goos: linux,   goarch: mipsle,   ext: '',   tags_src: others,  suffix: -softfloat, gomips: softfloat }
@@ -113,6 +119,16 @@ jobs:
           go-version: '1.25'
           check-latest: true
 
+      # Zig is installed ONLY for targets that need a musl cross CC
+      # (currently: linux/arm64-musl). Zig ships musl headers + libc.a
+      # for every arch, which lets us do `zig cc -target ...` without
+      # maintaining a separate musl-cross toolchain. Other targets
+      # skip this step, keeping the matrix runtime unchanged.
+      - name: Setup Zig (musl cross CC)
+        if: matrix.cc_target
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
 
       - name: Resolve build tags
         id: tags
@@ -145,22 +161,47 @@ jobs:
           GOARM:       ${{ matrix.goarm }}
           GOMIPS:      ${{ matrix.gomips }}
           GOAMD64:     ${{ matrix.goamd64 }}
+          # cc_target, when set, drives cross-CGO via `zig cc -target`.
+          # Currently: linux/arm64-musl. Empty for every other row.
+          CC_TARGET:   ${{ matrix.cc_target }}
         run: |
           set -euo pipefail
           VERSION='${{ needs.prepare.outputs.version }}'
           NAME="sing-box-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
           BIN="${NAME}${{ matrix.ext }}"
-          echo "Building $BIN (tags=${{ steps.tags.outputs.tags }}, CGO=${CGO_ENABLED}, GOAMD64=${GOAMD64:-default})"
+          # Cross-CGO via zig. For -musl targets we also pass
+          # -extldflags=-static so the final ELF has zero runtime libc
+          # dependency — this is the whole point of shipping a musl
+          # build (Alpine/OpenWrt/scratch containers can run it
+          # directly without adding glibc).
+          EXTRA_LDFLAGS=""
+          if [ -n "${CC_TARGET}" ]; then
+            export CC="zig cc -target ${CC_TARGET}"
+            export CXX="zig c++ -target ${CC_TARGET}"
+            EXTRA_LDFLAGS=" -extldflags=-static"
+            echo "Cross CGO via zig: CC='${CC}'"
+          fi
+          echo "Building $BIN (tags=${{ steps.tags.outputs.tags }}, CGO=${CGO_ENABLED}, GOAMD64=${GOAMD64:-default}, CC_TARGET=${CC_TARGET:-none})"
           go build -v -trimpath -buildvcs=false \
             -tags "${{ steps.tags.outputs.tags }}" \
-            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=${VERSION} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -buildid=" \
+            -ldflags "-s -w -X github.com/sagernet/sing-box/constant.Version=${VERSION} -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -buildid=${EXTRA_LDFLAGS}" \
             -o "$BIN" ./cmd/sing-box
           ls -lh "$BIN"
           # For glibc dynamic builds, surface the runtime ELF requirements
           # so the release notes can list the minimum supported distro.
+          # For musl static builds, verify NO dynamic dependencies — if
+          # something slipped in, fail the build loudly.
           if [ "${CGO_ENABLED}" = "1" ]; then
             echo "--- ELF dynamic dependencies ---"
-            objdump -p "$BIN" | grep -E '(NEEDED|GLIBC_)' | sort -u || true
+            DEPS=$(objdump -p "$BIN" | grep -E '(NEEDED|GLIBC_)' | sort -u || true)
+            echo "${DEPS}"
+            if [ -n "${CC_TARGET}" ]; then
+              if echo "${DEPS}" | grep -q "NEEDED"; then
+                echo "ERROR: musl build has dynamic NEEDED deps — expected fully static"
+                exit 1
+              fi
+              echo "musl static build OK — no dynamic deps"
+            fi
           fi
           echo "BIN=$BIN"   >> "$GITHUB_ENV"
           echo "NAME=$NAME" >> "$GITHUB_ENV"
