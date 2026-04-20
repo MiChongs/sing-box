@@ -371,17 +371,29 @@ jobs:
       # 和新二进制混在一起供用户下载 — 明确删除再重建，防止残留。
       # 注意：只删 Release（包括它挂载的 assets），不删 tag 本身 —— tag 已在
       # trigger 时被 GitHub 创建，softprops 会在下一步重新关联。
-      - name: Delete existing Release (idempotent)
+      #
+      # 用 gh api 直接列所有 release（包括 draft）按 tag_name 过滤删除。
+      # gh release view/list 默认不返回 draft，softprops 又会把 draft release
+      # 当 "already_exists" 报错，所以必须走 api 层保证草稿也被清掉。
+      - name: Delete existing Release (idempotent, handles draft)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG:      ${{ needs.prepare.outputs.tag }}
+          REPO:     ${{ github.repository }}
         run: |
           set -euo pipefail
-          if gh release view "$TAG" --repo "${{ github.repository }}" >/dev/null 2>&1; then
-            echo "::notice::Deleting existing Release $TAG"
-            gh release delete "$TAG" --repo "${{ github.repository }}" --yes --cleanup-tag=false
-          else
+          echo "Looking for any Release (draft or published) with tag=$TAG"
+          # List returns up to 100 releases including drafts when using the raw
+          # API endpoint; filter client-side by tag_name. Use jq to extract IDs.
+          IDS=$(gh api "repos/${REPO}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .id" || true)
+          if [ -z "$IDS" ]; then
             echo "No existing Release for $TAG, nothing to delete."
+          else
+            for id in $IDS; do
+              echo "::notice::Deleting Release id=$id (tag=$TAG)"
+              gh api -X DELETE "repos/${REPO}/releases/$id"
+            done
           fi
 
       - name: Create or Update Release
