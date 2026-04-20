@@ -64,26 +64,6 @@ func (c *PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) er
 	return err
 }
 
-func (c *PacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
-	if packetReader, ok := c.PacketConn.(N.PacketReader); ok {
-		return packetReader.ReadPacket(buffer)
-	}
-	_, addr, err := buffer.ReadPacketFrom(c.PacketConn)
-	if err != nil {
-		return M.Socksaddr{}, err
-	}
-	return M.SocksaddrFromNet(addr).Unwrap(), err
-}
-
-func (c *PacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
-	if packetWriter, ok := c.PacketConn.(N.PacketWriter); ok {
-		return packetWriter.WritePacket(buffer, destination)
-	}
-	defer buffer.Release()
-	_, err := c.PacketConn.WriteTo(buffer.Bytes(), destination.UDPAddr())
-	return err
-}
-
 func (c *PacketConn) Close() error {
 	c.group.access.Lock()
 	c.group.connections.Remove(c.element)

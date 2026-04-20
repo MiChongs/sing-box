@@ -186,7 +186,7 @@ func (m *Manager) startSingleOutbound(monitor *taskmonitor.Monitor, outbound ada
 		if err != nil {
 			return E.Cause(err, "start ", name)
 		}
-		m.logger.Trace("start ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
+		adapter.LogElapsed(m.logger, startTime, "start ", name)
 	} else if starter, isStarter := outbound.(interface {
 		Start() error
 	}); isStarter {
@@ -198,7 +198,7 @@ func (m *Manager) startSingleOutbound(monitor *taskmonitor.Monitor, outbound ada
 		if err != nil {
 			return E.Cause(err, "start ", name)
 		}
-		m.logger.Trace("start ", name, " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
+		adapter.LogElapsed(m.logger, startTime, "start ", name)
 	}
 	return nil
 }

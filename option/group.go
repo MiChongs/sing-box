@@ -148,18 +148,3 @@ type SmartOutboundOptions struct {
 	// (every dial re-evaluates from scratch). Recommended 1–5 s.
 	Hysteresis badoption.Duration `json:"hysteresis,omitempty"`
 }
-
-type URLTestFallbackOptions struct {
-	Enabled  bool               `json:"enabled,omitempty"`
-	MaxDelay badoption.Duration `json:"max_delay,omitempty"`
-}
-
-type LoadBalanceOutboundOptions struct {
-	GroupCommonOption
-	URL                       string             `json:"url,omitempty"`
-	Interval                  badoption.Duration `json:"interval,omitempty"`
-	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
-	TTL                       badoption.Duration `json:"ttl,omitempty"`
-	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
-	Strategy                  string             `json:"strategy,omitempty"`
-}
