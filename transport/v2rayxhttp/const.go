@@ -1,43 +1,51 @@
 package v2rayxhttp
 
-// XHTTP 模式常量；对应 option.V2RayXHTTPOptions.Mode 字段。
-// "auto" 由客户端按 transport 能力（HTTP/2 与否）挑选：
-//   有 H2 且支持 duplex → stream-one
-//   有 H2 但后端是 CDN 可能不支持上行流式 → stream-up
-//   纯 HTTP/1.1 或 CDN 明令禁止长请求 → packet-up
-// 当前实现客户端 auto 路径优先选 stream-one (H2) / stream-up (H1)。
+import "time"
+
+// XHTTP 协议模式。对齐 mihomo / XTLS-Xray：
+//   - auto:       有 TLS → stream-one; 无 TLS → packet-up
+//   - stream-one: 单条 H2 duplex POST（请求体上行 / 响应体下行）
+//   - stream-up:  POST 上行长流 + 独立 GET/SSE 下行长流
+//   - packet-up:  每条写入一次 POST（seq 递增）+ 单条 GET/SSE 下行
 const (
 	ModeAuto      = "auto"
-	ModePacketUp  = "packet-up"
-	ModeStreamUp  = "stream-up"
 	ModeStreamOne = "stream-one"
+	ModeStreamUp  = "stream-up"
+	ModePacketUp  = "packet-up"
 )
 
-// XHTTP 协议专用 header / query 名称，保持与 Xray 一致以便互通。
+// 默认 padding 范围与 Xray/mihomo 一致（100-1000 bytes）
+const defaultPaddingRange = "100-1000"
+
+// ConnIdleTimeout: tunnel 空闲时上游 HTTP transport 的最大保活时长。
+// 与 mihomo 对齐 (300s)，兼顾 CDN idle TCP 回收窗口。
+const ConnIdleTimeout = 300 * time.Second
+
+// ChromeH2KeepAlivePeriod: H2 读空闲 keep-alive 周期（Chrome 默认 45s）。
+// 对 CDN 身份指纹更自然（相比 quic-go H3 的 10s）。
+const ChromeH2KeepAlivePeriod = 45 * time.Second
+
+// packetUp 的默认参数（与 Xray 一致）
 const (
-	// 每请求 URL query 附随机 hex padding
-	paddingQueryKey = "x_padding"
-	// 同上但放 header（某些 CDN 吃掉 query）
-	paddingHeaderKey = "X-Padding"
+	defaultScMaxEachPostBytes   = 1_000_000
+	defaultScMinPostsIntervalMs = 30
+	defaultScMaxBufferedPosts   = 30
+)
 
-	// packet-up 模式：服务端用 SSE 或普通 chunked 下发下行
-	contentTypeSSE       = "text/event-stream"
-	contentTypeOctet     = "application/octet-stream"
-	contentTypePlainData = "application/grpc" // 某些 CDN 对该类型白名单更友好；与 Xray 对齐
-
-	// packet-up 模式 UP 方向默认 method
+// HTTP 方法常量
+const (
 	methodPost = "POST"
-	// stream-one / stream-up 的 down 方向 method
-	methodGet = "GET"
-
-	// SSE chunk 前缀（如果启用 no_sse_header=false）
-	sseDataPrefix = "data: "
-	sseChunkEnd   = "\n\n"
+	methodGet  = "GET"
 )
 
-// 服务端 packet-up 会话默认参数
+// 内容类型
 const (
-	defaultScMaxBufferedPosts = 30
-	// 会话空闲超时：SSE 通道关闭 + 30s 无新 POST 即回收 session 上下文
-	sessionIdleTimeoutSeconds = 60
+	contentTypeGRPC = "application/grpc" // Xray 默认上行 stream 类型
+	contentTypeSSE  = "text/event-stream"
+)
+
+// Padding 相关
+const (
+	paddingQueryKey  = "x_padding"
+	paddingRefererHD = "Referer" // default placement: padding 值封装为 URL 放进 Referer
 )

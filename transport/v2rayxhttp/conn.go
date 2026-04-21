@@ -56,6 +56,10 @@ type xhttpConn struct {
 	readDeadlineTimer *time.Timer
 	writeDeadlineTim  *time.Timer
 	deadlineFired     atomic.Bool
+
+	// onClose 在 Close 被成功调用一次后触发；供 dial 侧挂清理回调（例如
+	// cancel 绑定的 reqCtx，让 upload/download goroutine 尽快收尾）。
+	onClose func()
 }
 
 func newXHTTPConn(reader io.Reader, writer io.WriteCloser, remoteAddr net.Addr) *xhttpConn {
@@ -153,6 +157,9 @@ func (c *xhttpConn) Close() error {
 			if err := closer.Close(); err != nil && c.closeErr == nil {
 				c.closeErr = err
 			}
+		}
+		if c.onClose != nil {
+			c.onClose()
 		}
 	})
 	return c.closeErr
