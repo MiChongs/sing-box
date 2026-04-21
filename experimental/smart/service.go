@@ -9,12 +9,33 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/assetdl"
+	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/common/smart/lightgbm"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 )
+
+// resolveHTTPClientDetour extracts an outbound tag from an http_client option:
+//   - inline form with dialer.detour set → returns the detour tag directly
+//   - tag form (`"http_client": "foo"`) → looks up foo's detour via Manager
+//
+// Returns "" when no detour is derivable. Caller should then fall back to
+// legacy download_detour.
+func resolveHTTPClientDetour(ctx context.Context, opts *option.HTTPClientOptions) string {
+	if opts == nil {
+		return ""
+	}
+	if opts.Tag == "" {
+		return opts.Detour
+	}
+	mgr := service.FromContext[adapter.HTTPClientManager](ctx)
+	if m, ok := mgr.(*httpclient.Manager); ok {
+		return m.LookupDetour(opts.Tag)
+	}
+	return ""
+}
 
 var _ adapter.SmartService = (*Service)(nil)
 
@@ -136,15 +157,20 @@ func (s *Service) initModel() error {
 		}
 		interval := defaultDuration(opts.UpdateInterval, lightgbm.DefaultUpdateInterval)
 
-		// Resolve download_detour → adapter.Outbound (satisfies assetdl.Dialer).
-		// Empty or unresolvable tag → nil → assetdl falls back to direct net dial.
+		// Resolve detour outbound tag (assetdl wants an adapter.Outbound as Dialer).
+		// Preferred source: http_client (tag ref → Manager.LookupDetour, or inline .Detour).
+		// Legacy fallback: download_detour.
+		detourTag := resolveHTTPClientDetour(s.ctx, opts.HTTPClient)
+		if detourTag == "" {
+			detourTag = opts.DownloadDetour //nolint:staticcheck
+		}
 		var dialer assetdl.Dialer
-		if opts.DownloadDetour != "" {
+		if detourTag != "" {
 			if mgr := service.FromContext[adapter.OutboundManager](s.ctx); mgr != nil {
-				if ob, loaded := mgr.Outbound(opts.DownloadDetour); loaded {
+				if ob, loaded := mgr.Outbound(detourTag); loaded {
 					dialer = ob
 				} else {
-					s.logger.Warn("lightgbm: download_detour=[", opts.DownloadDetour, "] not found; using direct")
+					s.logger.Warn("lightgbm: detour=[", detourTag, "] not found; using direct")
 				}
 			} else {
 				s.logger.Warn("lightgbm: outbound manager unavailable; using direct")
@@ -169,8 +195,8 @@ func (s *Service) initModel() error {
 		}
 		s.dl = dl
 		via := "direct"
-		if opts.DownloadDetour != "" && dialer != nil {
-			via = opts.DownloadDetour
+		if detourTag != "" && dialer != nil {
+			via = detourTag
 		}
 		s.logger.Info("lightgbm: auto-update enabled (interval=", interval, ", via=", via, ")")
 		s.dl.Start()

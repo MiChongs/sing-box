@@ -26,7 +26,9 @@ type SmartLightGBMOptions struct {
 	AutoUpdate     bool               `json:"auto_update,omitempty"`     // periodic refresh
 	UpdateInterval badoption.Duration `json:"update_interval,omitempty"` // default 72h
 	ModelPath      string             `json:"model_path,omitempty"`      // default "smart_lgbm_model.bin" under base path
-	DownloadDetour string             `json:"download_detour,omitempty"` // optional outbound tag for fetch
+	HTTPClient     *HTTPClientOptions `json:"http_client,omitempty"`     // preferred: tag ref ("name") or inline
+	// Deprecated: use http_client instead
+	DownloadDetour string `json:"download_detour,omitempty"` // optional outbound tag for fetch
 }
 
 type SmartCollectorOptions struct {
@@ -40,11 +42,13 @@ type SmartCollectorOptions struct {
 // (Smart group's use_asn feature); other files are downloaded for manual
 // use or future consumers.
 type GeoXOptions struct {
-	Enabled        bool               `json:"enabled,omitempty"`         // master switch ("geodata-mode")
+	Enabled        bool               `json:"enabled,omitempty"`     // master switch ("geodata-mode")
 	AutoUpdate     bool               `json:"auto_update,omitempty"`
 	UpdateInterval badoption.Duration `json:"update_interval,omitempty"` // default 24h
-	DownloadDetour string             `json:"download_detour,omitempty"` // optional outbound tag
-	URL            GeoXURLs           `json:"url,omitempty"`
+	HTTPClient     *HTTPClientOptions `json:"http_client,omitempty"`     // preferred: tag ref or inline
+	// Deprecated: use http_client instead
+	DownloadDetour string   `json:"download_detour,omitempty"` // optional outbound tag
+	URL            GeoXURLs `json:"url,omitempty"`
 }
 
 // GeoXURLs holds remote URLs for the 4 recognised geo asset types.

@@ -162,6 +162,22 @@ func (m *Manager) resolveShared(tag string) (*sharedManagedTransport, error) {
 	return sharedTransport, nil
 }
 
+// LookupDetour returns the detour outbound tag declared by http_client[tag],
+// or "" if the tag is unknown / has no detour. Used by downloaders
+// (geox / lightgbm) that need an outbound tag rather than a transport.
+func (m *Manager) LookupDetour(tag string) string {
+	if tag == "" {
+		return ""
+	}
+	m.access.Lock()
+	defer m.access.Unlock()
+	define, loaded := m.defines[tag]
+	if !loaded {
+		return ""
+	}
+	return define.Detour
+}
+
 func (m *Manager) ResetNetwork() {
 	m.access.Lock()
 	defer m.access.Unlock()
