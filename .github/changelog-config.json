@@ -1,0 +1,97 @@
+{
+  "categories": [
+    {
+      "title": "## Features",
+      "labels": ["feat"],
+      "rules": [
+        { "pattern": "^feat(\\([^)]+\\))?!?:.+", "on_property": "title", "flags": "i" }
+      ]
+    },
+    {
+      "title": "## Bug Fixes",
+      "labels": ["fix"],
+      "rules": [
+        { "pattern": "^fix(\\([^)]+\\))?!?:.+", "on_property": "title", "flags": "i" }
+      ]
+    },
+    {
+      "title": "## Performance",
+      "labels": ["perf"],
+      "rules": [
+        { "pattern": "^perf(\\([^)]+\\))?!?:.+", "on_property": "title", "flags": "i" }
+      ]
+    },
+    {
+      "title": "## Refactor",
+      "labels": ["refactor"],
+      "rules": [
+        { "pattern": "^refactor(\\([^)]+\\))?!?:.+", "on_property": "title", "flags": "i" }
+      ]
+    },
+    {
+      "title": "## Documentation",
+      "labels": ["docs"],
+      "rules": [
+        { "pattern": "^docs(\\([^)]+\\))?!?:.+", "on_property": "title", "flags": "i" }
+      ]
+    },
+    {
+      "title": "## Tests",
+      "labels": ["test"],
+      "rules": [
+        { "pattern": "^test(\\([^)]+\\))?!?:.+", "on_property": "title", "flags": "i" }
+      ]
+    },
+    {
+      "title": "## CI / Build",
+      "labels": ["ci", "build"],
+      "rules": [
+        { "pattern": "^(ci|build)(\\([^)]+\\))?!?:.+", "on_property": "title", "flags": "i" }
+      ]
+    },
+    {
+      "title": "## Chores",
+      "labels": ["chore"],
+      "rules": [
+        { "pattern": "^chore(\\([^)]+\\))?!?:.+", "on_property": "title", "flags": "i" }
+      ]
+    },
+    {
+      "title": "## Style",
+      "labels": ["style"],
+      "rules": [
+        { "pattern": "^style(\\([^)]+\\))?!?:.+", "on_property": "title", "flags": "i" }
+      ]
+    },
+    {
+      "title": "## Reverts",
+      "labels": ["revert"],
+      "rules": [
+        { "pattern": "^revert(\\([^)]+\\))?!?:.+", "on_property": "title", "flags": "i" }
+      ]
+    },
+    {
+      "title": "## Other Changes",
+      "labels": [],
+      "exhaustive": false
+    }
+  ],
+  "ignore_labels": [],
+  "sort": {
+    "order": "DESC",
+    "on_property": "mergedAt"
+  },
+  "template": "#{{CHANGELOG}}\n#{{UNCATEGORIZED}}",
+  "pr_template": "- #{{TITLE}} ([`#{{COMMIT_SHA}}`](#{{URL}}))",
+  "empty_template": "_No noteworthy changes in this range._",
+  "commit_template": "- #{{TITLE}} ([`#{{COMMIT_SHA}}`](https://github.com/#{{OWNER}}/#{{REPO}}/commit/#{{COMMIT_SHA}}))",
+  "trim_values": true,
+  "max_tags_to_fetch": 200,
+  "max_pull_requests": 300,
+  "max_back_track_time_days": 365,
+  "exclude_merge_branches": [],
+  "tag_resolver": {
+    "method": "sort",
+    "filter": { "pattern": ".+" }
+  }
+}

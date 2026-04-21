@@ -439,99 +439,84 @@ jobs:
           sha256sum *.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Build changelog
+      # 引入 mikepenz/release-changelog-builder-action 做 commit 分类 + 美化；
+      # 配置见 .github/changelog-config.json。它只负责 "Changes since <PREV>"
+      # 那一段的美化（分类 + bullet + hash 链接），头尾元信息和 artifacts
+      # 表格仍由下面的 shell 拼接。
+      - name: Resolve previous tag
+        id: prevtag
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          PREV=$(git tag --sort=-creatordate | grep -v -F -x "$TAG" | head -n1 || true)
+          echo "prev=$PREV" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Build categorized changelog (external)
+        id: cl
+        uses: mikepenz/release-changelog-builder-action@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          configuration: .github/changelog-config.json
+          fromTag: ${{ steps.prevtag.outputs.prev }}
+          toTag:   ${{ needs.prepare.outputs.tag }}
+          failOnError: false
+          mode: COMMIT
+          fetchReleaseInformation: false
+          commitMode: true
+
+      - name: Assemble Release notes
         env:
           TAG:          ${{ needs.prepare.outputs.tag }}
+          PREV:         ${{ steps.prevtag.outputs.prev }}
           SKIP_ANDROID: ${{ needs.prepare.outputs.skip_android }}
           ANDROID_RES:  ${{ needs.android.result }}
           REPO:         ${{ github.repository }}
           SERVER_URL:   ${{ github.server_url }}
           RUN_ID:       ${{ github.run_id }}
           IS_PRE:       ${{ needs.prepare.outputs.prerelease }}
+          CL_BODY:      ${{ steps.cl.outputs.changelog }}
+          CL_COUNT:     ${{ steps.cl.outputs.changes }}
         run: |
           set -euo pipefail
-
-          PREV=$(git tag --sort=-creatordate | grep -v -F -x "$TAG" | head -n1 || true)
-          RANGE_DESC="initial release"
-          RANGE_CMD=(git log --no-merges --pretty=format:'%H%x09%h%x09%s' HEAD)
-          if [ -n "$PREV" ]; then
-            RANGE_DESC="since \`$PREV\`"
-            RANGE_CMD=(git log --no-merges --pretty=format:'%H%x09%h%x09%s' "${PREV}..HEAD")
-          fi
-
-          COMMITS_TSV=$("${RANGE_CMD[@]}" || true)
-          COMMIT_COUNT=$(printf '%s\n' "$COMMITS_TSV" | grep -c . || true)
           BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M UTC')
 
-          # Conventional-commit buckets. Lines not matching any prefix land in "Other".
-          declare -A BUCKETS=(
-            [feat]="Features"
-            [fix]="Bug Fixes"
-            [perf]="Performance"
-            [refactor]="Refactor"
-            [docs]="Documentation"
-            [test]="Tests"
-            [ci]="CI / Build"
-            [build]="CI / Build"
-            [chore]="Chores"
-            [style]="Style"
-            [revert]="Reverts"
-          )
-          ORDER=(feat fix perf refactor docs test ci chore style revert other)
-
-          declare -A SECTIONS
-          while IFS=$'\t' read -r _full short subject; do
-            [ -n "$subject" ] || continue
-            key=$(printf '%s' "$subject" | sed -n 's/^\([a-z]\+\)\(([^)]*)\)\?!\?:.*/\1/p')
-            if [ -z "$key" ] || [ -z "${BUCKETS[$key]:-}" ]; then
-              key=other
-            fi
-            SECTIONS[$key]+="- ${subject} (\`${short}\`)"$'\n'
-          done <<< "$COMMITS_TSV"
+          if [ -n "$PREV" ]; then
+            PREV_CELL="\`$PREV\`"
+            COMPARE_URL="${SERVER_URL}/${REPO}/compare/${PREV}...${TAG}"
+            RANGE_LINE="[\`$PREV\` … \`$TAG\`]($COMPARE_URL)"
+          else
+            PREV_CELL="(initial)"
+            RANGE_LINE="(initial release)"
+          fi
+          if [ "$IS_PRE" = 'true' ]; then
+            CHANNEL_CELL="pre-release"
+          else
+            CHANNEL_CELL="stable"
+          fi
 
           {
-            echo "# sing-box xiaobaf14g — \`$TAG\`"
+            echo "# sing-box xiaobaf14g &mdash; \`$TAG\`"
             echo ""
-            if [ -n "$PREV" ]; then
-              PREV_CELL="\`$PREV\`"
-            else
-              PREV_CELL="(initial)"
-            fi
-            if [ "$IS_PRE" = 'true' ]; then
-              CHANNEL_CELL="pre-release"
-            else
-              CHANNEL_CELL="stable"
-            fi
+            echo "> $RANGE_LINE"
+            echo ""
             echo "| Field | Value |"
             echo "|---|---|"
             echo "| Tag | \`$TAG\` |"
             echo "| Previous | $PREV_CELL |"
-            echo "| Commits | $COMMIT_COUNT |"
+            echo "| Commits | ${CL_COUNT:-0} |"
             echo "| Channel | $CHANNEL_CELL |"
             echo "| Built | $BUILD_DATE |"
             echo ""
             echo "---"
             echo ""
-            echo "## Changes $RANGE_DESC"
-            echo ""
-            if [ "$COMMIT_COUNT" -eq 0 ]; then
-              echo "_No commits in range._"
-              echo ""
+            if [ -n "${CL_BODY:-}" ]; then
+              printf '%s\n' "$CL_BODY"
             else
-              for key in "${ORDER[@]}"; do
-                body="${SECTIONS[$key]:-}"
-                [ -n "$body" ] || continue
-                if [ "$key" = other ]; then
-                  title="Other"
-                else
-                  title="${BUCKETS[$key]}"
-                fi
-                echo "### $title"
-                echo ""
-                printf '%s\n' "$body"
-              done
+              echo "_No noteworthy changes in this range._"
             fi
-
+            echo ""
             echo "---"
             echo ""
             echo "## Artifacts"
