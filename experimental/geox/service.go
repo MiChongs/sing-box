@@ -15,11 +15,28 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/assetdl"
+	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 )
+
+// resolveHTTPClientDetour mirrors smart.resolveHTTPClientDetour: lift an
+// outbound tag out of http_client (tag ref → Manager lookup, or inline .Detour).
+func resolveHTTPClientDetour(ctx context.Context, opts *option.HTTPClientOptions) string {
+	if opts == nil {
+		return ""
+	}
+	if opts.Tag == "" {
+		return opts.Detour
+	}
+	mgr := service.FromContext[adapter.HTTPClientManager](ctx)
+	if m, ok := mgr.(*httpclient.Manager); ok {
+		return m.LookupDetour(opts.Tag)
+	}
+	return ""
+}
 
 var _ adapter.GeoXService = (*Service)(nil)
 
@@ -208,28 +225,37 @@ func (s *Service) Start(stage adapter.StartStage) error {
 
 	s.ready = true
 	via := "direct"
-	if s.options.DownloadDetour != "" {
-		via = s.options.DownloadDetour
+	if tag := s.detourTag(); tag != "" {
+		via = tag
 	}
 	s.logger.Info("geox: enabled (auto_update=", s.options.AutoUpdate, ", interval=", interval, ", via=", via, ")")
 	return nil
 }
 
+// detourTag returns the effective outbound tag for downloads.
+// Preferred: http_client (tag ref or inline .Detour). Legacy: download_detour.
+func (s *Service) detourTag() string {
+	if tag := resolveHTTPClientDetour(s.ctx, s.options.HTTPClient); tag != "" {
+		return tag
+	}
+	return s.options.DownloadDetour //nolint:staticcheck
+}
+
 // resolveDetour looks up the download_detour outbound tag. Returns nil on
 // empty tag or resolution failure — assetdl then falls back to direct net dial.
 func (s *Service) resolveDetour() assetdl.Dialer {
-	tag := s.options.DownloadDetour
+	tag := s.detourTag()
 	if tag == "" {
 		return nil
 	}
 	mgr := service.FromContext[adapter.OutboundManager](s.ctx)
 	if mgr == nil {
-		s.logger.Warn("geox: download_detour=[", tag, "] requested but outbound manager unavailable; using direct")
+		s.logger.Warn("geox: detour=[", tag, "] requested but outbound manager unavailable; using direct")
 		return nil
 	}
 	ob, loaded := mgr.Outbound(tag)
 	if !loaded {
-		s.logger.Warn("geox: download_detour=[", tag, "] not found; using direct")
+		s.logger.Warn("geox: detour=[", tag, "] not found; using direct")
 		return nil
 	}
 	return ob
