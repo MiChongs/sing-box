@@ -2024,7 +2024,26 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	if snap == nil || len(snap.outbounds) == 0 {
 		return nil, E.New("smart: no outbounds available")
 	}
-	selectedOutbounds, isUnwrap, source := s.selectProxiesTraced(meta, snap.outbounds, isUDP)
+
+	// ── Sticky fast-path ──
+	// 目标：大池子（50+ 节点）下 Telegram 等长连接场景首包秒连。
+	// 选 sticky-session 算法（或 hysteresis 开启）的组，如果上次成功
+	// 到同一 target 的节点仍健在，直接返回单元素候选，省掉整条
+	// selectProxiesTraced (unwrap/prefetch/weight/delay 4 层 + 5 次 reorder)
+	// 决策链路 — 原本随节点数 O(N) 增长的延迟退化到 O(1) 几条 map lookup。
+	// 任何一个短路前置条件不满足 → 退回完整决策路径，不改变既有行为。
+	var selectedOutbounds []adapter.Outbound
+	var isUnwrap bool
+	var source string
+	isFastPath := false
+	if fastOb := s.stickyFastPath(meta, snap.outbounds, isUDP); fastOb != nil {
+		selectedOutbounds = []adapter.Outbound{fastOb}
+		isUnwrap = true
+		source = "sticky-fast"
+		isFastPath = true
+	} else {
+		selectedOutbounds, isUnwrap, source = s.selectProxiesTraced(meta, snap.outbounds, isUDP)
+	}
 
 	// If everyone in the candidate list is dead, selectProxiesTraced will
 	// have already fallen through to a fallback tier via fillProxies. But if
@@ -2056,15 +2075,21 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	// node-level score. Cached unwrap result is persisted BEFORE
 	// this rerank so the cache stays stable; the rerank only biases
 	// dial order on this specific attempt.
-	selectedOutbounds = s.reorderForRequestScene(selectedOutbounds, meta)
+	//
+	// Fast-path 命中时 selectedOutbounds 已经是单元素，重排无意义且会
+	// 触发 store 和 node-stats lookup —— 完全跳过以兑现 "Telegram 秒连"
+	// 承诺（从入口到 dialWithRetry 只走 map lookup + isAlive）。
+	if !isFastPath {
+		selectedOutbounds = s.reorderForRequestScene(selectedOutbounds, meta)
 
-	// True-alive check: push nodes whose recent stats OR active SNI
-	// probes say they're broken for THIS target to the tail of the
-	// list. Never hard-removes (so a broad outage still has a
-	// last-resort candidate), only deprioritises. Done AFTER the
-	// scene rerank so a scene-preferred-but-target-broken node
-	// doesn't stay at position 0. See smart_target_liveness.go.
-	selectedOutbounds = s.deprioritiseSuspicious(selectedOutbounds, meta.smartTarget)
+		// True-alive check: push nodes whose recent stats OR active SNI
+		// probes say they're broken for THIS target to the tail of the
+		// list. Never hard-removes (so a broad outage still has a
+		// last-resort candidate), only deprioritises. Done AFTER the
+		// scene rerank so a scene-preferred-but-target-broken node
+		// doesn't stay at position 0. See smart_target_liveness.go.
+		selectedOutbounds = s.deprioritiseSuspicious(selectedOutbounds, meta.smartTarget)
+	}
 
 	// Record the target hit so the periodic SNI probe task knows
 	// which targets are worth actively verifying.
