@@ -440,48 +440,138 @@ jobs:
           cat SHA256SUMS
 
       - name: Build changelog
+        env:
+          TAG:          ${{ needs.prepare.outputs.tag }}
+          SKIP_ANDROID: ${{ needs.prepare.outputs.skip_android }}
+          ANDROID_RES:  ${{ needs.android.result }}
+          REPO:         ${{ github.repository }}
+          SERVER_URL:   ${{ github.server_url }}
+          RUN_ID:       ${{ github.run_id }}
+          IS_PRE:       ${{ needs.prepare.outputs.prerelease }}
         run: |
           set -euo pipefail
-          TAG='${{ needs.prepare.outputs.tag }}'
-          # 找到上一个 tag (按创建时间降序)，跳过正在发布的 TAG 本身
+
           PREV=$(git tag --sort=-creatordate | grep -v -F -x "$TAG" | head -n1 || true)
-          {
-            if [ -n "$PREV" ]; then
-              echo "## Changes since \`$PREV\`"
-              echo ""
-              git log --no-merges --pretty='- %s (`%h`)' "${PREV}..HEAD" | head -n 100
-            else
-              echo "## Initial xiaobaf14g release"
-              echo ""
-              git log --no-merges --pretty='- %s (`%h`)' HEAD | head -n 30
+          RANGE_DESC="initial release"
+          RANGE_CMD=(git log --no-merges --pretty=format:'%H%x09%h%x09%s' HEAD)
+          if [ -n "$PREV" ]; then
+            RANGE_DESC="since \`$PREV\`"
+            RANGE_CMD=(git log --no-merges --pretty=format:'%H%x09%h%x09%s' "${PREV}..HEAD")
+          fi
+
+          COMMITS_TSV=$("${RANGE_CMD[@]}" || true)
+          COMMIT_COUNT=$(printf '%s\n' "$COMMITS_TSV" | grep -c . || true)
+          BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M UTC')
+
+          # Conventional-commit buckets. Lines not matching any prefix land in "Other".
+          declare -A BUCKETS=(
+            [feat]="Features"
+            [fix]="Bug Fixes"
+            [perf]="Performance"
+            [refactor]="Refactor"
+            [docs]="Documentation"
+            [test]="Tests"
+            [ci]="CI / Build"
+            [build]="CI / Build"
+            [chore]="Chores"
+            [style]="Style"
+            [revert]="Reverts"
+          )
+          ORDER=(feat fix perf refactor docs test ci chore style revert other)
+
+          declare -A SECTIONS
+          while IFS=$'\t' read -r _full short subject; do
+            [ -n "$subject" ] || continue
+            key=$(printf '%s' "$subject" | sed -n 's/^\([a-z]\+\)\(([^)]*)\)\?!\?:.*/\1/p')
+            if [ -z "$key" ] || [ -z "${BUCKETS[$key]:-}" ]; then
+              key=other
             fi
+            SECTIONS[$key]+="- ${subject} (\`${short}\`)"$'\n'
+          done <<< "$COMMITS_TSV"
+
+          {
+            echo "# sing-box xiaobaf14g — \`$TAG\`"
+            echo ""
+            if [ -n "$PREV" ]; then
+              PREV_CELL="\`$PREV\`"
+            else
+              PREV_CELL="(initial)"
+            fi
+            if [ "$IS_PRE" = 'true' ]; then
+              CHANNEL_CELL="pre-release"
+            else
+              CHANNEL_CELL="stable"
+            fi
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Tag | \`$TAG\` |"
+            echo "| Previous | $PREV_CELL |"
+            echo "| Commits | $COMMIT_COUNT |"
+            echo "| Channel | $CHANNEL_CELL |"
+            echo "| Built | $BUILD_DATE |"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Changes $RANGE_DESC"
+            echo ""
+            if [ "$COMMIT_COUNT" -eq 0 ]; then
+              echo "_No commits in range._"
+              echo ""
+            else
+              for key in "${ORDER[@]}"; do
+                body="${SECTIONS[$key]:-}"
+                [ -n "$body" ] || continue
+                if [ "$key" = other ]; then
+                  title="Other"
+                else
+                  title="${BUCKETS[$key]}"
+                fi
+                echo "### $title"
+                echo ""
+                printf '%s\n' "$body"
+              done
+            fi
+
+            echo "---"
             echo ""
             echo "## Artifacts"
             echo ""
-            for f in builds/*.tar.gz; do
-              [ -e "$f" ] || continue
-              SIZE=$(du -h "$f" | cut -f1)
-              echo "- \`$(basename "$f")\` — ${SIZE}"
-            done
+            if ls builds/*.tar.gz >/dev/null 2>&1; then
+              echo "| File | Size |"
+              echo "|---|---:|"
+              for f in builds/*.tar.gz; do
+                SIZE=$(du -h "$f" | cut -f1 | tr -d ' ')
+                printf '| `%s` | %s |\n' "$(basename "$f")" "$SIZE"
+              done
+            else
+              echo "_No artifacts produced._"
+            fi
             echo ""
-            echo "<details><summary>SHA256SUMS</summary>"
+            echo "<details><summary><b>SHA256SUMS</b></summary>"
             echo ""
             echo '```'
-            cat builds/SHA256SUMS
+            cat builds/SHA256SUMS 2>/dev/null || echo '(no checksum manifest)'
             echo '```'
             echo ""
             echo "</details>"
             echo ""
-            echo "## Android"
+            echo "---"
             echo ""
-            if [ '${{ needs.prepare.outputs.skip_android }}' = 'true' ]; then
-              echo "_Skipped (manually disabled via workflow input)._"
-            elif [ '${{ needs.android.result }}' = 'success' ]; then
-              echo "Built successfully."
+            echo "## Android Client"
+            echo ""
+            if [ "$SKIP_ANDROID" = 'true' ]; then
+              echo "> Skipped — disabled via workflow input."
+            elif [ "$ANDROID_RES" = 'success' ]; then
+              echo "> Built successfully and attached above."
             else
-              echo "_Build failed — see [Actions run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details._"
+              echo "> Build failed. Inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) for logs."
             fi
+            echo ""
+            echo "---"
+            echo ""
+            echo "<sub>Generated by xiaobaf14g release workflow · <a href=\"${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}\">run #${RUN_ID}</a></sub>"
           } > CHANGELOG_RELEASE.md
+
           echo "--- CHANGELOG_RELEASE.md ---"
           cat CHANGELOG_RELEASE.md
 
