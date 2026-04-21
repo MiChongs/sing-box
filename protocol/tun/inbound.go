@@ -420,7 +420,15 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 		err := t.tunStack.Start()
 		monitor.Finish()
 		if err != nil {
-			return E.Cause(err, "starting tun stack")
+			// IPv6 bind 失败（`bind: cannot assign requested address` 或
+			// `address family not supported`）在纯 IPv4 主机 / 容器里很常见 —
+			// Box.Start 不应因此 fatal。记 warn 继续；已建立的 IPv4 stack
+			// 仍然能用，用户 IPv6 流量会走 direct/fallback 路由。
+			if isIPv6BindFailure(err) {
+				t.logger.Warn("tun stack IPv6 bind failed, continuing with IPv4-only: ", err)
+			} else {
+				return E.Cause(err, "starting tun stack")
+			}
 		}
 		monitor.Start("starting tun interface")
 		err = t.tunIf.Start()
@@ -582,4 +590,34 @@ func (t *autoRedirectHandler) NewConnectionEx(ctx context.Context, conn net.Conn
 func (t *autoRedirectHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
 	t.logger.Error("unexpected packet connection in auto-redirect handler from ", source)
 	N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+}
+
+// isIPv6BindFailure 返回 err 是否是"本机没有 IPv6 地址族可用"导致的
+// bind 失败。典型触发:
+//   - 容器/VPS 禁用 IPv6 (sysctl net.ipv6.conf.*.disable_ipv6=1)
+//   - 云服务没给 instance 分配 IPv6 但路由表仍有 ::1
+//   - Android 某些 ROM VPN Service 不提供 IPv6 路由
+//
+// 这些场景下 IPv4 tun stack 本身能正常起。把 IPv6 bind 错误降级为 warn
+// 而不是 fatal 是合理的默认 —— 用户配置了 inet6_address 只是在"可用时"
+// 想要 IPv6；否则整个 sing-box 都起不来会让配置在有/无 IPv6 的机器间不
+// 可移植。
+//
+// 保守匹配：只认 "cannot assign requested address" 和
+// "address family not supported" 这两个典型错误串，其他 bind 错误（端口
+// 被占、权限不足）仍然上报 fatal，避免把严重问题吞掉。
+func isIPv6BindFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	// Linux EADDRNOTAVAIL + macOS/Windows 等价描述
+	if strings.Contains(s, "cannot assign requested address") {
+		return true
+	}
+	// Linux EAFNOSUPPORT — 内核编译时禁了 IPv6
+	if strings.Contains(s, "address family not supported") {
+		return true
+	}
+	return false
 }
