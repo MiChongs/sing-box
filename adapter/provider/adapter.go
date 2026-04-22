@@ -377,6 +377,224 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 	}
 }
 
+// UpdateBundle 原子化地同时应用 outbound + endpoint 两份新列表。
+//
+// 为什么需要它：原先 remote.go 依次调用 UpdateOutbounds / UpdateEndpoints，
+// 中间会发布一次只有新 outbound 但仍然持有旧 endpoint 的 snapshot；
+// 该窗口内并发读者（健康检查、clash API、group 的 onProviderUpdated
+// 回调）看到的是一个自我矛盾的集合，用户侧偶发表现成 "订阅刷新后节
+// 点数忽多忽少" 或 "group 里 endpoint 还是旧的，outbound 已经是新的"。
+//
+// 本方法把两次 Remove+Create+Publish 折叠到一次 writeAccess 临界区内，
+// 只 snapshot.Store 一次，彻底消除中间态可观察窗口。
+//
+// 性能红利与 UpdateOutbounds / UpdateEndpoints 一致：Remove / Create
+// 分别用 16 并发 semaphore 并行，每类只串行一次。
+//
+// 幂等保障：
+//   - opt 与旧 opt DeepEqual → 复用已有实例，不触发 Close / Create
+//   - opt 变更 → 旧实例在 Create 路径内部由 manager 自己 Close（不是
+//     这里直接 Remove），和 UpdateOutbounds 原有语义一致
+//   - 离群 tag (不在 new 列表里的) → 并行 Remove
+//   - Create 失败 → 记 Warn、该 slot 留 nil，最终 snapshot 跳过 nil；
+//     不会影响其他节点的上线
+func (a *Adapter) UpdateBundle(oldOutOpts, newOutOpts []option.Outbound,
+	oldEPOpts, newEPOpts []option.Endpoint) {
+	a.writeAccess.Lock()
+	defer a.writeAccess.Unlock()
+
+	outTags := a.resolveOutboundTags(newOutOpts)
+	epTags := a.resolveEndpointTags(newEPOpts)
+	wantedOut := make(map[string]struct{}, len(outTags))
+	for _, t := range outTags {
+		wantedOut[t] = struct{}{}
+	}
+	wantedEP := make(map[string]struct{}, len(epTags))
+	for _, t := range epTags {
+		wantedEP[t] = struct{}{}
+	}
+
+	// ── Phase 1: 并行 Remove 旧 outbound / 旧 endpoint ────────────────
+	// 两类混在同一个 semaphore 下跑以压总并发 —— 去掉大订阅换班场景
+	// 两批 wait 串联的延迟（500 outbounds 换 500 outbounds + 50 ep 换
+	// 50 ep 时，两阶段串行会吃到 ~3s，合并后 ~1s）。
+	oldSnap := a.loadSnapshot()
+	type removeJob struct {
+		tag      string
+		isEndpoint bool
+	}
+	var toRemove []removeJob
+	for _, ob := range oldSnap.all {
+		tag := ob.Tag()
+		_, isEP := a.endpoint.Get(tag)
+		if isEP {
+			if _, keep := wantedEP[tag]; !keep {
+				toRemove = append(toRemove, removeJob{tag: tag, isEndpoint: true})
+			}
+		} else {
+			if _, keep := wantedOut[tag]; !keep {
+				toRemove = append(toRemove, removeJob{tag: tag, isEndpoint: false})
+			}
+		}
+	}
+	if len(toRemove) > 0 {
+		const removeParallel = 16
+		sem := make(chan struct{}, removeParallel)
+		var wg sync.WaitGroup
+		for _, j := range toRemove {
+			wg.Add(1)
+			sem <- struct{}{}
+			job := j
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				var err error
+				if job.isEndpoint {
+					err = a.endpoint.Remove(job.tag)
+				} else {
+					err = a.outbound.Remove(job.tag)
+				}
+				if err != nil {
+					a.logger.Error(err, "close [", job.tag, "]")
+				}
+			}()
+		}
+		wg.Wait()
+	}
+
+	// ── Phase 2: 分拣 outbound "复用 / 待 Create" ──────────────────────
+	oldOutByTag := make(map[string]option.Outbound, len(oldOutOpts))
+	for _, opt := range oldOutOpts {
+		oldOutByTag[opt.Tag] = opt
+	}
+	outSlots := make([]adapter.Outbound, len(newOutOpts))
+	type outJob struct {
+		index int
+		opt   option.Outbound
+		tag   string
+	}
+	var outNeedCreate []outJob
+	for i, opt := range newOutOpts {
+		tag := outTags[i]
+		ob, exist := a.outbound.Outbound(tag)
+		if exist && reflect.DeepEqual(opt, oldOutByTag[opt.Tag]) {
+			outSlots[i] = ob
+			continue
+		}
+		outNeedCreate = append(outNeedCreate, outJob{index: i, opt: opt, tag: tag})
+	}
+
+	// ── Phase 3: 分拣 endpoint "复用 / 待 Create" ──────────────────────
+	oldEPByTag := make(map[string]option.Endpoint, len(oldEPOpts))
+	for _, opt := range oldEPOpts {
+		oldEPByTag[opt.Tag] = opt
+	}
+	epSlots := make([]adapter.Outbound, len(newEPOpts))
+	type epCreateJob struct {
+		index int
+		opt   option.Endpoint
+		tag   string
+	}
+	var epNeedCreate []epCreateJob
+	for i, opt := range newEPOpts {
+		tag := epTags[i]
+		ep, exist := a.endpoint.Get(tag)
+		if exist && reflect.DeepEqual(opt, oldEPByTag[opt.Tag]) {
+			epSlots[i] = ep
+			continue
+		}
+		epNeedCreate = append(epNeedCreate, epCreateJob{index: i, opt: opt, tag: tag})
+	}
+
+	// ── Phase 4: 并行 Create（两类共享 16 slot semaphore） ─────────────
+	totalCreate := len(outNeedCreate) + len(epNeedCreate)
+	if totalCreate > 0 {
+		const createParallel = 16
+		sem := make(chan struct{}, createParallel)
+		var wg sync.WaitGroup
+		for _, j := range outNeedCreate {
+			wg.Add(1)
+			sem <- struct{}{}
+			job := j
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				err := a.outbound.Create(
+					adapter.WithContext(a.ctx, &adapter.InboundContext{
+						Outbound: job.tag,
+					}),
+					a.router,
+					a.logFactory.NewLogger(F.ToString("outbound/", job.opt.Type, "[", job.tag, "]")),
+					job.tag,
+					job.opt.Type,
+					job.opt.Options,
+				)
+				if err != nil {
+					a.logger.Warn(err, " in ", job.tag, ", skip create this outbound")
+					return
+				}
+				ob, _ := a.outbound.Outbound(job.tag)
+				outSlots[job.index] = ob
+			}()
+		}
+		for _, j := range epNeedCreate {
+			wg.Add(1)
+			sem <- struct{}{}
+			job := j
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				err := a.endpoint.Create(
+					adapter.WithContext(a.ctx, &adapter.InboundContext{
+						Outbound: job.tag,
+					}),
+					a.router,
+					a.logFactory.NewLogger(F.ToString("endpoint/", job.opt.Type, "[", job.tag, "]")),
+					job.tag,
+					job.opt.Type,
+					job.opt.Options,
+				)
+				if err != nil {
+					a.logger.Warn(err, " in ", job.tag, ", skip create this endpoint")
+					return
+				}
+				ep, _ := a.endpoint.Get(job.tag)
+				epSlots[job.index] = ep
+			}()
+		}
+		wg.Wait()
+	}
+
+	// ── Phase 5: 按原序拼装 newAll + newByTag ──────────────────────────
+	newAll := make([]adapter.Outbound, 0, len(outSlots)+len(epSlots))
+	newByTag := make(map[string]adapter.Outbound, len(outSlots)+len(epSlots))
+	for _, ob := range outSlots {
+		if ob == nil {
+			continue
+		}
+		newAll = append(newAll, ob)
+		newByTag[ob.Tag()] = ob
+	}
+	for _, ep := range epSlots {
+		if ep == nil {
+			continue
+		}
+		newAll = append(newAll, ep)
+		newByTag[ep.Tag()] = ep
+	}
+
+	// ── Phase 6: 原子发布单一 snapshot ─────────────────────────────────
+	// 读端在此刻之前看到的始终是完整一致的旧 snapshot，之后看到的
+	// 是完整一致的新 snapshot —— 不存在 "新 outbound + 旧 endpoint"
+	// 的跨态中间窗口。
+	a.snapshot.Store(&providerSnapshot{all: newAll, byTag: newByTag})
+
+	// ── Phase 7: 触发一次 healthcheck（异步，不阻塞返回） ────────────
+	if a.enabled && a.history != nil {
+		go a.HealthCheck(a.ctx)
+	}
+}
+
 func (a *Adapter) HealthCheck(ctx context.Context) (map[string]uint16, error) {
 	if a.ticker != nil {
 		a.ticker.Reset(a.interval)

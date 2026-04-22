@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -60,26 +61,51 @@ func RegisterProvider(registry *provider.Registry) {
 
 var _ adapter.Provider = (*ProviderRemote)(nil)
 
+// inflightFetch 把并发的 Update() 请求合并成一次真实 fetch，第二个及以
+// 后的调用等同一次结果返回。原实现用 updating atomic.Bool 抢占 —— 第
+// 二个调用直接返 error "provider is updating"，dashboard 看到就是一次
+// "更新失败"，体验差。
+type inflightFetch struct {
+	done chan struct{}
+	err  error
+}
+
 type ProviderRemote struct {
 	provider.Adapter
-	ctx              context.Context
-	cancel           context.CancelFunc
-	logger           log.ContextLogger
-	outbound         adapter.OutboundManager
-	provider         adapter.ProviderManager
-	cacheFile        adapter.CacheFile
-	httpClient       *http.Client
-	hash             hash.HashType
-	lastEtag         string
-	lastOutOpts      []option.Outbound
-	lastEPOpts       []option.Endpoint
-	lastUpdated      time.Time
-	subscriptionInfo adapter.SubscriptionInfo
+	ctx        context.Context
+	cancel     context.CancelFunc
+	logger     log.ContextLogger
+	outbound   adapter.OutboundManager
+	provider   adapter.ProviderManager
+	cacheFile  adapter.CacheFile
+	httpClient *http.Client
+	hash       hash.HashType
+	// 读写路径并发：lastEtag / lastOutOpts / lastEPOpts / hash 只在
+	// fetch 内写，fetch 被 inflightFetch 串行化，读 (loadCacheFile /
+	// Update 等) 也只在 fetch 前后触发，不需要额外锁。
+	lastEtag    string
+	lastOutOpts []option.Outbound
+	lastEPOpts  []option.Endpoint
+	// lastContentHash 是上一次成功 fetch 的响应体 hash。当服务端不下发
+	// Etag (机场经常不实现) 时，用它做 "同内容短路"：hash 一致直接跳过
+	// parse + Remove + Create 全流程，只刷新 lastUpdated / cache。
+	//
+	// 规则：写入点严格在 "成功解析并应用了 newOpts" 之后，保证任何
+	// 命中短路的请求看到的确实是上一次应用过的内容。
+	lastContentHash hash.HashType
+	// 元数据改用 atomic.Value/TypedValue 封装：clash API 读路径
+	// (SubscriptionInfo/UpdatedAt) 不持锁、从 fetch 写路径看也不用
+	// 额外加锁 — Store/Load 保证一致可见。
+	subscriptionInfo atomic.Pointer[adapter.SubscriptionInfo]
+	lastUpdatedNano  atomic.Int64
+	// inflight 指针门控 dedupe，flightMu 保护指针本身的切换。
+	flightMu sync.Mutex
+	inflight *inflightFetch
 	// ticker: 原本是 *time.Ticker (固定 interval 周期)，改成 *time.Timer
 	// 后可以每轮独立带抖动重置。Update() / Close() 保留字段名避免外部
 	// 耦合 (Stop/Reset 在两种类型上签名一致)。
-	ticker           *time.Timer
-	updating         atomic.Bool
+	ticker   *time.Timer
+	updating atomic.Bool
 
 	httpClientOptions *option.HTTPClientOptions
 	downloadDetour    string
@@ -169,9 +195,9 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 	// 节点列表保持为空（或 cache 里的旧值），Smart / urltest 组会看到 0 个
 	// 可用节点，route 层面走 fallback / default outbound。
 	// loopUpdate 会按 update_interval 周期性重试，恢复后自动上线。
-	if s.lastUpdated.IsZero() {
+	if s.UpdatedAt().IsZero() {
 		ctx = interrupt.ContextWithIsProviderConnection(ctx)
-		if err := s.fetch(ctx, true); err != nil {
+		if err := s.fetchDedup(ctx, true); err != nil {
 			s.logger.Warn("initial fetch for outbound provider [", s.Tag(),
 				"] failed, will retry in background every ", s.updateInterval, ": ", err)
 		}
@@ -187,15 +213,36 @@ func (s *ProviderRemote) Update() error {
 		s.ticker.Reset(s.computeNextInterval())
 	}
 	ctx := interrupt.ContextWithIsProviderConnection(s.ctx)
-	return s.fetch(ctx, false)
+	// 走 dedup 路径：dashboard 连点刷新 / Update() 与 loopUpdate tick
+	// 撞车时，第二个及以后的调用共享同一次真实 fetch 的结果，不再
+	// 返回 "provider is updating" 那种用户看起来像失败的 error。
+	return s.fetchDedup(ctx, false)
 }
 
 func (s *ProviderRemote) UpdatedAt() time.Time {
-	return s.lastUpdated
+	n := s.lastUpdatedNano.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
 }
 
 func (s *ProviderRemote) SubscriptionInfo() adapter.SubscriptionInfo {
-	return s.subscriptionInfo
+	if p := s.subscriptionInfo.Load(); p != nil {
+		return *p
+	}
+	return adapter.SubscriptionInfo{}
+}
+
+// setSubscriptionInfo / setLastUpdated 单一写入点，fetch 成功路径调用。
+// Load 侧 (clash API / Update) 全部走 atomic，读写不互锁。
+func (s *ProviderRemote) setSubscriptionInfo(info adapter.SubscriptionInfo) {
+	cp := info
+	s.subscriptionInfo.Store(&cp)
+}
+
+func (s *ProviderRemote) setLastUpdated(t time.Time) {
+	s.lastUpdatedNano.Store(t.UnixNano())
 }
 
 func (s *ProviderRemote) Close() error {
@@ -232,9 +279,44 @@ func (s *ProviderRemote) resolveTransport() (adapter.HTTPTransport, error) {
 
 func (s *ProviderRemote) updateOnce() {
 	ctx := interrupt.ContextWithIsProviderConnection(s.ctx)
-	if err := s.fetch(ctx, false); err != nil {
+	if err := s.fetchDedup(ctx, false); err != nil {
 		s.logger.Error("update outbound provider: ", err)
 	}
+}
+
+// fetchDedup 合并并发 fetch 请求 —— 第二个及以后的调用阻塞在 in-flight
+// 的 done chan 上，收到同一结果后统一返回；与 singleflight 等价语义，
+// 但不额外引入依赖且省掉 key 分桶的开销（provider 只有一个 in-flight
+// 桶，map key 固定）。
+//
+// 为什么不直接去掉 updating atomic：保留它是为了在 fetch 内部触发的
+// 递归场景（比如 Update() 在 fetch 自身的 goroutine 内被意外调用到）
+// 仍然快速失败，防止死锁。真正的并发用户请求走 inflight 路径，只有
+// 真·嵌套调用会撞 updating。
+func (s *ProviderRemote) fetchDedup(ctx context.Context, isStart bool) error {
+	s.flightMu.Lock()
+	if f := s.inflight; f != nil {
+		s.flightMu.Unlock()
+		// 等待在途 fetch；调用者 ctx 取消也要能返回，不被在途请求绑架。
+		select {
+		case <-f.done:
+			return f.err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	f := &inflightFetch{done: make(chan struct{})}
+	s.inflight = f
+	s.flightMu.Unlock()
+
+	// 运行真正的 fetch；结果通过 inflightFetch.err 共享给所有等待者。
+	f.err = s.fetch(ctx, isStart)
+
+	s.flightMu.Lock()
+	s.inflight = nil
+	s.flightMu.Unlock()
+	close(f.done)
+	return f.err
 }
 
 func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
@@ -297,8 +379,9 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusNotModified:
-		s.subscriptionInfo = info
-		s.lastUpdated = time.Now()
+		s.setSubscriptionInfo(info)
+		now := time.Now()
+		s.setLastUpdated(now)
 		if s.cacheFile != nil {
 			saveSub := s.cacheFile.LoadSubscription(s.Tag())
 			if saveSub != nil {
@@ -310,7 +393,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 						saveSub.Content = append([]byte(infoStr+"\n"), saveSub.Content[index+1:]...)
 					}
 				}
-				saveSub.LastUpdated = s.lastUpdated
+				saveSub.LastUpdated = now
 				if err := s.cacheFile.SaveSubscription(s.Tag(), saveSub); err != nil {
 					s.logger.Error("save outbound provider cache file: ", err)
 				}
@@ -373,6 +456,39 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	if eTagHeader != "" {
 		s.lastEtag = eTagHeader
 	}
+
+	// ── 内容级幂等短路 ───────────────────────────────────────────────
+	// 服务端若未下发 Etag (机场常见) 但响应 body 逐字节相同，原流程
+	// 仍然会走完整条 parse → DeepEqual → publish 链路；新出站对象都
+	// 是一样的，但触发 snapshot.Store 仍然会让 group.onProviderUpdated
+	// 激活一次全量重建，下游 URLTest 组顺带再跑一次健康检查。大订阅
+	// 下这一趟"空更新"几秒钟就过去了，用户感知为"每小时卡顿一下"。
+	//
+	// 这里算一次 body hash（复用 sing-box 自己的 MakeHash，crc + size
+	// 混合，2 MB 订阅算下来 ~1ms）；与上次成功后保存的 lastContentHash
+	// 完全相同则只刷新 lastUpdated + 元数据，跳过所有重建。
+	//
+	// 注意：hash 匹配但 Etag 丢失 / 变化 的情况下，依旧会更新 lastEtag
+	// (上面已做)，下次就能重新走 304 快路径。
+	contentHash := hash.MakeHash(contentRaw)
+	if s.lastContentHash.IsValid() && s.lastContentHash.Equal(contentHash) {
+		s.setSubscriptionInfo(info)
+		s.setLastUpdated(time.Now())
+		if s.cacheFile != nil {
+			saveSub := s.cacheFile.LoadSubscription(s.Tag())
+			if saveSub != nil {
+				saveSub.LastUpdated = s.UpdatedAt()
+				saveSub.LastEtag = s.lastEtag
+				if err := s.cacheFile.SaveSubscription(s.Tag(), saveSub); err != nil {
+					s.logger.Error("save outbound provider cache file: ", err)
+				}
+			}
+		}
+		s.logger.Info("update outbound provider ", s.Tag(),
+			": content-hash unchanged, skip rebuild (", fetchedBytes, " bytes)")
+		return nil
+	}
+
 	content, _ := parser.DecodeBase64URLSafe(string(contentRaw))
 	if !hasInfo {
 		firstLine, others := getFirstLine(content)
@@ -384,9 +500,12 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	if err := s.updateProviderFromContent(content); err != nil {
 		return err
 	}
+	// Content 应用成功后才写入 hash —— 失败路径不更新，下一次 fetch
+	// 同样 body 才能走重试 rebuild 而不是错误地当成 "已应用"。
+	s.lastContentHash = contentHash
 	s.UpdateGroups()
-	s.subscriptionInfo = info
-	s.lastUpdated = time.Now()
+	s.setSubscriptionInfo(info)
+	s.setLastUpdated(time.Now())
 	if s.path != "" || s.cacheFile != nil {
 		content, _ := json.Marshal(option.Options{
 			Outbounds: s.lastOutOpts,
@@ -399,7 +518,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 		}
 		if s.cacheFile != nil {
 			saveSub := &adapter.SavedBinary{
-				LastUpdated: s.lastUpdated,
+				LastUpdated: s.UpdatedAt(),
 				LastEtag:    s.lastEtag,
 			}
 			if s.path != "" {
@@ -490,7 +609,8 @@ func (s *ProviderRemote) loadCacheFile() error {
 		return err
 	}
 	s.UpdateGroups()
-	s.lastUpdated, s.lastEtag = lastUpdated, lastEtag
+	s.setLastUpdated(lastUpdated)
+	s.lastEtag = lastEtag
 	return nil
 }
 
@@ -498,16 +618,17 @@ func (s *ProviderRemote) loadFromContent(contentRaw []byte) error {
 	content, _ := parser.DecodeBase64URLSafe(string(contentRaw))
 	firstLine, others := getFirstLine(content)
 	if info, ok := parseInfo(firstLine); ok {
-		s.subscriptionInfo = info
+		s.setSubscriptionInfo(info)
 		content, _ = parser.DecodeBase64URLSafe(others)
 	}
 	outboundOpts, endpointOpts, err := parser.ParseBoxSubscription(s.ctx, content)
 	if err != nil {
 		return err
 	}
-	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
+	// 原子应用：outbound + endpoint 单一 snapshot 发布，读端不会看到
+	// "新 outbound + 旧 endpoint" 的中间态。
+	s.UpdateBundle(s.lastOutOpts, outboundOpts, s.lastEPOpts, endpointOpts)
 	s.lastOutOpts = outboundOpts
-	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
 	s.lastEPOpts = endpointOpts
 	return nil
 }
@@ -524,11 +645,12 @@ func pathExists(path string) (bool, error) {
 }
 
 func (s *ProviderRemote) loopUpdate() {
-	if time.Since(s.lastUpdated) < s.updateInterval {
+	lastUpdated := s.UpdatedAt()
+	if !lastUpdated.IsZero() && time.Since(lastUpdated) < s.updateInterval {
 		select {
 		case <-s.ctx.Done():
 			return
-		case <-time.After(time.Until(s.lastUpdated.Add(s.updateInterval))):
+		case <-time.After(time.Until(lastUpdated.Add(s.updateInterval))):
 			s.updateOnce()
 		}
 	} else {
@@ -610,9 +732,11 @@ func (s *ProviderRemote) updateProviderFromContent(content string) error {
 	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool {
 		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
 	})
-	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
+	// 原子应用：替代 UpdateOutbounds + UpdateEndpoints 两次 snapshot
+	// 发布。消除 "新 outbound + 旧 endpoint" 跨态窗口对 group 回调
+	// / healthcheck / clash API 的可见污染。
+	s.UpdateBundle(s.lastOutOpts, outboundOpts, s.lastEPOpts, endpointOpts)
 	s.lastOutOpts = outboundOpts
-	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
 	s.lastEPOpts = endpointOpts
 	return nil
 }
