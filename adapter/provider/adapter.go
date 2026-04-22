@@ -230,7 +230,14 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 
 	// 1. 删除老 outbound 里已不在新列表里的节点
 	//    只清理 "非 endpoint" 的部分，endpoint 由 UpdateEndpoints 负责
+	//
+	// 大订阅刷新时 "去掉的节点数" 经常和 "加的节点数" 在同一量级，
+	// outbound.Remove 内部会走 common.Close 触发每个出站的 Close 链
+	// (关闭 mux 池 / 释放 reality stream / 回收 xhttp upload pool)，
+	// 单个 Remove 0.3-3ms；串行 500 节点 ≈ 1.5s 仍卡在 writeAccess 下。
+	// 和下面的 Create 对称并行化，封顶 16 避免挤压文件描述符。
 	oldSnap := a.loadSnapshot()
+	toRemove := make([]string, 0)
 	for _, ob := range oldSnap.all {
 		if _, keep := wanted[ob.Tag()]; keep {
 			continue
@@ -239,9 +246,25 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 			// endpoint 归 UpdateEndpoints 管，这里跳过，避免误删
 			continue
 		}
-		if err := a.outbound.Remove(ob.Tag()); err != nil {
-			a.logger.Error(err, "close outbound [", ob.Tag(), "]")
+		toRemove = append(toRemove, ob.Tag())
+	}
+	if len(toRemove) > 0 {
+		const removeParallel = 16
+		sem := make(chan struct{}, removeParallel)
+		var wg sync.WaitGroup
+		for _, tag := range toRemove {
+			wg.Add(1)
+			sem <- struct{}{}
+			t := tag
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				if err := a.outbound.Remove(t); err != nil {
+					a.logger.Error(err, "close outbound [", t, "]")
+				}
+			}()
 		}
+		wg.Wait()
 	}
 
 	// 2. 建 old tag→opts 的索引用于 DeepEqual 判变
