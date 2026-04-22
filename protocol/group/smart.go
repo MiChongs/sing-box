@@ -785,6 +785,12 @@ func (s *Smart) PostStart() error {
 		{"cleanup-old", 10 * time.Minute, 120 * time.Minute, s.cleanupOldRecords, false, false},
 		{"cleanup-orphan", 10 * time.Minute, 10 * time.Minute, s.cleanupOrphanedNodeCache, false, false},
 		{"cleanup-orphan-groups", 15 * time.Minute, 120 * time.Minute, s.cleanupOrphanedGroups, false, false},
+		// In-memory map janitor. Keeps knownDead / targetDebargo /
+		// shortLife / hysteresisMemo / stickyByTarget from growing
+		// unbounded. Runs unconditionally (no idleSkip): idle groups
+		// are precisely when accumulated maps matter most since
+		// cleanup-driven access paths also go quiet.
+		{"prune-memory-maps", 3 * time.Minute, 5 * time.Minute, s.pruneStaleMemoryMaps, false, false},
 		// Queue flush must run even when idle — ensures pending writes
 		// from the final pre-idle dials actually land on disk.
 		{"flush-queue", 5 * time.Second, 5 * time.Minute, s.flushQueue, false, false},
@@ -2872,6 +2878,14 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 		ct := time.Since(start).Milliseconds()
 		if err != nil && err != context.Canceled && !errors.Is(err, context.Canceled) {
 			tag := outbounds[0].Tag()
+			// Mark dead on failure — parity with the multi-node race arm
+			// below. Missing this mark was the primary reason a single
+			// dead candidate kept being re-selected: recordDialFailure
+			// only bumps the breaker (needs cbMaxConsecFail hits), while
+			// knownDead flips isAlive=false immediately so the NEXT
+			// selectProxiesTraced round skips the node and dialWithRetry
+			// can actually find a fresh candidate via hot re-selection.
+			s.markDead(tag)
 			if s.recordDialFailure(tag) {
 				s.logger.DebugContext(ctx, "smart[", s.Tag(), "] circuit-breaker OPEN for [", tag,
 					"] after ", cbMaxConsecFail, " consecutive failures in ", cbWindow)
@@ -2903,11 +2917,37 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 		}()
 	}
 
+	// drainLosers closes any conn that arrives after the race has a
+	// winner. Losers' DialContext may return conn != nil && err == nil
+	// if the handshake completes after the winner cancel(); without an
+	// explicit drain + Close the conn is buffered into `results` and
+	// GC'd without being closed — leaking a TCP socket + upstream mux
+	// stream per losing arm. Mihomo's fallback.go closes loser arms the
+	// same way. Fired via goroutine so the user-facing return path is
+	// not held back waiting for slow-cancel arms; raceCtx cancellation
+	// should already have interrupted most of them.
+	remaining := 0
+	drainLosers := func(consumed int) {
+		remaining = len(outbounds) - consumed
+		if remaining <= 0 {
+			return
+		}
+		go func(n int) {
+			for i := 0; i < n; i++ {
+				r := <-results
+				if r.err == nil && r.conn != nil {
+					_ = r.conn.Close()
+				}
+			}
+		}(remaining)
+	}
+
 	var errs []error
 	for i := 0; i < len(outbounds); i++ {
 		r := <-results
 		if r.err == nil {
 			cancel()
+			drainLosers(i + 1)
 			return r.conn, r.tag, r.connectTime, nil
 		}
 		errs = append(errs, r.err)
@@ -4818,6 +4858,120 @@ func (s *Smart) isTargetDebargoed(target, proxyTag string) bool {
 		return false
 	}
 	return true
+}
+
+// Maximum retained entries for maps whose values have no timestamp and
+// therefore cannot be pruned by age. When these caps are exceeded the
+// janitor clears the entire map — losing the sticky/hysteresis
+// affinity for existing targets is vastly preferable to an unbounded
+// RSS climb over weeks of mixed-DNS traffic (Telegram, Twitter, Google
+// Play all produce dozens of unique targets per session).
+const (
+	stickyByTargetMaxEntries = 8192
+)
+
+// pruneStaleMemoryMaps evicts stale / excessive entries from the
+// target-keyed in-memory caches. Without this the Smart group leaks
+// RSS on long-running processes: every unique DNS target that ever
+// failed a dial (targetDebargo) or got a breaker flip (knownDead
+// entries for ephemeral proxy tags no longer in the snapshot) or any
+// short-life classification stays resident forever because the
+// originating lookup paths only delete on re-access.
+//
+// Bounded-size caps (stickyByTarget, hysteresisMemo fallback) are
+// deliberately coarse — clear the whole map at the cap. The
+// alternative is tracking lastUsed per entry, which doubles memory
+// overhead for a strictly worse trade-off on a map designed to be a
+// short-horizon cache. Sticky affinity re-establishes itself on the
+// very next successful dial per target, so a cap-triggered clear is
+// invisible to the user except for one non-sticky dial per target.
+//
+// The function is goroutine-safe: all writes go through xsync.MapOf
+// or protected by the existing mutex of the owning struct, so callers
+// may invoke this from the timing-wheel task without additional
+// synchronisation.
+func (s *Smart) pruneStaleMemoryMaps() {
+	now := time.Now()
+	nowNanos := now.UnixNano()
+	var kd, td, sl, st, hy int
+
+	// knownDead: TTL-driven. Entries older than 2×knownDeadTTL have
+	// already expired from isAlive's perspective and only waste
+	// memory keeping the node tag resident.
+	if s.knownDead != nil {
+		kdCutoff := now.Add(-2 * knownDeadTTL)
+		s.knownDead.Range(func(tag string, deadAt time.Time) bool {
+			if deadAt.Before(kdCutoff) {
+				s.knownDead.Delete(tag)
+				kd++
+			}
+			return true
+		})
+	}
+
+	// targetDebargo: only pruned on-read. Sweeps here so infrequently-
+	// dialled targets don't accumulate.
+	if s.targetDebargo != nil {
+		tdCutoff := now.Add(-targetDebargoTTL)
+		s.targetDebargo.Range(func(key string, at time.Time) bool {
+			if at.Before(tdCutoff) {
+				s.targetDebargo.Delete(key)
+				td++
+			}
+			return true
+		})
+	}
+
+	// shortLife: recordShortLife only prunes its OWN key (the one
+	// being written). Keys never re-written rot forever. Here we drop
+	// entries whose newest timestamp is already outside the shortLife
+	// window — they cannot contribute to a future threshold crossing.
+	s.shortLifeMu.Lock()
+	slCutoff := now.Add(-shortLifeWindow)
+	for k, stamps := range s.shortLife {
+		if len(stamps) == 0 {
+			delete(s.shortLife, k)
+			sl++
+			continue
+		}
+		if stamps[len(stamps)-1].Before(slCutoff) {
+			delete(s.shortLife, k)
+			sl++
+		}
+	}
+	s.shortLifeMu.Unlock()
+
+	// hysteresisMemo: entries outlive their window. Prune anything
+	// older than 2×hysteresisWindow — still readable by the algo
+	// pass until 1×window, kept one extra window as cushion against
+	// clock skew, then definitely stale.
+	if s.hysteresisMemo != nil && s.hysteresisWindow > 0 {
+		hyCutoff := nowNanos - int64(2*s.hysteresisWindow)
+		s.hysteresisMemo.Range(func(k stickyKey, entry hysteresisEntry) bool {
+			if entry.at < hyCutoff {
+				s.hysteresisMemo.Delete(k)
+				hy++
+			}
+			return true
+		})
+	}
+
+	// stickyByTarget: no per-entry timestamp. Cap-based eviction —
+	// when the map exceeds the cap, clear everything and let the next
+	// successful dial per target rebuild the affinity.
+	if s.stickyByTarget != nil {
+		size := s.stickyByTarget.Size()
+		if size > stickyByTargetMaxEntries {
+			s.stickyByTarget.Clear()
+			st = size
+		}
+	}
+
+	if kd+td+sl+st+hy > 0 {
+		s.logger.Debug("smart[", s.Tag(), "] memory-map prune: knownDead=", kd,
+			" targetDebargo=", td, " shortLife=", sl,
+			" stickyByTarget=", st, " hysteresisMemo=", hy)
+	}
 }
 
 // markAlive clears tag from knownDead and resets its circuit breaker.
