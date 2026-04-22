@@ -62,6 +62,38 @@ const (
 	// hit its deadline), which is rare.
 	smartBaseBackoff = 20 * time.Millisecond
 
+	// ── Hedged dial (speculative failover) ────────────────────────────
+	//
+	// 问题：选择型算法 (sticky / round-robin / weighted-rr / p2c /
+	// weighted-random / consistent-hashing) 在 round 0 只 dial 一个节
+	// 点。primary 若是一个握手卡住但尚未 TCP RST 的"僵尸"节点
+	// (常见场景：节点服务器/运营商出端防火墙 DROP 静默丢包)，整个
+	// round 0 会吃到 10s 超时才进 round 1。用户肉眼感知就是"点一下
+	// 半分钟才出结果"。
+	//
+	// 方案：hedged dial (Tail at Scale 论文的 hedging requests 模式)。
+	// primary 启动 smartHedgedDelay 后仍未返回且 len(outbounds) >= 2，
+	// 就在 next-best 候选上追加一次 speculative dial。先完成的赢得，
+	// 对方 ctx 取消。healthy primary 在 250ms 内一般握手已完成，hedge
+	// 没机会起飞，算法原契约不变；primary 真的死了才走 hedge 路径。
+	//
+	// 仅在 primary 有"健康存疑"信号时触发 (recent dial failure count > 0
+	// 或 cb half-open 状态或 knownDead 未解除)，否则白白多打一条握手
+	// 浪费资源。这条护栏保证正常运行时无额外开销，只在确实需要加速
+	// failover 时付 hedge 代价。
+	smartHedgedDelay = 250 * time.Millisecond
+
+	// ── Adaptive round timeout ────────────────────────────────────────
+	// 当 round 0 的 primary 最近有 dial failure 计数，说明 "历史上此节
+	// 点最近某次 dial 过，但失败了"。即使 breaker 还没 OPEN (cbMax
+	// ConsecFail=2 需两次)，也应该把 round 超时从 10s 上限压到 3s —
+	// 让 reselectTried 热重选更快生效。
+	//
+	// 仍然不低于 2×TCPTimeout (避免慢速网络上的误杀)，也不超过原
+	// maxHistCT 计算出来的动态值 (那条路径是基于真实历史 ct，比 3s
+	// 更精准的情况不应被覆盖)。
+	smartAdaptiveTimeoutMax = 3 * time.Second
+
 	// Circuit breaker parameters. When a node accumulates
 	// cbMaxConsecFail failures within cbWindow, the breaker opens for
 	// cbOpenDuration — during that window the node is excluded from
@@ -2753,9 +2785,33 @@ func (s *Smart) dialWithRetry(ctx context.Context, network string, dest M.Socksa
 		s.logger.DebugContext(ctx, "smart[", s.Tag(), "] round ", i, " batch=",
 			proxyTagsPreview(batch, 5), " timeout=", timeout)
 
+		// Hedged-dial protection: round 0 的单节点 batch 若 primary
+		// 健康存疑，且 outbounds 还有 next-best 可借，就把 batch 扩到 2
+		// 并走 hedgedDial (staggered race)。对选择型算法的语义影响：
+		// primary 健康时 250ms 内已完成握手，hedge 未起飞；primary 真
+		// 的慢/死才让 hedge 接管，反而把算法的"首选偏好"通过快速兜底
+		// 维持住 (否则 primary 死的情况下用户看到的是 10s 超时，契约
+		// 同样"没得选")。
+		useHedge := false
+		if i == 0 && len(batch) == 1 && len(outbounds) >= 2 &&
+			s.shouldHedgeDial(batch[0].Tag()) {
+			batch = outbounds[:2]
+			useHedge = true
+		}
+
 		roundStart := time.Now()
 		ctxDial, cancel := context.WithTimeout(ctx, timeout)
-		conn, proxyTag, connectTime, err := s.parallelDial(ctxDial, network, dest, batch, meta)
+		var (
+			conn        net.Conn
+			proxyTag    string
+			connectTime int64
+			err         error
+		)
+		if useHedge {
+			conn, proxyTag, connectTime, err = s.hedgedDial(ctxDial, network, dest, batch, meta)
+		} else {
+			conn, proxyTag, connectTime, err = s.parallelDial(ctxDial, network, dest, batch, meta)
+		}
 		cancel()
 		roundDur := time.Since(roundStart)
 
@@ -2862,8 +2918,71 @@ func (s *Smart) getBatch(outbounds []adapter.Outbound, meta *smartDialMeta, roun
 	if timeout <= 0 || timeout > 10*time.Second {
 		timeout = 10 * time.Second
 	}
+	// Adaptive tighten: when the primary candidate has accumulated dial
+	// failures (but breaker not yet open), clamp round timeout to
+	// smartAdaptiveTimeoutMax so a silent/hung node releases the loop
+	// faster. Lower floor kept at 2×TCPTimeout to avoid mis-killing slow
+	// mobile networks.
+	if len(batch) > 0 {
+		if cnt := s.dialFailureCountFor(batch[0].Tag()); cnt > 0 {
+			aMax := smartAdaptiveTimeoutMax
+			if aMax < 2*C.TCPTimeout {
+				aMax = 2 * C.TCPTimeout
+			}
+			if timeout > aMax {
+				timeout = aMax
+			}
+		}
+	}
 
 	return batch, timeout
+}
+
+// dialFailureCountFor reports the in-window dial failure count for tag.
+// Returns 0 when the tag has never failed or decayed out of window.
+//
+// 不触发 mutation — 纯观测用 (adaptive timeout / hedged dial trigger)。
+// 独立方法方便测试 & 避免直接依赖 Smart 内部 breakers 字段。
+func (s *Smart) dialFailureCountFor(tag string) int32 {
+	if tag == "" {
+		return 0
+	}
+	cb, ok := s.breakers.Load(tag)
+	if !ok {
+		return 0
+	}
+	return cb.consecFails.Load()
+}
+
+// shouldHedgeDial reports whether round 0's single-node primary deserves
+// a speculative hedge on the next-best candidate. Three signals trigger
+// hedging; any one is enough:
+//
+//  1. primary 最近有 dial 失败计数 (健康存疑，哪怕 breaker 未 OPEN)
+//  2. primary 在 knownDead 里但 TTL 还没过 (即将 fail 的可能性高)
+//  3. primary 没有 alive-verified 记录 (从未跑过 real dial，用 hedge
+//     保护"冷启动节点 + 老节点"混合场景的首包)
+//
+// 返回 false 时 parallelDial 保持原来的单 dial 行为 — 健康节点不付
+// hedge 代价。
+func (s *Smart) shouldHedgeDial(tag string) bool {
+	if tag == "" {
+		return false
+	}
+	if s.dialFailureCountFor(tag) > 0 {
+		return true
+	}
+	if s.knownDead != nil {
+		if _, bad := s.knownDead.Load(tag); bad {
+			return true
+		}
+	}
+	if s.aliveAt != nil {
+		if _, ok := s.aliveAt.Load(tag); !ok {
+			return true
+		}
+	}
+	return false
 }
 
 // parallelDial races all outbounds in batch; first success wins. Losers get
@@ -2964,6 +3083,125 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 		}
 	}
 
+	return nil, "", 0, E.Errors(errs...)
+}
+
+// hedgedDial 对 outbounds 执行 "错时竞速 (staggered race)"：
+//
+//   primary (index 0) 立刻起飞，backup (index 1..) 被延后 smartHedgedDelay
+//   再起飞。先完成任何一个节点的 dial 即获胜，其余 ctx 取消。
+//
+// 与 parallelDial 的区别：并行 race 所有 arm 都立刻发车，会双倍消耗
+// 上行带宽/SYN 表/远端连接数；hedged dial 默认只打一条连接，仅在
+// primary 真的慢/无响应时付第二条连接的代价。典型场景 (primary
+// 健康) 下 hedge 没机会起飞，资源消耗与单 dial 相同。
+//
+// 失败统计：两条 arm 的失败都走 markDead + recordDialFailure +
+// recordFailedDial，与 parallelDial 对齐；loser arm 的 conn 若在 cancel
+// 后才握手成功也会被 drainLosers Close 掉避免 socket 泄漏。
+func (s *Smart) hedgedDial(ctx context.Context, network string, dest M.Socksaddr,
+	outbounds []adapter.Outbound, meta *smartDialMeta) (net.Conn, string, int64, error) {
+	if len(outbounds) == 1 {
+		// Fallback: caller 传入单节点时退化到 parallelDial 的单节点分支，
+		// 语义一致。
+		return s.parallelDial(ctx, network, dest, outbounds, meta)
+	}
+
+	type result struct {
+		conn        net.Conn
+		tag         string
+		connectTime int64
+		err         error
+	}
+	raceCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	results := make(chan result, len(outbounds))
+	// Primary arm 立刻起飞。
+	primary := outbounds[0]
+	go func() {
+		start := time.Now()
+		conn, err := primary.DialContext(raceCtx, network, dest)
+		ct := time.Since(start).Milliseconds()
+		results <- result{conn, primary.Tag(), ct, err}
+	}()
+
+	// Hedge arms 延后 smartHedgedDelay 起飞；中间 raceCtx 若因 primary
+	// 赢得竞速被 cancel，hedge 不再启动，节省一次握手开销。
+	hedgeTimer := time.NewTimer(smartHedgedDelay)
+	defer hedgeTimer.Stop()
+	hedgeStarted := false
+	launchHedges := func() {
+		if hedgeStarted {
+			return
+		}
+		hedgeStarted = true
+		for i := 1; i < len(outbounds); i++ {
+			ob := outbounds[i]
+			go func() {
+				start := time.Now()
+				conn, err := ob.DialContext(raceCtx, network, dest)
+				ct := time.Since(start).Milliseconds()
+				results <- result{conn, ob.Tag(), ct, err}
+			}()
+		}
+	}
+
+	// 用一个期望结果数变量 — 如果 hedge 未起飞，总结果只有 1 条
+	// (primary)。
+	expected := 1
+	drainLosers := func(consumed int) {
+		rem := expected - consumed
+		if rem <= 0 {
+			return
+		}
+		go func(n int) {
+			for i := 0; i < n; i++ {
+				r := <-results
+				if r.err == nil && r.conn != nil {
+					_ = r.conn.Close()
+				}
+			}
+		}(rem)
+	}
+
+	var errs []error
+	for received := 0; received < expected; {
+		select {
+		case <-hedgeTimer.C:
+			launchHedges()
+			expected = len(outbounds)
+		case r := <-results:
+			received++
+			if r.err == nil {
+				cancel()
+				drainLosers(received)
+				return r.conn, r.tag, r.connectTime, nil
+			}
+			errs = append(errs, r.err)
+			if r.err != context.Canceled && !errors.Is(r.err, context.Canceled) {
+				s.markDead(r.tag)
+				if s.recordDialFailure(r.tag) {
+					s.logger.DebugContext(ctx, "smart[", s.Tag(),
+						"] circuit-breaker OPEN for [", r.tag,
+						"] after ", cbMaxConsecFail, " consecutive failures in ", cbWindow)
+				}
+				rtag, rct, rmeta := r.tag, r.connectTime, meta
+				getSmartWorker().submit(func() { s.recordFailedDial(rtag, rmeta, rct) })
+			}
+			// primary 快速失败 → 不等 hedge timer 直接启动 hedges (加速
+			// 失败切换；本来就要追加 hedge，提前一点点避免再浪费 250ms)。
+			if received == 1 && !hedgeStarted {
+				if !hedgeTimer.Stop() {
+					<-hedgeTimer.C
+				}
+				launchHedges()
+				expected = len(outbounds)
+			}
+		case <-ctx.Done():
+			return nil, "", 0, ctx.Err()
+		}
+	}
 	return nil, "", 0, E.Errors(errs...)
 }
 
@@ -4448,58 +4686,95 @@ func (s *Smart) checkAndRecoverDegradedNodes() {
 	if err != nil {
 		return
 	}
-
-	var ops []smart.StoreOperation
-	now := time.Now().Unix()
-	unblocked, recovered, stillDegraded := 0, 0, 0
-
-	for nodeName, data := range stateData {
-		var state smart.NodeState
-		if json.Unmarshal(data, &state) != nil {
-			continue
-		}
-
-		updated := false
-		if state.BlockedUntil > 0 && state.BlockedUntil <= now {
-			state.BlockedUntil = 0
-			updated = true
-			unblocked++
-			s.logger.Info("smart[", s.Tag(), "] unblocked node [", nodeName,
-				"] (cooldown ended)")
-		}
-
-		if state.Degraded && state.BlockedUntil == 0 {
-			recoveryFactor := math.Min(1.0, state.DegradedFactor+0.01)
-			state.FailureCount = int(float64(state.FailureCount) * 0.95)
-			if recoveryFactor >= 0.99 {
-				state.Degraded = false
-				state.DegradedFactor = 1.0
-				recovered++
-				s.logger.Info("smart[", s.Tag(), "] node [", nodeName, "] fully recovered")
-			} else {
-				state.DegradedFactor = recoveryFactor
-				stillDegraded++
-			}
-			updated = true
-		}
-
-		if updated {
-			if stateBytes, err := json.Marshal(&state); err == nil {
-				ops = append(ops, smart.StoreOperation{
-					Type:   smart.OpSaveNodeState,
-					Group:  s.Tag(),
-					Config: smartConfigName,
-					Node:   nodeName,
-					Data:   stateBytes,
-				})
-			}
-		}
+	if len(stateData) == 0 {
+		return
 	}
+
+	// 原实现在单 goroutine 里串行 json.Unmarshal → 修改 → json.Marshal。
+	// 大订阅 (>500 节点) 每 5 分钟跑一次，单次走到 300-800ms，全部占用
+	// 主调度 goroutine — Android 上这段时间调度器延迟可见 jitter。
+	//
+	// 并行化：每个节点的状态修正彼此独立 (不同 nodeName 不共享 state
+	// 结构、不共享 ops 切片 — 最后 append 走 mutex 即可)；用 shared
+	// worker pool 把 CPU 工作打散到所有 P 上。Android GOMAXPROCS 通常
+	// 4-8，submit 仍然经过 ants 池 (64 worker 上限)，不会对系统产生
+	// 额外压力。
+	//
+	// 仍然保留 "更新后 append 进 global queue"：bbolt 写由 flush-queue
+	// 任务统一合并，不会因为并行 recovery 而产生写放大。
+	now := time.Now().Unix()
+	var (
+		opsMu                               sync.Mutex
+		ops                                 []smart.StoreOperation
+		unblocked, recovered, stillDegraded atomic.Int32
+	)
+
+	const recoveryParallel = 8 // 够 Android 4-8 核 + 有轻量等待窗口
+	sem := make(chan struct{}, recoveryParallel)
+	var wg sync.WaitGroup
+	for nodeName, data := range stateData {
+		wg.Add(1)
+		sem <- struct{}{}
+		name, raw := nodeName, data
+		go func() {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			var state smart.NodeState
+			if json.Unmarshal(raw, &state) != nil {
+				return
+			}
+
+			updated := false
+			if state.BlockedUntil > 0 && state.BlockedUntil <= now {
+				state.BlockedUntil = 0
+				updated = true
+				unblocked.Add(1)
+				s.logger.Info("smart[", s.Tag(), "] unblocked node [", name,
+					"] (cooldown ended)")
+			}
+
+			if state.Degraded && state.BlockedUntil == 0 {
+				recoveryFactor := math.Min(1.0, state.DegradedFactor+0.01)
+				state.FailureCount = int(float64(state.FailureCount) * 0.95)
+				if recoveryFactor >= 0.99 {
+					state.Degraded = false
+					state.DegradedFactor = 1.0
+					recovered.Add(1)
+					s.logger.Info("smart[", s.Tag(), "] node [", name, "] fully recovered")
+				} else {
+					state.DegradedFactor = recoveryFactor
+					stillDegraded.Add(1)
+				}
+				updated = true
+			}
+
+			if !updated {
+				return
+			}
+			stateBytes, err := json.Marshal(&state)
+			if err != nil {
+				return
+			}
+			op := smart.StoreOperation{
+				Type:   smart.OpSaveNodeState,
+				Group:  s.Tag(),
+				Config: smartConfigName,
+				Node:   name,
+				Data:   stateBytes,
+			}
+			opsMu.Lock()
+			ops = append(ops, op)
+			opsMu.Unlock()
+		}()
+	}
+	wg.Wait()
 
 	if len(ops) > 0 {
 		s.store.AppendToGlobalQueue(ops...)
-		s.logger.Debug("smart[", s.Tag(), "] recovery check: unblocked=", unblocked,
-			" recovered=", recovered, " still_degraded=", stillDegraded)
+		s.logger.Debug("smart[", s.Tag(), "] recovery check: unblocked=",
+			unblocked.Load(), " recovered=", recovered.Load(),
+			" still_degraded=", stillDegraded.Load())
 	}
 }
 
