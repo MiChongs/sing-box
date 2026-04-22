@@ -157,7 +157,14 @@ func (m *Manager) startOutbounds(outbounds []adapter.Outbound) error {
 				wg.Add(1)
 				go func(outbound adapter.Outbound) {
 					defer wg.Done()
-					if err := m.startSingleOutbound(monitor, outbound); err != nil {
+					// 每个 goroutine 使用自己的 Monitor 实例，避免
+					// 共享 monitor 下并发 Start/Finish 产生的字段竞态。
+					// 即便 Monitor 内部已加锁，"G1 的 Start → G2 的
+					// Finish" 这种跨 goroutine 配对仍会让某个任务的
+					// 超时告警丢失 (G2 的 Finish 停了 G1 的 timer)，
+					// 按每个任务一个 Monitor 语义才正确。
+					taskMonitor := taskmonitor.New(m.logger, C.StartTimeout)
+					if err := m.startSingleOutbound(taskMonitor, outbound); err != nil {
 						errOnce.Do(func() { startErr = err })
 					}
 				}(ob)
