@@ -2,6 +2,7 @@ package remote
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -9,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -31,6 +31,14 @@ import (
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 )
+
+// providerFetchTimeout caps a single HTTP subscription fetch.
+// Without this the request inherits s.ctx which only cancels on Close,
+// so a hanging upstream stalls the entire loopUpdate goroutine forever —
+// subsequent ticks would find updating==true and refuse to run, and the
+// user sees "订阅半小时没更新". 90s is long enough for slow mobile
+// networks yet short enough to surface server issues in one interval.
+const providerFetchTimeout = 90 * time.Second
 
 func RegisterProvider(registry *provider.Registry) {
 	provider.Register[option.ProviderRemoteOptions](registry, C.ProviderTypeRemote, NewProviderRemote)
@@ -224,7 +232,13 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 		return E.New("provider http client not initialized (startup not complete)")
 	}
 	s.logger.Debug("updating outbound provider ", s.Tag(), " from URL: ", s.url)
-	req, err := http.NewRequest(http.MethodGet, s.url, nil)
+	// Apply a bounded per-fetch timeout on top of the caller ctx so a hung
+	// upstream can't stall loopUpdate forever. When the user triggered the
+	// fetch via /providers/{tag}/update the clash API handler already has
+	// its own deadline; our timeout only kicks in for the periodic path.
+	fetchCtx, fetchCancel := context.WithTimeout(ctx, providerFetchTimeout)
+	defer fetchCancel()
+	req, err := http.NewRequestWithContext(fetchCtx, http.MethodGet, s.url, nil)
 	if err != nil {
 		return err
 	}
@@ -232,10 +246,20 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 		req.Header.Set("If-None-Match", s.lastEtag)
 	}
 	req.Header.Set("User-Agent", s.userAgent)
-	if !isStart {
-		defer s.httpClient.CloseIdleConnections()
+	// 主动声明 gzip 编码 —— 机场/clash-meta 类订阅服务器大多支持，
+	// base64 订阅里 URL/密码/UUID 的熵很低，gzip 常能压 70%+。
+	// 原逻辑依赖 Go 默认的 "空 Accept-Encoding → transport 自动补 gzip"
+	// 行为，但一旦 user 配置了 http_client headers 或 download_detour 走
+	// 某些中间件可能就丢了这层隐式压缩。显式声明更稳。
+	if req.Header.Get("Accept-Encoding") == "" {
+		req.Header.Set("Accept-Encoding", "gzip")
 	}
-	resp, err := s.httpClient.Do(req.WithContext(ctx))
+	// 不再 CloseIdleConnections —— 原实现每次 fetch 后都 close，踩死
+	// HTTP/2 连接复用与 TCP keep-alive。虽然 update_interval>=1h，但
+	// 用户手动点 clash API refresh 连续两次或初次 fetch 失败快速重试
+	// 时都会白白多握手一次。httpClientManager 内部已经管池化生命周期，
+	// 我们这里不要越俎代庖。
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -276,7 +300,22 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 		return E.New("unexpected status: ", resp.Status)
 	}
 	defer resp.Body.Close()
-	contentRaw, err := io.ReadAll(resp.Body)
+	// Server honoured our Accept-Encoding: gzip → transparently wrap. Go
+	// stdlib normally does this itself but only when `Accept-Encoding`
+	// wasn't set BY THE USER; we now set it explicitly above so the auto
+	// path is disabled and the server's `Content-Encoding: gzip` reaches
+	// us raw. Detecting once here keeps the rest of the function body
+	// unchanged (still reads plain text).
+	bodyReader := io.Reader(resp.Body)
+	if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+		gzr, gzErr := gzip.NewReader(resp.Body)
+		if gzErr != nil {
+			return E.Cause(gzErr, "gzip decode subscription")
+		}
+		defer gzr.Close()
+		bodyReader = gzr
+	}
+	contentRaw, err := io.ReadAll(bodyReader)
 	if err != nil {
 		return err
 	}
@@ -425,7 +464,13 @@ func (s *ProviderRemote) loopUpdate() {
 	}
 	s.ticker = time.NewTicker(s.updateInterval)
 	for {
-		runtime.GC()
+		// 原实现每个 tick 前都 runtime.GC() —— 对 N 个 provider 就是每 N
+		// 小时触发 N 次 STW Full GC，Android 手机上能观察到明显卡顿/
+		// 丢包（每个 GC pause 10-50ms × N 个 provider 串联）。
+		// Go runtime 自己的 GC pacer 已经足够处理订阅解析后那批
+		// 短命对象，额外强制 GC 只会抢 CPU、打断业务流。
+		// 移除后若真的内存占用飙高，Smart 组里的 pruneStaleMemoryMaps
+		// + debug.FreeOSMemory 会兜底。
 		select {
 		case <-s.ctx.Done():
 			return

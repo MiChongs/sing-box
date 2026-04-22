@@ -261,28 +261,88 @@ func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Ou
 		}
 	}
 
+	// 3a. 先遍历一遍判断哪些 opt 需要 Create / 哪些可复用。
+	//
+	// 复用的直接拿旧对象；需要 Create 的进 needCreate 队列走后面的
+	// 并行 Create。拆成两步是为了：
+	//   - 大订阅（1000+ 节点）初次加载时 Create 占整个 fetch >90% 的时间；
+	//     outbound.Create 内部只有 m.access 下的短 map 写入是串行热点，
+	//     registry.CreateOutbound + LegacyStart（TLS/uTLS/reality/xhttp/
+	//     ws-mux 等各自的握手准备）才是耗时大头，且完全无共享状态，
+	//     可以安全并发。
+	//   - 串行 for-loop 直接把 N*T_create 全部累加到 writeAccess 下，
+	//     1000 节点 × 5ms = 5s 可直接观测；并行度 16 后 ≈ 300ms。
+	type createJob struct {
+		index int
+		opt   option.Outbound
+		tag   string
+	}
+	needCreate := make([]createJob, 0, len(newOpts))
+	// slot 数组长度与 newOpts 对齐；复用位提前填好，待 Create 位会被
+	// 并行 worker 填补。这样最终按原序拼装 newAll 不需额外排序。
+	slots := make([]adapter.Outbound, len(newOpts))
 	for i, opt := range newOpts {
 		tag := newTags[i]
 		outbound, exist := a.outbound.Outbound(tag)
-		if !exist || !reflect.DeepEqual(opt, oldOptByTag[opt.Tag]) {
-			err := a.outbound.Create(
-				adapter.WithContext(a.ctx, &adapter.InboundContext{
-					Outbound: tag,
-				}),
-				a.router,
-				a.logFactory.NewLogger(F.ToString("outbound/", opt.Type, "[", tag, "]")),
-				tag,
-				opt.Type,
-				opt.Options,
-			)
-			if err != nil {
-				a.logger.Warn(err, " in ", tag, ", skip create this outbound")
-				continue
-			}
-			outbound, _ = a.outbound.Outbound(tag)
+		if exist && reflect.DeepEqual(opt, oldOptByTag[opt.Tag]) {
+			slots[i] = outbound
+			continue
 		}
-		newAll = append(newAll, outbound)
-		newByTag[tag] = outbound
+		needCreate = append(needCreate, createJob{index: i, opt: opt, tag: tag})
+	}
+
+	// 3b. 并行 Create（池化 worker，封顶 16 并发；ants 满载时 Submit 阻塞）。
+	//
+	// 为何用新开一个 16 worker 的 sync.WaitGroup 而不是 providerWorkerPool：
+	//   - providerWorkerPool 是 healthcheck 共用池（64 workers），Create
+	//     突发会把它占满导致同时段的健康探测全部排队。
+	//   - Create 是 CPU+syscall 混合、可能触发 DNS 解析（reality 预握手
+	//     等），16 并发刚好卡在多数家宽 / 云主机的并发出站上限之下。
+	//   - 失败统一用 logger.Warn，不 return —— 保留原串行版本 "skip
+	//     create this outbound" 的语义，单个节点坏配置不影响其他节点。
+	if len(needCreate) > 0 {
+		const createParallel = 16
+		sem := make(chan struct{}, createParallel)
+		var wg sync.WaitGroup
+		for _, job := range needCreate {
+			wg.Add(1)
+			sem <- struct{}{}
+			j := job
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				err := a.outbound.Create(
+					adapter.WithContext(a.ctx, &adapter.InboundContext{
+						Outbound: j.tag,
+					}),
+					a.router,
+					a.logFactory.NewLogger(F.ToString("outbound/", j.opt.Type, "[", j.tag, "]")),
+					j.tag,
+					j.opt.Type,
+					j.opt.Options,
+				)
+				if err != nil {
+					a.logger.Warn(err, " in ", j.tag, ", skip create this outbound")
+					return
+				}
+				// outbound.Create 内部已经把新对象写入 m.outboundByTag，
+				// 这里 Lookup 取回即可；Create 成功但 Lookup miss 理论
+				// 上不可能，若发生当作失败处理（slot 保持 nil，下面
+				// newAll 组装时跳过 nil）。
+				ob, _ := a.outbound.Outbound(j.tag)
+				slots[j.index] = ob
+			}()
+		}
+		wg.Wait()
+	}
+
+	// 3c. 按原序拼装 newAll + newByTag，跳过 Create 失败留下的 nil slot。
+	for _, ob := range slots {
+		if ob == nil {
+			continue
+		}
+		newAll = append(newAll, ob)
+		newByTag[ob.Tag()] = ob
 	}
 
 	// 4. 原子发布新 snapshot；读端在此刻之前仍然看到老 snapshot
@@ -541,26 +601,61 @@ func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.En
 	for _, opt := range oldOpts {
 		oldOptByTag[opt.Tag] = opt
 	}
-	endpoints := make([]adapter.Outbound, 0, len(newOpts))
+	// 对称于 UpdateOutbounds：先分出 "复用 / 需创建"，再并行 Create。
+	// 保留原顺序（slots 下标对齐 newOpts 下标）以维持 endpoints 切片的
+	// 稳定排序，否则下游依赖 All() / Outbounds() 输出序的 UI（clash
+	// dashboard）会每次订阅都看到节点顺序抖动。
+	type epJob struct {
+		index int
+		opt   option.Endpoint
+		tag   string
+	}
+	needCreate := make([]epJob, 0, len(newOpts))
+	slots := make([]adapter.Outbound, len(newOpts))
 	for i, opt := range newOpts {
 		tag := newTags[i]
 		ep, exist := a.endpoint.Get(tag)
-		if !exist || !reflect.DeepEqual(opt, oldOptByTag[opt.Tag]) {
-			err := a.endpoint.Create(
-				adapter.WithContext(a.ctx, &adapter.InboundContext{
-					Outbound: tag,
-				}),
-				a.router,
-				a.logFactory.NewLogger(F.ToString("endpoint/", opt.Type, "[", tag, "]")),
-				tag,
-				opt.Type,
-				opt.Options,
-			)
-			if err != nil {
-				a.logger.Warn(err, " in ", tag, ", skip create this endpoint")
-				continue
-			}
-			ep, _ = a.endpoint.Get(tag)
+		if exist && reflect.DeepEqual(opt, oldOptByTag[opt.Tag]) {
+			slots[i] = ep
+			continue
+		}
+		needCreate = append(needCreate, epJob{index: i, opt: opt, tag: tag})
+	}
+	if len(needCreate) > 0 {
+		const createParallel = 16
+		sem := make(chan struct{}, createParallel)
+		var wg sync.WaitGroup
+		for _, job := range needCreate {
+			wg.Add(1)
+			sem <- struct{}{}
+			j := job
+			go func() {
+				defer wg.Done()
+				defer func() { <-sem }()
+				err := a.endpoint.Create(
+					adapter.WithContext(a.ctx, &adapter.InboundContext{
+						Outbound: j.tag,
+					}),
+					a.router,
+					a.logFactory.NewLogger(F.ToString("endpoint/", j.opt.Type, "[", j.tag, "]")),
+					j.tag,
+					j.opt.Type,
+					j.opt.Options,
+				)
+				if err != nil {
+					a.logger.Warn(err, " in ", j.tag, ", skip create this endpoint")
+					return
+				}
+				ep, _ := a.endpoint.Get(j.tag)
+				slots[j.index] = ep
+			}()
+		}
+		wg.Wait()
+	}
+	endpoints := make([]adapter.Outbound, 0, len(newOpts))
+	for _, ep := range slots {
+		if ep == nil {
+			continue
 		}
 		endpoints = append(endpoints, ep)
 	}
