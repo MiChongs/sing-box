@@ -74,14 +74,25 @@ func proxyRouter(server *Server, router adapter.Router) http.Handler {
 // so the UI can render a toast like "已解除对 HK-01 的固定，当前推荐 HK-07".
 func clearProxySelection(w http.ResponseWriter, r *http.Request) {
 	proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
-	sg, ok := proxy.(*group.Smart)
-	if !ok {
+	switch p := proxy.(type) {
+	case *group.Smart:
+		render.JSON(w, r, p.ClearSelection())
+	case *group.URLTest:
+		// URLTest's temporary manual pin — empty tag clears it. The pin
+		// also auto-clears on the next user-triggered speed test, so
+		// DELETE just mirrors that lifecycle for UIs that bind the
+		// "release fixed" button to the REST verb.
+		previous := p.Selected()
+		p.SelectOutbound("")
+		render.JSON(w, r, render.M{
+			"group":        p.Tag(),
+			"previous_pin": previous,
+			"now":          p.Now(),
+		})
+	default:
 		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError("only Smart groups support clearing the manual pin; Selector requires PUT with a node name"))
-		return
+		render.JSON(w, r, newError("only Smart and URLTest groups support clearing the manual pin; Selector requires PUT with a node name"))
 	}
-	res := sg.ClearSelection()
-	render.JSON(w, r, res)
 }
 
 // getSmartGroupWeights returns the Smart group's weight ranking.
@@ -221,6 +232,18 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 		// `hidden=false`, `icon=""` are the documented "absent" sentinels.
 		info.Put("hidden", groupOutbound.Hidden())
 		info.Put("icon", groupOutbound.Icon())
+
+		// URLTest's temporary manual pin surfaces like Smart's `fixed`
+		// so metacubexd / zashboard can render a uniform "pinned" chip
+		// across group types. `fixedActive` echoes `fixed` because
+		// URLTest doesn't have a separate "pin suspended" state — if
+		// the pin is still in the snapshot it remains in effect.
+		if ut, ok := detour.(*group.URLTest); ok {
+			selected := ut.Selected()
+			info.Put("fixed", selected)
+			info.Put("fixedSuspended", false)
+			info.Put("fixedActive", selected)
+		}
 
 		if sg, ok := detour.(*group.Smart); ok {
 			info.Put("testUrl", sg.TestURL())
@@ -367,9 +390,17 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 			render.JSON(w, r, newError("Smart update error: not found"))
 			return
 		}
+	case *group.URLTest:
+		// Temporary manual pin on URLTest — empty name clears. Auto-
+		// released on the next user-triggered group speed test.
+		if !p.SelectOutbound(req.Name) {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("URLTest update error: not found"))
+			return
+		}
 	default:
 		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError("Must be a Selector or Smart"))
+		render.JSON(w, r, newError("Must be a Selector, Smart, or URLTest"))
 		return
 	}
 

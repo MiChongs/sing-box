@@ -657,12 +657,23 @@ func (s *StartedService) SelectOutbound(ctx context.Context, request *SelectOutb
 	if !isLoaded {
 		return nil, E.New("selector not found: ", request.GroupTag)
 	}
-	selector, isSelector := outboundGroup.(*group.Selector)
-	if !isSelector {
-		return nil, E.New("outbound is not a selector: ", request.GroupTag)
-	}
-	if !selector.SelectOutbound(request.OutboundTag) {
-		return nil, E.New("outbound not found in selector: ", request.OutboundTag)
+	switch p := outboundGroup.(type) {
+	case *group.Selector:
+		if !p.SelectOutbound(request.OutboundTag) {
+			return nil, E.New("outbound not found in selector: ", request.OutboundTag)
+		}
+	case *group.URLTest:
+		// URLTest's temporary manual pin — auto-released on the next
+		// user-triggered speed test. Empty tag clears the pin.
+		if !p.SelectOutbound(request.OutboundTag) {
+			return nil, E.New("outbound not found in urltest: ", request.OutboundTag)
+		}
+	case *group.Smart:
+		if !p.SelectOutbound(request.OutboundTag) {
+			return nil, E.New("outbound not found in smart: ", request.OutboundTag)
+		}
+	default:
+		return nil, E.New("outbound group does not support manual selection: ", request.GroupTag)
 	}
 	s.urlTestObserver.Emit(struct{}{})
 	return &emptypb.Empty{}, nil

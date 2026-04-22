@@ -28,6 +28,15 @@ import (
 	"github.com/sagernet/sing/service/pause"
 )
 
+// manualPinData holds the user's temporary manual selection on a URLTest group.
+// The pin is released automatically when the user triggers another manual speed
+// test (clash API /group/{name}/delay or libbox URLTest RPC), so periodic
+// health checks and dial-failure auto-rechecks never silently unpin.
+type manualPinData struct {
+	tag      string
+	outbound adapter.Outbound
+}
+
 const (
 	maxScreeningConcurrency = 16 // Phase 1: coarse screening — balanced speed vs memory
 	maxPrecisionConcurrency = 2  // Phase 2: precision retest — minimal concurrency for accuracy
@@ -208,12 +217,66 @@ func (s *URLTest) Close() error {
 }
 
 func (s *URLTest) Now() string {
+	if pin := s.group.manualPin.Load(); pin != nil {
+		return pin.tag
+	}
 	if tcp := s.group.selectedOutboundTCP.Load(); tcp != nil {
 		return tcp.Tag()
 	} else if udp := s.group.selectedOutboundUDP.Load(); udp != nil {
 		return udp.Tag()
 	}
 	return ""
+}
+
+// Selected reports the user's manually-pinned outbound tag, or "" when the
+// group is running on automatic selection. Mirrors Smart.Selected semantics so
+// dashboards can render the pinned / fixed state uniformly across group types.
+func (s *URLTest) Selected() string {
+	if pin := s.group.manualPin.Load(); pin != nil {
+		return pin.tag
+	}
+	return ""
+}
+
+// SelectOutbound pins a node as the temporary manual selection, or clears the
+// pin when tag == "". Returns false only when tag is non-empty and not a
+// member of the current group snapshot. The pin survives periodic health
+// checks and dial-failure-triggered rechecks, and is released automatically on
+// the next user-triggered URL test (see URLTestGroup.URLTest /
+// URLTest.CheckOutbounds). New dials see the pin immediately; active
+// connections are interrupted when interruptExistConnections is enabled
+// (mirrors Selector.SelectOutbound).
+func (s *URLTest) SelectOutbound(tag string) bool {
+	if tag == "" {
+		if s.group.clearManualPin() {
+			s.logger.Info("manual pin released")
+			if s.interruptExternalConnections {
+				s.group.interruptGroup.Interrupt(true)
+			}
+		}
+		return true
+	}
+	detour := s.group.findOutboundByTag(tag)
+	if detour == nil {
+		return false
+	}
+	prev := s.group.manualPin.Swap(&manualPinData{tag: tag, outbound: detour})
+	if prev != nil && prev.outbound == detour {
+		return true
+	}
+	s.logger.Info("manual pin set to ", tag)
+	// Make the pin visible to cached-select fast paths and any code reading
+	// selectedOutboundTCP/UDP directly (DialContext/ListenPacket). Only
+	// overwrite when the pin supports the network so UDP-only / TCP-only
+	// nodes don't poison the other-network cached slot.
+	if common.Contains(detour.Network(), N.NetworkTCP) {
+		s.group.selectedOutboundTCP.Store(detour)
+	}
+	if common.Contains(detour.Network(), N.NetworkUDP) {
+		s.group.selectedOutboundUDP.Store(detour)
+	}
+	s.group.interruptGroup.Interrupt(s.interruptExternalConnections)
+	return true
 }
 
 func (s *URLTest) All() []string {
@@ -227,10 +290,21 @@ func (s *URLTest) All() []string {
 }
 
 func (s *URLTest) URLTest(ctx context.Context) (map[string]uint16, error) {
+	// User-triggered manual test — release the manual pin so selection
+	// returns to the best measured node after this cycle completes.
+	if s.group.clearManualPin() {
+		s.logger.Info("manual pin released by user speed test")
+	}
 	return s.group.URLTest(ctx)
 }
 
 func (s *URLTest) CheckOutbounds() {
+	// User-triggered via gRPC/libbox — release the manual pin before
+	// running. Internal callers use g.CheckOutbounds directly and must
+	// preserve the pin.
+	if s.group.clearManualPin() {
+		s.logger.Info("manual pin released by user speed test")
+	}
 	s.group.CheckOutbounds(true)
 }
 
@@ -245,12 +319,19 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	s.group.Touch()
 	var outbound adapter.Outbound
 	switch N.NetworkName(network) {
-	case N.NetworkTCP:
-		outbound = s.group.selectedOutboundTCP.Load()
-	case N.NetworkUDP:
-		outbound = s.group.selectedOutboundUDP.Load()
+	case N.NetworkTCP, N.NetworkUDP:
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
+	}
+	if pinned := s.group.pinnedOutbound(N.NetworkName(network)); pinned != nil {
+		outbound = pinned
+	} else {
+		switch N.NetworkName(network) {
+		case N.NetworkTCP:
+			outbound = s.group.selectedOutboundTCP.Load()
+		case N.NetworkUDP:
+			outbound = s.group.selectedOutboundUDP.Load()
+		}
 	}
 	if outbound == nil {
 		outbound, _ = s.group.Select(network)
@@ -281,7 +362,12 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 
 func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	s.group.Touch()
-	outbound := s.group.selectedOutboundUDP.Load()
+	var outbound adapter.Outbound
+	if pinned := s.group.pinnedOutbound(N.NetworkUDP); pinned != nil {
+		outbound = pinned
+	} else {
+		outbound = s.group.selectedOutboundUDP.Load()
+	}
 	if outbound == nil {
 		outbound, _ = s.group.Select(N.NetworkUDP)
 	}
@@ -321,7 +407,12 @@ func (s *URLTest) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 
 func (s *URLTest) NewDirectRouteConnection(metadata adapter.InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error) {
 	s.group.Touch()
-	selected := s.group.selectedOutboundTCP.Load()
+	var selected adapter.Outbound
+	if pinned := s.group.pinnedOutbound(metadata.Network); pinned != nil {
+		selected = pinned
+	} else {
+		selected = s.group.selectedOutboundTCP.Load()
+	}
 	if selected == nil {
 		selected, _ = s.group.Select(N.NetworkTCP)
 	}
@@ -464,6 +555,10 @@ type URLTestGroup struct {
 	// expectedStatus: 上层 URLTest.NewURLTest 在构造 group 之前解析好
 	// 再传进来；每次 URL 探测透传给 urltest.URLTestWithStatus。nil = 旧启发式。
 	expectedStatus *urltest.StatusMatcher
+
+	// manualPin: user's temporary manual selection. nil = auto.
+	// Set via SelectOutbound, cleared at the next user-triggered URL test.
+	manualPin atomic.Pointer[manualPinData]
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, tags []string, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, fallback URLTestFallback, interruptExternalConnections bool, expectedStatus *urltest.StatusMatcher) (*URLTestGroup, error) {
@@ -560,7 +655,52 @@ func (g *URLTestGroup) Close() error {
 //     haven't seen too many dial failures on it, give it a grace period. Avoids
 //     thrash when the test URL is temporarily blocked while traffic still works.
 //  3. Only switch when current is truly unusable (dropped from set, or marked bad).
+// pinnedOutbound returns the manually-pinned outbound when it is still a
+// member of the snapshot and supports the requested network; nil otherwise.
+// When the pin has been removed from the snapshot (provider update dropped
+// it), the pin is auto-cleared so selection falls back to automatic.
+func (g *URLTestGroup) pinnedOutbound(network string) adapter.Outbound {
+	pin := g.manualPin.Load()
+	if pin == nil {
+		return nil
+	}
+	st := g.getState()
+	if st == nil || !g.outboundStillPresent(st, pin.outbound) {
+		g.manualPin.CompareAndSwap(pin, nil)
+		return nil
+	}
+	if network != "" && !common.Contains(pin.outbound.Network(), network) {
+		return nil
+	}
+	return pin.outbound
+}
+
+// clearManualPin drops the pin if one is set. Returns true when a pin was
+// actually cleared so callers can log / interrupt conditionally.
+func (g *URLTestGroup) clearManualPin() bool {
+	return g.manualPin.Swap(nil) != nil
+}
+
+// findOutboundByTag walks the current snapshot looking for tag. Used by
+// SelectOutbound so the pin only accepts tags that actually belong to this
+// group (mirrors Selector.SelectOutbound's membership guard).
+func (g *URLTestGroup) findOutboundByTag(tag string) adapter.Outbound {
+	st := g.getState()
+	if st == nil {
+		return nil
+	}
+	for _, o := range st.outbounds {
+		if o.Tag() == tag {
+			return o
+		}
+	}
+	return nil
+}
+
 func (g *URLTestGroup) Select(network string) (adapter.Outbound, bool) {
+	if pin := g.pinnedOutbound(network); pin != nil {
+		return pin, true
+	}
 	st := g.getState()
 	var candidates []rankedOutbound
 	if st != nil {
