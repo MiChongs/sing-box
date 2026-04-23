@@ -405,13 +405,23 @@ func NewClient(
 	}, nil
 }
 
+// buildTransport 按 ALPN 派发底层 RoundTripper（与 mihomo / Xray 对齐）：
+//
+//	显式 alpn = ["http/1.1"]   → http.Transport（裸 H1 长 POST + GET，CDN 兼容性最好）
+//	显式 alpn = ["h3"]         → 暂未实现（需 quic-go），返回错误而不是错配 transport
+//	其他（默认 / ["h2", ...]） → http2.Transport
+//
+// 之前不分 ALPN 一律走 http2.Transport，遇到 alpn=["http/1.1"] 的服务端配置时
+// TLS 实际协商出 h1，http2.Transport.RoundTrip 立即失败 (`http2: unsupported`)，
+// DialContext 整个失败 → URLTest 永远不通、xhttp outbound 完全不可用。
+//
+// 无 TLS 时只能走 H1（h2 需要 ALPN）。
 func buildTransport(
 	dialer N.Dialer,
 	serverAddr M.Socksaddr,
 	tlsConfig boxtls.Config,
 ) (http.RoundTripper, error) {
 	if tlsConfig == nil {
-		// HTTP/1.1 only. h2 需要 TLS ALPN，明文通道不启用。
 		return &http.Transport{
 			Proxy: nil,
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -422,11 +432,36 @@ func buildTransport(
 			MaxIdleConns:      16,
 		}, nil
 	}
-	// 确保 ALPN 同时包含 h2 和 http/1.1；Reality + H2 场景下 h2 也必要。
-	if alpn := tlsConfig.NextProtos(); len(alpn) == 0 {
+
+	alpn := tlsConfig.NextProtos()
+	tlsDialer := boxtls.NewDialer(dialer, tlsConfig)
+
+	// alpn = ["http/1.1"] → 强制 H1 transport，复用同一 TLS dial。
+	if len(alpn) == 1 && alpn[0] == "http/1.1" {
+		return &http.Transport{
+			Proxy: nil,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return tlsDialer.DialTLSContext(ctx, serverAddr)
+			},
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return tlsDialer.DialTLSContext(ctx, serverAddr)
+			},
+			ForceAttemptHTTP2: false,
+			IdleConnTimeout:   ConnIdleTimeout,
+			MaxIdleConns:      16,
+		}, nil
+	}
+	// alpn = ["h3"] 暂不支持 — 显式报错好于装 http2.Transport 静默失败。
+	if len(alpn) == 1 && alpn[0] == "h3" {
+		return nil, E.New("xhttp: HTTP/3 transport not yet implemented (alpn=[\"h3\"])")
+	}
+
+	// 默认 / 多值 → H2。若 ALPN 完全为空（未配置），补 ["h2", "http/1.1"]
+	// 让 TLS 优先尝试 h2，失败时仍能 fallback 到 h1（但仍走 http2.Transport，
+	// 这是 mihomo / Xray 的同构行为 — 默认假定服务端支持 h2）。
+	if len(alpn) == 0 {
 		tlsConfig.SetNextProtos([]string{"h2", "http/1.1"})
 	}
-	tlsDialer := boxtls.NewDialer(dialer, tlsConfig)
 	return &http2.Transport{
 		DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
 			c, err := tlsDialer.DialTLSContext(ctx, serverAddr)
