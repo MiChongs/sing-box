@@ -275,6 +275,24 @@ type Smart struct {
 	dialFailAt    atomic.Int64
 	recheckOnce   atomic.Bool
 
+	// Network-storm sentinel. Incremented on every dial failure, decays
+	// back toward zero on every successful dial. When the running
+	// window shows sustained failures AND the most recent failure is
+	// within stormFailureWindow, background probe dispatchers
+	// (runHealthCheck / preWarmPriorityNodes / runTargetLivenessProbes)
+	// short-circuit — launching probes during a confirmed outage just
+	// piles work onto the shared worker pool without producing useful
+	// signal, and is the primary driver of the RSS spike users observe
+	// on Wi-Fi ↔ cellular handoff or network-down.
+	//
+	// Distinct from dialFailCount: that one only tracks consecutive
+	// failures to trigger an emergency prefetch refresh. stormFailures
+	// is a separate running counter so the two signals don't step on
+	// each other (emergency refresh still fires once; storm gating
+	// persists until failures decay out).
+	stormFailures   atomic.Int32
+	stormLastFailAt atomic.Int64
+
 	// knownDead records nodes that failed their most recent probe. It
 	// disambiguates "untested" (history=nil → assume alive during bootstrap)
 	// from "tested and failed" (must-not-select until next success). The
@@ -2143,6 +2161,13 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	s.rememberStickyChoice(meta.smartTarget, proxyTag, isUDP)
 	s.rememberHysteresisChoice(meta.smartTarget, proxyTag, isUDP)
 	s.markAlive(proxyTag) // successful dial = confirmed alive; clears knownDead
+	// Synchronously decay storm counter on success. Previously only
+	// happened inside the eventual recordStats path on conn close,
+	// which meant a group could stay in "storm" gated state long
+	// after the network recovered (until users actually closed
+	// enough in-flight conns). Running this inline on every
+	// successful dial releases the gate within one good dial.
+	s.onDialOutcome(true)
 	// Auto-resume pin: if the just-succeeded node IS the user's pin,
 	// the pin is healthy again — clear the suspended flag so the
 	// Clash API stops showing "pin unavailable".
@@ -2276,6 +2301,10 @@ func (s *Smart) racePacketCandidates(
 			s.rememberStickyChoice(meta.smartTarget, ob.Tag(), true)
 			s.rememberHysteresisChoice(meta.smartTarget, ob.Tag(), true)
 			s.markAlive(ob.Tag())
+			// Sync storm-counter decay — same rationale as the TCP DialContext
+			// success path: releases the probe gate within one good dial
+			// instead of waiting for an eventual recordStats on conn close.
+			s.onDialOutcome(true)
 			s.maybeResumePin(ob.Tag())
 			s.logger.InfoContext(ctx, "smart[", s.Tag(), "] UDP → ", destination,
 				" via [", ob.Tag(), "] in ", connectTime, "ms (target=",
@@ -2287,8 +2316,14 @@ func (s *Smart) racePacketCandidates(
 		s.markDead(ob.Tag())
 		s.logger.DebugContext(ctx, "smart[", s.Tag(), "] UDP probe [", ob.Tag(),
 			"] failed in ", connectTime, "ms: ", err)
+		// Sync storm-counter bump for the UDP race too — same reason as
+		// the TCP paths: don't let trySubmit's drop shield storm detection.
+		s.onDialOutcome(false)
 		tag, ct, m := ob.Tag(), connectTime, meta
-		getSmartWorker().submit(func() {
+		// trySubmit: the UDP race loops through every candidate so a
+		// network-down burst spams N submits per ListenPacket call.
+		// Drop-on-overload keeps the pool backlog bounded.
+		getSmartWorker().trySubmit(func() {
 			s.recordStats("failed", m, tag, ct, 0, 0, 0, 0, 0, 0)
 		})
 	}
@@ -3009,8 +3044,21 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 				s.logger.DebugContext(ctx, "smart[", s.Tag(), "] circuit-breaker OPEN for [", tag,
 					"] after ", cbMaxConsecFail, " consecutive failures in ", cbWindow)
 			}
+			// Storm-detection counter must advance synchronously: it
+			// gates background probe dispatch, and if we only bumped it
+			// inside the submitted recordStats closure we'd miss the
+			// signal whenever the pool shedding drops that submit —
+			// exactly the case where storm detection matters most.
+			s.onDialOutcome(false)
 			ct2, tag2, meta2 := ct, tag, meta
-			getSmartWorker().submit(func() { s.recordFailedDial(tag2, meta2, ct2) })
+			// trySubmit (not submit): during a network storm, the failure-
+			// recording telemetry is the #1 producer of pool-backlog growth.
+			// Each of these submits runs recordStats → 200 ms DNS lookup →
+			// bbolt queue append; 100 concurrent failing dials × 12 submits
+			// each would park 1200 callers in the pool's cond.Wait() under
+			// the old blocking-unbounded policy. Shedding the oldest-first
+			// here keeps backlog bounded AND the per-storm RSS flat.
+			getSmartWorker().trySubmit(func() { s.recordFailedDial(tag2, meta2, ct2) })
 		}
 		return conn, outbounds[0].Tag(), ct, err
 	}
@@ -3078,8 +3126,13 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 				s.logger.DebugContext(ctx, "smart[", s.Tag(), "] circuit-breaker OPEN for [", r.tag,
 					"] after ", cbMaxConsecFail, " consecutive failures in ", cbWindow)
 			}
+			// Sync storm-counter bump — see single-node branch rationale.
+			s.onDialOutcome(false)
 			rtag, rct, rmeta := r.tag, r.connectTime, meta
-			getSmartWorker().submit(func() { s.recordFailedDial(rtag, rmeta, rct) })
+			// See parallelDial-single-node branch: trySubmit instead of
+			// submit so a storm-of-failures doesn't grow the pool backlog
+			// without bound.
+			getSmartWorker().trySubmit(func() { s.recordFailedDial(rtag, rmeta, rct) })
 		}
 	}
 
@@ -3186,8 +3239,14 @@ func (s *Smart) hedgedDial(ctx context.Context, network string, dest M.Socksaddr
 						"] circuit-breaker OPEN for [", r.tag,
 						"] after ", cbMaxConsecFail, " consecutive failures in ", cbWindow)
 				}
+				// Sync storm-counter bump — see parallelDial rationale.
+				s.onDialOutcome(false)
 				rtag, rct, rmeta := r.tag, r.connectTime, meta
-				getSmartWorker().submit(func() { s.recordFailedDial(rtag, rmeta, rct) })
+				// Shed-on-overload: mirror parallelDial — during a
+				// mass-failure storm a hedged-dial loop generates up
+				// to 2×failures worth of recordFailedDial submits, so
+				// trySubmit keeps the pool backlog bounded.
+				getSmartWorker().trySubmit(func() { s.recordFailedDial(rtag, rmeta, rct) })
 			}
 			// primary 快速失败 → 不等 hedge timer 直接启动 hedges (加速
 			// 失败切换；本来就要追加 hedge，提前一点点避免再浪费 250ms)。
@@ -3591,7 +3650,11 @@ func (c *smartTrackedConn) Close() error {
 		cs, meta, tag, ctime := c.s, c.meta, c.proxyTag, c.connectTime
 		statusCopy := status
 		latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy := latency, up, down, maxUpBps, maxDownBps, durMS
-		getSmartWorker().submit(func() {
+		// trySubmit: during a network-switch burst every in-flight conn
+		// closes roughly together, producing a herd of stats submits.
+		// Drop-on-overload is acceptable (one close sample) and keeps
+		// the pool backlog bounded.
+		getSmartWorker().trySubmit(func() {
 			cs.recordStats(statusCopy, meta, tag, ctime,
 				latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy)
 		})
@@ -3702,7 +3765,9 @@ func (c *smartTrackedPacketConn) Close() error {
 		}
 		cs, meta, tag, ctime := c.s, c.meta, c.proxyTag, c.connectTime
 		latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy := latency, up, down, maxUpBps, maxDownBps, durMS
-		getSmartWorker().submit(func() {
+		// trySubmit: see smartTrackedConn.Close — UDP close-herds during
+		// network handoff generate the same submit burst as TCP.
+		getSmartWorker().trySubmit(func() {
 			cs.recordStats("closed", meta, tag, ctime,
 				latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy)
 		})
@@ -3818,10 +3883,28 @@ func (s *Smart) closeTargetConnections(target, nodeTag string) {
 func (s *Smart) onDialOutcome(success bool) {
 	if success {
 		s.dialFailCount.Store(0)
+		// Quick-decay the storm sentinel on successful dials so a
+		// single-node hiccup (which we MUST react to with emergency
+		// prefetch) doesn't accidentally gate background probes for
+		// the whole group. One good dial halves the running count,
+		// matching the behaviour of an exponential moving average
+		// without holding timestamp arrays.
+		if cur := s.stormFailures.Load(); cur > 0 {
+			s.stormFailures.Store(cur / 2)
+		}
 		return
 	}
 	now := time.Now().Unix()
 	last := s.dialFailAt.Swap(now)
+	// Storm sentinel always observes the failure timestamp, even before
+	// the emergency-refresh branch below gates. Its clamp at
+	// stormFailuresCap keeps the atomic from wrapping under sustained
+	// outages (worst case: network stays dead for hours; counter sits
+	// at the cap and the gate stays on — which is exactly what we want).
+	s.stormLastFailAt.Store(now)
+	if sf := s.stormFailures.Add(1); sf > stormFailuresCap {
+		s.stormFailures.Store(stormFailuresCap)
+	}
 	if now-last > 60 {
 		// >1 minute since last failure — reset counter
 		s.dialFailCount.Store(1)
@@ -3837,6 +3920,52 @@ func (s *Smart) onDialOutcome(success bool) {
 			s.runPrefetch()
 		})
 	}
+}
+
+// Storm-gate parameters. A Smart group is in "storm" state when the
+// running failure count is above stormFailuresThreshold AND the most
+// recent failure was within stormFailureWindow. Background probe
+// dispatchers (runHealthCheck / preWarmPriorityNodes /
+// runTargetLivenessProbes) short-circuit under storm so the shared
+// worker pool isn't buried under probes that can't possibly succeed.
+//
+// The threshold is deliberately low (5) so we gate during a real outage
+// but a handful of scattered failures on one flaky node doesn't silence
+// the probe pipeline for the whole group. The window is short (30 s)
+// so transient conditions release the gate quickly once the network
+// recovers — the first successful dial halves the counter too, which
+// usually drops it below threshold within one good request.
+const (
+	stormFailuresThreshold = 5
+	stormFailureWindow     = 30 * time.Second
+	stormFailuresCap       = 1 << 14 // 16 384 — prevents atomic wraparound
+)
+
+// inNetworkStorm reports whether this group is currently observing a
+// sustained failure pattern consistent with a network-layer outage.
+// Cheap: two atomic loads plus one comparison on the hot path; callers
+// invoke this at the top of dispatch paths and bail immediately when
+// true.
+//
+// The design deliberately conflates "network handoff" with "network
+// dead" — both produce the same symptom (mass probe failures) and
+// deserve the same treatment (stop piling work onto the shared pool
+// until the situation clears).
+func (s *Smart) inNetworkStorm() bool {
+	if s == nil {
+		return false
+	}
+	if s.stormFailures.Load() < stormFailuresThreshold {
+		return false
+	}
+	last := s.stormLastFailAt.Load()
+	if last == 0 {
+		return false
+	}
+	if time.Since(time.Unix(last, 0)) > stormFailureWindow {
+		return false
+	}
+	return true
 }
 
 func (s *Smart) wrapPacketConn(pc net.PacketConn, tag string, meta *smartDialMeta, connectTime int64) net.PacketConn {
@@ -3874,15 +4003,14 @@ func (s *Smart) recordStats(
 		return
 	}
 
-	// Feed dial outcome into group-level failure tracking (mihomo's
-	// onDialFailed / onDialSuccess). Accumulated failures trigger an async
-	// prefetch refresh so the group catches new breakage faster than the
-	// scheduled 10-minute tick.
-	if status == "failed" {
-		s.onDialOutcome(false)
-	} else {
-		s.onDialOutcome(true)
-	}
+	// onDialOutcome is NOT called here anymore — it is invoked inline on
+	// every dial (failure: parallelDial / hedgedDial / UDP race; success:
+	// DialContext / ListenPacket). That guarantees the storm counter and
+	// emergency-refresh signal advance regardless of whether this
+	// recordStats call was dispatched via trySubmit (and potentially
+	// dropped under pool overload). Keeping the call here too would
+	// produce double-counting on every dial whose submit actually runs,
+	// which we deliberately avoid.
 
 	if s.store == nil {
 		return
@@ -4153,9 +4281,12 @@ func (s *Smart) recordStats(
 		// Must COPY the ModelInput by value — `input` gets released back
 		// to the pool when recordStats returns (via defer), and the
 		// async goroutine can't hold a reference to pooled memory.
+		// trySubmit: training-sample loss is acceptable under pool
+		// overload — we'd rather drop a few samples than let a network
+		// outage grow RSS through pool-backlog accumulation.
 		inputSnap := *input
 		cmetaCopy, w, srcCopy := cmeta, baseWeight, source
-		getSmartWorker().submit(func() {
+		getSmartWorker().trySubmit(func() {
 			s.dataCollector.AddSample(&inputSnap, cmetaCopy, w, srcCopy)
 		})
 	}
@@ -4205,7 +4336,12 @@ func (s *Smart) recordStats(
 			Node:   proxyTag,
 			Data:   data,
 		}
-		getSmartWorker().submit(func() {
+		// trySubmit: dropping a single stats record during an overload
+		// storm is far better than parking thousands of submit callers.
+		// The per-record loss is captured by flushQueue running on its
+		// own periodic tick; if the backlog clears before that tick, no
+		// visible effect.
+		getSmartWorker().trySubmit(func() {
 			s.store.AppendToGlobalQueue(op)
 		})
 	}
@@ -4406,6 +4542,20 @@ func (s *Smart) runHealthCheck() {
 	}
 	snap := s.state.Load()
 	if snap == nil || len(snap.outbounds) == 0 {
+		return
+	}
+	// Network-storm gate: during a confirmed outage / handoff, every
+	// probe is going to time out for the 5 s per-probe budget and
+	// produce no useful signal. Dispatching them anyway piles up
+	// worker-pool submits and probe-semaphore waiters, which is the
+	// RSS explosion path users observed. Skip this tick; the next
+	// scheduled tick will re-evaluate. If we're wrong (network
+	// actually came back while we were gated), the first successful
+	// user dial halves the storm counter and the NEXT tick runs
+	// probes normally.
+	if s.inNetworkStorm() {
+		s.logger.Debug("smart[", s.Tag(),
+			"] health-check skipped — network-storm gate active (recent dial failures above threshold)")
 		return
 	}
 
@@ -5253,6 +5403,17 @@ func (s *Smart) pruneStaleMemoryMaps() {
 		s.logger.Debug("smart[", s.Tag(), "] memory-map prune: knownDead=", kd,
 			" targetDebargo=", td, " shortLife=", sl,
 			" stickyByTarget=", st, " hysteresisMemo=", hy)
+	}
+
+	// Process-global freshness-cache prune. Gated so only the first
+	// group to reach the claim within the interval does the scan —
+	// every group holds a reference to the same underlying map, so
+	// running it N times is pure waste. Zero cost on groups that lose
+	// the claim.
+	if claimGlobalTask("prune-freshness-cache", globalFreshnessPruneInterval) {
+		if w := getSmartWorker(); w != nil {
+			w.pruneFreshnessCache()
+		}
 	}
 }
 

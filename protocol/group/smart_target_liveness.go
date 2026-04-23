@@ -411,6 +411,15 @@ func (s *Smart) runTargetLivenessProbes() {
 	if s.isGroupIdle() {
 		return
 	}
+	// Also skip during a confirmed network storm: SNI handshakes will
+	// all fail, recording "blocked" for every (target, node) pair
+	// which over-demotes trusted nodes once the network recovers. The
+	// next storm-clear tick gets us fresh data.
+	if s.inNetworkStorm() {
+		s.logger.Debug("smart[", s.Tag(),
+			"] target-liveness probes skipped — network-storm gate active")
+		return
+	}
 	targets := s.targetLiveness.hits.topK(sniProbeTopK)
 	if len(targets) == 0 {
 		return

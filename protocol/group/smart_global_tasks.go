@@ -93,3 +93,11 @@ const globalCleanupOrphanGroupsInterval = 2 * time.Hour
 
 // globalCleanupOldInterval for the bbolt-scan cleanup-old task.
 const globalCleanupOldInterval = 2 * time.Hour
+
+// globalFreshnessPruneInterval caps how often the process-wide freshness
+// cache gets pruned. The cache is shared across Smart groups, so prune
+// work must also be process-global — a single 5-min janitor call
+// removes entries older than freshnessPruneTTL (=10 min) so a
+// long-running daemon doesn't accumulate probeResult entries for tags
+// from reconfigured / removed outbounds.
+const globalFreshnessPruneInterval = 5 * time.Minute

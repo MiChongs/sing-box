@@ -318,6 +318,19 @@ func (s *Smart) preWarmPriorityNodes() {
 	if snap == nil || len(snap.outbounds) == 0 {
 		return
 	}
+	// Storm-gate: preWarm is called from the network-change handler,
+	// but the network might STILL be down (Wi-Fi handoff where the
+	// new interface is up but routing tables haven't stabilised, or
+	// the phone switched to a captive portal). Dispatching 2+ probes
+	// right into a known-bad network just wastes pool slots that
+	// recordFailedDial submits are already queuing for. The next
+	// successful user dial halves the storm counter; once it drops
+	// below threshold the regular runHealthCheck tick resumes probes.
+	if s.inNetworkStorm() {
+		s.logger.Debug("smart[", s.Tag(),
+			"] preWarm skipped — network-storm gate active")
+		return
+	}
 
 	// Build priority set: manual pin > lastSelected > stop. Both are
 	// best-effort — empty strings mean "no signal", skip.

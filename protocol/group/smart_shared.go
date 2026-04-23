@@ -188,9 +188,22 @@ func getSmartWorker() *smartSharedWorker {
 		// probe + prefetch work, 64 workers process the burst in parallel
 		// without letting the goroutine count explode. Unused workers
 		// expire after the idle timeout so idle resources are reclaimed.
+		//
+		// MaxBlockingTasks=256 bounds the parked-caller pile-up when the
+		// pool saturates. Without this, ants' blocking semantics park
+		// submit callers in cond.Wait() UNBOUNDED — during a Wi-Fi ↔
+		// cellular handoff or a full network outage, 15 Smart groups
+		// firing mass recordFailedDial + runHealthCheck + stats flush
+		// submits concurrently can stack up thousands of parked goroutines
+		// (~8 KB stack each) in seconds, which is the RSS explosion users
+		// observe on network switch. Beyond 256 queued callers Submit
+		// returns ErrPoolOverload and our wrapper silently drops the task
+		// — acceptable because every dropped task is either telemetry
+		// (stats / data collector) or a retry-on-schedule probe.
 		pool, err := ants.NewPool(64,
 			ants.WithExpiryDuration(30*time.Second),
 			ants.WithNonblocking(false),
+			ants.WithMaxBlockingTasks(smartPoolMaxBlockingTasks),
 			ants.WithPreAlloc(false),
 		)
 		if err != nil {
@@ -211,15 +224,49 @@ func getSmartWorker() *smartSharedWorker {
 	return smartWorker
 }
 
-// submit schedules fn to run on the shared worker pool. Blocks briefly if
-// the pool is saturated (which is the intended back-pressure — we don't
-// want unbounded goroutine creation on a busy config).
+// smartPoolMaxBlockingTasks caps parked Submit callers when every worker
+// is busy. Chosen to absorb a normal multi-group burst (16 groups × ~8
+// concurrent tasks = 128 peak) with headroom, but stay far below the
+// "thousands of parked goroutines" regime observed during network
+// handoffs. Each parked caller holds ~8 KB stack plus the mutex
+// bookkeeping, so 256 ≈ 2 MB worst case — predictable and bounded.
+const smartPoolMaxBlockingTasks = 256
+
+// submit schedules fn to run on the shared worker pool. When the pool is
+// saturated AND the backlog is at MaxBlockingTasks, pool.Submit returns
+// ErrPoolOverload and we silently drop the task. Callers must assume
+// submit is best-effort — critical side-effects MUST run inline BEFORE
+// the submit call, not inside the submitted closure.
+//
+// During network outages / handoffs this drop-on-overload behaviour is
+// what prevents the parked-goroutine pile-up that otherwise grows RSS
+// unboundedly. Dropped tasks are either telemetry (acceptable to lose)
+// or periodic probes (next tick re-submits).
 func (w *smartSharedWorker) submit(fn func()) {
 	if w.pool != nil {
 		_ = w.pool.Submit(fn)
 		return
 	}
 	go fn()
+}
+
+// trySubmit is the explicit-shedding variant of submit. Returns true when
+// the task was accepted, false when the pool is overloaded and the task
+// was NOT enqueued. Callers on hot paths (stats recording, data
+// collector) use this so they can skip preparatory work (map allocations,
+// struct copies) when the backlog is shedding — reduces allocation
+// pressure during storms beyond just dropping the scheduled fn.
+func (w *smartSharedWorker) trySubmit(fn func()) bool {
+	if w == nil {
+		return false
+	}
+	if w.pool == nil {
+		// No pool: fall back to unbounded go, same as submit. Callers
+		// still observe a true-return so they skip no work.
+		go fn()
+		return true
+	}
+	return w.pool.Submit(fn) == nil
 }
 
 // getWheel lazily starts the shared timing wheel on first use. 100ms tick
@@ -376,4 +423,38 @@ func (w *smartSharedWorker) probeOnce(
 		return 0, err
 	}
 	return v.(uint16), err
+}
+
+// freshnessPruneTTL is how long a probeResult lingers after its last
+// refresh before pruneFreshnessCache drops it. Probes keyed by tag
+// accumulate across the process lifetime — a Smart group that cycled
+// through 500 historical node tags and then got reconfigured leaves
+// 500 stale entries that never get overwritten again. Each entry holds
+// a URLTestDetail struct (~200 bytes) plus map overhead, so without
+// pruning the cache can climb into MB territory on long-running daemons
+// even though the freshness window itself is just 1 second.
+//
+// 10 minutes is well past any live probe's usefulness (freshWindow is
+// 1 s) and also past the maximum runHealthCheck freshWindow (5 min),
+// so no probe that's still authoritative gets pruned.
+const freshnessPruneTTL = 10 * time.Minute
+
+// pruneFreshnessCache drops entries older than freshnessPruneTTL. Called
+// periodically from the process-wide janitor task registered by the
+// first Smart group that starts. Cheap O(N) scan of the xsync.MapOf;
+// entries deleted inline while Range'ing is safe for xsync.
+func (w *smartSharedWorker) pruneFreshnessCache() {
+	if w == nil || w.freshnessCache == nil {
+		return
+	}
+	cutoff := time.Now().Add(-freshnessPruneTTL)
+	var dropped int
+	w.freshnessCache.Range(func(tag string, v probeResult) bool {
+		if v.at.Before(cutoff) {
+			w.freshnessCache.Delete(tag)
+			dropped++
+		}
+		return true
+	})
+	_ = dropped // observable via future instrumentation; no log spam on empty sweeps
 }
