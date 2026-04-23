@@ -451,9 +451,10 @@ func buildTransport(
 			MaxIdleConns:      16,
 		}, nil
 	}
-	// alpn = ["h3"] 暂不支持 — 显式报错好于装 http2.Transport 静默失败。
+	// alpn = ["h3"] → HTTP/3，由 buildH3Transport 实现（with_quic 构建标签）。
+	// 未启用 with_quic 时返回明确错误信息（见 h3_stub.go）。
 	if len(alpn) == 1 && alpn[0] == "h3" {
-		return nil, E.New("xhttp: HTTP/3 transport not yet implemented (alpn=[\"h3\"])")
+		return buildH3Transport(dialer, serverAddr, tlsConfig)
 	}
 
 	// 默认 / 多值 → H2。若 ALPN 完全为空（未配置），补 ["h2", "http/1.1"]
