@@ -4165,10 +4165,17 @@ func (s *Smart) recordStats(
 		// mihomo's findSameConnection equivalent: force-close in-flight
 		// connections to the same target so the user's client re-issues
 		// against the refreshed node selection.
+		//
+		// Gated by interrupt_exist_connections: 当用户显式选择"保留长连接"
+		// 时，degrade 只更新缓存/路由，不再主动撕掉用户已建立的下载/直播流；
+		// 新拨号自然走更新后的选择即可。否则与原行为一致，立即撕掉以促客户端
+		// 重连到新选中的节点。
 		if s.store != nil {
 			s.store.DeleteUnwrapResult(s.Tag(), smartConfigName, target, meta.asnCode, meta.isUDP)
 		}
-		s.closeTargetConnections(target, proxyTag)
+		if s.interruptExternalConnections {
+			s.closeTargetConnections(target, proxyTag)
+		}
 	}
 
 	// Update host failure/success counter. Only update lastUsed on zero-traffic

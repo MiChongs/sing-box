@@ -8,11 +8,15 @@
 // 两者协议规范用 sing-box 自有 deps (stdlib net/http + golang.org/x/net/http2)
 // 重写。协议关键点:
 //
-//   1. Path 结构:
-//      stream-one / stream-up upload:  POST  <base>/<session>
-//      stream-up download / packet-up: GET   <base>/<session>
+//   1. Path 结构（与 mihomo / XTLS-Xray 完全对齐）:
+//      stream-one:                     POST  <base>/                （无 session — h2 stream 天然隔离）
+//      stream-up upload / download:    POST  <base>/<session>  /  GET <base>/<session>
+//      packet-up download:              GET   <base>/<session>
 //      packet-up upload (每条):         POST  <base>/<session>/<seq>
 //      session 是 16-byte 随机 hex；seq 是自 0 递增的十进制。
+//      *** 历史 bug: 早期把 session 也拼进了 stream-one 的 URL，被 Xray 服务端
+//      当成 stream-up 半截上行而拒绝 (404 / 立即关连接)，表现为 urltest 永远
+//      不通、xhttp outbound 完全不可用。fix: stream-one 路径必须保持 <base>/。
 //
 //   2. 上行 Content-Type = application/grpc（stream 模式 req.Body 非 nil 时）
 //      packet-up 上行 Content-Type 缺省（服务端按 payload 解析）
@@ -207,11 +211,15 @@ func normalizePath(p string) string {
 	return p
 }
 
+// normalizeMode 与 mihomo / Xray 服务端 auto 默认一致：
+//   - Reality 场景：stream-one（H2 双向单流，最低开销）
+//   - 其他（包括普通 TLS、纯 HTTP）：packet-up（每包独立 POST，CDN/WAF 兼容性最好）
+//
+// 之前 useTLS → stream-one 的判定和 Xray 服务端 auto 不一致，会导致客户端
+// 用 H2 单流握上 stream-one 路径而服务端期待 packet-up 路径，握手必失败。
 func normalizeMode(m string, hasReality, useTLS bool) string {
+	_ = useTLS
 	if m == "" || m == ModeAuto {
-		if useTLS {
-			return ModeStreamOne
-		}
 		if hasReality {
 			return ModeStreamOne
 		}
@@ -475,10 +483,10 @@ func randSessionID() string {
 // ──────────────────────────────────────────────────────────────────────
 
 func (c *Client) dialStreamOne(ctx context.Context) (net.Conn, error) {
-	session := randSessionID()
+	// stream-one 不需要 session：单条 H2 双向流，无须服务端做 upload/download
+	// 关联。带 session 反而会被 Xray 服务端当成 stream-up 半截上行直接拒绝。
 	host := c.cfg.pickHost()
 	u := c.cfg.baseURL(host)
-	u.Path = appendPath(u.Path, session)
 
 	pr, pw := io.Pipe()
 	conn := newLateXHTTPConn(pw, c.cfg.serverAddr.TCPAddr())
