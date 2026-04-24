@@ -514,6 +514,50 @@ func randSessionID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// gotConnSignal 封装 httptrace.GotConn 的一次性通知通道。
+// 语义：
+//   - signal() 由 GotConn 回调调用（可能多次：http2 内部重试 / 连接池事件），
+//     向 wait() 发送一个建连成功信号，已满或已关闭都静默丢弃。
+//   - close() 由错误/取消路径调用，用来解阻塞还在 wait() 上挂着的协程。
+//
+// 关键点：signal 与 close 之间必须互斥，否则 "在已关闭通道上发送" 会 panic
+// （历史 bug：x/net/http2 在 RoundTrip 返回后仍可能回调 GotConn，与错误路径
+// 的 close(gotConn) 赛跑）。这里用 Mutex 保证两者严格互斥，并用 closed 标记
+// 让 close 幂等。
+type gotConnSignal struct {
+	mu     sync.Mutex
+	ch     chan struct{}
+	closed bool
+}
+
+func newGotConnSignal() *gotConnSignal {
+	return &gotConnSignal{ch: make(chan struct{}, 1)}
+}
+
+func (g *gotConnSignal) signal() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return
+	}
+	select {
+	case g.ch <- struct{}{}:
+	default:
+	}
+}
+
+func (g *gotConnSignal) close() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.closed {
+		return
+	}
+	g.closed = true
+	close(g.ch)
+}
+
+func (g *gotConnSignal) wait() <-chan struct{} { return g.ch }
+
 // ──────────────────────────────────────────────────────────────────────
 // stream-one: 单 POST H2 双向 (req.Body ↑ / resp.Body ↓)
 // ──────────────────────────────────────────────────────────────────────
@@ -533,14 +577,9 @@ func (c *Client) dialStreamOne(ctx context.Context) (net.Conn, error) {
 	stopLink := linkContexts(ctx, reqCancel)
 	defer stopLink()
 
-	gotConn := make(chan struct{}, 1)
+	gotConn := newGotConnSignal()
 	traceCtx := httptrace.WithClientTrace(reqCtx, &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) {
-			select {
-			case gotConn <- struct{}{}:
-			default:
-			}
-		},
+		GotConn: func(httptrace.GotConnInfo) { gotConn.signal() },
 	})
 
 	req, err := http.NewRequestWithContext(traceCtx, methodPost, u.String(), pr)
@@ -559,7 +598,7 @@ func (c *Client) dialStreamOne(ctx context.Context) (net.Conn, error) {
 		resp, err := c.transport.RoundTrip(req)
 		if err != nil {
 			setupErr <- err
-			close(gotConn) // 可能 gotConn 一直没触发（DNS/拨号失败），解阻塞
+			gotConn.close() // 解阻塞 wait()；与 signal() 互斥，避免 send on closed。
 			wrc.closeWithError(err)
 			return
 		}
@@ -574,7 +613,7 @@ func (c *Client) dialStreamOne(ctx context.Context) (net.Conn, error) {
 	// 等 TCP 连上再返回（打破 CDN 缓冲头的死锁），但给 dial ctx 一个
 	// 逃生口：ctx 过期 / RoundTrip 拨号失败都要可以 bail。
 	select {
-	case <-gotConn:
+	case <-gotConn.wait():
 		// OK，tunnel 已建立
 	case err := <-setupErr:
 		reqCancel()
@@ -625,14 +664,9 @@ func (c *Client) dialStreamUp(ctx context.Context) (net.Conn, error) {
 	stopLink := linkContexts(ctx, reqCancel)
 	defer stopLink()
 
-	gotConn := make(chan struct{}, 1)
+	gotConn := newGotConnSignal()
 	downCtx := httptrace.WithClientTrace(reqCtx, &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) {
-			select {
-			case gotConn <- struct{}{}:
-			default:
-			}
-		},
+		GotConn: func(httptrace.GotConnInfo) { gotConn.signal() },
 	})
 
 	// 先发 GET 下行，等 TCP 建立；然后再发 POST 上行。顺序要先 down 再 up，
@@ -653,7 +687,7 @@ func (c *Client) dialStreamUp(ctx context.Context) (net.Conn, error) {
 		resp, err := c.transport.RoundTrip(downReq)
 		if err != nil {
 			downErr <- err
-			close(gotConn)
+			gotConn.close() // 解阻塞 wait()；与 signal() 互斥。
 			wrc.closeWithError(err)
 			return
 		}
@@ -666,7 +700,7 @@ func (c *Client) dialStreamUp(ctx context.Context) (net.Conn, error) {
 	}()
 
 	select {
-	case <-gotConn:
+	case <-gotConn.wait():
 	case err := <-downErr:
 		reqCancel()
 		_ = pr.Close()
@@ -740,14 +774,9 @@ func (c *Client) dialPacketUp(ctx context.Context) (net.Conn, error) {
 	stopLink := linkContexts(ctx, reqCancel)
 	defer stopLink()
 
-	gotConn := make(chan struct{}, 1)
+	gotConn := newGotConnSignal()
 	downCtx := httptrace.WithClientTrace(reqCtx, &httptrace.ClientTrace{
-		GotConn: func(httptrace.GotConnInfo) {
-			select {
-			case gotConn <- struct{}{}:
-			default:
-			}
-		},
+		GotConn: func(httptrace.GotConnInfo) { gotConn.signal() },
 	})
 	downReq, err := http.NewRequestWithContext(downCtx, methodGet, uDown.String(), nil)
 	if err != nil {
@@ -764,7 +793,7 @@ func (c *Client) dialPacketUp(ctx context.Context) (net.Conn, error) {
 		resp, err := c.transport.RoundTrip(downReq)
 		if err != nil {
 			downErr <- err
-			close(gotConn)
+			gotConn.close() // 解阻塞 wait()；与 signal() 互斥。
 			wrc.closeWithError(err)
 			return
 		}
@@ -777,7 +806,7 @@ func (c *Client) dialPacketUp(ctx context.Context) (net.Conn, error) {
 	}()
 
 	select {
-	case <-gotConn:
+	case <-gotConn.wait():
 	case err := <-downErr:
 		reqCancel()
 		writerCancel()
