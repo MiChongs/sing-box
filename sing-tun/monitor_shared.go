@@ -48,6 +48,13 @@ type defaultInterfaceMonitor struct {
 	access                sync.Mutex
 	callbacks             list.List[DefaultInterfaceUpdateCallback]
 	myInterface           string
+
+	// updateAccess 串行化 postCheckUpdate，避免 burst 事件 + ForceUpdate 并发
+	// 多次 netlink 查询。checkUpdate 每次耗时 μs 级（NETLINK RuleList/
+	// RouteList / GetBestInterface），加锁是为了正确性不是性能瓶颈。
+	updateAccess sync.Mutex
+	// forcing 合并并发 ForceUpdate；已有协程在跑就直接丢弃。
+	forcing atomic.Bool
 }
 
 func NewDefaultInterfaceMonitor(networkMonitor NetworkUpdateMonitor, logger logger.Logger, options DefaultInterfaceMonitorOptions) (DefaultInterfaceMonitor, error) {
@@ -66,15 +73,26 @@ func (m *defaultInterfaceMonitor) Start() error {
 	return nil
 }
 
+// burstCoalesceWindow 是 netlink/系统事件 burst 合并窗口。从 1s 降到 50ms 的理由：
+//
+//	1s 窗口会把 Android Wi-Fi↔蜂窝切换期间的真实 FIB 已 ready 状态拖延 ~1s，
+//	导致期间每个 DNS packet 都命中 "no route to internet" 刷屏；内核 FIB 本身
+//	在切网后几十毫秒内就稳定了，我们只需要一个足够吞掉同一事件簇（addr/link/
+//	route/policy 连发十几条）的合并窗口。50ms 足够合并一次切网 burst，对稳态
+//	CPU 几乎无影响（稳态无事件）。
+const burstCoalesceWindow = 50 * time.Millisecond
+
 func (m *defaultInterfaceMonitor) delayCheckUpdate() {
 	if m.checkUpdateTimer == nil {
-		m.checkUpdateTimer = time.AfterFunc(time.Second, m.postCheckUpdate)
+		m.checkUpdateTimer = time.AfterFunc(burstCoalesceWindow, m.postCheckUpdate)
 	} else {
-		m.checkUpdateTimer.Reset(time.Second)
+		m.checkUpdateTimer.Reset(burstCoalesceWindow)
 	}
 }
 
 func (m *defaultInterfaceMonitor) postCheckUpdate() {
+	m.updateAccess.Lock()
+	defer m.updateAccess.Unlock()
 	err := m.interfaceFinder.Update()
 	if err != nil {
 		m.logger.Error("update interface: ", err)
@@ -92,6 +110,18 @@ func (m *defaultInterfaceMonitor) postCheckUpdate() {
 	} else {
 		m.noRoute = false
 	}
+}
+
+// ForceUpdate 异步、合并触发一次 checkUpdate。若已有 goroutine 在跑则直接丢弃
+// （该次调用会借到正在进行的那轮结果）。热路径开销 = 一次 CAS。
+func (m *defaultInterfaceMonitor) ForceUpdate() {
+	if !m.forcing.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer m.forcing.Store(false)
+		m.postCheckUpdate()
+	}()
 }
 
 func (m *defaultInterfaceMonitor) Close() error {

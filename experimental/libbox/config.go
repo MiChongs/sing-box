@@ -206,6 +206,8 @@ func (s *interfaceMonitorStub) MyInterface() string {
 	return ""
 }
 
+func (s *interfaceMonitorStub) ForceUpdate() {}
+
 func FormatConfig(configContent string) (*StringBox, error) {
 	options, err := parseConfig(baseContext(nil), configContent)
 	if err != nil {

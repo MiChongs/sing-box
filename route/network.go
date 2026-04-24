@@ -376,24 +376,40 @@ func (r *NetworkManager) AutoDetectInterfaceFunc() control.Func {
 				return r.platformInterface.AutoDetectInterfaceControl(int(fd))
 			})
 		}
-	} else {
-		if r.interfaceMonitor == nil {
+	}
+	if r.interfaceMonitor == nil {
+		return nil
+	}
+	// 直接构造 control.Func，而不走 control.BindToInterfaceFunc：
+	// BindToInterfaceFunc 在 (name=="" && index==-1) 时必报 "interface not found"，
+	// 这是我们要规避的硬失败路径。
+	//
+	// 策略：
+	//   1) 目的地属于某个本地接口 → bind 该接口（原语义保持）；
+	//   2) monitor 追踪到默认接口 → bind 默认接口；
+	//   3) monitor 快照为 nil（尚未追上切网事件）→ 不 bind，交给内核 FIB 自己
+	//      选路。这样"用户态预测"失效时还有内核兜底，避免"有网但报 no route
+	//      to internet"的刷屏；dial 若真的不通，内核返回的 ENETUNREACH/
+	//      EHOSTUNREACH 会由 HintUnreachable 反馈 monitor 重探。
+	return func(network, address string, conn syscall.RawConn) error {
+		remoteAddr := M.ParseSocksaddr(address).Addr
+		if remoteAddr.IsValid() {
+			if iif, err := r.interfaceFinder.ByAddr(remoteAddr); err == nil {
+				return control.BindToInterface0(r.interfaceFinder, conn, network, address, iif.Name, iif.Index, false)
+			}
+		}
+		defaultInterface := r.interfaceMonitor.DefaultInterface()
+		if defaultInterface == nil {
 			return nil
 		}
-		return control.BindToInterfaceFunc(r.interfaceFinder, func(network string, address string) (interfaceName string, interfaceIndex int, err error) {
-			remoteAddr := M.ParseSocksaddr(address).Addr
-			if remoteAddr.IsValid() {
-				iif, err := r.interfaceFinder.ByAddr(remoteAddr)
-				if err == nil {
-					return iif.Name, iif.Index, nil
-				}
-			}
-			defaultInterface := r.interfaceMonitor.DefaultInterface()
-			if defaultInterface == nil {
-				return "", -1, tun.ErrNoRoute
-			}
-			return defaultInterface.Name, defaultInterface.Index, nil
-		})
+		return control.BindToInterface0(r.interfaceFinder, conn, network, address, defaultInterface.Name, defaultInterface.Index, false)
+	}
+}
+
+// HintUnreachable 见 adapter.NetworkManager。零开销合并触发 monitor 重探。
+func (r *NetworkManager) HintUnreachable() {
+	if r.interfaceMonitor != nil {
+		r.interfaceMonitor.ForceUpdate()
 	}
 }
 

@@ -104,6 +104,11 @@ func (m *platformDefaultInterfaceMonitor) updateDefaultInterface(interfaceName s
 	}
 }
 
+// ForceUpdate —— platform 模式的 default interface 由宿主（Android
+// ConnectivityManager / iOS NEPathMonitor）主动 push，用户态无法也无需主动扫 FIB；
+// 真正的恢复依赖宿主下一次 callback。这里仅为接口一致性做 no-op。
+func (m *platformDefaultInterfaceMonitor) ForceUpdate() {}
+
 func (m *platformDefaultInterfaceMonitor) RegisterMyInterface(interfaceName string) {
 	m.defaultInterfaceAccess.Lock()
 	defer m.defaultInterfaceAccess.Unlock()
