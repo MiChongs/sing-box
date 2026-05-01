@@ -24,6 +24,16 @@ import (
 	"github.com/sagernet/sing/service/pause"
 )
 
+const (
+	// ruleSetFetchTimeout 单次 rule-set 远端拉取整体超时（含 dial+TLS+headers+body）。
+	// 没有该上限时，DNS 黑洞 / TLS 握手挂死 / 慢响应都会永久卡住 fast-retry 轮次，
+	// 同时让 io.ReadAll 的内部 grow 无限堆积。
+	ruleSetFetchTimeout = 60 * time.Second
+	// ruleSetMaxResponseBytes 响应体硬上限。.srs 通常 KB ~ 数 MB；50 MiB 留足余量
+	// 同时防止恶意/异常源拖垮内存。
+	ruleSetMaxResponseBytes = 50 * 1024 * 1024
+)
+
 var _ adapter.RuleSet = (*RemoteRuleSet)(nil)
 
 type RemoteRuleSet struct {
@@ -179,7 +189,10 @@ func (s *RemoteRuleSet) Update(ctx context.Context) error {
 
 func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	s.logger.DebugContext(ctx, "updating rule-set ", s.tag, " from URL: ", s.options.URL)
-	request, err := http.NewRequest("GET", s.options.URL, nil)
+	// 给单次拉取套整体超时；防止异常源把 fast-retry 永久卡住或让 io.ReadAll 无限堆积内存。
+	reqCtx, cancel := context.WithTimeout(ctx, ruleSetFetchTimeout)
+	defer cancel()
+	request, err := http.NewRequestWithContext(reqCtx, "GET", s.options.URL, nil)
 	if err != nil {
 		return err
 	}
@@ -189,7 +202,7 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	if !isStart {
 		defer s.httpClient.CloseIdleConnections()
 	}
-	response, err := s.httpClient.Do(request.WithContext(ctx))
+	response, err := s.httpClient.Do(request)
 	if err != nil {
 		return err
 	}
@@ -214,9 +227,17 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	default:
 		return E.New("unexpected status: ", response.Status)
 	}
-	content, err := io.ReadAll(response.Body)
+	// LimitReader 多读 1 字节用于判定是否超限。无 cap 的 io.ReadAll 会让恶意源
+	// 通过 chunked 编码持续 grow 内部 buffer 直到 OOM。
+	content, err := io.ReadAll(io.LimitReader(response.Body, ruleSetMaxResponseBytes+1))
 	if err != nil {
 		return err
+	}
+	if len(content) > ruleSetMaxResponseBytes {
+		return E.New("rule-set ", s.tag, " response exceeds size limit ", ruleSetMaxResponseBytes>>20, " MiB")
+	}
+	if len(content) == 0 {
+		return E.New("rule-set ", s.tag, " empty response body")
 	}
 	err = s.loadBytes(content, s)
 	if err != nil {

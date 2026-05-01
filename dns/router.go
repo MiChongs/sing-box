@@ -124,7 +124,15 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.DNSOp
 }
 
 func (r *Router) Initialize(rules []option.DNSRule) error {
-	r.rawRules = append(r.rawRules[:0], rules...)
+	// 显式新分配 + clone：避免 append(rawRules[:0], …) 复用旧底层数组时，
+	// 老 DNSRule 元素（含 RuleAction/RuleSet 等闭包级引用）滞留在 cap 之内
+	// GC 不掉。Initialize 在 box.New 校验阶段被调用一次，run 阶段 reload
+	// 还可能再次调用 —— 每次都要彻底切断旧底层引用，否则同一进程内多次
+	// reload 会留下随次数线性增长的旧规则副本。
+	if oldRaw := r.rawRules; cap(oldRaw) > 0 {
+		clear(oldRaw[:cap(oldRaw)])
+	}
+	r.rawRules = append([]option.DNSRule(nil), rules...)
 	newRules, _, _, err := r.buildRules(false)
 	if err != nil {
 		return err
