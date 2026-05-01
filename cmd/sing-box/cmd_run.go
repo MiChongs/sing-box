@@ -57,6 +57,15 @@ func readConfigAt(path string) (*OptionsEntry, error) {
 	if err != nil {
 		return nil, E.Cause(err, "read config at ", path)
 	}
+	// 防御：sing/common/json/internal/contextjson 的 comment 解析器在遇到
+	// malformed JSON（典型：未闭合字符串如 `"server": "dns_hosts<EOL>`）时，
+	// skipJSONString 一路扫到 EOF → parseObject/parseArray 解析器 desync →
+	// p.nodes append 死循环，最终 3GB+ OOM 杀掉进程，没有清晰错误。
+	// 先用一个 cheap 的状态机做语法粗校验：注释剥离 + 引号/括号配平，
+	// 不合法直接报告精确位置；通过后再交给 sing 的完整解析器，避免触发 OOM。
+	if err := preValidateJSONSyntax(configContent); err != nil {
+		return nil, E.Cause(err, "config syntax check at ", path)
+	}
 	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, configContent)
 	if err != nil {
 		return nil, E.Cause(err, "decode config at ", path)
@@ -66,6 +75,128 @@ func readConfigAt(path string) (*OptionsEntry, error) {
 		path:    path,
 		options: options,
 	}, nil
+}
+
+// preValidateJSONSyntax 做一遍轻量状态机预校验：剥离 // 行注释 / # 行注释 /
+// /* */ 块注释，保持引号/转义/括号语义，最终检查 string/object/array 是否配平。
+// 不合法直接返回带行列号的错误。目的是在 sing 库的 comment parser 因 malformed
+// 输入死循环 OOM 之前，给出可读的语法错误。
+func preValidateJSONSyntax(data []byte) error {
+	var (
+		braceDepth   int
+		bracketDepth int
+		stringStart  = -1
+		stringStartL = 0
+		stringStartC = 0
+		line         = 1
+		col          = 1
+	)
+	advance := func(c byte) {
+		if c == '\n' {
+			line++
+			col = 1
+		} else {
+			col++
+		}
+	}
+	for i := 0; i < len(data); i++ {
+		c := data[i]
+		// 字符串内：仅识别 \\<x> 转义和 " 闭合。出现裸 \n / \r 即未闭合。
+		if stringStart >= 0 {
+			switch c {
+			case '\\':
+				if i+1 < len(data) {
+					advance(c)
+					advance(data[i+1])
+					i++
+				} else {
+					return E.New("unterminated string literal at line ", stringStartL, " column ", stringStartC)
+				}
+				continue
+			case '"':
+				stringStart = -1
+				advance(c)
+				continue
+			case '\n', '\r':
+				return E.New("unterminated string literal at line ", stringStartL, " column ", stringStartC, " (raw control character inside string)")
+			}
+			advance(c)
+			continue
+		}
+		// 字符串外：处理注释 + 括号 + 引号。
+		switch c {
+		case '"':
+			stringStart = i
+			stringStartL = line
+			stringStartC = col
+			advance(c)
+		case '{':
+			braceDepth++
+			advance(c)
+		case '}':
+			braceDepth--
+			if braceDepth < 0 {
+				return E.New("unmatched '}' at line ", line, " column ", col)
+			}
+			advance(c)
+		case '[':
+			bracketDepth++
+			advance(c)
+		case ']':
+			bracketDepth--
+			if bracketDepth < 0 {
+				return E.New("unmatched ']' at line ", line, " column ", col)
+			}
+			advance(c)
+		case '/':
+			if i+1 < len(data) && data[i+1] == '/' {
+				for i < len(data) && data[i] != '\n' {
+					advance(data[i])
+					i++
+				}
+				if i < len(data) {
+					advance(data[i])
+				}
+			} else if i+1 < len(data) && data[i+1] == '*' {
+				cmtL, cmtC := line, col
+				advance(c)
+				advance(data[i+1])
+				i += 2
+				for i+1 < len(data) && !(data[i] == '*' && data[i+1] == '/') {
+					advance(data[i])
+					i++
+				}
+				if i+1 >= len(data) {
+					return E.New("unterminated block comment at line ", cmtL, " column ", cmtC)
+				}
+				advance(data[i])
+				advance(data[i+1])
+				i++
+			} else {
+				advance(c)
+			}
+		case '#':
+			for i < len(data) && data[i] != '\n' {
+				advance(data[i])
+				i++
+			}
+			if i < len(data) {
+				advance(data[i])
+			}
+		default:
+			advance(c)
+		}
+	}
+	if stringStart >= 0 {
+		return E.New("unterminated string literal at line ", stringStartL, " column ", stringStartC)
+	}
+	if braceDepth != 0 {
+		return E.New("brace mismatch: ", braceDepth, " unclosed '{' (expected closing '}')")
+	}
+	if bracketDepth != 0 {
+		return E.New("bracket mismatch: ", bracketDepth, " unclosed '[' (expected closing ']')")
+	}
+	return nil
 }
 
 func readConfig() ([]*OptionsEntry, error) {
