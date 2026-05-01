@@ -88,10 +88,18 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 		// rule_set 在 DNS 规则中无 match_response 使用）。让 fetch 重新
 		// 拉取最新内容覆盖坏缓存，比让整个进程崩溃更友好。
 		s.logger.Warn("restore cached rule-set ", s.tag, " failed: ", err,
-			" — starting without cache, fresh fetch follows")
+			" — discarding bad cache, fresh fetch follows")
 		s.hash = hash.HashType{}
 		s.lastEtag = ""
 		s.lastUpdated = time.Time{}
+		// 同时主动清空 cache.db 中该 tag 的旧脏数据，避免下次启动若 fetch 仍未成
+		// 功时再次吃到旧 IP-only 内容触发同样错误。Save 一个 zero-value SavedBinary
+		// 即抹掉旧 Hash/Etag/Content/LastUpdated，等价 evict。
+		if s.cacheFile != nil {
+			if saveErr := s.cacheFile.SaveRuleSet(s.tag, &adapter.SavedBinary{}); saveErr != nil {
+				s.logger.Debug("evict stale rule-set cache ", s.tag, ": ", saveErr)
+			}
+		}
 	}
 	if s.lastUpdated.IsZero() {
 		err = s.fetch(ctx, true)
