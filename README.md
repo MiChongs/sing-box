@@ -8,9 +8,9 @@
 [![Code Size](https://img.shields.io/github/languages/code-size/MiChongs/sing-box)](https://github.com/MiChongs/sing-box)
 [![Packaging status](https://repology.org/badge/vertical-allrepos/sing-box.svg)](https://repology.org/project/sing-box/versions)
 
-本仓库基于 [reF1nd/sing-box](https://github.com/reF1nd/sing-box)（其上游为 [SagerNet/sing-box](https://github.com/SagerNet/sing-box)）维护，目标是把 Smart 调度、XHTTP 传输、订阅与规则集的容错与性能改造，整合在一份可在 Windows / Linux / Android / Darwin 编译落地的发行物里。
+本仓库 fork 自 [reF1nd/sing-box](https://github.com/reF1nd/sing-box)，再上游是 [SagerNet/sing-box](https://github.com/SagerNet/sing-box)。改动集中在 Smart 调度、XHTTP 传输、订阅与规则集的容错与性能；Windows、Linux、Android、Darwin 四个平台都能编译。
 
-发布产物随 `xiaobaf14g-release.yml` 工作流构建，命名后缀固定 `xiaobaf14g`。
+发布走 `xiaobaf14g-release.yml`，文件名后缀固定 `xiaobaf14g`。
 
 ## 与上游的主要差异
 
@@ -18,14 +18,14 @@
 
 - 基于 LightGBM 模型 + 在线 EWMA / t-digest 评分的节点选择，权重数据持久化到磁盘
 - 支持 sticky session、断点恢复、人工 pin、节点 priority、anomaly 抑制、watchdog
-- 网络切换 / 中断时引入 pool 背压封顶 + storm 闸门 + 缓存清理，防止内存膨胀
-- 故障节点 markDead、并发 hedged dial、单节点恢复路径并行化
+- 网络切换或中断时给连接池加了背压封顶和 storm 闸门，并清理缓存，避免内存炸开
+- 故障节点会被标记 dead；恢复路径并发 hedged dial
 - 可选 `lightgbm.url` / `auto_update` / `update_interval` / `model_path`，权重收集器路径可配置
 
 ### XHTTP 传输（v2rayxhttp）
 
 - 客户端按 XTLS/Xray + mihomo 协议规范重写
-- 接入 quic-go，完整支持 HTTP/3 传输（`alpn: ["h3"]`）
+- 接入 quic-go，支持 HTTP/3（`alpn: ["h3"]`）
 - 按 ALPN 派发底层 RoundTripper，避免 `http/1.1` 配置下整组节点 dial 失败
 - 修复 `GotConn` 回调与错误路径 `close(chan)` 赛跑导致的 "send on closed channel" panic
 
@@ -50,32 +50,32 @@
 
 ### 订阅 Provider
 
-- 远端订阅 60s 超时 + 50 MiB 响应体封顶 + `LimitReader` 防止恶意服务端拉爆内存
-- 拉取失败 60s 快速重试，指数退避（封顶 30 min），±20% 抖动，启动期 2s jitter 错峰
-- 拉取失败时不阻塞启动，沿用本地缓存继续运行
-- 订阅刷新原子化、并发合并、内容 hash 短路；移除 STW GC 与误杀连接池
+- 远端订阅 60s 超时、响应体 50 MiB 封顶，用 `LimitReader` 兜住恶意服务端
+- 拉取失败时 60s 快速重试，指数退避到 30 min 封顶，±20% 抖动，启动期再加 2s 错峰
+- 拉取失败不阻塞启动，沿用本地缓存继续跑
+- 刷新做了原子化和并发合并，内容 hash 一致就短路；删掉了原来的 STW GC 和误杀连接池
 - detour tag 自动加 provider 前缀，重复出站 tag 自动改名
 
 ### 规则集 / Rule Set
 
-- 缓存校验失败时清空 `cache.db` 中旧脏数据，避免 IP-only 旧缓存被新 DNS 校验拒绝后反复炸进程
-- 缓存加载失败时容错启动，不再阻塞 sing-box 进程
-- 拉取链路同样有超时 + 体积封顶
-- `rule-provider` 接入 clash-api，支持远端规则集 `path` 字段
+- 缓存校验不过时主动清掉 `cache.db` 里的旧脏数据，避免 IP-only 旧缓存被新 DNS 校验拒掉后反复炸进程
+- 缓存加载失败也能起来，不阻塞主进程
+- 拉取链路同样有超时和体积封顶
+- `rule-provider` 接入 clash-api，远端规则集支持 `path` 字段
 
 ### DNS
 
-- 新增 TCP / TLS pipeline（RFC 9210），同一连接连发多查询不等响应
-- TCP 服务端复用支持 `reuse`，pipeline 启用时强制开启
-- `round_robin_cache`、`min_cache_ttl`、`max_cache_ttl`
-- DNS 规则评估链路对 `respond` action 的 `evaluatedResponse` 严格性更高，未先行 `evaluate` 直接报错
+- TCP / TLS 加了 pipeline（RFC 9210），同一连接可以连发多个查询不用等响应
+- TCP 多了 `reuse`，开 pipeline 时会被强制打开
+- 新增 `round_robin_cache`、`min_cache_ttl`、`max_cache_ttl`
+- `respond` action 现在要求前面先有过一次成功的 `evaluate`，否则直接报错
 - 启动 check / run 路径修复 `rawRules` 切片复用导致的引用残留
 
 ### 路由 / TUN
 
-- 切网过渡期消除 "no route to internet" + ENETUNREACH 刷屏，事件驱动 + 内核 FIB 兜底
-- `auto_redirect_disable_mark_mode` 选项
-- 切网防御与 HintUnreachable 钩子保留在 `route/network.go`
+- 切网过渡期不再刷 "no route to internet" 和 ENETUNREACH，改成事件驱动加内核 FIB 兜底
+- 多了一个 `auto_redirect_disable_mark_mode` 选项
+- 切网防御和 HintUnreachable 的钩子都在 `route/network.go`
 
 ### 入站 TLS
 
@@ -135,11 +135,11 @@
 
 ### 命令行防御
 
-- `cmd/sing-box`：在调用 sing 库 JSON 解析器之前做一次轻量状态机预校验（注释剥离 + 引号 / 括号配平），未闭合字符串 / 块注释 / 括号失衡时返回精确行列号错误。规避上游 comment parser 在 malformed config 上死循环 OOM。
+- `cmd/sing-box` 在交给 sing 库解析之前先跑一遍状态机预校验：剥注释、配平引号和括号。遇到未闭合字符串、未闭合块注释或括号失衡，直接返回带行列号的错误。原本上游的 comment parser 碰到 malformed config 会死循环吃满 3GB 内存才被杀，这一步把它拦在外面。
 
 ## 构建
 
-仓库自带 `xiaobaf14g-release.yml`，推 `v*` tag 即触发四平台构建。手动构建：
+推 `v*` tag 就会触发 `xiaobaf14g-release.yml` 跑四平台构建。手动编译：
 
 ```bash
 TAGS="with_quic with_grpc with_dhcp with_wireguard with_utls with_acme with_clash_api with_v2ray_api with_gvisor with_xhttp"
@@ -149,7 +149,7 @@ go build -tags "$TAGS" -trimpath \
   ./cmd/sing-box
 ```
 
-要求 Go 版本以 `go.mod` 中的 `go` 行为准。
+Go 版本看 `go.mod`。
 
 ## 文档
 
