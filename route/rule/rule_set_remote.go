@@ -88,7 +88,13 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	if s.lastUpdated.IsZero() {
 		err = s.fetch(ctx, true)
 		if err != nil {
-			return E.Cause(err, "initial rule-set: ", s.tag)
+			// 容错启动：远端拉取失败时，不阻塞 box 启动。
+			// PostStart 的 loopUpdate 会按 update_interval 周期性重试，
+			// 无网络/订阅源临时不可达不会让整个进程崩溃。空规则集在
+			// match 时直接返回 false，等价于"该规则永远不命中"，对路
+			// 由分流逻辑安全（命中失败由后续规则兜底）。
+			s.logger.Warn("initial rule-set ", s.tag, " fetch failed: ", err,
+				" — starting with empty set, will retry every ", s.updateInterval)
 		}
 	}
 	s.updateTicker = time.NewTicker(s.updateInterval)
@@ -104,13 +110,33 @@ func (s *RemoteRuleSet) loopUpdate() {
 	if time.Since(s.lastUpdated) > s.updateInterval {
 		s.update()
 	}
+	// 容错启动快速重试：lastUpdated 仍为零（首次 fetch 从未成功）时，
+	// 不能等到 updateInterval（通常 1d）才重试 —— 在网络刚恢复时启动
+	// 的实例会卡在空规则集一整天。改用 60s 间隔的 fastRetryTicker 直
+	// 到首次拉取成功，之后切回正常 updateTicker 节流。
+	const fastRetryInterval = 60 * time.Second
+	var fastRetryTicker *time.Ticker
+	if s.lastUpdated.IsZero() {
+		fastRetryTicker = time.NewTicker(fastRetryInterval)
+		defer fastRetryTicker.Stop()
+	}
 	for {
 		runtime.GC()
+		var fastRetryC <-chan time.Time
+		if fastRetryTicker != nil {
+			fastRetryC = fastRetryTicker.C
+		}
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-s.updateTicker.C:
 			s.update()
+		case <-fastRetryC:
+			s.update()
+			if !s.lastUpdated.IsZero() {
+				fastRetryTicker.Stop()
+				fastRetryTicker = nil
+			}
 		}
 	}
 }

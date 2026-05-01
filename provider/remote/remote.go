@@ -135,10 +135,17 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
 	if s.lastUpdated.IsZero() {
-		ctx = interrupt.ContextWithIsProviderConnection(ctx)
-		err := s.fetch(ctx, true)
+		fetchCtx := interrupt.ContextWithIsProviderConnection(ctx)
+		err := s.fetch(fetchCtx, true)
 		if err != nil {
-			return E.Cause(err, "initial outbound provider: ", s.Tag())
+			// 容错启动：远端订阅源拉取失败时，不阻塞 box 启动。
+			// loopUpdate 的 fast-retry 路径会按 60s 周期性重试直到成
+			// 功（之后切回 update_interval）。空 provider 在 selector
+			// / urltest / smart group 中表现为"该 provider 暂无节点"，
+			// 不影响其他 provider 节点，订阅源临时不可达不会让整个
+			// 进程崩溃。
+			s.logger.Warn("initial outbound provider ", s.Tag(), " fetch failed: ", err,
+				" — starting empty, will retry every 60s until success")
 		}
 	}
 	go s.loopUpdate()
@@ -405,14 +412,33 @@ func (s *ProviderRemote) loopUpdate() {
 	} else {
 		s.updateOnce()
 	}
+	// 容错启动快速重试：lastUpdated 仍为零（首次 fetch 从未成功）时，
+	// 不能等到 update_interval（典型 5–10m）才重试。改用 60s 间隔的
+	// fastRetryTicker 直到首次拉取成功，之后切回正常 ticker 节流。
+	const fastRetryInterval = 60 * time.Second
+	var fastRetryTicker *time.Ticker
+	if s.lastUpdated.IsZero() {
+		fastRetryTicker = time.NewTicker(fastRetryInterval)
+		defer fastRetryTicker.Stop()
+	}
 	s.ticker = time.NewTicker(s.updateInterval)
 	for {
 		runtime.GC()
+		var fastRetryC <-chan time.Time
+		if fastRetryTicker != nil {
+			fastRetryC = fastRetryTicker.C
+		}
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-s.ticker.C:
 			s.updateOnce()
+		case <-fastRetryC:
+			s.updateOnce()
+			if !s.lastUpdated.IsZero() {
+				fastRetryTicker.Stop()
+				fastRetryTicker = nil
+			}
 		}
 	}
 }
