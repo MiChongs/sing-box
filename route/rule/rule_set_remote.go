@@ -81,9 +81,17 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
-	err = s.loadCacheFile()
-	if err != nil {
-		return E.Cause(err, "restore cached rule-set")
+	if err = s.loadCacheFile(); err != nil {
+		// 容错启动：缓存加载失败也不阻塞 box 启动。
+		// 典型触发场景：上游升级 / DNS 规则收紧后，旧 IP-only rule_set
+		// 缓存触发 ValidateRuleSetMetadataUpdate（如 1.14 起禁止纯 IP_CIDR
+		// rule_set 在 DNS 规则中无 match_response 使用）。让 fetch 重新
+		// 拉取最新内容覆盖坏缓存，比让整个进程崩溃更友好。
+		s.logger.Warn("restore cached rule-set ", s.tag, " failed: ", err,
+			" — starting without cache, fresh fetch follows")
+		s.hash = hash.HashType{}
+		s.lastEtag = ""
+		s.lastUpdated = time.Time{}
 	}
 	if s.lastUpdated.IsZero() {
 		err = s.fetch(ctx, true)
