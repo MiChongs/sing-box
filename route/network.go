@@ -408,9 +408,14 @@ func (r *NetworkManager) AutoDetectInterfaceFunc() control.Func {
 }
 
 // HintUnreachable 见 adapter.NetworkManager。零开销合并触发 monitor 重探。
+// 上游 sing-tun 没有 ForceUpdate；只有 fork 自定义 monitor 实现该方法。
+// 通过接口断言：能力存在则调用，缺失则 no-op（依赖原生 debounce 自然收敛）。
 func (r *NetworkManager) HintUnreachable() {
-	if r.interfaceMonitor != nil {
-		r.interfaceMonitor.ForceUpdate()
+	if r.interfaceMonitor == nil {
+		return
+	}
+	if forceUpdater, ok := r.interfaceMonitor.(interface{ ForceUpdate() }); ok {
+		forceUpdater.ForceUpdate()
 	}
 }
 
