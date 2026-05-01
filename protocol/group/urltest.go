@@ -390,6 +390,7 @@ func (s *URLTest) isGroupActive() bool {
 	return time.Since(s.group.lastActive.Load()) <= s.group.idleTimeout
 }
 
+
 func (s *URLTest) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	s.group.Touch()
 	var outbound adapter.Outbound
@@ -470,12 +471,12 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	return nil, E.New("all outbounds failed for UDP to ", destination)
 }
 
-func (s *URLTest) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (s *URLTest) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = interrupt.ContextWithIsExternalConnection(ctx)
 	s.connection.NewConnection(ctx, s, conn, metadata, onClose)
 }
 
-func (s *URLTest) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (s *URLTest) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	ctx = interrupt.ContextWithIsExternalConnection(ctx)
 	s.connection.NewPacketConnection(ctx, s, conn, metadata, onClose)
 }
@@ -585,6 +586,7 @@ func (s *URLTest) onProviderUpdated(tag string) error {
 	}
 	return nil
 }
+
 
 type URLTestGroup struct {
 	ctx                          context.Context

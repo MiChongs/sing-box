@@ -5,7 +5,8 @@ icon: material/alert-decagram
 !!! quote "sing-box 1.14.0 中的更改"
 
     :material-delete-clock: [independent_cache](#independent_cache)  
-    :material-plus: [optimistic](#optimistic)
+    :material-plus: [optimistic](#optimistic)  
+    :material-plus: [timeout](#timeout)
 
 !!! quote "sing-box 1.12.0 中的更改"
 
@@ -34,6 +35,7 @@ icon: material/alert-decagram
     "min_cache_ttl": 0,
     "max_cache_ttl": 0,
     "optimistic": false, // or {}
+    "timeout": "",
     "reverse_mapping": false,
     "client_subnet": "",
     "fakeip": {}
@@ -128,6 +130,16 @@ LRU 缓存容量。
 过期缓存条目可被乐观提供的最长时间。
 
 默认使用 `3d`。
+
+#### timeout
+
+!!! question "自 sing-box 1.14.0 起"
+
+每次 DNS 查询的默认超时时间。
+
+默认使用 `10s`。
+
+可被 `rules.[].timeout`（DNS 规则动作）或 `domain_resolver.timeout` 覆盖。
 
 #### reverse_mapping
 

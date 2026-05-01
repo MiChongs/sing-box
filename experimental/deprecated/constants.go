@@ -109,6 +109,33 @@ var OptionLegacyTailscaleEndpointDialer = Note{
 	EnvName:           "LEGACY_TAILSCALE_ENDPOINT_DIALER",
 }
 
+var OptionRuleSetIPCIDRAcceptEmpty = Note{
+	Name:              "dns-rule-rule-set-ip-cidr-accept-empty",
+	Description:       "Legacy `rule_set_ip_cidr_accept_empty` DNS rule item",
+	DeprecatedVersion: "1.14.0",
+	ScheduledVersion:  "1.16.0",
+	EnvName:           "DNS_RULE_RULE_SET_IP_CIDR_ACCEPT_EMPTY",
+	MigrationLink:     "https://sing-box.sagernet.org/migration/#migrate-address-filter-fields-to-response-matching",
+}
+
+var OptionLegacyDNSAddressFilter = Note{
+	Name:              "legacy-dns-address-filter",
+	Description:       "Legacy Address Filter Fields in DNS rules",
+	DeprecatedVersion: "1.14.0",
+	ScheduledVersion:  "1.16.0",
+	EnvName:           "LEGACY_DNS_ADDRESS_FILTER",
+	MigrationLink:     "https://sing-box.sagernet.org/migration/#migrate-address-filter-fields-to-response-matching",
+}
+
+var OptionLegacyDNSRuleStrategy = Note{
+	Name:              "legacy-dns-rule-strategy",
+	Description:       "Legacy `strategy` DNS rule action option",
+	DeprecatedVersion: "1.14.0",
+	ScheduledVersion:  "1.16.0",
+	EnvName:           "LEGACY_DNS_RULE_STRATEGY",
+	MigrationLink:     "https://sing-box.sagernet.org/migration/#migrate-dns-rule-action-strategy-to-rule-items",
+}
+
 var OptionIndependentDNSCache = Note{
 	Name:              "independent-dns-cache",
 	Description:       "`independent_cache` DNS option",
@@ -151,42 +178,6 @@ var OptionImplicitDefaultHTTPClient = Note{
 	EnvName:           "IMPLICIT_DEFAULT_HTTP_CLIENT",
 }
 
-var OptionIPAcceptAny = Note{
-	Name:              "dns-rule-ip-accept-any",
-	Description:       "Legacy `ip_accept_any` DNS rule item",
-	DeprecatedVersion: "1.14.0",
-	ScheduledVersion:  "1.16.0",
-	EnvName:           "DNS_RULE_IP_ACCEPT_ANY",
-	MigrationLink:     "https://sing-box.sagernet.org/migration/#migrate-address-filter-fields-to-response-matching",
-}
-
-var OptionRuleSetIPCIDRAcceptEmpty = Note{
-	Name:              "dns-rule-rule-set-ip-cidr-accept-empty",
-	Description:       "Legacy `rule_set_ip_cidr_accept_empty` DNS rule item",
-	DeprecatedVersion: "1.14.0",
-	ScheduledVersion:  "1.16.0",
-	EnvName:           "DNS_RULE_RULE_SET_IP_CIDR_ACCEPT_EMPTY",
-	MigrationLink:     "https://sing-box.sagernet.org/migration/#migrate-address-filter-fields-to-response-matching",
-}
-
-var OptionLegacyDNSAddressFilter = Note{
-	Name:              "legacy-dns-address-filter",
-	Description:       "Legacy Address Filter Fields in DNS rules",
-	DeprecatedVersion: "1.14.0",
-	ScheduledVersion:  "1.16.0",
-	EnvName:           "LEGACY_DNS_ADDRESS_FILTER",
-	MigrationLink:     "https://sing-box.sagernet.org/migration/#migrate-address-filter-fields-to-response-matching",
-}
-
-var OptionLegacyDNSRuleStrategy = Note{
-	Name:              "legacy-dns-rule-strategy",
-	Description:       "Legacy `strategy` DNS rule action option",
-	DeprecatedVersion: "1.14.0",
-	ScheduledVersion:  "1.16.0",
-	EnvName:           "LEGACY_DNS_RULE_STRATEGY",
-	MigrationLink:     "https://sing-box.sagernet.org/migration/#migrate-dns-rule-action-strategy-to-rule-items",
-}
-
 var Options = []Note{
 	OptionOutboundDNSRuleItem,
 	OptionMissingDomainResolver,
@@ -194,7 +185,6 @@ var Options = []Note{
 	OptionInlineACME,
 	OptionLegacyRuleSetDownloadDetour,
 	OptionLegacyTailscaleEndpointDialer,
-	OptionIPAcceptAny,
 	OptionRuleSetIPCIDRAcceptEmpty,
 	OptionLegacyDNSAddressFilter,
 	OptionLegacyDNSRuleStrategy,

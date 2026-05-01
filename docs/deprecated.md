@@ -37,15 +37,7 @@ Old fields will be removed in sing-box 1.16.0.
 
 #### Legacy `strategy` DNS rule action option
 
-Legacy `strategy` DNS rule action option is deprecated,
-check [Migration](../migration/#migrate-dns-rule-action-strategy-to-rule-items).
-
-Old fields will be removed in sing-box 1.16.0.
-
-#### Legacy `ip_accept_any` DNS rule item
-
-Legacy `ip_accept_any` DNS rule item is deprecated,
-check [Migration](../migration/#migrate-address-filter-fields-to-response-matching).
+Legacy `strategy` DNS rule action option is deprecated.
 
 Old fields will be removed in sing-box 1.16.0.
 
@@ -53,6 +45,21 @@ Old fields will be removed in sing-box 1.16.0.
 
 Legacy `rule_set_ip_cidr_accept_empty` DNS rule item is deprecated,
 check [Migration](../migration/#migrate-address-filter-fields-to-response-matching).
+
+Old fields will be removed in sing-box 1.16.0.
+
+#### `independent_cache` DNS option
+
+`independent_cache` DNS option is deprecated.
+The DNS cache now always keys by transport, making this option unnecessary,
+check [Migration](../migration/#migrate-independent-dns-cache).
+
+Old fields will be removed in sing-box 1.16.0.
+
+#### `store_rdrc` cache file option
+
+`store_rdrc` cache file option is deprecated,
+check [Migration](../migration/#migrate-store-rdrc).
 
 Old fields will be removed in sing-box 1.16.0.
 

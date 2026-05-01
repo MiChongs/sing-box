@@ -569,7 +569,15 @@ func (s *Box) preStart() error {
 	if err != nil {
 		return err
 	}
-	err = adapter.Start(s.logger, adapter.StartStateStart, s.outbound, s.dnsTransport, s.network, s.connection, s.router, s.dnsRouter)
+	err = adapter.Start(s.logger, adapter.StartStateStart, s.outbound, s.dnsTransport, s.network, s.connection)
+	if err != nil {
+		return err
+	}
+	err = adapter.StartNamed(s.logger, adapter.StartStateStart, []adapter.LifecycleService{s.httpClientService})
+	if err != nil {
+		return err
+	}
+	err = adapter.Start(s.logger, adapter.StartStateStart, s.provider, s.router, s.dnsRouter)
 	if err != nil {
 		return err
 	}
@@ -640,12 +648,11 @@ func (s *Box) Close() error {
 		{"dns-transport", s.dnsTransport},
 		{"network", s.network},
 	} {
-		s.logger.Trace("close ", closeItem.name)
-		startTime := time.Now()
+		done := adapter.LogElapsed(s.logger, "close ", closeItem.name)
 		err = E.Append(err, closeItem.service.Close(), func(err error) error {
 			return E.Cause(err, "close ", closeItem.name)
 		})
-		adapter.LogElapsed(s.logger, startTime, "close ", closeItem.name)
+		done()
 	}
 	if s.httpClientService != nil {
 		s.logger.Trace("close ", s.httpClientService.Name())
@@ -656,19 +663,17 @@ func (s *Box) Close() error {
 		s.logger.Trace("close ", s.httpClientService.Name(), " completed (", F.Seconds(time.Since(startTime).Seconds()), "s)")
 	}
 	for _, lifecycleService := range s.internalService {
-		s.logger.Trace("close ", lifecycleService.Name())
-		startTime := time.Now()
+		done := adapter.LogElapsed(s.logger, "close ", lifecycleService.Name())
 		err = E.Append(err, lifecycleService.Close(), func(err error) error {
 			return E.Cause(err, "close ", lifecycleService.Name())
 		})
-		adapter.LogElapsed(s.logger, startTime, "close ", lifecycleService.Name())
+		done()
 	}
-	s.logger.Trace("close logger")
-	startTime := time.Now()
+	done := adapter.LogElapsed(s.logger, "close logger")
 	err = E.Append(err, s.logFactory.Close(), func(err error) error {
 		return E.Cause(err, "close logger")
 	})
-	adapter.LogElapsed(s.logger, startTime, "close logger")
+	done()
 	return err
 }
 

@@ -23,12 +23,12 @@ type Inbound interface {
 
 type TCPInjectableInbound interface {
 	Inbound
-	ConnectionHandlerEx
+	ConnectionHandler
 }
 
 type UDPInjectableInbound interface {
 	Inbound
-	PacketConnectionHandlerEx
+	PacketConnectionHandler
 }
 
 type InboundRegistry interface {
@@ -72,7 +72,6 @@ type InboundContext struct {
 	// 在同一 InboundContext 生命周期内复用 backing array，避免每次规则匹配都
 	// 分配新切片。调用方均为同步、立即消费，不持有跨作用域引用，因此复用安全。
 	dnsResponseAddrCache []netip.Addr
-
 
 	// Deprecated: implement in rule action
 	InboundDetour             string

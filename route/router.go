@@ -309,6 +309,7 @@ func (r *Router) NeighborResolver() adapter.NeighborResolver {
 func (r *Router) ResetNetwork() {
 	r.network.ResetNetwork()
 	r.httpClientManager.ResetNetwork()
+	r.dns.ResetNetwork()
 }
 
 func (r *Router) DefaultDomainMatchStrategy() C.DomainMatchStrategy {

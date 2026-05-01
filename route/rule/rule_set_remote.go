@@ -81,20 +81,14 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	}
 	startContext.Register(transport)
 	s.httpClient = &http.Client{Transport: transport}
-	// loadCacheFile 失败只 warn，等同于"无 cache"，后面初次 fetch 兜底。
-	// 用户看到过 "validation failed" 类的 cache 损坏错误，本机故障不应该
-	// 连带阻止启动，让 loopUpdate 自己重新拉就是了。
-	if err := s.loadCacheFile(); err != nil {
-		s.logger.Warn("restore cached rule-set: ", err)
+	err = s.loadCacheFile()
+	if err != nil {
+		return E.Cause(err, "restore cached rule-set")
 	}
-	// 初次 fetch 失败不再 fatal。场景 = 订阅源 HTTP 5xx / DNS 解析失败
-	// / detour 出站还没就绪等所有可恢复故障。rule-set 保持空规则，route
-	// 层匹配到该 rule-set 的规则直接 miss 不命中，下一条规则或 default
-	// outbound 兜底。loopUpdate 周期性重试，上游恢复后自动补齐。
 	if s.lastUpdated.IsZero() {
-		if err := s.fetch(ctx, true); err != nil {
-			s.logger.Warn("initial fetch for rule-set [", s.tag,
-				"] failed, will retry every ", s.updateInterval, ": ", err)
+		err = s.fetch(ctx, true)
+		if err != nil {
+			return E.Cause(err, "initial rule-set: ", s.tag)
 		}
 	}
 	s.updateTicker = time.NewTicker(s.updateInterval)

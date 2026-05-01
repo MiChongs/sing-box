@@ -6,7 +6,9 @@ icon: material/new-box
 
     :material-delete-clock: [strategy](#strategy)  
     :material-plus: [evaluate](#evaluate)  
-    :material-plus: [respond](#respond)
+    :material-plus: [respond](#respond)  
+    :material-plus: [disable_optimistic_cache](#disable_optimistic_cache)  
+    :material-plus: [timeout](#timeout)
 
 !!! quote "Changes in sing-box 1.12.0"
 
@@ -25,6 +27,7 @@ icon: material/new-box
   "disable_cache": false,
   "disable_optimistic_cache": false,
   "rewrite_ttl": null,
+  "timeout": "",
   "client_subnet": null
 }
 ```
@@ -45,7 +48,7 @@ Tag of target server.
 
     `strategy` is deprecated in sing-box 1.14.0 and will be removed in sing-box 1.16.0.
 
-Set domain strategy for this query. Deprecated, check [Migration](/migration/#migrate-dns-rule-action-strategy-to-rule-items).
+Set domain strategy for this query.
 
 One of `prefer_ipv4` `prefer_ipv6` `ipv4_only` `ipv6_only`.
 
@@ -62,6 +65,14 @@ Disable optimistic DNS caching in this query.
 #### rewrite_ttl
 
 Rewrite TTL in DNS responses.
+
+#### timeout
+
+!!! question "Since sing-box 1.14.0"
+
+Override the DNS query timeout for matched queries.
+
+Will override `dns.timeout`.
 
 #### client_subnet
 
@@ -80,7 +91,9 @@ Will override `dns.client_subnet`.
   "action": "evaluate",
   "server": "",
   "disable_cache": false,
+  "disable_optimistic_cache": false,
   "rewrite_ttl": null,
+  "timeout": "",
   "client_subnet": null
 }
 ```
@@ -104,9 +117,23 @@ Tag of target server.
 
 Disable cache and save cache in this query.
 
+#### disable_optimistic_cache
+
+!!! question "Since sing-box 1.14.0"
+
+Disable optimistic DNS caching in this query.
+
 #### rewrite_ttl
 
 Rewrite TTL in DNS responses.
+
+#### timeout
+
+!!! question "Since sing-box 1.14.0"
+
+Override the DNS query timeout for matched queries.
+
+Will override `dns.timeout`.
 
 #### client_subnet
 
@@ -140,6 +167,7 @@ Only allowed after a preceding top-level `evaluate` rule. If the action is reach
   "disable_cache": false,
   "disable_optimistic_cache": false,
   "rewrite_ttl": null,
+  "timeout": "",
   "client_subnet": null
 }
 ```

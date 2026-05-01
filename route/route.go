@@ -74,7 +74,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		metadata.LastInbound = metadata.Inbound
 		metadata.Inbound = metadata.InboundDetour
 		metadata.InboundDetour = ""
-		injectable.NewConnectionEx(ctx, conn, metadata, onClose)
+		injectable.NewConnection(ctx, conn, metadata, onClose)
 		return nil
 	}
 	metadata.Network = N.NetworkTCP
@@ -153,8 +153,8 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	for _, tracker := range r.trackers {
 		conn = tracker.RoutedConnection(ctx, conn, metadata, selectedRule, selectedOutbound)
 	}
-	if outboundHandler, isHandler := selectedOutbound.(adapter.ConnectionHandlerEx); isHandler {
-		outboundHandler.NewConnectionEx(ctx, conn, metadata, onClose)
+	if outboundHandler, isHandler := selectedOutbound.(adapter.ConnectionHandler); isHandler {
+		outboundHandler.NewConnection(ctx, conn, metadata, onClose)
 	} else {
 		r.connection.NewConnection(ctx, selectedOutbound, conn, metadata, onClose)
 	}
@@ -210,7 +210,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		metadata.LastInbound = metadata.Inbound
 		metadata.Inbound = metadata.InboundDetour
 		metadata.InboundDetour = ""
-		injectable.NewPacketConnectionEx(ctx, conn, metadata, onClose)
+		injectable.NewPacketConnection(ctx, conn, metadata, onClose)
 		return nil
 	}
 	// TODO: move to UoT
@@ -282,8 +282,8 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	if metadata.FakeIP || metadata.DestOverride {
 		conn = bufio.NewNATPacketConn(bufio.NewNetPacketConn(conn), metadata.OriginDestination, metadata.Destination)
 	}
-	if outboundHandler, isHandler := selectedOutbound.(adapter.PacketConnectionHandlerEx); isHandler {
-		outboundHandler.NewPacketConnectionEx(ctx, conn, metadata, onClose)
+	if outboundHandler, isHandler := selectedOutbound.(adapter.PacketConnectionHandler); isHandler {
+		outboundHandler.NewPacketConnection(ctx, conn, metadata, onClose)
 	} else {
 		r.connection.NewPacketConnection(ctx, selectedOutbound, conn, metadata, onClose)
 	}
@@ -408,16 +408,7 @@ func (r *Router) matchRule(
 	selectedRule adapter.Rule, selectedRuleIndex int,
 	buffers []*buf.Buffer, packetBuffers []*N.PacketBuffer, fatalErr error,
 ) {
-	// upstream e4bc45997: Skip process search for non-local source
-	// addresses. The inline process-info logic has been extracted into
-	// r.searchProcessInfo(ctx, metadata), which additionally gates on
-	// isLocalSource to avoid a costly ProcFS scan for remote clients
-	// (eg TUN-routed traffic from other hosts on the LAN).
 	r.searchProcessInfo(ctx, metadata)
-	// upstream 2cf78e1df: neighbor lookup populates SourceMACAddress /
-	// SourceHostname for the new rule_item_mac / rule_item_hostname
-	// matchers. xiaobaf14g already had this block in place; upstream
-	// commit matches our wording exactly.
 	if r.neighborResolver != nil && metadata.SourceMACAddress == nil && metadata.Source.Addr.IsValid() {
 		mac, macFound := r.neighborResolver.LookupMAC(metadata.Source.Addr)
 		if macFound {
@@ -834,6 +825,7 @@ func (r *Router) actionResolve(ctx context.Context, metadata *adapter.InboundCon
 			DisableCache:           action.DisableCache,
 			DisableOptimisticCache: action.DisableOptimisticCache,
 			RewriteTTL:             action.RewriteTTL,
+			Timeout:                action.Timeout,
 			ClientSubnet:           action.ClientSubnet,
 		})
 		if err != nil {

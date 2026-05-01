@@ -140,16 +140,7 @@ func (m *Manager) resolveShared(tag string) (*sharedManagedTransport, error) {
 	if !loaded {
 		return nil, E.New("http_client not found: ", tag)
 	}
-	// User explicitly declared a shared http_client with a specific detour.
-	// Upstream's "detour to an empty direct outbound makes no sense" check
-	// is a safeguard against misconfiguration in outbound chains, but for
-	// http_clients the detour is the whole point — if the user pointed at
-	// a bare `direct` outbound they are declaring "download via direct",
-	// which is the documented replacement for the legacy `download_detour`
-	// field (which itself auto-set this flag; the tag path lost it).
-	sharedOptions := define.Options()
-	sharedOptions.DisableEmptyDirectCheck = true
-	transport, err := NewTransport(m.ctx, m.logger, tag, sharedOptions)
+	transport, err := NewTransport(m.ctx, m.logger, tag, define.Options())
 	if err != nil {
 		return nil, E.Cause(err, "create shared http_client[", tag, "]")
 	}
@@ -162,20 +153,18 @@ func (m *Manager) resolveShared(tag string) (*sharedManagedTransport, error) {
 	return sharedTransport, nil
 }
 
-// LookupDetour returns the detour outbound tag declared by http_client[tag],
-// or "" if the tag is unknown / has no detour. Used by downloaders
-// (geox / lightgbm) that need an outbound tag rather than a transport.
+// LookupDetour returns the configured Detour outbound tag for the http_client
+// referenced by tag. Returns "" if the tag is unknown or no detour is set.
+// Used by the smart service to resolve which outbound to use for asset
+// downloads when an http_client tag (rather than inline options) is provided.
 func (m *Manager) LookupDetour(tag string) string {
-	if tag == "" {
-		return ""
-	}
 	m.access.Lock()
 	defer m.access.Unlock()
 	define, loaded := m.defines[tag]
 	if !loaded {
 		return ""
 	}
-	return define.Detour
+	return define.Options().Detour
 }
 
 func (m *Manager) ResetNetwork() {

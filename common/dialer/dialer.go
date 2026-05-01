@@ -98,6 +98,7 @@ func NewWithOptions(options Options) (N.Dialer, error) {
 			dnsQueryOptions = adapter.DNSQueryOptions{
 				Transport:              transport,
 				Strategy:               strategy,
+				Timeout:                time.Duration(dialOptions.DomainResolver.Timeout),
 				DisableCache:           dialOptions.DomainResolver.DisableCache,
 				DisableOptimisticCache: dialOptions.DomainResolver.DisableOptimisticCache,
 				RewriteTTL:             dialOptions.DomainResolver.RewriteTTL,

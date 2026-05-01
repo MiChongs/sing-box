@@ -82,7 +82,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			}
 			inbound.fallbackAddrTLSNextProto = fallbackAddrNextProto
 		}
-		fallbackHandler = adapter.NewUpstreamContextHandlerEx(inbound.fallbackConnection, nil)
+		fallbackHandler = adapter.NewUpstreamContextHandler(inbound.fallbackConnection, nil)
 	}
 
 	service, err := anytls.NewService(anytls.ServiceConfig{
@@ -125,7 +125,7 @@ func (h *Inbound) Close() error {
 	return common.Close(h.listener, h.tlsConfig)
 }
 
-func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	if h.tlsConfig != nil {
 		tlsConn, err := tls.ServerHandshake(ctx, conn, h.tlsConfig)
 		if err != nil {

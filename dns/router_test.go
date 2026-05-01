@@ -15,7 +15,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	rulepkg "github.com/sagernet/sing-box/route/rule"
-	"github.com/sagernet/sing-tun"
+	tun "github.com/sagernet/sing-tun"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
 	N "github.com/sagernet/sing/common/network"
@@ -122,7 +122,6 @@ func (r *fakeRouter) setRuleSet(tag string, ruleSet adapter.RuleSet) {
 	r.ruleSets[tag] = ruleSet
 }
 func (r *fakeRouter) Rules() []adapter.Rule                      { return nil }
-func (r *fakeRouter) RuleSets() []adapter.RuleSet                { return nil }
 func (r *fakeRouter) Rule(string) (adapter.Rule, bool)           { return nil, false }
 func (r *fakeRouter) NeedFindProcess() bool                      { return false }
 func (r *fakeRouter) NeedFindNeighbor() bool                     { return false }
@@ -130,9 +129,18 @@ func (r *fakeRouter) NeighborResolver() adapter.NeighborResolver { return nil }
 func (r *fakeRouter) AppendTracker(adapter.ConnectionTracker)    {}
 func (r *fakeRouter) ResetNetwork()                              {}
 func (r *fakeRouter) DefaultDomainMatchStrategy() C.DomainMatchStrategy {
-	return C.DomainMatchStrategyAsIS
+	return 0
 }
 func (r *fakeRouter) Reload() {}
+func (r *fakeRouter) RuleSets() []adapter.RuleSet {
+	r.access.RLock()
+	defer r.access.RUnlock()
+	var result []adapter.RuleSet
+	for _, rs := range r.ruleSets {
+		result = append(result, rs)
+	}
+	return result
+}
 
 type fakeRuleSet struct {
 	access                   sync.Mutex
@@ -146,8 +154,8 @@ type fakeRuleSet struct {
 }
 
 func (s *fakeRuleSet) Name() string                                                  { return "fake-rule-set" }
-func (s *fakeRuleSet) Type() string                                                  { return "" }
-func (s *fakeRuleSet) Format() string                                                { return "" }
+func (s *fakeRuleSet) Type() string                                                  { return "local" }
+func (s *fakeRuleSet) Format() string                                                { return "source" }
 func (s *fakeRuleSet) UpdatedTime() time.Time                                        { return time.Time{} }
 func (s *fakeRuleSet) Update(context.Context) error                                  { return nil }
 func (s *fakeRuleSet) StartContext(context.Context, *adapter.HTTPStartContext) error { return nil }
@@ -199,7 +207,8 @@ func (s *fakeRuleSet) UnregisterCallback(element *list.Element[adapter.RuleSetUp
 	defer s.access.Unlock()
 	s.callbacks.Remove(element)
 }
-func (s *fakeRuleSet) Close() error { return nil }
+func (s *fakeRuleSet) Close() error      { return nil }
+func (s *fakeRuleSet) RuleCount() uint64 { return 0 }
 func (s *fakeRuleSet) Match(metadata *adapter.InboundContext) bool {
 	s.access.Lock()
 	match := s.match
@@ -209,8 +218,7 @@ func (s *fakeRuleSet) Match(metadata *adapter.InboundContext) bool {
 	}
 	return true
 }
-func (s *fakeRuleSet) String() string    { return "fake-rule-set" }
-func (s *fakeRuleSet) RuleCount() uint64 { return 0 }
+func (s *fakeRuleSet) String() string { return "fake-rule-set" }
 func (s *fakeRuleSet) updateMetadata(metadata adapter.RuleSetMetadata) {
 	s.access.Lock()
 	s.metadata = metadata
@@ -772,7 +780,8 @@ func TestValidateRuleSetMetadataUpdateAllowsRuleSetThatKeepsNonLegacyDNSMode(t *
 	require.False(t, router.legacyDNSMode)
 
 	err := router.ValidateRuleSetMetadataUpdate("dynamic-set", adapter.RuleSetMetadata{
-		ContainsIPCIDRRule: true,
+		ContainsIPCIDRRule:    true,
+		ContainsNonIPCIDRRule: true,
 	})
 	require.NoError(t, err)
 }
@@ -817,6 +826,163 @@ func TestValidateRuleSetMetadataUpdateAllowsRelaxingLegacyRequirement(t *testing
 
 	err := router.ValidateRuleSetMetadataUpdate("dynamic-set", adapter.RuleSetMetadata{})
 	require.NoError(t, err)
+}
+
+func TestInitializeRejectsPureIPRuleSetWhenLegacyDNSModeDisabled(t *testing.T) {
+	t.Parallel()
+
+	fakeSet := &fakeRuleSet{
+		metadata: adapter.RuleSetMetadata{
+			ContainsIPCIDRRule: true,
+		},
+	}
+	routerService := &fakeRouter{
+		ruleSets: map[string]adapter.RuleSet{
+			"pure-ip": fakeSet,
+		},
+	}
+	ctx := service.ContextWith[adapter.Router](context.Background(), routerService)
+	router := &Router{
+		ctx:                   ctx,
+		logger:                log.NewNOPFactory().NewLogger("dns"),
+		transport:             &fakeDNSTransportManager{},
+		client:                &fakeDNSClient{},
+		rawRules:              make([]option.DNSRule, 0, 2),
+		rules:                 make([]adapter.DNSRule, 0, 2),
+		defaultDomainStrategy: C.DomainStrategyAsIS,
+	}
+	err := router.Initialize([]option.DNSRule{
+		{
+			Type: C.RuleTypeDefault,
+			DefaultOptions: option.DefaultDNSRule{
+				RawDefaultDNSRule: option.RawDefaultDNSRule{
+					QueryType: badoption.Listable[option.DNSQueryType]{option.DNSQueryType(mDNS.TypeA)},
+				},
+				DNSRuleAction: option.DNSRuleAction{
+					Action:       C.RuleActionTypeRoute,
+					RouteOptions: option.DNSRouteActionOptions{Server: "selected"},
+				},
+			},
+		},
+		{
+			Type: C.RuleTypeDefault,
+			DefaultOptions: option.DefaultDNSRule{
+				RawDefaultDNSRule: option.RawDefaultDNSRule{
+					RuleSet: badoption.Listable[string]{"pure-ip"},
+				},
+				DNSRuleAction: option.DNSRuleAction{
+					Action:       C.RuleActionTypeRoute,
+					RouteOptions: option.DNSRouteActionOptions{Server: "selected"},
+				},
+			},
+		},
+	})
+	require.ErrorContains(t, err, "Address Filter Fields")
+}
+
+func TestInitializeAllowsMixedRuleSetWhenLegacyDNSModeDisabled(t *testing.T) {
+	t.Parallel()
+
+	fakeSet := &fakeRuleSet{
+		metadata: adapter.RuleSetMetadata{
+			ContainsIPCIDRRule:    true,
+			ContainsNonIPCIDRRule: true,
+		},
+	}
+	routerService := &fakeRouter{
+		ruleSets: map[string]adapter.RuleSet{
+			"mixed": fakeSet,
+		},
+	}
+	ctx := service.ContextWith[adapter.Router](context.Background(), routerService)
+	router := newTestRouterWithContext(t, ctx, []option.DNSRule{
+		{
+			Type: C.RuleTypeDefault,
+			DefaultOptions: option.DefaultDNSRule{
+				RawDefaultDNSRule: option.RawDefaultDNSRule{
+					QueryType: badoption.Listable[option.DNSQueryType]{option.DNSQueryType(mDNS.TypeA)},
+				},
+				DNSRuleAction: option.DNSRuleAction{
+					Action:       C.RuleActionTypeRoute,
+					RouteOptions: option.DNSRouteActionOptions{Server: "selected"},
+				},
+			},
+		},
+		{
+			Type: C.RuleTypeDefault,
+			DefaultOptions: option.DefaultDNSRule{
+				RawDefaultDNSRule: option.RawDefaultDNSRule{
+					RuleSet: badoption.Listable[string]{"mixed"},
+				},
+				DNSRuleAction: option.DNSRuleAction{
+					Action:       C.RuleActionTypeRoute,
+					RouteOptions: option.DNSRouteActionOptions{Server: "selected"},
+				},
+			},
+		},
+	}, &fakeDNSTransportManager{
+		defaultTransport: &fakeDNSTransport{tag: "default", transportType: C.DNSTypeUDP},
+		transports: map[string]adapter.DNSTransport{
+			"default":  &fakeDNSTransport{tag: "default", transportType: C.DNSTypeUDP},
+			"selected": &fakeDNSTransport{tag: "selected", transportType: C.DNSTypeUDP},
+		},
+	}, &fakeDNSClient{})
+	require.False(t, router.legacyDNSMode)
+}
+
+func TestValidateRuleSetMetadataUpdateRejectsRuleSetFlippingToPureIP(t *testing.T) {
+	t.Parallel()
+
+	fakeSet := &fakeRuleSet{
+		metadata: adapter.RuleSetMetadata{
+			ContainsIPCIDRRule:    true,
+			ContainsNonIPCIDRRule: true,
+		},
+	}
+	routerService := &fakeRouter{
+		ruleSets: map[string]adapter.RuleSet{
+			"mixed": fakeSet,
+		},
+	}
+	ctx := service.ContextWith[adapter.Router](context.Background(), routerService)
+	router := newTestRouterWithContext(t, ctx, []option.DNSRule{
+		{
+			Type: C.RuleTypeDefault,
+			DefaultOptions: option.DefaultDNSRule{
+				RawDefaultDNSRule: option.RawDefaultDNSRule{
+					QueryType: badoption.Listable[option.DNSQueryType]{option.DNSQueryType(mDNS.TypeA)},
+				},
+				DNSRuleAction: option.DNSRuleAction{
+					Action:       C.RuleActionTypeRoute,
+					RouteOptions: option.DNSRouteActionOptions{Server: "selected"},
+				},
+			},
+		},
+		{
+			Type: C.RuleTypeDefault,
+			DefaultOptions: option.DefaultDNSRule{
+				RawDefaultDNSRule: option.RawDefaultDNSRule{
+					RuleSet: badoption.Listable[string]{"mixed"},
+				},
+				DNSRuleAction: option.DNSRuleAction{
+					Action:       C.RuleActionTypeRoute,
+					RouteOptions: option.DNSRouteActionOptions{Server: "selected"},
+				},
+			},
+		},
+	}, &fakeDNSTransportManager{
+		defaultTransport: &fakeDNSTransport{tag: "default", transportType: C.DNSTypeUDP},
+		transports: map[string]adapter.DNSTransport{
+			"default":  &fakeDNSTransport{tag: "default", transportType: C.DNSTypeUDP},
+			"selected": &fakeDNSTransport{tag: "selected", transportType: C.DNSTypeUDP},
+		},
+	}, &fakeDNSClient{})
+	require.False(t, router.legacyDNSMode)
+
+	err := router.ValidateRuleSetMetadataUpdate("mixed", adapter.RuleSetMetadata{
+		ContainsIPCIDRRule: true,
+	})
+	require.ErrorContains(t, err, "Address Filter Fields")
 }
 
 func TestCloseWaitsForInFlightLookupUntilContextCancellation(t *testing.T) {

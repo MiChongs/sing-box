@@ -22,6 +22,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/cleanup"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	N "github.com/sagernet/sing/common/network"
@@ -53,6 +54,7 @@ type Server struct {
 	trafficManager *trafficontrol.Manager
 	urlTestHistory adapter.URLTestHistoryStorage
 	logDebug       bool
+	cleaner        *cleanup.Cleaner
 
 	mode           string
 	modeList       []string
@@ -101,6 +103,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		externalUIDownloadDetour: options.ExternalUIDownloadDetour,
 		externalUIUpdateInterval: updateInterval,
 		cacheFile:                service.FromContext[adapter.CacheFile](ctx),
+		cleaner:                  cleanup.Add(trafficManager.Clear),
 	}
 	s.urlTestHistory = service.FromContext[adapter.URLTestHistoryStorage](ctx)
 	if s.urlTestHistory == nil {
@@ -148,6 +151,10 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/cache", cacheRouter(ctx))
 		r.Mount("/dns", dnsRouter(s.dnsRouter))
 		r.Mount("/smart", smartRouter(ctx))
+
+		if service.FromContext[adapter.PlatformInterface](ctx) == nil {
+			r.Mount("/restart", restartRouter(ctx, logFactory))
+		}
 
 		if service.FromContext[adapter.PlatformInterface](ctx) == nil {
 			r.Mount("/restart", restartRouter(ctx, logFactory))
@@ -249,6 +256,7 @@ func (s *Server) Close() error {
 		common.PtrOrNil(s.httpServer),
 		s.trafficManager,
 		s.urlTestHistory,
+		common.PtrOrNil(s.cleaner),
 	)
 }
 

@@ -130,116 +130,6 @@ func v2rayTransportWs(host string, path string) option.V2RayWebsocketOptions {
 	return WebsocketOptions
 }
 
-// v2rayTransportXHTTP 把 V2Ray/Xray 分享链接里的 type=xhttp 选项组装成
-// V2RayXHTTPOptions，装进 Transport.Extra。返回的 Transport 已经 Type=xhttp，
-// 调用方直接 options.Transport = &Transport 即可。
-//
-// 识别的 URL query:
-//   type=xhttp (caller 判断触发)
-//   path       → Path
-//   host       → Host (单值; 逗号分隔转 Listable)
-//   mode       → Mode ("auto" / "packet-up" / "stream-up" / "stream-one")
-//   extra      → JSON 编码的完整 xhttpSettings，合并到 XHTTPOptions
-//
-// extra 字段最常被 Xray 客户端分享工具使用 —— 它们把完整 xhttpSettings
-// JSON urlencode 进去，字段多时链接太长难拷贝。我们做 best-effort 解析：
-// 成功了把 extra 里的字段 merge 进来；失败了就只用顶层几个字段。
-func v2rayTransportXHTTP(proxy map[string]string) option.V2RayTransportOptions {
-	xOpts := &option.V2RayXHTTPOptions{}
-	if path, ok := proxy["path"]; ok && path != "" {
-		xOpts.Path = path
-	}
-	if host, ok := proxy["host"]; ok && host != "" {
-		// 逗号分隔多个 host
-		if strings.Contains(host, ",") {
-			xOpts.Host = strings.Split(host, ",")
-		} else {
-			xOpts.Host = badoption.Listable[string]{host}
-		}
-	}
-	if mode, ok := proxy["mode"]; ok && mode != "" {
-		xOpts.Mode = mode
-	}
-	// extra 字段：JSON-encoded xhttpSettings。成功 merge，失败忽略。
-	if extraStr, ok := proxy["extra"]; ok && extraStr != "" {
-		parseXHTTPExtra(xOpts, extraStr)
-	}
-	return option.V2RayTransportOptions{
-		Type:  C.V2RayTransportTypeXHTTP,
-		Extra: xOpts,
-	}
-}
-
-// parseXHTTPExtra 解析 Xray 分享链接里的 extra=<json> 参数。
-// 字段名与 Xray 官方一致（camelCase 和 snake_case 都支持），失败静默。
-func parseXHTTPExtra(x *option.V2RayXHTTPOptions, raw string) {
-	var m map[string]any
-	if err := json.Unmarshal([]byte(raw), &m); err != nil {
-		return
-	}
-	getStr := func(keys ...string) string {
-		for _, k := range keys {
-			if v, ok := m[k]; ok {
-				if s, ok := v.(string); ok && s != "" {
-					return s
-				}
-			}
-		}
-		return ""
-	}
-	getInt := func(keys ...string) int {
-		for _, k := range keys {
-			if v, ok := m[k]; ok {
-				switch n := v.(type) {
-				case float64:
-					return int(n)
-				case int:
-					return n
-				}
-			}
-		}
-		return 0
-	}
-	getBool := func(keys ...string) bool {
-		for _, k := range keys {
-			if v, ok := m[k]; ok {
-				if b, ok := v.(bool); ok {
-					return b
-				}
-			}
-		}
-		return false
-	}
-	if s := getStr("path"); s != "" {
-		x.Path = s
-	}
-	if s := getStr("host"); s != "" {
-		if strings.Contains(s, ",") {
-			x.Host = strings.Split(s, ",")
-		} else {
-			x.Host = badoption.Listable[string]{s}
-		}
-	}
-	if s := getStr("mode"); s != "" {
-		x.Mode = s
-	}
-	if v := getStr("xPaddingBytes", "x_padding_bytes"); v != "" {
-		x.XPaddingBytes = v
-	}
-	if getBool("noSSEHeader", "no_sse_header") {
-		x.NoSSEHeader = true
-	}
-	if n := getInt("scMaxEachPostBytes", "sc_max_each_post_bytes"); n > 0 {
-		x.ScMaxEachPostBytes = n
-	}
-	if n := getInt("scMinPostsIntervalMs", "sc_min_posts_interval_ms"); n > 0 {
-		x.ScMinPostsIntervalMs = n
-	}
-	if n := getInt("scMaxBufferedPosts", "sc_max_buffered_posts"); n > 0 {
-		x.ScMaxBufferedPosts = n
-	}
-}
-
 func parseShadowsocksLink(link string) (option.Outbound, error) {
 	linkURL, err := url.Parse(link)
 	if err != nil {
@@ -467,8 +357,6 @@ func parseVMessLink(link string) (option.Outbound, error) {
 				if host, exists := proxy["host"]; exists && host != "" {
 					Transport.GRPCOptions.ServiceName = host
 				}
-			case "xhttp":
-				Transport = v2rayTransportXHTTP(proxy)
 			default:
 				continue
 			}
@@ -541,9 +429,6 @@ func parseVLESSLink(link string) (option.Outbound, error) {
 				if serviceName, exists := proxy["serviceName"]; exists && serviceName != "" {
 					Transport.GRPCOptions.ServiceName = serviceName
 				}
-			case "xhttp":
-				// VLESS + XHTTP（含 REALITY/Vision 组合）是 XTLS 推广的主要用法
-				Transport = v2rayTransportXHTTP(proxy)
 			default:
 				continue
 			}
@@ -649,8 +534,6 @@ func parseTrojanLink(link string) (option.Outbound, error) {
 				if serviceName, exists := proxy["grpc-service-name"]; exists && serviceName != "" {
 					Transport.GRPCOptions.ServiceName = serviceName
 				}
-			case "xhttp":
-				Transport = v2rayTransportXHTTP(proxy)
 			default:
 				continue
 			}

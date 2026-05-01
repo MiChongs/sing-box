@@ -31,16 +31,7 @@ func NewIPCIDRItem(isSource bool, prefixStrings []string) (*IPCIDRItem, error) {
 			builder.Add(addr)
 			continue
 		}
-		// Surface the ORIGINAL user-provided string and a format
-		// hint. The underlying err chain points at Go's internal
-		// "ParsePrefix(x/32)" fallback which hides the original
-		// value and confuses operators trying to locate the bad
-		// entry in their config. ParseAddr's error is usually
-		// more descriptive ("unable to parse IP") so we wrap that
-		// one and prepend a self-explanatory message.
-		return nil, E.Cause(addrErr, "parse ipcidr[", i,
-			"]=\"", prefixString,
-			"\": not a valid IP or CIDR (expected forms: 1.2.3.4, 1.2.3.0/24, ::1, 2001:db8::/32)")
+		return nil, E.Cause(err, "parse [", i, "]")
 	}
 	var description string
 	if isSource {
@@ -103,7 +94,7 @@ func (r *IPCIDRItem) Match(metadata *adapter.InboundContext) bool {
 		return r.ipSet.Contains(metadata.Destination.Addr)
 	}
 	addresses := metadata.DestinationAddresses
-	if len(addresses) > 0 {
+	if len(addresses) > 0 || len(metadata.CacheIPs) > 0 {
 		for _, address := range addresses {
 			if r.ipSet.Contains(address) {
 				return true

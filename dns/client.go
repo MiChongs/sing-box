@@ -62,83 +62,43 @@ type dnsMsg struct {
 	msg       *dns.Msg
 }
 
-// RoundRobin returns a new *dns.Msg with rotated A/AAAA answer order.
-// Avoids dm.msg.Copy() which deep-copies the entire message (1-5KB per call).
-// We only shallow-copy the Msg struct and rebuild the Answer slice with shared
-// RR pointers (DNS RRs are treated as immutable). Per-call allocation reduced
-// from ~1-5KB to ~200 bytes (just the new Answer slice).
-func (dm *dnsMsg) RoundRobin() *dns.Msg {
-	// Shallow copy Msg struct header — RR pointers shared (immutable)
-	result := *dm.msg
-	origAnswer := dm.msg.Answer
-	if len(origAnswer) == 0 {
-		return &result
-	}
-
-	// Fast path: count without allocating intermediate slices
-	var ipv4Count, ipv6Count int
-	for _, ans := range origAnswer {
-		switch ans.(type) {
+func (dm *dnsMsg) applyRoundRobin(msg *dns.Msg) {
+	var (
+		ipv4Answers []*dns.A
+		ipv6Answers []*dns.AAAA
+	)
+	for _, ans := range msg.Answer {
+		switch a := ans.(type) {
 		case *dns.A:
-			ipv4Count++
+			ipv4Answers = append(ipv4Answers, a)
 		case *dns.AAAA:
-			ipv6Count++
+			ipv6Answers = append(ipv6Answers, a)
 		}
 	}
-	// No rotation needed — return shallow copy as-is
-	if ipv4Count <= 1 && ipv6Count <= 1 {
-		return &result
-	}
-
-	// Allocate ONE new Answer slice; reuse RR pointers from original
-	newAnswer := make([]dns.RR, 0, len(origAnswer))
-
-	// Preserve non-A/AAAA records (CNAME, TXT, etc.)
-	for _, ans := range origAnswer {
-		switch ans.(type) {
-		case *dns.A, *dns.AAAA:
-		default:
-			newAnswer = append(newAnswer, ans)
+	if len(ipv4Answers) > 1 {
+		newIndex := (atomic.AddInt32(&dm.ipv4Index, 1) % int32(len(ipv4Answers)))
+		atomic.StoreInt32(&dm.ipv4Index, newIndex)
+		rotatedIPv4 := reverseRotateSlice(ipv4Answers, newIndex)
+		msg.Answer = removeAnswersOfType(msg.Answer, dns.TypeA)
+		for _, ipv4 := range rotatedIPv4 {
+			msg.Answer = append(msg.Answer, ipv4)
 		}
 	}
-
-	// Collect A records (small, stack-friendly if few)
-	if ipv4Count > 0 {
-		a := make([]dns.RR, 0, ipv4Count)
-		for _, ans := range origAnswer {
-			if _, ok := ans.(*dns.A); ok {
-				a = append(a, ans)
-			}
-		}
-		if ipv4Count > 1 {
-			idx := atomic.AddInt32(&dm.ipv4Index, 1) % int32(ipv4Count)
-			// Rotate: [idx:] + [:idx] — reuses underlying array via append
-			newAnswer = append(newAnswer, a[idx:]...)
-			newAnswer = append(newAnswer, a[:idx]...)
-		} else {
-			newAnswer = append(newAnswer, a...)
+	if len(ipv6Answers) > 1 {
+		newIndex := (atomic.AddInt32(&dm.ipv6Index, 1) % int32(len(ipv6Answers)))
+		atomic.StoreInt32(&dm.ipv6Index, newIndex)
+		rotatedIPv6 := reverseRotateSlice(ipv6Answers, newIndex)
+		msg.Answer = removeAnswersOfType(msg.Answer, dns.TypeAAAA)
+		for _, ipv6 := range rotatedIPv6 {
+			msg.Answer = append(msg.Answer, ipv6)
 		}
 	}
+}
 
-	// Collect AAAA records
-	if ipv6Count > 0 {
-		aaaa := make([]dns.RR, 0, ipv6Count)
-		for _, ans := range origAnswer {
-			if _, ok := ans.(*dns.AAAA); ok {
-				aaaa = append(aaaa, ans)
-			}
-		}
-		if ipv6Count > 1 {
-			idx := atomic.AddInt32(&dm.ipv6Index, 1) % int32(ipv6Count)
-			newAnswer = append(newAnswer, aaaa[idx:]...)
-			newAnswer = append(newAnswer, aaaa[:idx]...)
-		} else {
-			newAnswer = append(newAnswer, aaaa...)
-		}
-	}
-
-	result.Answer = newAnswer
-	return &result
+func (dm *dnsMsg) RoundRobin() *dns.Msg {
+	rotatedMsg := dm.msg.Copy()
+	dm.applyRoundRobin(rotatedMsg)
+	return rotatedMsg
 }
 
 type Client struct {
@@ -158,6 +118,7 @@ type Client struct {
 	initDNSCacheFunc  func() adapter.DNSCacheStore
 	logger            logger.ContextLogger
 	cache             freelru.Cache[dnsCacheKey, *dnsMsg]
+	roundRobinIndex   freelru.Cache[dnsCacheKey, *dnsMsg]
 	cacheLock         compatible.Map[dnsCacheKey, chan struct{}]
 	backgroundRefresh compatible.Map[dnsCacheKey, struct{}]
 }
@@ -227,6 +188,8 @@ func (c *Client) Start() {
 	}
 	if c.dnsCache == nil {
 		c.initializeMemoryCache()
+	} else if c.roundRobinCache {
+		c.roundRobinIndex = common.Must1(freelru.NewSharded[dnsCacheKey, *dnsMsg](c.cacheCapacity, maphash.NewHasher[dnsCacheKey]().Hash32))
 	}
 }
 
@@ -349,7 +312,7 @@ func (c *Client) Exchange(ctx context.Context, transport adapter.DNSTransport, m
 			return nil, ErrResponseRejectedCached
 		}
 	}
-	response, err := c.exchangeToTransport(ctx, transport, message)
+	response, err := c.exchangeToTransport(ctx, transport, message, options.Timeout)
 	if err != nil {
 		return nil, err
 	}
@@ -457,9 +420,6 @@ func (c *Client) storeCache(transport adapter.DNSTransport, question dns.Questio
 		return
 	}
 	if c.dnsCache != nil {
-		if transport.Type() == C.DNSTypeFakeIP {
-			return
-		}
 		packed, err := message.Pack()
 		if err == nil {
 			expireAt := time.Now().Add(time.Second * time.Duration(timeToLive))
@@ -536,7 +496,17 @@ func (c *Client) getRoundRobin(response *dnsMsg) *dns.Msg {
 
 func (c *Client) loadResponse(question dns.Question, transport adapter.DNSTransport) (*dns.Msg, int, bool) {
 	if c.dnsCache != nil {
-		return c.loadPersistentResponse(question, transport)
+		response, ttl, isStale := c.loadPersistentResponse(question, transport)
+		if response != nil && c.roundRobinIndex != nil {
+			key := dnsCacheKey{Question: question, transportTag: transport.Tag()}
+			state, loaded := c.roundRobinIndex.Get(key)
+			if !loaded {
+				state = &dnsMsg{}
+				c.roundRobinIndex.Add(key, state)
+			}
+			state.applyRoundRobin(response)
+		}
+		return response, ttl, isStale
 	}
 	if c.cache == nil {
 		return nil, 0, false
@@ -583,6 +553,7 @@ func (c *Client) loadPersistentResponse(question dns.Question, transport adapter
 		if c.logger != nil {
 			c.logger.Warn("load persistent DNS cache for ", question.Name, ": unpack failed: ", err)
 		}
+		c.dnsCache.DeleteDNSCache(transport.Tag(), question.Name, question.Qtype)
 		return nil, 0, false
 	}
 	if c.disableExpire {
@@ -644,10 +615,10 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, question d
 	go func() {
 		defer c.backgroundRefresh.Delete(key)
 		ctx := contextWithTransportTag(c.ctx, transport.Tag())
-		response, err := c.exchangeToTransport(ctx, transport, message)
+		response, err := c.exchangeToTransport(ctx, transport, message, options.Timeout)
 		if err != nil {
 			if c.logger != nil {
-				c.logger.Debug("optimistic refresh failed for ", FqdnToDomain(question.Name), ": ", err)
+				c.logger.DebugContext(ctx, "optimistic refresh failed for ", FqdnToDomain(question.Name), ": ", err)
 			}
 			return
 		}
@@ -659,6 +630,9 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, question d
 				rejected = !responseChecker(response)
 			}
 			if rejected {
+				if c.logger != nil {
+					c.logger.DebugContext(ctx, "optimistic refresh rejected for ", FqdnToDomain(question.Name))
+				}
 				if c.rdrc != nil {
 					c.rdrc.SaveRDRCAsync(transport.Tag(), question.Name, question.Qtype, c.logger)
 				}
@@ -669,6 +643,7 @@ func (c *Client) backgroundRefreshDNS(transport adapter.DNSTransport, question d
 		}
 		timeToLive := c.applyResponseOptions(question, response, options)
 		c.storeCache(transport, question, response, timeToLive)
+		logRefreshedResponse(c.logger, ctx, response, timeToLive)
 	}()
 }
 
@@ -695,8 +670,11 @@ func stripDNSPadding(response *dns.Msg) {
 	}
 }
 
-func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg) (*dns.Msg, error) {
-	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+func (c *Client) exchangeToTransport(ctx context.Context, transport adapter.DNSTransport, message *dns.Msg, timeout time.Duration) (*dns.Msg, error) {
+	if timeout == 0 {
+		timeout = c.timeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	response, err := transport.Exchange(ctx, message)
 	if err == nil {

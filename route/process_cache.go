@@ -81,6 +81,13 @@ func (r *Router) isLocalSource(source netip.Addr) bool {
 	if source.IsLoopback() {
 		return true
 	}
+	if r.platformInterface != nil {
+		for _, addr := range r.platformInterface.MyInterfaceAddress() {
+			if addr.Unmap() == source {
+				return true
+			}
+		}
+	}
 	for _, netInterface := range r.network.InterfaceFinder().Interfaces() {
 		for _, prefix := range netInterface.Addresses {
 			if prefix.Addr().Unmap() == source {

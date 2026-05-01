@@ -11,7 +11,6 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
-	"github.com/sagernet/sing-box/common/expiringpool"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/log"
@@ -29,10 +28,10 @@ import (
 var _ adapter.DNSTransport = (*TCPTransport)(nil)
 
 type dnsTransportManager interface {
-	removeActiveConn(conn *reuseableDNSConn)
 	markPipelineDetected() bool
 	isPipelineDetected() bool
-	getDetectionCounters() (consecutiveOutOfOrder, outOfOrderCount, totalResponses *int32)
+	getDetectionCounters() (*int32, *int32, *int32)
+	removeActiveConn(conn *reuseableDNSConn)
 }
 
 func RegisterTCP(registry *dns.TransportRegistry) {
@@ -40,21 +39,10 @@ func RegisterTCP(registry *dns.TransportRegistry) {
 }
 
 type TCPTransport struct {
-	*BaseTransport
+	dns.TransportAdapter
 	dialer     N.Dialer
 	serverAddr M.Socksaddr
-
-	connections           *expiringpool.ExpiringPool[*reuseableDNSConn]
-	enablePipeline        bool
-	idleTimeout           time.Duration
-	disableKeepAlive      bool
-	maxQueries            int
-	activeConns           []*reuseableDNSConn
-	activeAccess          sync.Mutex
-	pipelineDetected      int32
-	consecutiveOutOfOrder int32
-	outOfOrderCount       int32
-	totalResponses        int32
+	pipelinePool
 }
 
 func NewTCP(ctx context.Context, logger log.ContextLogger, tag string, options option.RemoteTCPDNSServerOptions) (adapter.DNSTransport, error) {
@@ -98,18 +86,19 @@ func NewTCP(ctx context.Context, logger log.ContextLogger, tag string, options o
 		maxQueries = 0
 	}
 	transport := &TCPTransport{
-		BaseTransport:    NewBaseTransport(dns.NewTransportAdapterWithRemoteOptions(C.DNSTypeTCP, tag, options.RemoteDNSServerOptions), logger),
+		TransportAdapter: dns.NewTransportAdapterWithRemoteOptions(C.DNSTypeTCP, tag, options.RemoteDNSServerOptions),
 		dialer:           transportDialer,
 		serverAddr:       serverAddr,
-		enablePipeline:   options.Pipeline,
-		idleTimeout:      poolIdleTimeout,
-		disableKeepAlive: options.DisableTCPKeepAlive,
-		maxQueries:       maxQueries,
+		pipelinePool: pipelinePool{
+			logger:           logger,
+			enablePipeline:   options.Pipeline,
+			idleTimeout:      poolIdleTimeout,
+			disableKeepAlive: options.DisableTCPKeepAlive,
+			maxQueries:       maxQueries,
+		},
 	}
 	if enableConnReuse {
-		transport.connections = expiringpool.New(ctx, poolIdleTimeout, func(conn *reuseableDNSConn) {
-			conn.Close()
-		})
+		transport.connections = newReuseableDNSConnPool()
 	}
 	return transport, nil
 }
@@ -118,226 +107,51 @@ func (t *TCPTransport) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
-	err := t.SetStarted()
-	if err != nil {
-		return err
-	}
-	if t.connections != nil {
-		t.connections.Start()
-	}
 	return dialer.InitializeDetour(t.dialer)
 }
 
 func (t *TCPTransport) Close() error {
-	if t.connections != nil {
-		t.connections.Close()
-	}
-	return t.BaseTransport.Close()
+	return t.pipelinePool.closePool()
 }
 
 func (t *TCPTransport) Reset() {
-	if t.connections != nil {
-		t.connections.Drain()
-	}
-	t.activeAccess.Lock()
-	activeConns := t.activeConns
-	t.activeConns = nil
-	t.activeAccess.Unlock()
-	for _, conn := range activeConns {
-		conn.Close()
-	}
-	atomic.StoreInt32(&t.pipelineDetected, 0)
-	atomic.StoreInt32(&t.consecutiveOutOfOrder, 0)
-	atomic.StoreInt32(&t.outOfOrderCount, 0)
-	atomic.StoreInt32(&t.totalResponses, 0)
+	t.pipelinePool.resetPool()
 }
 
 func (t *TCPTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
-	if !t.BeginQuery() {
-		return nil, ErrTransportClosed
-	}
-	defer t.EndQuery()
-
 	if t.connections == nil {
 		return t.createNewConnection(ctx, message)
 	}
-
-	if t.enablePipeline {
-		if t.maxQueries == 0 {
-			conn := t.getValidConnFromPool()
-			if conn != nil {
-				response, err := conn.Exchange(ctx, message)
-				if err == nil {
-					return response, nil
-				}
-				if ctx.Err() != nil {
-					return nil, err
-				}
-				t.Logger.Debug("retrying query on new connection after reused conn failure: ", err)
-			}
-			return t.createNewConnection(ctx, message)
-		} else {
-			conn := t.findAndReserveActiveConn()
-			if conn != nil {
-				response, err := conn.exchangeWithoutIncrement(ctx, message)
-				if err == nil {
-					return response, nil
-				}
-				if ctx.Err() != nil {
-					return nil, err
-				}
-				t.Logger.Debug("retrying query after active conn failure: ", err)
-			}
-
-			conn = t.getValidConnFromPool()
-			if conn != nil {
-				t.addActiveConn(conn)
-				response, err := conn.Exchange(ctx, message)
-				if err == nil {
-					return response, nil
-				}
-				if ctx.Err() != nil {
-					return nil, err
-				}
-				t.Logger.Debug("retrying query on new connection after pooled conn failure: ", err)
-			}
-
-			return t.createNewConnection(ctx, message)
-		}
-	} else {
-		conn := t.getValidConnFromPool()
-		if conn != nil {
-			response, err := conn.Exchange(ctx, message)
-			if err == nil {
-				return response, nil
-			}
-			if ctx.Err() != nil {
-				return nil, err
-			}
-			t.Logger.Debug("retrying query on new connection after reused conn failure: ", err)
-		}
-		return t.createNewConnection(ctx, message)
-	}
-}
-
-func (t *TCPTransport) getValidConnFromPool() *reuseableDNSConn {
-	for {
-		conn := t.connections.Get()
-		if conn == nil {
-			return nil
-		}
-		select {
-		case <-conn.done:
-			continue
-		default:
-			return conn
-		}
-	}
-}
-
-func (t *TCPTransport) findAndReserveActiveConn() *reuseableDNSConn {
-	t.activeAccess.Lock()
-	defer t.activeAccess.Unlock()
-
-	var bestConn *reuseableDNSConn
-	var minQueries int32 = -1
-	var closedCount int
-
-	for _, conn := range t.activeConns {
-		select {
-		case <-conn.done:
-			closedCount++
-		default:
-			if conn.maxQueries <= 0 || atomic.LoadInt32(&conn.activeQueries) < int32(conn.maxQueries) {
-				current := atomic.LoadInt32(&conn.activeQueries)
-				if minQueries == -1 || current < minQueries {
-					minQueries = current
-					bestConn = conn
-				}
-			}
-		}
-	}
-
-	if bestConn != nil && minQueries == 0 && closedCount == 0 {
-		atomic.AddInt32(&bestConn.activeQueries, 1)
-		return bestConn
-	}
-
-	if closedCount > 0 {
-		validConns := make([]*reuseableDNSConn, 0, len(t.activeConns)-closedCount)
-		for _, conn := range t.activeConns {
-			select {
-			case <-conn.done:
-			default:
-				validConns = append(validConns, conn)
-			}
-		}
-		t.activeConns = validConns
-	}
-
-	if bestConn != nil {
-		atomic.AddInt32(&bestConn.activeQueries, 1)
-	}
-
-	return bestConn
-}
-
-func (t *TCPTransport) addActiveConn(conn *reuseableDNSConn) {
-	t.activeAccess.Lock()
-	defer t.activeAccess.Unlock()
-
-	for _, c := range t.activeConns {
-		if c == conn {
-			return
-		}
-	}
-
-	t.activeConns = append(t.activeConns, conn)
-}
-
-func (t *TCPTransport) removeActiveConn(conn *reuseableDNSConn) {
-	t.activeAccess.Lock()
-	defer t.activeAccess.Unlock()
-
-	for i, c := range t.activeConns {
-		if c == conn {
-			last := len(t.activeConns) - 1
-			t.activeConns[i] = t.activeConns[last]
-			t.activeConns = t.activeConns[:last]
-			return
-		}
-	}
-}
-
-func (t *TCPTransport) markPipelineDetected() bool {
-	return atomic.CompareAndSwapInt32(&t.pipelineDetected, 0, 1)
-}
-
-func (t *TCPTransport) isPipelineDetected() bool {
-	return atomic.LoadInt32(&t.pipelineDetected) != 0
-}
-
-func (t *TCPTransport) getDetectionCounters() (*int32, *int32, *int32) {
-	return &t.consecutiveOutOfOrder, &t.outOfOrderCount, &t.totalResponses
+	return t.pipelinePool.exchange(ctx, message, t.createNewConnection)
 }
 
 func (t *TCPTransport) createNewConnection(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+	if t.connections != nil {
+		conn, _, err := t.connections.Acquire(ctx, func(ctx context.Context) (*reuseableDNSConn, error) {
+			rawConn, err := t.dialer.DialContext(ctx, N.NetworkTCP, t.serverAddr)
+			if err != nil {
+				return nil, E.Cause(err, "dial TCP connection")
+			}
+			var connIdleTimeout time.Duration
+			if t.disableKeepAlive {
+				connIdleTimeout = t.idleTimeout
+			}
+			return newReuseableDNSConn(rawConn, t.logger, t.enablePipeline, connIdleTimeout, t.maxQueries, t.connections, t), nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if t.enablePipeline && t.maxQueries > 0 {
+			t.addActiveConn(conn)
+		}
+		return conn.Exchange(ctx, message)
+	}
 	rawConn, err := t.dialer.DialContext(ctx, N.NetworkTCP, t.serverAddr)
 	if err != nil {
 		return nil, E.Cause(err, "dial TCP connection")
 	}
-	var connIdleTimeout time.Duration
-	if t.connections != nil && t.disableKeepAlive {
-		connIdleTimeout = t.idleTimeout
-	}
-	conn := newReuseableDNSConn(rawConn, t.Logger, t.enablePipeline, connIdleTimeout, t.maxQueries, t.connections, t)
-
-	if t.connections == nil {
-		defer conn.Close()
-	} else if t.enablePipeline && t.maxQueries > 0 {
-		t.addActiveConn(conn)
-	}
-
+	conn := newReuseableDNSConn(rawConn, t.logger, t.enablePipeline, 0, t.maxQueries, nil, t)
+	defer conn.Close()
 	return conn.Exchange(ctx, message)
 }
 
@@ -397,13 +211,13 @@ type reuseableDNSConn struct {
 	enablePipeline bool
 	activeQueries  int32
 	maxQueries     int
-	pool           *expiringpool.ExpiringPool[*reuseableDNSConn]
+	pool           *ConnPool[*reuseableDNSConn]
 	transport      dnsTransportManager
 	idleTimeout    time.Duration
 	idleTimer      *time.Timer
 }
 
-func newReuseableDNSConn(conn net.Conn, logger logger.ContextLogger, enablePipeline bool, idleTimeout time.Duration, maxQueries int, pool *expiringpool.ExpiringPool[*reuseableDNSConn], transport dnsTransportManager) *reuseableDNSConn {
+func newReuseableDNSConn(conn net.Conn, logger logger.ContextLogger, enablePipeline bool, idleTimeout time.Duration, maxQueries int, pool *ConnPool[*reuseableDNSConn], transport dnsTransportManager) *reuseableDNSConn {
 	c := &reuseableDNSConn{
 		Conn:           conn,
 		logger:         logger,
@@ -447,8 +261,9 @@ func (c *reuseableDNSConn) exchangeWithCleanup(ctx context.Context, message *mDN
 			}
 			select {
 			case <-c.done:
+				c.pool.Invalidate(c, c.err)
 			default:
-				c.pool.Put(c)
+				c.pool.Release(c, true)
 			}
 		}
 	}()
@@ -530,7 +345,7 @@ func (c *reuseableDNSConn) recvLoop() {
 
 		if !loaded {
 			if c.logger != nil {
-				c.logger.Warn("received response for unknown message ID: ", message.Id)
+				c.logger.Debug("received response for unknown message ID: ", message.Id)
 			}
 			continue
 		}

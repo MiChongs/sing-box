@@ -1,5 +1,4 @@
-//go:build !darwin || !cgo
-
+//go:build !darwin || (darwin && !cgo)
 
 package local
 

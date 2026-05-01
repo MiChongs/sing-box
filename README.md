@@ -111,47 +111,6 @@ TCP Keep alive options.
 - `pipeline`: Enable DNS pipelining (RFC 9210). Multiple queries can be sent over the same TLS connection without waiting for responses,
 significantly improving performance in high-concurrency scenarios.
 
-## Dialer
-
-```json
-{
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct",
-      "tcp_keep_alive": "5m",
-      "tcp_keep_alive_interval": "75s",
-      "tcp_keep_alive_count": 0,
-      "disable_tcp_keep_alive": false
-    }
-  ]
-}
-```
-
-TCP Keep alive options.
-
-## DNS
-
-### TCP
-
-```json
-{
-  "dns": {
-    "servers": [
-      {
-        "type": "tcp",
-        "tag": "cloudlfare-tcp",
-        "server": "1.1.1.1",
-        "server_port": 53,
-        "reuse": true
-      }
-    ]
-  }
-}
-```
-
-- `reuse`: Reuse TCP connection.
-
 ## URLTest Fallback 支持
 
 按照**可用性**和**顺序**选择出站

@@ -9,8 +9,8 @@ import (
 )
 
 type stderrManager struct {
-	logger   logger.Logger
 	access   sync.Mutex
+	logger   logger.Logger
 	reported map[string]bool
 }
 
@@ -23,12 +23,11 @@ func NewStderrManager(logger logger.Logger) Manager {
 
 func (f *stderrManager) ReportDeprecated(feature Note) {
 	f.access.Lock()
+	defer f.access.Unlock()
 	if f.reported[feature.Name] {
-		f.access.Unlock()
 		return
 	}
 	f.reported[feature.Name] = true
-	f.access.Unlock()
 	if !feature.Impending() {
 		f.logger.Warn(feature.MessageWithLink())
 		return

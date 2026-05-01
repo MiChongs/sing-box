@@ -633,13 +633,11 @@ func (c *CommandClient) GetDeprecatedNotes() (DeprecatedNoteIterator, error) {
 		}
 		var notes []*DeprecatedNote
 		for _, warning := range warnings.Warnings {
-			// upstream's DeprecatedWarning proto only has Message /
-			// Impending / MigrationLink; Description / DeprecatedVersion /
-			// ScheduledVersion are xiaobaf14g-local fields not surfaced
-			// across the daemon RPC boundary. Map what we have; UIs
-			// relying on the richer fields will need to parse Message.
 			notes = append(notes, &DeprecatedNote{
-				MigrationLink: warning.MigrationLink,
+				Description:       warning.Description,
+				DeprecatedVersion: warning.DeprecatedVersion,
+				ScheduledVersion:  warning.ScheduledVersion,
+				MigrationLink:     warning.MigrationLink,
 			})
 		}
 		return newIterator(notes), nil

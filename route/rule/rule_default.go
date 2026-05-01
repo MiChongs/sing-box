@@ -340,10 +340,9 @@ func NewLogicalRule(ctx context.Context, logger log.ContextLogger, options optio
 			action:              action,
 		},
 	}
+	router := service.FromContext[adapter.Router](ctx)
 	if rule.domainMatchStrategy == C.DomainMatchStrategyAsIS {
-		if router := service.FromContext[adapter.Router](ctx); router != nil {
-			rule.domainMatchStrategy = router.DefaultDomainMatchStrategy()
-		}
+		rule.domainMatchStrategy = router.DefaultDomainMatchStrategy()
 	}
 	switch options.Mode {
 	case C.LogicalTypeAnd:

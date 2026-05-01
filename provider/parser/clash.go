@@ -221,7 +221,6 @@ type VmessOption struct {
 	HTTP2Opts           HTTP2Options `yaml:"h2-opts,omitempty"`
 	GrpcOpts            GrpcOptions  `yaml:"grpc-opts,omitempty"`
 	WSOpts              WSOptions    `yaml:"ws-opts,omitempty"`
-	XHTTPOpts           XHTTPOptions `yaml:"xhttp-opts,omitempty"`
 	PacketAddr          bool         `yaml:"packet-addr,omitempty"`
 	XUDP                bool         `yaml:"xudp,omitempty"`
 	PacketEncoding      string       `yaml:"packet-encoding,omitempty"`
@@ -256,7 +255,7 @@ func (v *VmessOption) Build() any {
 		OutboundTLSOptionsContainer: clashTLSOptions(v.Server, v.TLSOptions),
 		PacketEncoding:              v.PacketEncoding,
 		Multiplex:                   v.MuxOpts.Build(),
-		Transport:                   clashTransport(v.Network, v.HTTPOpts, v.HTTP2Opts, v.GrpcOpts, v.WSOpts, v.XHTTPOpts),
+		Transport:                   clashTransport(v.Network, v.HTTPOpts, v.HTTP2Opts, v.GrpcOpts, v.WSOpts),
 	}
 }
 
@@ -276,7 +275,6 @@ type VlessOption struct {
 	HTTP2Opts      HTTP2Options `yaml:"h2-opts,omitempty"`
 	GrpcOpts       GrpcOptions  `yaml:"grpc-opts,omitempty"`
 	WSOpts         WSOptions    `yaml:"ws-opts,omitempty"`
-	XHTTPOpts      XHTTPOptions `yaml:"xhttp-opts,omitempty"`
 	MuxOpts        *MuxOptions  `yaml:"smux,omitempty"`
 }
 
@@ -302,7 +300,7 @@ func (v *VlessOption) Build() any {
 		Network:                     clashNetworks(v.UDP),
 		OutboundTLSOptionsContainer: clashTLSOptions(v.Server, v.TLSOptions),
 		Multiplex:                   v.MuxOpts.Build(),
-		Transport:                   clashTransport(v.Network, v.HTTPOpts, v.HTTP2Opts, v.GrpcOpts, v.WSOpts, v.XHTTPOpts),
+		Transport:                   clashTransport(v.Network, v.HTTPOpts, v.HTTP2Opts, v.GrpcOpts, v.WSOpts),
 		PacketEncoding:              &v.PacketEncoding,
 	}
 }
@@ -351,11 +349,10 @@ type TrojanOption struct {
 	TLSOptions    `yaml:",inline"`
 	Password      string      `yaml:"password"`
 	UDP           bool        `yaml:"udp,omitempty"`
-	Network       string       `yaml:"network,omitempty"`
-	GrpcOpts      GrpcOptions  `yaml:"grpc-opts,omitempty"`
-	WSOpts        WSOptions    `yaml:"ws-opts,omitempty"`
-	XHTTPOpts     XHTTPOptions `yaml:"xhttp-opts,omitempty"`
-	MuxOpts       *MuxOptions  `yaml:"smux,omitempty"`
+	Network       string      `yaml:"network,omitempty"`
+	GrpcOpts      GrpcOptions `yaml:"grpc-opts,omitempty"`
+	WSOpts        WSOptions   `yaml:"ws-opts,omitempty"`
+	MuxOpts       *MuxOptions `yaml:"smux,omitempty"`
 }
 
 func (t *TrojanOption) Build() any {
@@ -367,7 +364,7 @@ func (t *TrojanOption) Build() any {
 		Network:                     clashNetworks(t.UDP),
 		OutboundTLSOptionsContainer: clashTLSOptions(t.Server, &t.TLSOptions),
 		Multiplex:                   t.MuxOpts.Build(),
-		Transport:                   clashTransport(t.Network, HTTPOptions{}, HTTP2Options{}, t.GrpcOpts, t.WSOpts, t.XHTTPOpts),
+		Transport:                   clashTransport(t.Network, HTTPOptions{}, HTTP2Options{}, t.GrpcOpts, t.WSOpts),
 	}
 }
 
@@ -611,31 +608,6 @@ type WSOptions struct {
 	MaxEarlyData        int               `yaml:"max-early-data,omitempty"`
 	EarlyDataHeaderName string            `yaml:"early-data-header-name,omitempty"`
 	V2rayHttpUpgrade    bool              `yaml:"v2ray-http-upgrade,omitempty"`
-}
-
-// XHTTPOptions 对应 mihomo/clash yaml 里的 xhttp-opts 子对象：
-//   xhttp-opts:
-//     path: /yyy
-//     host: z.com
-//     mode: packet-up
-//     x-padding-bytes: "100-1000"
-//     no-sse-header: false
-//     sc-max-each-post-bytes: 1000000
-//     sc-min-posts-interval-ms: 30
-//     sc-max-buffered-posts: 30
-//     headers:
-//       User-Agent: "..."
-// 字段命名与 mihomo 保持一致（kebab-case）。
-type XHTTPOptions struct {
-	Path                 string            `yaml:"path,omitempty"`
-	Host                 string            `yaml:"host,omitempty"`
-	Mode                 string            `yaml:"mode,omitempty"`
-	Headers              map[string]string `yaml:"headers,omitempty"`
-	NoSSEHeader          bool              `yaml:"no-sse-header,omitempty"`
-	XPaddingBytes        string            `yaml:"x-padding-bytes,omitempty"`
-	ScMaxEachPostBytes   int               `yaml:"sc-max-each-post-bytes,omitempty"`
-	ScMinPostsIntervalMs int               `yaml:"sc-min-posts-interval-ms,omitempty"`
-	ScMaxBufferedPosts   int               `yaml:"sc-max-buffered-posts,omitempty"`
 }
 
 type MuxOptions struct {
@@ -913,39 +885,8 @@ func clashSpeedToNetworkBytes(speed string) *byteformats.NetworkBytesCompat {
 	return networkBytes
 }
 
-// clashTransport 根据 mihomo 的 network 字段派发到对应 transport options。
-// 新增 network="xhttp" case：把 XHTTPOptions 转成 option.V2RayXHTTPOptions
-// 装进 Transport.Extra，Type=V2RayTransportTypeXHTTP。需要 with_xhttp build tag
-// 才能真正起效；否则运行期 option 反序列化会报未知 type。
-func clashTransport(network string, httpOpts HTTPOptions, h2Opts HTTP2Options, grpcOpts GrpcOptions, wsOpts WSOptions, xhttpOpts XHTTPOptions) *option.V2RayTransportOptions {
+func clashTransport(network string, httpOpts HTTPOptions, h2Opts HTTP2Options, grpcOpts GrpcOptions, wsOpts WSOptions) *option.V2RayTransportOptions {
 	switch network {
-	case "xhttp":
-		x := &option.V2RayXHTTPOptions{
-			Path:                 xhttpOpts.Path,
-			Mode:                 xhttpOpts.Mode,
-			NoSSEHeader:          xhttpOpts.NoSSEHeader,
-			XPaddingBytes:        xhttpOpts.XPaddingBytes,
-			ScMaxEachPostBytes:   xhttpOpts.ScMaxEachPostBytes,
-			ScMinPostsIntervalMs: xhttpOpts.ScMinPostsIntervalMs,
-			ScMaxBufferedPosts:   xhttpOpts.ScMaxBufferedPosts,
-		}
-		if xhttpOpts.Host != "" {
-			if strings.Contains(xhttpOpts.Host, ",") {
-				x.Host = strings.Split(xhttpOpts.Host, ",")
-			} else {
-				x.Host = badoption.Listable[string]{xhttpOpts.Host}
-			}
-		}
-		if len(xhttpOpts.Headers) > 0 {
-			x.Headers = badoption.HTTPHeader{}
-			for k, v := range xhttpOpts.Headers {
-				x.Headers[k] = badoption.Listable[string]{v}
-			}
-		}
-		return &option.V2RayTransportOptions{
-			Type:  C.V2RayTransportTypeXHTTP,
-			Extra: x,
-		}
 	case "http":
 		return &option.V2RayTransportOptions{
 			Type: C.V2RayTransportTypeHTTP,
