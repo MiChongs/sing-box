@@ -24,6 +24,11 @@ import (
 	"github.com/sagernet/sing/service/pause"
 )
 
+const (
+	ruleSetFetchTimeout      = 60 * time.Second
+	ruleSetMaxResponseBytes  = 50 * 1024 * 1024
+)
+
 var _ adapter.RuleSet = (*RemoteRuleSet)(nil)
 
 type RemoteRuleSet struct {
@@ -87,7 +92,7 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	if s.lastUpdated.IsZero() {
 		err = s.fetch(ctx, true)
 		if err != nil {
-			return E.Cause(err, "initial rule-set: ", s.tag)
+			s.logger.Warn(E.Cause(err, "initial rule-set fetch failed, starting empty: ", s.tag))
 		}
 	}
 	s.updateTicker = time.NewTicker(s.updateInterval)
@@ -105,10 +110,6 @@ func (s *RemoteRuleSet) loopUpdate() {
 	}
 	for {
 		runtime.GC()
-		var fastRetryC <-chan time.Time
-		if fastRetryTicker != nil {
-			fastRetryC = fastRetryTicker.C
-		}
 		select {
 		case <-s.ctx.Done():
 			return
@@ -180,6 +181,9 @@ func (s *RemoteRuleSet) fetch(ctx context.Context, isStart bool) error {
 	content, err := io.ReadAll(io.LimitReader(response.Body, ruleSetMaxResponseBytes+1))
 	if err != nil {
 		return err
+	}
+	if len(content) > ruleSetMaxResponseBytes {
+		return E.New("rule-set response too large: ", len(content), " > ", ruleSetMaxResponseBytes)
 	}
 	err = s.loadBytes(content, s)
 	if err != nil {

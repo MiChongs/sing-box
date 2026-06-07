@@ -48,6 +48,9 @@ type Selector struct {
 	exclude         *regexp.Regexp
 	include         *regexp.Regexp
 	useAllProviders bool
+
+	hidden bool
+	icon   string
 }
 
 func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SelectorOutboundOptions) (adapter.Outbound, error) {
@@ -71,6 +74,8 @@ func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextL
 		exclude:         (*regexp.Regexp)(options.Exclude),
 		include:         (*regexp.Regexp)(options.Include),
 		useAllProviders: options.UseAllProviders,
+		hidden:          options.Hidden,
+		icon:            options.Icon,
 	}
 	return outbound, nil
 }

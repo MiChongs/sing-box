@@ -99,10 +99,6 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		externalController:       options.ExternalController != "",
 		externalUIDownloadURL:    options.ExternalUIDownloadURL,
 		externalUIHTTPClient:     options.ExternalUIHTTPClient,
-		externalUIUpdateInterval: updateInterval,
-		cacheFile:                service.FromContext[adapter.CacheFile](ctx),
-		cleaner:                  cleanup.Add(trafficManager.Clear),
-
 		//nolint:staticcheck
 		externalUIDownloadDetour: options.ExternalUIDownloadDetour,
 		externalUIUpdateInterval: updateInterval,
@@ -155,10 +151,6 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/cache", cacheRouter(ctx))
 		r.Mount("/dns", dnsRouter(s.dnsRouter))
 		r.Mount("/smart", smartRouter(ctx))
-
-		if service.FromContext[adapter.PlatformInterface](ctx) == nil {
-			r.Mount("/restart", restartRouter(ctx, logFactory))
-		}
 
 		if service.FromContext[adapter.PlatformInterface](ctx) == nil {
 			r.Mount("/restart", restartRouter(ctx, logFactory))

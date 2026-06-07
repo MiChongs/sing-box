@@ -32,12 +32,6 @@ type NetworkManager interface {
 	WIFIState() WIFIState
 	UpdateWIFIState()
 	ResetNetwork()
-	RegisterNetworkResetCallback(callback func())
-
-	// HintUnreachable 供下游（DNS/outbound）在遇到 ENETUNREACH/EHOSTUNREACH 时
-	// 反馈给 monitor，异步合并触发一次默认接口重探。正常调用开销为一次 CAS；
-	// 真的切网时把 monitor 的感知从最多 ~1s 压到 <100ms，对用户无感。
-	HintUnreachable()
 }
 
 type NetworkOptions struct {

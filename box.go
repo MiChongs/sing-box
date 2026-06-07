@@ -25,6 +25,8 @@ import (
 	"github.com/sagernet/sing-box/experimental"
 	"github.com/sagernet/sing-box/experimental/cachefile"
 	"github.com/sagernet/sing-box/experimental/deprecated"
+	geoxservice "github.com/sagernet/sing-box/experimental/geox"
+	smartservice "github.com/sagernet/sing-box/experimental/smart"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/direct"

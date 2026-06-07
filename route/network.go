@@ -56,9 +56,6 @@ type NetworkManager struct {
 	wifiMonitor            settings.WIFIMonitor
 	wifiState              adapter.WIFIState
 	wifiStateMutex         sync.RWMutex
-	resetCallbackAccess    sync.Mutex
-	resetCallbacks         []func()
-
 	// Reset-coalescence state. Android's ConnectivityManager fires
 	// 5-15 callbacks during a single Wi-Fi ↔ cellular handoff (burst
 	// window ~200ms-2s: interfaceAdded / defaultChanged /
@@ -407,18 +404,6 @@ func (r *NetworkManager) AutoDetectInterfaceFunc() control.Func {
 			return nil
 		}
 		return control.BindToInterface0(r.interfaceFinder, conn, network, address, defaultInterface.Name, defaultInterface.Index, false)
-	}
-}
-
-// HintUnreachable 见 adapter.NetworkManager。零开销合并触发 monitor 重探。
-// 上游 sing-tun 没有 ForceUpdate；只有 fork 自定义 monitor 实现该方法。
-// 通过接口断言：能力存在则调用，缺失则 no-op（依赖原生 debounce 自然收敛）。
-func (r *NetworkManager) HintUnreachable() {
-	if r.interfaceMonitor == nil {
-		return
-	}
-	if forceUpdater, ok := r.interfaceMonitor.(interface{ ForceUpdate() }); ok {
-		forceUpdater.ForceUpdate()
 	}
 }
 

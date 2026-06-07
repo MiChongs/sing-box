@@ -69,6 +69,9 @@ type LoadBalance struct {
 	exclude         *regexp.Regexp
 	include         *regexp.Regexp
 	useAllProviders bool
+
+	hidden bool
+	icon   string
 }
 
 func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.LoadBalanceOutboundOptions) (adapter.Outbound, error) {
@@ -104,9 +107,14 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		exclude:         (*regexp.Regexp)(options.Exclude),
 		include:         (*regexp.Regexp)(options.Include),
 		useAllProviders: options.UseAllProviders,
+		hidden:          options.Hidden,
+		icon:            options.Icon,
 	}
 	return outbound, nil
 }
+
+func (s *LoadBalance) Hidden() bool { return s.hidden }
+func (s *LoadBalance) Icon() string { return s.icon }
 
 func (s *LoadBalance) Start() error {
 	if s.useAllProviders {

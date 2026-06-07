@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	bbolt "github.com/sagernet/bbolt"
 	"github.com/oschwald/maxminddb-golang"
 	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/sagernet/sing-box/adapter"
@@ -702,9 +703,13 @@ func (s *Smart) PostStart() error {
 
 	// Get cache file and init store
 	if cacheFile := service.FromContext[adapter.CacheFile](s.ctx); cacheFile != nil {
-		db := cacheFile.SmartDB()
-		if db != nil {
-			s.store = smart.GetOrInitStore(db)
+		type smartDBProvider interface {
+			SmartDB() any
+		}
+		if provider, ok := cacheFile.(smartDBProvider); ok {
+			if db, ok := provider.SmartDB().(*bbolt.DB); ok && db != nil {
+				s.store = smart.GetOrInitStore(db)
+			}
 		}
 	}
 

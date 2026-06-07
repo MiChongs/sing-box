@@ -58,11 +58,6 @@ func (r *Router) hijackDNSPacket(ctx context.Context, conn N.PacketConn, packetB
 	err := dnsOutbound.NewDNSPacketConnection(ctx, r.dns, conn, packetBuffers, metadata)
 	N.CloseOnHandshakeFailure(conn, onClose, err)
 	if err != nil && !E.IsClosedOrCanceled(err) {
-		// 瞬态不可达：让 monitor 立刻重探；错误仍返回上层（TCP 路径由 caller
-		// 决定是否重试 / 静默）。这里不直接打日志，上层只有一个 return 点。
-		if isTransientUnreachable(err) && r.network != nil {
-			r.network.HintUnreachable()
-		}
 		return E.Cause(err, "process DNS packet")
 	}
 	return nil
@@ -73,11 +68,7 @@ func ExchangeDNSPacket(ctx context.Context, router adapter.DNSRouter, logger log
 	if err == nil || R.IsRejected(err) || E.IsClosedOrCanceled(err) {
 		return
 	}
-	// 切网瞬态错误：反馈 monitor + 降级 Debug + per-second 节流，避免刷屏。
 	if isTransientUnreachable(err) {
-		if networkManager != nil {
-			networkManager.HintUnreachable()
-		}
 		if transientDNSLogThrottle.allow() {
 			logger.DebugContext(ctx, E.Cause(err, "process DNS packet (transient, auto-retry)"))
 		}

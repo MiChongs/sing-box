@@ -174,7 +174,6 @@ func (r *Router) Start(stage adapter.StartStage) error {
 			startContext.Close()
 		}
 		r.network.Initialize(r.ruleSets)
-		r.network.RegisterNetworkResetCallback(r.dns.ResetNetwork)
 		needFindProcess := r.needFindProcess
 		needFindNeighbor := r.needFindNeighbor
 		for _, ruleSet := range r.ruleSets {
