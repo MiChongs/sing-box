@@ -1,7 +1,6 @@
 package urltest
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -83,50 +82,76 @@ func (s *HistoryStorage) Close() error {
 
 // ════════════════ TLS session cache ════════════════
 
-// sessionCacheFor returns a per-hostname tls.ClientSessionCache so probes
-// of the same SNI can resume across invocations. Different SNIs get distinct
-// caches so tickets don't cross-contaminate. Size 8 is enough — only the
-// most recent ticket matters for resumption.
-var (
-	sessionCacheMu     sync.Mutex
-	sessionCacheByHost = make(map[string]tls.ClientSessionCache)
+// sessionCache wraps a tls.ClientSessionCache with a last-access timestamp
+// for LRU eviction. The cache itself is goroutine-safe (stdlib guarantee).
+type sessionCache struct {
+	cache      tls.ClientSessionCache
+	lastAccess atomic.Int64 // UnixNano
+}
+
+func (s *sessionCache) touch() {
+	s.lastAccess.Store(time.Now().UnixNano())
+}
+
+const (
+	sessionCacheMaxEntries = 256
+	sessionCacheExpiry     = 30 * time.Minute
 )
 
+var sessionCaches sync.Map // hostname → *sessionCache
+
 func sessionCacheFor(hostname string) tls.ClientSessionCache {
-	sessionCacheMu.Lock()
-	defer sessionCacheMu.Unlock()
-	if c, ok := sessionCacheByHost[hostname]; ok {
-		return c
+	if v, ok := sessionCaches.Load(hostname); ok {
+		sc := v.(*sessionCache)
+		sc.touch()
+		return sc.cache
 	}
-	c := tls.NewLRUClientSessionCache(8)
-	sessionCacheByHost[hostname] = c
-	return c
+	sc := &sessionCache{cache: tls.NewLRUClientSessionCache(8)}
+	sc.touch()
+	if actual, loaded := sessionCaches.LoadOrStore(hostname, sc); loaded {
+		return actual.(*sessionCache).cache
+	}
+	return sc.cache
+}
+
+// PruneSessionCaches removes entries not accessed within sessionCacheExpiry
+// and caps the total at sessionCacheMaxEntries. Called from group Close()
+// or periodically by long-lived services.
+func PruneSessionCaches() {
+	now := time.Now().UnixNano()
+	cutoff := now - int64(sessionCacheExpiry)
+	var count int
+	sessionCaches.Range(func(key, value any) bool {
+		count++
+		sc := value.(*sessionCache)
+		if sc.lastAccess.Load() < cutoff {
+			sessionCaches.Delete(key)
+			count--
+		}
+		return true
+	})
+	if count > sessionCacheMaxEntries {
+		oldest := now
+		var oldestKey any
+		sessionCaches.Range(func(key, value any) bool {
+			sc := value.(*sessionCache)
+			if t := sc.lastAccess.Load(); t < oldest {
+				oldest = t
+				oldestKey = key
+			}
+			return true
+		})
+		if oldestKey != nil {
+			sessionCaches.Delete(oldestKey)
+		}
+	}
 }
 
 // ════════════════ URLTestDetail ════════════════
 
 // URLTestDetail captures per-phase timings for callers that need them
 // (Smart group's recordStats, LightGBM feature extractor, sticky-session
-// signal). All fields measure pure phase duration, never cumulative:
-//
-//	TCPConnectMS   — time inside detour.DialContext. For proxy chains
-//	                 this is "TCP to edge + proxy handshake" since the
-//	                 inner proxy handshake blocks DialContext until the
-//	                 tunnel is up. TLS is NOT included.
-//	TLSHandshakeMS — TLS handshake wall time (read from httptrace).
-//	                 0 for http://, 0 for failed handshakes, 0 when the
-//	                 second (warm) request is the headline since that
-//	                 request reuses the conn.
-//	FirstByteMS    — write_request_done → first response byte. Pure
-//	                 HTTP RTT, no handshake artefacts.
-//	DidResume      — TLS resumption flag from the handshake. Probes of
-//	                 the same SNI benefit from sessionCacheFor and will
-//	                 normally resume on the second probe onwards.
-//	DNSResolveMS   — reserved (always 0 here): proxy chains resolve
-//	                 internally; if we ever own DNS we'll fill this.
-//	TCPRetransmissions / TCPLosses / PathMTU — kernel counters via
-//	                 tcpinfo. Linux + direct-fd only; 0 on other
-//	                 platforms or wrapped conns (proxy stacks hide fd).
+// signal). All fields measure pure phase duration, never cumulative.
 type URLTestDetail struct {
 	TCPConnectMS   int64
 	TLSHandshakeMS int64
@@ -141,52 +166,24 @@ type URLTestDetail struct {
 
 // ════════════════ Public API ════════════════
 
-// URLTest probes link through detour and returns the headline delay in
-// milliseconds. The number respects C.URLTestUnifiedDelay:
-//
-//   - unified_delay = false → cold-conn TTFB (dial + TLS + first byte).
-//     What a browser tab feels on the very first click through this node.
-//   - unified_delay = true  → warm-conn HTTP RTT measured via a second
-//     request on the keep-alive pool, mirroring mihomo's behaviour. This
-//     drops handshake overhead, giving a cross-protocol-comparable number.
-//
-// API kept stable for compatibility — every previous caller still works.
 func URLTest(ctx context.Context, link string, detour N.Dialer) (t uint16, err error) {
 	return URLTestWithDetailAndStatus(ctx, link, detour, nil, nil)
 }
 
-// URLTestWithStatus accepts an explicit StatusMatcher (mihomo
-// expected-status). matcher == nil reverts to the legacy heuristic:
-// strict 204 for /generate_204 endpoints, < 400 elsewhere.
 func URLTestWithStatus(ctx context.Context, link string, detour N.Dialer, matcher *StatusMatcher) (t uint16, err error) {
 	return URLTestWithDetailAndStatus(ctx, link, detour, nil, matcher)
 }
 
-// URLTestWithDetail captures per-phase timings into detail (when non-nil).
-// matcher stays at the legacy heuristic.
 func URLTestWithDetail(ctx context.Context, link string, detour N.Dialer, detail *URLTestDetail) (t uint16, err error) {
 	return URLTestWithDetailAndStatus(ctx, link, detour, detail, nil)
 }
 
-// URLTestWithDetailAndStatus is the canonical probe — every other entry
-// point delegates here.
+// URLTestWithDetailAndStatus is the canonical probe entry point.
 //
-// Implementation notes (and the reason this looks like mihomo):
-//
-// The previous probe wrote raw HTTP/1.1 over a hand-rolled bufio reader
-// stacked on top of `tls.Client(instance, ...)`. That worked for plain
-// TCP-style outbounds but fell over for QUIC-stream proxies (hysteria2,
-// tuic): a fresh stream per probe can't be cleanly torn down without
-// triggering server-side stream-error handling, and the raw `Connection:
-// close` request frame couldn't survive the QUIC half-close semantics on
-// real-world deployments.
-//
-// The fix mirrors mihomo: dial the proxy once, hand the resulting net.Conn
-// back to a stdlib `net/http.Transport`. The Transport speaks HTTP/1.1
-// over the proxy stream, manages keep-alive idempotently, and does not
-// care that the underlying conn is a QUIC stream. As a side effect, we
-// also get the canonical mihomo `unified_delay` semantics (warm-conn
-// second request) for free.
+// Design: dial the proxy once, hand the conn to net/http.Transport for
+// HTTP/1.1 request/response. This works across all protocols (TCP, QUIC
+// streams, WireGuard/gVisor netstack, Tailscale, Shadowsocks+plugins)
+// because they all return net.Conn-compatible objects.
 func URLTestWithDetailAndStatus(ctx context.Context, link string, detour N.Dialer, detail *URLTestDetail, matcher *StatusMatcher) (t uint16, err error) {
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
@@ -214,32 +211,28 @@ func URLTestWithDetailAndStatus(ctx context.Context, link string, detour N.Diale
 	if dialErr != nil {
 		return 0, dialErr
 	}
+	// Ensure conn is always closed. Transport.CloseIdleConnections releases
+	// the Transport's reference first (defer is LIFO), then we close the
+	// underlying conn.
 	defer instance.Close()
 	if detail != nil {
 		detail.TCPConnectMS = time.Since(dialStart).Milliseconds()
 	}
 
-	// ── Phase 2: build a single-shot http.Transport over the proxy conn ──
-	// Transport.DialContext returns `instance` on the first call only.
-	// Subsequent calls (which only happen if the conn dies and Transport
-	// tries to reopen) get an error to break a redial loop — we already
-	// committed the per-probe instance and a fresh dial would burn another
-	// proxy handshake without the caller knowing.
+	// ── Phase 2: build single-shot http.Transport over the proxy conn ──
 	var dialed atomic.Bool
 	transport := &http.Transport{
 		DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
 			if !dialed.CompareAndSwap(false, true) {
-				return nil, errors.New("urltest: only one dial allowed per probe")
+				return nil, errors.New("urltest: conn already consumed; no redial")
 			}
 			return instance, nil
 		},
 		MaxIdleConnsPerHost:   1,
 		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
+		TLSHandshakeTimeout:   C.TCPTimeout,
 		ExpectContinueTimeout: 1 * time.Second,
-		// http/1.1 only — h2 can multiplex streams which doesn't compose
-		// with a per-probe single net.Conn handed back from DialContext.
-		ForceAttemptHTTP2: false,
+		ForceAttemptHTTP2:     false,
 		TLSClientConfig: &tls.Config{
 			ServerName:         hostname,
 			Time:               ntp.TimeFuncFromContext(ctx),
@@ -273,11 +266,6 @@ func URLTestWithDetailAndStatus(ctx context.Context, link string, detour N.Diale
 		return 0, statusErr
 	}
 
-	// `start` is what the headline delay is measured from. unified_delay
-	// = false keeps it at dialStart, so the headline includes the full
-	// cold-conn TTFB. unified_delay = true reassigns it to "just before
-	// the warm second request" if that request succeeds, mirroring
-	// mihomo's measurement boundary.
 	start := dialStart
 	firstByteMS := probe1.firstByteMS()
 
@@ -298,14 +286,11 @@ func URLTestWithDetailAndStatus(ctx context.Context, link string, detour N.Diale
 
 	totalDelay := time.Since(start)
 	t = uint16(totalDelay.Milliseconds())
-	// Sub-ms RTTs collapse to 1; upstream code treats 0 as "failed probe".
 	if t == 0 && totalDelay > 0 {
 		t = 1
 	}
 
 	if detail != nil {
-		// TLS metrics always come from the cold probe — the warm request
-		// reuses the conn so it has no handshake of its own.
 		detail.TLSHandshakeMS = probe1.tlsMS()
 		detail.DidResume = probe1.didResume()
 		detail.FirstByteMS = firstByteMS
@@ -318,14 +303,8 @@ func URLTestWithDetailAndStatus(ctx context.Context, link string, detour N.Diale
 	return
 }
 
-// validateStatus mirrors drainResponse's status-decision logic for the
-// http.Client probe path:
-//
-//   - matcher != nil  → matcher decides; bypasses the captive-portal
-//                       and < 400 heuristic entirely.
-//   - matcher == nil  → strict 204 on /generate_204 endpoints (so a
-//                       captive-portal login page returning 200 fails),
-//                       otherwise < 400 passes, ≥ 400 fails.
+// ════════════════ Status validation ════════════════
+
 func validateStatus(code int, linkURL *url.URL, matcher *StatusMatcher) error {
 	if matcher != nil {
 		if matcher.Match(code) {
@@ -343,19 +322,28 @@ func validateStatus(code int, linkURL *url.URL, matcher *StatusMatcher) error {
 	return nil
 }
 
+func isGenerate204(u *url.URL) bool {
+	if u == nil {
+		return false
+	}
+	p := u.Path
+	return p == "/generate_204" || p == "/gen_204" ||
+		strings.HasSuffix(p, "/generate_204") ||
+		strings.HasSuffix(p, "/gen_204")
+}
+
 // ════════════════ httptrace plumbing ════════════════
 
 // probeTrace records per-request phase timestamps via httptrace. The
 // callbacks may fire from different goroutines (httptrace docs), so
-// timestamps are stored as atomic UnixNano values and the resume flag
-// as atomic.Bool. After client.Do returns, every callback for THIS
-// request has either fired or never will, so the read side is safe.
+// timestamps are stored as atomic values. After client.Do returns,
+// all callbacks have completed — reads are safe without extra sync.
 type probeTrace struct {
-	tlsStartNS   atomic.Int64
-	tlsDoneNS    atomic.Int64
-	wroteAtNS    atomic.Int64
-	firstByteNS  atomic.Int64
-	resume       atomic.Bool
+	tlsStartNS  atomic.Int64
+	tlsDoneNS   atomic.Int64
+	wroteAtNS   atomic.Int64
+	firstByteNS atomic.Int64
+	resume      atomic.Bool
 }
 
 func newProbeTrace() *probeTrace { return &probeTrace{} }
@@ -403,116 +391,7 @@ func (p *probeTrace) firstByteMS() int64 {
 
 func (p *probeTrace) didResume() bool { return p.resume.Load() }
 
-// ════════════════ Legacy helpers (retained for tests + status logic) ════════════════
-//
-// drainResponse / measureRequest / probeHTTP / readerPool / etc. are kept
-// for two reasons:
-//
-//   1. drainResponse encodes the matcher + require-204 + < 400 status
-//      decision tree; the bench/integration tests pin its behaviour and
-//      double as documentation for what "valid response" means.
-//   2. The bufio.Reader pool, residual-body cap, and Peek-deadline guards
-//      are cheap defensive utilities. Even though the http.Client probe
-//      path doesn't use them, leaving the helpers in place means future
-//      raw-conn callers (e.g. a fast-path probe gated to plain TCP
-//      proxies) can reach for them without re-deriving the rules.
-
-const (
-	// bufioSize sized so HEAD response headers fit comfortably.
-	// generate_204 ≈ 400B; 2KB is headroom without bloating the pool
-	// (100 concurrent probes ≈ 200KB resident).
-	bufioSize = 2048
-
-	// maxResidualBody caps how many bytes drainResponse will pull from
-	// a spec-violating HEAD+body response before giving up.
-	maxResidualBody = 64 * 1024
-)
-
-var readerPool = sync.Pool{
-	New: func() any { return bufio.NewReaderSize(nil, bufioSize) },
-}
-
-var errBodyTooLarge = errors.New("urltest: response body exceeds safety limit")
-
-// isGenerate204 reports whether linkURL is a strict generate_204 endpoint
-// (one that REQUIRES HTTP 204). Used to detect captive-portal / ISP /
-// proxy hijacks that return 200/302 with a login page. The check pins the
-// path to canonical Google / Chromium conventions — checking "204" as a
-// substring false-positives on hosts like 204.1.2.3 or paths like
-// /docs/204-error.
-func isGenerate204(u *url.URL) bool {
-	if u == nil {
-		return false
-	}
-	p := u.Path
-	return p == "/generate_204" || p == "/gen_204" ||
-		strings.HasSuffix(p, "/generate_204") ||
-		strings.HasSuffix(p, "/gen_204")
-}
-
-// measureRequest / drainResponse / isHEADRejected / httpStatusError remain
-// for the test surface and for any future raw-conn caller. They are NOT
-// exercised by URLTestWithDetailAndStatus.
-
-func isHEADRejected(err error) bool {
-	if err == nil {
-		return false
-	}
-	if hs, ok := err.(*httpStatusError); ok {
-		return hs.code == http.StatusMethodNotAllowed
-	}
-	return false
-}
-
-func measureRequest(conn net.Conn, reader *bufio.Reader, reqBytes []byte, req *http.Request, peekDeadline time.Time, req204 bool, matcher *StatusMatcher) (time.Duration, error) {
-	_ = conn.SetReadDeadline(peekDeadline)
-	defer conn.SetReadDeadline(time.Time{})
-
-	writeStart := time.Now()
-	if _, err := conn.Write(reqBytes); err != nil {
-		return 0, err
-	}
-	if _, err := reader.Peek(1); err != nil {
-		return 0, err
-	}
-	rtt := time.Since(writeStart)
-	if err := drainResponse(reader, req, req204, matcher); err != nil {
-		return rtt, err
-	}
-	return rtt, nil
-}
-
-func drainResponse(reader *bufio.Reader, req *http.Request, require204 bool, matcher *StatusMatcher) error {
-	resp, err := http.ReadResponse(reader, req)
-	if err != nil {
-		return err
-	}
-	if cl := resp.ContentLength; cl > 0 {
-		if cl > maxResidualBody {
-			return errBodyTooLarge
-		}
-		if _, err = io.CopyN(io.Discard, reader, cl); err != nil {
-			return err
-		}
-	}
-	_, _ = io.Copy(io.Discard, resp.Body)
-	_ = resp.Body.Close()
-
-	if matcher != nil {
-		if matcher.Match(resp.StatusCode) {
-			return nil
-		}
-		return errors.New("urltest: status " + strconv.Itoa(resp.StatusCode) +
-			" not in expected-status=" + matcher.String())
-	}
-	if require204 && resp.StatusCode != 204 {
-		return errors.New("urltest: captive-portal or hijack detected (expected 204, got " + strconv.Itoa(resp.StatusCode) + ")")
-	}
-	if resp.StatusCode >= 400 {
-		return &httpStatusError{resp.StatusCode}
-	}
-	return nil
-}
+// ════════════════ Error types ════════════════
 
 type httpStatusError struct{ code int }
 
@@ -522,4 +401,14 @@ func (e *httpStatusError) Error() string {
 		byte((e.code/10)%10) + '0',
 		byte(e.code%10) + '0',
 	})
+}
+
+func IsHEADRejected(err error) bool {
+	if err == nil {
+		return false
+	}
+	if hs, ok := err.(*httpStatusError); ok {
+		return hs.code == http.StatusMethodNotAllowed
+	}
+	return false
 }
