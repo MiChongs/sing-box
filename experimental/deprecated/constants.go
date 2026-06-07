@@ -162,6 +162,14 @@ var OptionLegacyProviderDownloadDetour = Note{
 	EnvName:           "LEGACY_PROVIDER_DOWNLOAD_DETOUR",
 }
 
+var OptionLegacyTailscaleEndpointDialer = Note{
+	Name:              "legacy-tailscale-endpoint-dialer",
+	Description:       "legacy dialer options in tailscale endpoint, use control_http_client instead",
+	DeprecatedVersion: "1.14.0",
+	ScheduledVersion:  "1.16.0",
+	EnvName:           "LEGACY_TAILSCALE_ENDPOINT_DIALER",
+}
+
 var OptionImplicitDefaultHTTPClient = Note{
 	Name:              "implicit-default-http-client",
 	Description:       "implicit default HTTP client using default outbound for remote rule-sets",
@@ -183,5 +191,6 @@ var Options = []Note{
 	OptionStoreRDRC,
 	OptionLegacyClashAPIExternalUIDownloadDetour,
 	OptionLegacyProviderDownloadDetour,
+	OptionLegacyTailscaleEndpointDialer,
 	OptionImplicitDefaultHTTPClient,
 }

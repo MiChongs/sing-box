@@ -25,9 +25,12 @@ import (
 	"github.com/sagernet/gvisor/pkg/tcpip/transport/icmp"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/endpoint"
+	"crypto/tls"
+
 	"github.com/sagernet/sing-box/common/dialer"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
+	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/tailscale/tailssh"
@@ -42,6 +45,7 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/ntp"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 	tailscaleroot "github.com/sagernet/tailscale"
@@ -130,7 +134,6 @@ type Endpoint struct {
 	systemInterfaceGSO  bool
 	systemInterfaceMTU  uint32
 	keyAuth             bool
-	serverStarted       bool
 	started             atomic.Bool
 	systemTun           tun.Tun
 	systemDialer        *dialer.DefaultDialer
@@ -633,9 +636,9 @@ func (t *Endpoint) Close() error {
 	t.started.Store(false)
 	common.Close(common.PtrOrNil(t.sshServerInstance))
 	t.sshServerInstance = nil
-	if t.serverStarted {
+	if t.serverStarted.Load() {
 		err = common.Close(common.PtrOrNil(t.server))
-		t.serverStarted = false
+		t.serverStarted.Store(false)
 	}
 	netmon.RegisterInterfaceGetter(nil)
 	netns.SetControlFunc(nil)
