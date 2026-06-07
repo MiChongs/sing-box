@@ -63,7 +63,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		if err != nil {
 			return nil, E.Cause(err, "inner domain resolver")
 		}
-		outbound.innerDNSQueryOptions = *innerDNSOpts
+		outbound.innerDNSQueryOptions = innerDNSOpts
 	}
 	uotOptions := common.PtrValueOrDefault(options.UDPOverTCP)
 	if uotOptions.Enabled {

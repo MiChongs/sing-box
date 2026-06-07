@@ -34,10 +34,11 @@ import (
 var _ adapter.NetworkManager = (*NetworkManager)(nil)
 
 type NetworkManager struct {
-	logger            logger.ContextLogger
-	interfaceFinder   *control.DefaultInterfaceFinder
-	networkInterfaces common.TypedValue[[]adapter.NetworkInterface]
-
+	ctx                    context.Context
+	logger                 logger.ContextLogger
+	router                 adapter.Router
+	interfaceFinder        *control.DefaultInterfaceFinder
+	networkInterfaces      common.TypedValue[[]adapter.NetworkInterface]
 	autoDetectInterface    bool
 	defaultOptions         adapter.NetworkOptions
 	autoRedirectOutputMark uint32
@@ -101,6 +102,7 @@ func NewNetworkManager(ctx context.Context, logger logger.ContextLogger, options
 		return nil, E.New("`default_mark` is only supported on linux")
 	}
 	nm := &NetworkManager{
+		ctx:                 ctx,
 		logger:              logger,
 		interfaceFinder:     control.NewDefaultInterfaceFinder(),
 		autoDetectInterface: options.AutoDetectInterface,
@@ -169,6 +171,7 @@ func (r *NetworkManager) Start(stage adapter.StartStage) error {
 	monitor := taskmonitor.New(r.logger, C.StartTimeout)
 	switch stage {
 	case adapter.StartStateInitialize:
+		r.router = service.FromContext[adapter.Router](r.ctx)
 		if r.networkMonitor != nil {
 			monitor.Start("initialize network monitor")
 			err := r.networkMonitor.Start()
@@ -531,18 +534,7 @@ func (r *NetworkManager) ResetNetwork() {
 		}
 	}
 
-	r.resetCallbackAccess.Lock()
-	callbacks := r.resetCallbacks
-	r.resetCallbackAccess.Unlock()
-	for _, callback := range callbacks {
-		callback()
-	}
-}
-
-func (r *NetworkManager) RegisterNetworkResetCallback(callback func()) {
-	r.resetCallbackAccess.Lock()
-	defer r.resetCallbackAccess.Unlock()
-	r.resetCallbacks = append(r.resetCallbacks, callback)
+	r.router.ResetNetwork()
 }
 
 func (r *NetworkManager) notifyInterfaceUpdate(defaultInterface *control.Interface, flags int) {

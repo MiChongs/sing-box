@@ -18,19 +18,19 @@ import (
 var _ adapter.ProviderManager = (*Manager)(nil)
 
 type Manager struct {
-	logger                log.ContextLogger
-	registry              adapter.ProviderRegistry
-	access                sync.Mutex
-	started               bool
-	stage                 adapter.StartStage
-	startContextTriggered bool
-	providers             []adapter.Provider
-	providerByTag         map[string]adapter.Provider
-	wg                    sync.WaitGroup
+	ctx           context.Context
+	logger        log.ContextLogger
+	registry      adapter.ProviderRegistry
+	access        sync.Mutex
+	started       bool
+	stage         adapter.StartStage
+	providers     []adapter.Provider
+	providerByTag map[string]adapter.Provider
 }
 
-func NewManager(logger logger.ContextLogger, registry adapter.ProviderRegistry) *Manager {
+func NewManager(ctx context.Context, logger logger.ContextLogger, registry adapter.ProviderRegistry) *Manager {
 	return &Manager{
+		ctx:           ctx,
 		logger:        logger,
 		registry:      registry,
 		providerByTag: make(map[string]adapter.Provider),
@@ -40,23 +40,6 @@ func NewManager(logger logger.ContextLogger, registry adapter.ProviderRegistry) 
 func (m *Manager) Initialize() {
 }
 
-// StartContext 的触发时机 = provider 出现在 box.Start 的哪个 stage。
-// upstream 9ffd1b8f7 (Start DNS transports before providers) 把 provider
-// 从 StartStateStart 挪到 StartStatePostStart，为了让 DNS transport 先起
-// 以便 provider 初次 fetch 订阅时能解析域名。但原 Manager.Start 只在
-// stage==StartStateStart 时 spawn StartContext，结果 provider 的
-// httpClient 永远不初始化 — 用户运行时任何 /providers/proxies/{tag}/update
-// 都会 NPE 崩溃。
-//
-// 修复：startContextTriggered 原子位保证 StartContext 只跑一次，不论 box.go
-// 把 provider 放在哪个 stage。首次触发发生在第一个 stage == Start 或
-// PostStart 时（两个 stage 都先于 Started，覆盖了所有合理的 box 流程）。
-// 放在 Started 就太晚了：Manager.Create 会在 stage>=Start 时为新建 provider
-// 同步调 StartContext，若 Started 之前都没 trigger，startup 完成后 provider
-// 全是 nil httpClient 状态。
-//
-// 可能的退路：upstream 未来如果把 provider 放回 StartStateStart，本版本
-// 仍然兼容 — 先触发的 stage 胜出，第二次调用 Start(PostStart) 不重复跑。
 func (m *Manager) Start(stage adapter.StartStage) error {
 	m.access.Lock()
 	if m.started && m.stage >= stage {
@@ -65,43 +48,21 @@ func (m *Manager) Start(stage adapter.StartStage) error {
 	m.started = true
 	m.stage = stage
 	providers := m.providers
-	alreadyTriggered := m.startContextTriggered
-	if !alreadyTriggered && (stage == adapter.StartStateStart || stage == adapter.StartStatePostStart) {
-		m.startContextTriggered = true
-	}
 	m.access.Unlock()
-	shouldTrigger := !alreadyTriggered &&
-		(stage == adapter.StartStateStart || stage == adapter.StartStatePostStart) &&
-		len(providers) > 0
-	if shouldTrigger {
+	if stage == adapter.StartStateStart && len(providers) > 0 {
 		startContext := adapter.NewHTTPStartContext()
 		defer startContext.Close()
-		var wg sync.WaitGroup
-		var startErr error
-		var errOnce sync.Once
 		for _, provider := range providers {
-			contextStarter, ok := provider.(interface {
+			if contextStarter, ok := provider.(interface {
 				StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
-			})
-			if !ok {
-				continue
-			}
-			wg.Add(1)
-			go func(p adapter.Provider, starter interface {
-				StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
-			}) {
-				defer wg.Done()
-				if err := starter.StartContext(context.Background(), startContext); err != nil {
-					errOnce.Do(func() {
-						startErr = E.Cause(err, stage, " provider/", p.Type(), "[", p.Tag(), "]")
-					})
+			}); ok {
+				err := contextStarter.StartContext(m.ctx, startContext)
+				if err != nil {
+					return E.Cause(err, stage, " provider/", provider.Type(), "[", provider.Tag(), "]")
 				}
-			}(provider, contextStarter)
+			}
 		}
-		wg.Wait()
-		if startErr != nil {
-			return startErr
-		}
+		return nil
 	}
 	return nil
 }
@@ -182,7 +143,9 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory 
 			if contextStarter, ok := provider.(interface {
 				StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
 			}); ok {
-				err = contextStarter.StartContext(context.Background(), nil)
+				startContext := adapter.NewHTTPStartContext()
+				err = contextStarter.StartContext(m.ctx, startContext)
+				startContext.Close()
 				if err != nil {
 					return E.Cause(err, "start provider/", provider.Type(), "[", provider.Tag(), "]")
 				}

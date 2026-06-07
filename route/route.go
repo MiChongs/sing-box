@@ -31,7 +31,7 @@ import (
 
 // Deprecated: use RouteConnectionEx instead.
 func (r *Router) RouteConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
-	done := make(chan interface{})
+	done := make(chan any)
 	err := r.routeConnection(ctx, conn, metadata, N.OnceClose(func(it error) {
 		close(done)
 	}))
@@ -87,6 +87,10 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 		return E.New("global UoT not supported since sing-box v1.7.0.")
 	case uot.LegacyMagicAddress:
 		return E.New("global UoT (legacy) not supported since sing-box v1.7.0.")
+	}
+	if metadata.InboundType == C.TypeTun && metadata.Protocol == C.ProtocolDNS {
+		N.CloseOnHandshakeFailure(conn, onClose, r.hijackDNSStream(ctx, conn, metadata))
+		return nil
 	}
 	if deadline.NeedAdditionalReadDeadline(conn) {
 		conn = deadline.NewConn(conn)
@@ -162,7 +166,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 }
 
 func (r *Router) RoutePacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) error {
-	done := make(chan interface{})
+	done := make(chan any)
 	err := r.routePacketConnection(ctx, conn, metadata, N.OnceClose(func(it error) {
 		close(done)
 	}))
@@ -220,6 +224,9 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	/*if deadline.NeedAdditionalReadDeadline(conn) {
 		conn = deadline.NewPacketConn(bufio.NewNetPacketConn(conn))
 	}*/
+	if metadata.InboundType == C.TypeTun && metadata.Protocol == C.ProtocolDNS {
+		return r.hijackDNSPacket(ctx, conn, nil, metadata, onClose)
+	}
 	selectedRule, _, _, packetBuffers, err := r.matchRule(ctx, &metadata, false, false, nil, conn)
 	if err != nil {
 		return err
@@ -495,6 +502,10 @@ match:
 			routeOptions = &action.RuleActionRouteOptions
 		case *R.RuleActionRouteOptions:
 			routeOptions = action
+		case *R.RuleActionBypass:
+			if action.Outbound != "" {
+				routeOptions = &action.RuleActionRouteOptions
+			}
 		}
 		if routeOptions != nil {
 			// TODO: add nat
@@ -543,6 +554,10 @@ match:
 			}
 			if routeOptions.TLSRecordFragment {
 				metadata.TLSRecordFragment = true
+			}
+			if routeOptions.TLSSpoof != "" {
+				metadata.TLSSpoof = routeOptions.TLSSpoof
+				metadata.TLSSpoofMethod = routeOptions.TLSSpoofMethod
 			}
 		}
 		switch action := currentRule.Action().(type) {
@@ -678,6 +693,7 @@ func (r *Router) actionSniff(
 			packetSniffers = []sniff.PacketSniffer{
 				sniff.DomainNameQuery,
 				sniff.QUICClientHello,
+				sniff.QUICShortHeader,
 				sniff.STUNMessage,
 				sniff.UTP,
 				sniff.UDPTracker,
@@ -773,6 +789,16 @@ func (r *Router) actionSniff(
 		}
 	finally:
 		if err == nil {
+			if metadata.Protocol == C.ProtocolQUIC {
+				if metadata.SniffHost != "" {
+					r.cacheQUICSniff(metadata.Source, metadata.Destination, metadata.SniffHost)
+				} else {
+					if sniffHost, ok := r.lookupQUICSniff(metadata.Source, metadata.Destination); ok {
+						metadata.SniffHost = sniffHost
+						r.logger.DebugContext(ctx, "restored QUIC SNI from cache: ", sniffHost)
+					}
+				}
+			}
 			if metadata.SniffHost != "" && metadata.Client != "" {
 				r.logger.DebugContext(ctx, "sniffed packet protocol: ", metadata.Protocol, ", domain: ", metadata.SniffHost, ", client: ", metadata.Client)
 			} else if metadata.SniffHost != "" {

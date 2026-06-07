@@ -43,6 +43,7 @@ type Inbound struct {
 	logger                      log.ContextLogger
 	tunOptions                  tun.Options
 	udpTimeout                  time.Duration
+	dnsHijackAddress            []netip.Addr
 	stack                       string
 	tunIf                       tun.Tun
 	tunStack                    tun.Stack
@@ -192,6 +193,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			GSO:                                   enableGSO,
 			Inet4Address:                          inet4Address,
 			Inet6Address:                          inet6Address,
+			DNSMode:                               options.DNSMode,
+			DNSAddress:                            options.DNSAddress,
 			AutoRoute:                             options.AutoRoute,
 			IPRoute2TableIndex:                    tableIndex,
 			IPRoute2RuleIndex:                     ruleIndex,
@@ -315,6 +318,12 @@ func (t *Inbound) Tag() string {
 
 func (t *Inbound) Start(stage adapter.StartStage) error {
 	switch stage {
+	case adapter.StartStateInitialize:
+		if t.tunOptions.DNSModeOrDefault() != tun.DNSModeDisabled && len(t.tunOptions.DNSAddress) == 0 {
+			inet4DNSAddress, _ := t.tunOptions.Inet4DNSAddress()
+			inet6DNSAddress, _ := t.tunOptions.Inet6DNSAddress()
+			t.dnsHijackAddress = append(inet4DNSAddress, inet6DNSAddress...)
+		}
 	case adapter.StartStateStart:
 		if C.IsAndroid && t.platformInterface == nil {
 			t.tunOptions.BuildAndroidRules(t.networkManager.PackageManager())
@@ -378,9 +387,6 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 		if t.platformInterface != nil && t.platformInterface.UsePlatformInterface() {
 			tunInterface, err = t.platformInterface.OpenInterface(&tunOptions, t.platformOptions)
 		} else {
-			if HookBeforeCreatePlatformInterface != nil {
-				HookBeforeCreatePlatformInterface()
-			}
 			tunInterface, err = tun.New(tunOptions)
 		}
 		monitor.Finish()
@@ -403,6 +409,7 @@ func (t *Inbound) Start(stage adapter.StartStage) error {
 			Tun:                    tunInterface,
 			TunOptions:             t.tunOptions,
 			UDPTimeout:             t.udpTimeout,
+			ICMPTimeout:            C.ICMPTimeout,
 			Handler:                t,
 			Logger:                 t.logger,
 			ForwarderBindInterface: forwarderBindInterface,
@@ -523,9 +530,17 @@ func (t *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.S
 	metadata.InboundType = C.TypeTun
 	metadata.Source = source
 	metadata.Destination = destination
-
-	t.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
-	t.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
+	for _, dnsHijackAddress := range t.dnsHijackAddress {
+		if destination.Addr == dnsHijackAddress {
+			metadata.Protocol = C.ProtocolDNS
+		}
+	}
+	if metadata.Protocol == C.ProtocolDNS {
+		t.logger.InfoContext(ctx, "inbound DNS connection from ", metadata.Source)
+	} else {
+		t.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
+		t.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
+	}
 	t.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -536,9 +551,17 @@ func (t *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, 
 	metadata.InboundType = C.TypeTun
 	metadata.Source = source
 	metadata.Destination = destination
-
-	t.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
-	t.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
+	for _, dnsHijackAddress := range t.dnsHijackAddress {
+		if destination.Addr == dnsHijackAddress {
+			metadata.Protocol = C.ProtocolDNS
+		}
+	}
+	if metadata.Protocol == C.ProtocolDNS {
+		t.logger.InfoContext(ctx, "inbound DNS packet connection from ", metadata.Source)
+	} else {
+		t.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
+		t.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
+	}
 	t.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }
 
@@ -581,9 +604,17 @@ func (t *autoRedirectHandler) NewConnectionEx(ctx context.Context, conn net.Conn
 	metadata.InboundType = C.TypeRedirect
 	metadata.Source = source
 	metadata.Destination = destination
-
-	t.logger.InfoContext(ctx, "inbound redirect connection from ", metadata.Source)
-	t.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
+	for _, dnsHijackAddress := range t.dnsHijackAddress {
+		if destination.Addr == dnsHijackAddress {
+			metadata.Protocol = C.ProtocolDNS
+		}
+	}
+	if metadata.Protocol == C.ProtocolDNS {
+		t.logger.InfoContext(ctx, "inbound redirect DNS connection from ", metadata.Source)
+	} else {
+		t.logger.InfoContext(ctx, "inbound redirect connection from ", metadata.Source)
+		t.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
+	}
 	t.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 

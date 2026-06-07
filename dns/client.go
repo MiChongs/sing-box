@@ -30,14 +30,6 @@ var (
 
 var _ adapter.DNSClient = (*Client)(nil)
 
-func rotateSlice[T any](slice []T, steps int32) []T {
-	if len(slice) <= 1 {
-		return slice
-	}
-	steps = steps % int32(len(slice))
-	return append(slice[steps:], slice[:steps]...)
-}
-
 func reverseRotateSlice[T any](slice []T, steps int32) []T {
 	if len(slice) <= 1 {
 		return slice
@@ -57,8 +49,8 @@ func removeAnswersOfType(answers []dns.RR, rrType uint16) []dns.RR {
 }
 
 type dnsMsg struct {
-	ipv4Index int32
-	ipv6Index int32
+	ipv4Index atomic.Int32
+	ipv6Index atomic.Int32
 	msg       *dns.Msg
 }
 
@@ -76,8 +68,8 @@ func (dm *dnsMsg) applyRoundRobin(msg *dns.Msg) {
 		}
 	}
 	if len(ipv4Answers) > 1 {
-		newIndex := (atomic.AddInt32(&dm.ipv4Index, 1) % int32(len(ipv4Answers)))
-		atomic.StoreInt32(&dm.ipv4Index, newIndex)
+		newIndex := (dm.ipv4Index.Add(1) % int32(len(ipv4Answers)))
+		dm.ipv4Index.Store(newIndex)
 		rotatedIPv4 := reverseRotateSlice(ipv4Answers, newIndex)
 		msg.Answer = removeAnswersOfType(msg.Answer, dns.TypeA)
 		for _, ipv4 := range rotatedIPv4 {
@@ -85,8 +77,8 @@ func (dm *dnsMsg) applyRoundRobin(msg *dns.Msg) {
 		}
 	}
 	if len(ipv6Answers) > 1 {
-		newIndex := (atomic.AddInt32(&dm.ipv6Index, 1) % int32(len(ipv6Answers)))
-		atomic.StoreInt32(&dm.ipv6Index, newIndex)
+		newIndex := (dm.ipv6Index.Add(1) % int32(len(ipv6Answers)))
+		dm.ipv6Index.Store(newIndex)
 		rotatedIPv6 := reverseRotateSlice(ipv6Answers, newIndex)
 		msg.Answer = removeAnswersOfType(msg.Answer, dns.TypeAAAA)
 		for _, ipv6 := range rotatedIPv6 {
@@ -140,10 +132,7 @@ type ClientOptions struct {
 }
 
 func NewClient(options ClientOptions) *Client {
-	cacheCapacity := options.CacheCapacity
-	if cacheCapacity < 1024 {
-		cacheCapacity = 1024
-	}
+	cacheCapacity := max(options.CacheCapacity, 1024)
 	client := &Client{
 		ctx:               options.Context,
 		timeout:           options.Timeout,
@@ -364,9 +353,10 @@ func (c *Client) Lookup(ctx context.Context, transport adapter.DNSTransport, dom
 	if options.LookupStrategy != C.DomainStrategyAsIS {
 		lookupOptions.Strategy = strategy
 	}
-	if strategy == C.DomainStrategyIPv4Only {
+	switch strategy {
+	case C.DomainStrategyIPv4Only:
 		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeA, lookupOptions, responseChecker)
-	} else if strategy == C.DomainStrategyIPv6Only {
+	case C.DomainStrategyIPv6Only:
 		return c.lookupToExchange(ctx, transport, dnsName, dns.TypeAAAA, lookupOptions, responseChecker)
 	}
 	var response4 []netip.Addr
@@ -533,10 +523,7 @@ func (c *Client) loadResponse(question dns.Question, transport adapter.DNSTransp
 		c.cache.Remove(key)
 		return nil, 0, false
 	}
-	nowTTL := int(expireAt.Sub(timeNow).Seconds())
-	if nowTTL < 0 {
-		nowTTL = 0
-	}
+	nowTTL := max(int(expireAt.Sub(timeNow).Seconds()), 0)
 	response := c.getRoundRobin(cached)
 	normalizeTTL(response, uint32(nowTTL))
 	return response, nowTTL, false
@@ -567,10 +554,7 @@ func (c *Client) loadPersistentResponse(question dns.Question, transport adapter
 		}
 		return nil, 0, false
 	}
-	nowTTL := int(expireAt.Sub(timeNow).Seconds())
-	if nowTTL < 0 {
-		nowTTL = 0
-	}
+	nowTTL := max(int(expireAt.Sub(timeNow).Seconds()), 0)
 	normalizeTTL(response, uint32(nowTTL))
 	return response, nowTTL, false
 }
@@ -592,13 +576,7 @@ func (c *Client) applyResponseOptions(question dns.Question, response *dns.Msg, 
 			https.SVCB = content
 		}
 	}
-	timeToLive := computeTimeToLive(response)
-	if timeToLive < c.minCacheTTL {
-		timeToLive = c.minCacheTTL
-	}
-	if timeToLive > c.maxCacheTTL {
-		timeToLive = c.maxCacheTTL
-	}
+	timeToLive := min(max(computeTimeToLive(response), c.minCacheTTL), c.maxCacheTTL)
 	if options.RewriteTTL != nil {
 		timeToLive = *options.RewriteTTL
 	}
@@ -692,18 +670,6 @@ func MessageToAddresses(response *dns.Msg) []netip.Addr {
 	return adapter.DNSResponseAddresses(response)
 }
 
-func wrapError(err error) error {
-	switch dnsErr := err.(type) {
-	case *net.DNSError:
-		if dnsErr.IsNotFound {
-			return RcodeNameError
-		}
-	case *net.AddrError:
-		return RcodeNameError
-	}
-	return err
-}
-
 type transportKey struct{}
 
 func contextWithTransportTag(ctx context.Context, transportTag string) context.Context {
@@ -713,6 +679,29 @@ func contextWithTransportTag(ctx context.Context, transportTag string) context.C
 func transportTagFromContext(ctx context.Context) (string, bool) {
 	value, loaded := ctx.Value(transportKey{}).(string)
 	return value, loaded
+}
+
+type aliasChainContextKey struct{}
+
+func ContextWithAliasResolution(ctx context.Context, source, target string) (context.Context, bool) {
+	if source == target {
+		return ctx, true
+	}
+	var chain map[string]struct{}
+	if existing, ok := ctx.Value(aliasChainContextKey{}).(map[string]struct{}); ok {
+		if _, found := existing[target]; found {
+			return ctx, true
+		}
+		chain = make(map[string]struct{}, len(existing)+2)
+		for k := range existing {
+			chain[k] = struct{}{}
+		}
+	} else {
+		chain = make(map[string]struct{}, 2)
+	}
+	chain[source] = struct{}{}
+	chain[target] = struct{}{}
+	return context.WithValue(ctx, aliasChainContextKey{}, chain), false
 }
 
 func FixedResponseStatus(message *dns.Msg, rcode int) *dns.Msg {

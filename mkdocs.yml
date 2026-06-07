@@ -93,6 +93,7 @@ nav:
               - HTTPS: configuration/dns/server/https.md
               - HTTP3: configuration/dns/server/http3.md
               - DHCP: configuration/dns/server/dhcp.md
+              - mDNS: configuration/dns/server/mdns.md
               - FakeIP: configuration/dns/server/fakeip.md
               - Tailscale: configuration/dns/server/tailscale.md
               - Resolved: configuration/dns/server/resolved.md
@@ -150,6 +151,7 @@ nav:
           - SOCKS: configuration/inbound/socks.md
           - HTTP: configuration/inbound/http.md
           - Shadowsocks: configuration/inbound/shadowsocks.md
+          - Snell: configuration/inbound/snell.md
           - VMess: configuration/inbound/vmess.md
           - Trojan: configuration/inbound/trojan.md
           - Naive: configuration/inbound/naive.md
@@ -170,6 +172,7 @@ nav:
           - SOCKS: configuration/outbound/socks.md
           - HTTP: configuration/outbound/http.md
           - Shadowsocks: configuration/outbound/shadowsocks.md
+          - Snell: configuration/outbound/snell.md
           - VMess: configuration/outbound/vmess.md
           - Trojan: configuration/outbound/trojan.md
           - Naive: configuration/outbound/naive.md
@@ -196,6 +199,7 @@ nav:
           - SSM API: configuration/service/ssm-api.md
           - CCM: configuration/service/ccm.md
           - OCM: configuration/service/ocm.md
+          - Hysteria Realm: configuration/service/hysteria-realm.md
 markdown_extensions:
   - toc:
       slugify: !!python/object/apply:pymdownx.slugs.slugify

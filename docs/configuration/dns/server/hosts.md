@@ -55,6 +55,8 @@ Example:
 
 Predefined hosts.
 
+Each entry maps a domain name to either one or more IP addresses, or another domain name (alias).
+
 Example:
 
 ```json
@@ -64,7 +66,8 @@ Example:
     "localhost": [
       "127.0.0.1",
       "::1"
-    ]
+    ],
+    "alias.example.com": "www.real-target.com"
   }
 }
 ```
@@ -89,13 +92,9 @@ Example:
             ],
             "rules": [
               {
-                "action": "evaluate",
+                "preferred_by": "hosts",
+                "action": "route",
                 "server": "hosts"
-              },
-              {
-                "match_response": true,
-                "ip_accept_any": true,
-                "action": "respond"
               }
             ]
           }

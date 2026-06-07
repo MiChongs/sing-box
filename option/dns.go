@@ -148,9 +148,47 @@ func (o *DNSServerAddressOptions) ReplaceServerOptions(options ServerOptions) {
 	*o = DNSServerAddressOptions(options)
 }
 
+type HostsDNSPredefinedValue struct {
+	Addresses []netip.Addr
+	Domain    string
+}
+
+func (v HostsDNSPredefinedValue) MarshalJSON() ([]byte, error) {
+	if v.Domain != "" {
+		return json.Marshal(v.Domain)
+	}
+	switch len(v.Addresses) {
+	case 0:
+		return json.Marshal(nil)
+	case 1:
+		return json.Marshal(v.Addresses[0])
+	default:
+		return json.Marshal(v.Addresses)
+	}
+}
+
+func (v *HostsDNSPredefinedValue) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		addr, parseErr := netip.ParseAddr(s)
+		if parseErr == nil {
+			v.Addresses = []netip.Addr{addr}
+		} else {
+			v.Domain = s
+		}
+		return nil
+	}
+	var addrs []netip.Addr
+	if err := json.Unmarshal(data, &addrs); err == nil {
+		v.Addresses = addrs
+		return nil
+	}
+	return E.New("invalid predefined value: expected IP address(es) or domain name")
+}
+
 type HostsDNSServerOptions struct {
-	Path       badoption.Listable[string]                                `json:"path,omitempty"`
-	Predefined *badjson.TypedMap[string, badoption.Listable[netip.Addr]] `json:"predefined,omitempty"`
+	Path       badoption.Listable[string]                         `json:"path,omitempty"`
+	Predefined *badjson.TypedMap[string, HostsDNSPredefinedValue] `json:"predefined,omitempty"`
 }
 
 type RawLocalDNSServerOptions struct {
@@ -159,7 +197,8 @@ type RawLocalDNSServerOptions struct {
 
 type LocalDNSServerOptions struct {
 	RawLocalDNSServerOptions
-	PreferGo bool `json:"prefer_go,omitempty"`
+	PreferGo       bool                       `json:"prefer_go,omitempty"`
+	NeighborDomain badoption.Listable[string] `json:"neighbor_domain,omitempty"`
 }
 
 type RemoteDNSServerOptions struct {
@@ -226,4 +265,9 @@ type FakeIPDNSServerOptions struct {
 type DHCPDNSServerOptions struct {
 	LocalDNSServerOptions
 	Interface string `json:"interface,omitempty"`
+}
+
+type MDNSDNSServerOptions struct {
+	LocalDNSServerOptions
+	Interface badoption.Listable[string] `json:"interface,omitempty"`
 }

@@ -1,9 +1,6 @@
 package libbox
 
-import (
-	C "github.com/sagernet/sing-box/constant"
-	"github.com/sagernet/sing-box/option"
-)
+import C "github.com/sagernet/sing-box/constant"
 
 type PlatformInterface interface {
 	LocalDNSTransport() LocalDNSTransport
@@ -24,6 +21,31 @@ type PlatformInterface interface {
 	StartNeighborMonitor(listener NeighborUpdateListener) error
 	CloseNeighborMonitor(listener NeighborUpdateListener) error
 	RegisterMyInterface(name string)
+	UsePlatformShell() bool
+	CheckPlatformShell() error
+	OpenShellSession(user *PlatformUser, command string, environ StringIterator, term string, rows int32, cols int32) (ShellSession, error)
+	LookupUser(username string) (*PlatformUser, error)
+	LookupSFTPServer() (string, error)
+	ReadSystemSSHHostKey() (string, error)
+	TailscaleHostname() string
+}
+
+type PlatformUser struct {
+	Username string
+	Uid      int32
+	Gid      int32
+	HomeDir  string
+	Shell    string
+
+	groups []int32
+}
+
+func (u *PlatformUser) SetGroups(groups Int32Iterator) {
+	u.groups = iteratorToArray[int32](groups)
+}
+
+func (u *PlatformUser) Groups() Int32Iterator {
+	return newIterator(u.groups)
 }
 
 type NeighborUpdateListener interface {
@@ -104,38 +126,4 @@ type OnDemandRule interface {
 type OnDemandRuleIterator interface {
 	Next() OnDemandRule
 	HasNext() bool
-}
-
-type onDemandRule struct {
-	option.OnDemandRule
-}
-
-func (r *onDemandRule) Target() int32 {
-	if r.OnDemandRule.Action == nil {
-		return -1
-	}
-	return int32(*r.OnDemandRule.Action)
-}
-
-func (r *onDemandRule) DNSSearchDomainMatch() StringIterator {
-	return newIterator(r.OnDemandRule.DNSSearchDomainMatch)
-}
-
-func (r *onDemandRule) DNSServerAddressMatch() StringIterator {
-	return newIterator(r.OnDemandRule.DNSServerAddressMatch)
-}
-
-func (r *onDemandRule) InterfaceTypeMatch() int32 {
-	if r.OnDemandRule.InterfaceTypeMatch == nil {
-		return -1
-	}
-	return int32(*r.OnDemandRule.InterfaceTypeMatch)
-}
-
-func (r *onDemandRule) SSIDMatch() StringIterator {
-	return newIterator(r.OnDemandRule.SSIDMatch)
-}
-
-func (r *onDemandRule) ProbeURL() string {
-	return r.OnDemandRule.ProbeURL
 }

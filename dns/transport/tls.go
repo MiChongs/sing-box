@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
+	"github.com/sagernet/sing/common/bufio/deadline"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -21,6 +22,8 @@ import (
 )
 
 var _ adapter.DNSTransport = (*TLSTransport)(nil)
+
+const tlsDNSMaxInflight = 8
 
 func RegisterTLS(registry *dns.TransportRegistry) {
 	dns.RegisterTransport[option.RemoteTLSDNSServerOptions](registry, C.DNSTypeTLS, NewTLS)
@@ -69,10 +72,7 @@ func NewTLS(ctx context.Context, logger log.ContextLogger, tag string, options o
 		}
 		poolIdleTimeout = keepAliveIdle + keepAliveInterval
 	}
-	maxQueries := options.MaxQueries
-	if maxQueries <= 0 {
-		maxQueries = 0
-	}
+	maxQueries := max(options.MaxQueries, 0)
 	if !options.Pipeline && maxQueries > 0 {
 		maxQueries = 0
 	}
@@ -91,7 +91,7 @@ func NewTLSRaw(_ context.Context, logger logger.ContextLogger, adapter dns.Trans
 			idleTimeout:      idleTimeout,
 			disableKeepAlive: disableKeepAlive,
 			maxQueries:       maxQueries,
-			connections:      newReuseableDNSConnPool(),
+			connections:      newReuseableDNSConnPool(tlsDNSMaxInflight),
 		},
 	}
 }
@@ -125,7 +125,7 @@ func (t *TLSTransport) createNewConnection(ctx context.Context, message *mDNS.Ms
 		if t.disableKeepAlive {
 			connIdleTimeout = t.idleTimeout
 		}
-		return newReuseableDNSConn(tlsConn, t.logger, t.enablePipeline, connIdleTimeout, t.maxQueries, t.connections, t), nil
+		return newReuseableDNSConn(tlsConn, t.logger, t.enablePipeline, connIdleTimeout, t.maxQueries, t.connections, t, deadline.NeedAdditionalReadDeadline(tlsConn.NetConn())), nil
 	})
 	if err != nil {
 		return nil, err

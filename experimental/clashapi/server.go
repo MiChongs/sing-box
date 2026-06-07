@@ -44,6 +44,7 @@ var _ adapter.ClashServer = (*Server)(nil)
 
 type Server struct {
 	ctx            context.Context
+	network        adapter.NetworkManager
 	router         adapter.Router
 	dnsRouter      adapter.DNSRouter
 	outbound       adapter.OutboundManager
@@ -75,15 +76,13 @@ type Server struct {
 func NewServer(ctx context.Context, logFactory log.ObservableFactory, options option.ClashAPIOptions) (adapter.ClashServer, error) {
 	trafficManager := trafficontrol.NewManager()
 	chiRouter := chi.NewRouter()
-	updateInterval := time.Duration(options.ExternalUIUpdateInterval)
-	if updateInterval <= 0 {
-		updateInterval = 0
-	}
+	updateInterval := max(time.Duration(options.ExternalUIUpdateInterval), 0)
 	if updateInterval > 0 && updateInterval < time.Hour {
 		updateInterval = time.Hour
 	}
 	s := &Server{
 		ctx:       ctx,
+		network:   service.FromContext[adapter.NetworkManager](ctx),
 		router:    service.FromContext[adapter.Router](ctx),
 		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
 		outbound:  service.FromContext[adapter.OutboundManager](ctx),
@@ -100,6 +99,11 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		externalController:       options.ExternalController != "",
 		externalUIDownloadURL:    options.ExternalUIDownloadURL,
 		externalUIHTTPClient:     options.ExternalUIHTTPClient,
+		externalUIUpdateInterval: updateInterval,
+		cacheFile:                service.FromContext[adapter.CacheFile](ctx),
+		cleaner:                  cleanup.Add(trafficManager.Clear),
+
+		//nolint:staticcheck
 		externalUIDownloadDetour: options.ExternalUIDownloadDetour,
 		externalUIUpdateInterval: updateInterval,
 		cacheFile:                service.FromContext[adapter.CacheFile](ctx),
@@ -143,7 +147,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/configs", configRouter(s, logFactory))
 		r.Mount("/proxies", proxyRouter(s, s.router))
 		r.Mount("/rules", ruleRouter(s.router, s.dnsRouter))
-		r.Mount("/connections", connectionRouter(s.ctx, s.router, trafficManager))
+		r.Mount("/connections", connectionRouter(s.ctx, s.network, trafficManager))
 		r.Mount("/providers/proxies", proxyProviderRouter(s))
 		r.Mount("/providers/rules", ruleProviderRouter(s.router))
 		r.Mount("/script", scriptRouter())
@@ -151,6 +155,10 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/cache", cacheRouter(ctx))
 		r.Mount("/dns", dnsRouter(s.dnsRouter))
 		r.Mount("/smart", smartRouter(ctx))
+
+		if service.FromContext[adapter.PlatformInterface](ctx) == nil {
+			r.Mount("/restart", restartRouter(ctx, logFactory))
+		}
 
 		if service.FromContext[adapter.PlatformInterface](ctx) == nil {
 			r.Mount("/restart", restartRouter(ctx, logFactory))
@@ -204,7 +212,7 @@ func (s *Server) Start(stage adapter.StartStage) error {
 				listener net.Listener
 				err      error
 			)
-			for i := 0; i < 3; i++ {
+			for range 3 {
 				listener, err = net.Listen("tcp", s.httpServer.Addr)
 				if runtime.GOOS == "android" && errors.Is(err, syscall.EADDRINUSE) {
 					time.Sleep(100 * time.Millisecond)

@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio/deadline"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
@@ -78,10 +79,7 @@ func NewTCP(ctx context.Context, logger log.ContextLogger, tag string, options o
 		}
 		poolIdleTimeout = keepAliveIdle + keepAliveInterval
 	}
-	maxQueries := options.MaxQueries
-	if maxQueries <= 0 {
-		maxQueries = 0
-	}
+	maxQueries := max(options.MaxQueries, 0)
 	if !options.Pipeline && maxQueries > 0 {
 		maxQueries = 0
 	}
@@ -98,7 +96,7 @@ func NewTCP(ctx context.Context, logger log.ContextLogger, tag string, options o
 		},
 	}
 	if enableConnReuse {
-		transport.connections = newReuseableDNSConnPool()
+		transport.connections = newReuseableDNSConnPool(0)
 	}
 	return transport, nil
 }
@@ -136,7 +134,7 @@ func (t *TCPTransport) createNewConnection(ctx context.Context, message *mDNS.Ms
 			if t.disableKeepAlive {
 				connIdleTimeout = t.idleTimeout
 			}
-			return newReuseableDNSConn(rawConn, t.logger, t.enablePipeline, connIdleTimeout, t.maxQueries, t.connections, t), nil
+			return newReuseableDNSConn(rawConn, t.logger, t.enablePipeline, connIdleTimeout, t.maxQueries, t.connections, t, deadline.NeedAdditionalReadDeadline(rawConn)), nil
 		})
 		if err != nil {
 			return nil, err
@@ -150,9 +148,23 @@ func (t *TCPTransport) createNewConnection(ctx context.Context, message *mDNS.Ms
 	if err != nil {
 		return nil, E.Cause(err, "dial TCP connection")
 	}
-	conn := newReuseableDNSConn(rawConn, t.logger, t.enablePipeline, 0, t.maxQueries, nil, t)
+	conn := newReuseableDNSConn(rawConn, t.logger, t.enablePipeline, 0, t.maxQueries, nil, t, deadline.NeedAdditionalReadDeadline(rawConn))
 	defer conn.Close()
 	return conn.Exchange(ctx, message)
+}
+
+func setConnDeadline(ctx context.Context, conn net.Conn, needClose bool) func() {
+	if needClose {
+		stop := context.AfterFunc(ctx, func() {
+			conn.Close()
+		})
+		return func() { stop() }
+	}
+	if d, ok := ctx.Deadline(); ok {
+		conn.SetDeadline(d)
+		return func() { conn.SetDeadline(time.Time{}) }
+	}
+	return func() {}
 }
 
 func ReadMessage(reader io.Reader) (*mDNS.Msg, error) {
@@ -199,35 +211,37 @@ type dnsCallback struct {
 
 type reuseableDNSConn struct {
 	net.Conn
-	logger         logger.ContextLogger
-	access         sync.RWMutex
-	done           chan struct{}
-	closeOnce      sync.Once
-	err            error
-	queryId        uint16
-	callbacks      map[uint16]*dnsCallback
-	writeLock      sync.Mutex
-	startReadOnce  sync.Once
-	enablePipeline bool
-	activeQueries  int32
-	maxQueries     int
-	pool           *ConnPool[*reuseableDNSConn]
-	transport      dnsTransportManager
-	idleTimeout    time.Duration
-	idleTimer      *time.Timer
+	logger            logger.ContextLogger
+	access            sync.RWMutex
+	done              chan struct{}
+	closeOnce         sync.Once
+	err               error
+	queryId           uint16
+	callbacks         map[uint16]*dnsCallback
+	writeLock         sync.Mutex
+	startReadOnce     sync.Once
+	enablePipeline    bool
+	needDeadlineClose bool
+	activeQueries     atomic.Int32
+	maxQueries        int
+	pool              *ConnPool[*reuseableDNSConn]
+	transport         dnsTransportManager
+	idleTimeout       time.Duration
+	idleTimer         *time.Timer
 }
 
-func newReuseableDNSConn(conn net.Conn, logger logger.ContextLogger, enablePipeline bool, idleTimeout time.Duration, maxQueries int, pool *ConnPool[*reuseableDNSConn], transport dnsTransportManager) *reuseableDNSConn {
+func newReuseableDNSConn(conn net.Conn, logger logger.ContextLogger, enablePipeline bool, idleTimeout time.Duration, maxQueries int, pool *ConnPool[*reuseableDNSConn], transport dnsTransportManager, needDeadlineClose bool) *reuseableDNSConn {
 	c := &reuseableDNSConn{
-		Conn:           conn,
-		logger:         logger,
-		done:           make(chan struct{}),
-		callbacks:      make(map[uint16]*dnsCallback),
-		enablePipeline: enablePipeline,
-		maxQueries:     maxQueries,
-		pool:           pool,
-		transport:      transport,
-		idleTimeout:    idleTimeout,
+		Conn:              conn,
+		logger:            logger,
+		done:              make(chan struct{}),
+		callbacks:         make(map[uint16]*dnsCallback),
+		enablePipeline:    enablePipeline,
+		needDeadlineClose: needDeadlineClose,
+		maxQueries:        maxQueries,
+		pool:              pool,
+		transport:         transport,
+		idleTimeout:       idleTimeout,
 	}
 	if idleTimeout > 0 {
 		c.idleTimer = time.AfterFunc(idleTimeout, func() {
@@ -238,7 +252,7 @@ func newReuseableDNSConn(conn net.Conn, logger logger.ContextLogger, enablePipel
 }
 
 func (c *reuseableDNSConn) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
-	atomic.AddInt32(&c.activeQueries, 1)
+	c.activeQueries.Add(1)
 	return c.exchangeWithCleanup(ctx, message, true)
 }
 
@@ -254,7 +268,7 @@ func (c *reuseableDNSConn) exchangeWithCleanup(ctx context.Context, message *mDN
 		if resetTimer && !c.enablePipeline && c.idleTimer != nil {
 			c.idleTimer.Reset(c.idleTimeout)
 		}
-		newCount := atomic.AddInt32(&c.activeQueries, -1)
+		newCount := c.activeQueries.Add(-1)
 		if newCount == 0 && c.pool != nil {
 			if c.enablePipeline && c.maxQueries > 0 && c.transport != nil {
 				c.transport.removeActiveConn(c)
@@ -271,6 +285,7 @@ func (c *reuseableDNSConn) exchangeWithCleanup(ctx context.Context, message *mDN
 	if !c.enablePipeline {
 		c.writeLock.Lock()
 		defer c.writeLock.Unlock()
+		defer setConnDeadline(ctx, c.Conn, c.needDeadlineClose)()
 
 		err := WriteMessage(c.Conn, 0, message)
 		if err != nil {
@@ -399,7 +414,7 @@ func (c *reuseableDNSConn) IsOverMaxQueries() bool {
 	if c.maxQueries <= 0 {
 		return false
 	}
-	return atomic.LoadInt32(&c.activeQueries) >= int32(c.maxQueries)
+	return c.activeQueries.Load() >= int32(c.maxQueries)
 }
 
 func (c *reuseableDNSConn) closeWithError(err error) {

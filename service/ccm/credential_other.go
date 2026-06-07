@@ -1,4 +1,4 @@
-//go:build !darwin || (darwin && !cgo)
+//go:build !darwin || !cgo
 
 package ccm
 

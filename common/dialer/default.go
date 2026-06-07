@@ -161,10 +161,7 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		if keepInterval == 0 {
 			keepInterval = C.TCPKeepAliveInterval
 		}
-		keepCount := options.TCPKeepAliveCount
-		if keepCount < 0 {
-			keepCount = 0
-		}
+		keepCount := max(options.TCPKeepAliveCount, 0)
 		dialer.KeepAliveConfig = net.KeepAliveConfig{
 			Enable:   true,
 			Idle:     keepIdle,

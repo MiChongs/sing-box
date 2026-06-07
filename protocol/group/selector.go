@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"regexp"
-	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -41,17 +40,14 @@ type Selector struct {
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 
-	provider         adapter.ProviderManager
-	providers        map[string]adapter.Provider
-	outboundsCacheMu sync.Mutex
-	outboundsCache   map[string][]adapter.Outbound
+	provider       adapter.ProviderManager
+	providers      map[string]adapter.Provider
+	outboundsCache map[string][]adapter.Outbound
 
 	providerTags    []string
 	exclude         *regexp.Regexp
 	include         *regexp.Regexp
 	useAllProviders bool
-	hidden          bool
-	icon            string
 }
 
 func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SelectorOutboundOptions) (adapter.Outbound, error) {
@@ -75,8 +71,6 @@ func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextL
 		exclude:         (*regexp.Regexp)(options.Exclude),
 		include:         (*regexp.Regexp)(options.Include),
 		useAllProviders: options.UseAllProviders,
-		hidden:          options.Hidden,
-		icon:            options.Icon,
 	}
 	return outbound, nil
 }
@@ -229,7 +223,6 @@ func (s *Selector) onProviderUpdated(tag string) error {
 	for _, tag := range tags {
 		outboundByTag[tag] = s.outbounds[tag]
 	}
-	s.outboundsCacheMu.Lock()
 	for _, providerTag := range s.providerTags {
 		if providerTag != tag && s.outboundsCache[providerTag] != nil {
 			for _, detour := range s.outboundsCache[providerTag] {
@@ -254,7 +247,6 @@ func (s *Selector) onProviderUpdated(tag string) error {
 		}
 		s.outboundsCache[providerTag] = cache
 	}
-	s.outboundsCacheMu.Unlock()
 	if len(tags) == 0 {
 		detour, _ := s.outbound.Outbound("Compatible")
 		tags = append(tags, detour.Tag())

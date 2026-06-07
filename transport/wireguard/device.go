@@ -29,6 +29,7 @@ type DeviceOptions struct {
 	GSO            bool
 	Handler        tun.Handler
 	UDPTimeout     time.Duration
+	ICMPTimeout    time.Duration
 	CreateDialer   func(interfaceName string) N.Dialer
 	Name           string
 	MTU            uint32

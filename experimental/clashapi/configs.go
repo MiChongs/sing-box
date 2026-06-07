@@ -70,6 +70,6 @@ func patchConfigs(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func updateConfigs(w http.ResponseWriter, r *http.Request) {
+/* func updateConfigs(w http.ResponseWriter, r *http.Request) {
 	render.NoContent(w, r)
-}
+} */

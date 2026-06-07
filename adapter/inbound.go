@@ -7,6 +7,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/sagernet/sing-box/common/tlsspoof"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -68,11 +69,6 @@ type InboundContext struct {
 	CacheIPs []netip.Addr
 	Domain   string
 
-	// dnsResponseAddrCache 是 DNSResponseAddressesForMatch 的内部复用缓冲区，
-	// 在同一 InboundContext 生命周期内复用 backing array，避免每次规则匹配都
-	// 分配新切片。调用方均为同步、立即消费，不持有跨作用域引用，因此复用安全。
-	dnsResponseAddrCache []netip.Addr
-
 	// Deprecated: implement in rule action
 	InboundDetour             string
 	LastInbound               string
@@ -84,6 +80,8 @@ type InboundContext struct {
 	TLSFragment               bool
 	TLSFragmentFallbackDelay  time.Duration
 	TLSRecordFragment         bool
+	TLSSpoof                  string
+	TLSSpoofMethod            tlsspoof.Method
 
 	NetworkStrategy     *C.NetworkStrategy
 	NetworkType         []C.InterfaceType
@@ -133,7 +131,39 @@ type ruleMatchCacheFields struct {
 type ruleCacheFields struct {
 	IPCIDRMatchSource bool
 	IPCIDRAcceptEmpty bool
-	ruleMatchCacheFields
+
+	SourceAddressMatch           bool
+	SourcePortMatch              bool
+	DestinationAddressMatch      bool
+	DestinationPortMatch         bool
+	DidMatch                     bool
+	IgnoreDestinationIPCIDRMatch bool
+
+	// extended metadata
+	Extended *InboundContextExtended
+}
+
+type InboundContextExtended struct {
+	RealOutboundChain []string
+}
+
+func (c *InboundContext) InitExtended() {
+	if c.Extended == nil {
+		c.Extended = new(InboundContextExtended)
+	}
+}
+
+func (c *InboundContext) AppendRealOutbound(tag string) {
+	if c.Extended != nil {
+		c.Extended.RealOutboundChain = append(c.Extended.RealOutboundChain, tag)
+	}
+}
+
+func (c *InboundContext) GetRealOutboundChain() []string {
+	if c.Extended != nil {
+		return c.Extended.RealOutboundChain
+	}
+	return nil
 }
 
 type InboundContextExtended struct {
@@ -232,6 +262,51 @@ func dnsResponseAddressesInto(dst []netip.Addr, response *dns.Msg) []netip.Addr 
 		}
 	}
 	return dst
+}
+
+func (c *InboundContext) DNSResponseAddressesForMatch() []netip.Addr {
+	return DNSResponseAddresses(c.DNSResponse)
+}
+
+func DNSResponseAddresses(response *dns.Msg) []netip.Addr {
+	if response == nil || response.Rcode != dns.RcodeSuccess {
+		return nil
+	}
+	addresses := make([]netip.Addr, 0, len(response.Answer))
+	for _, rawRecord := range response.Answer {
+		switch record := rawRecord.(type) {
+		case *dns.A:
+			addr := M.AddrFromIP(record.A)
+			if addr.IsValid() {
+				addresses = append(addresses, addr)
+			}
+		case *dns.AAAA:
+			addr := M.AddrFromIP(record.AAAA)
+			if addr.IsValid() {
+				addresses = append(addresses, addr)
+			}
+		case *dns.HTTPS:
+			for _, value := range record.SVCB.Value {
+				switch hint := value.(type) {
+				case *dns.SVCBIPv4Hint:
+					for _, ip := range hint.Hint {
+						addr := M.AddrFromIP(ip).Unmap()
+						if addr.IsValid() {
+							addresses = append(addresses, addr)
+						}
+					}
+				case *dns.SVCBIPv6Hint:
+					for _, ip := range hint.Hint {
+						addr := M.AddrFromIP(ip)
+						if addr.IsValid() {
+							addresses = append(addresses, addr)
+						}
+					}
+				}
+			}
+		}
+	}
+	return addresses
 }
 
 type inboundContextKey struct{}

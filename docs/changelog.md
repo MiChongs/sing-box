@@ -2,6 +2,137 @@
 icon: material/alert-decagram
 ---
 
+#### 1.14.0-alpha.28
+
+* Fixes and improvements
+
+#### 1.14.0-alpha.27
+
+* Add Tailscale SSH server **1**
+* Fixes and improvements
+
+**1**:
+
+Adds an [`ssh_server`](/configuration/endpoint/tailscale/#ssh_server) field to
+[Tailscale](/configuration/endpoint/tailscale/) endpoints, running a Tailscale SSH
+server on tailnet port 22. Access is controlled by the SSH ACL in the Tailscale
+admin console, which maps each connection to a local user (behavior varies by
+platform; iOS and tvOS are not yet supported). The value may be `true` (equivalent
+to `{ "enabled": true }`), or an object that additionally sets
+[`disable_pty`](/configuration/endpoint/tailscale/#ssh_serverdisable_pty),
+[`disable_sftp`](/configuration/endpoint/tailscale/#ssh_serverdisable_sftp), and
+[`disable_forwarding`](/configuration/endpoint/tailscale/#ssh_serverdisable_forwarding).
+
+#### 1.14.0-alpha.26
+
+* Add gecko obfs for Hysteria2 **1**
+* Fixes and improvements
+
+**1**:
+
+Adds `gecko` as a new QUIC traffic obfuscation type for
+[Hysteria2 inbound](/configuration/inbound/hysteria2/#obfstype) and
+[outbound](/configuration/outbound/hysteria2/#obfstype), alongside the
+existing `salamander`. Gecko supports configurable
+[`min_packet_size`](/configuration/inbound/hysteria2/#obfsmin_packet_size)
+(default 512) and
+[`max_packet_size`](/configuration/inbound/hysteria2/#obfsmax_packet_size)
+(default 1200) fields.
+
+#### 1.14.0-alpha.25
+
+* Revert Tailscale endpoint dial fields deprecation and remove `control_http_client` **1**
+* Fixes and improvements
+
+**1**:
+
+The `control_http_client` field on
+[Tailscale](/configuration/endpoint/tailscale/) endpoints introduced in
+`1.14.0-alpha.13` is removed, and the deprecation of
+[Dial Fields](/configuration/endpoint/tailscale/#dial-fields) is reverted.
+
+#### 1.13.12
+
+* Update naiveproxy to v148.0.7778.96-1
+* Fixes and improvements
+
+#### 1.14.0-alpha.22
+
+* Add Hysteria Realm service and Hysteria2 NAT traversal support **1**
+* Fixes and improvements
+
+**1**:
+
+The new [Hysteria Realm service](/configuration/service/hysteria-realm/)
+is a rendezvous service for Hysteria2 NAT traversal. A Hysteria2 server
+behind NAT registers its STUN-discovered public addresses on a stable
+realm endpoint via the new
+[`realm`](/configuration/inbound/hysteria2/#realm) inbound field;
+clients query the realm via the new
+[`realm`](/configuration/outbound/hysteria2/#realm) outbound field to
+learn the server's current addresses and perform UDP hole-punching to
+establish a direct QUIC connection. Once hole-punching succeeds, all
+proxy traffic flows directly between client and server.
+
+#### 1.14.0-alpha.21
+
+* Allow customizing TUN DNS mode and hijack interface DNS by default **1**
+* Add mDNS DNS server **2**
+* Add `preferred_by` DNS rule item **3**
+* Add neighbor-based hostname resolution for the local DNS server **4**
+* Update NaiveProxy to 148.0.7778.96-1
+* Add more TLS spoof methods and route rule action support **5**
+* Fixes and improvements
+
+**1**:
+
+Adds [`dns_mode`](/configuration/inbound/tun/#dns_mode) and
+[`dns_address`](/configuration/inbound/tun/#dns_address) on the TUN inbound.
+The default `hijack` mode now sets the platform's native interface DNS
+(`systemd-resolved` on Linux, per-interface DNS on Windows and Apple) and
+installs platform-level DNS hijacking (an `iproute2` rule on Linux,
+nftables DNAT when `auto_redirect` is enabled, WFP filters on Windows when
+`strict_route` is enabled). Earlier versions did not touch the interface
+DNS or the platform firewall.
+
+**2**:
+
+The new [mDNS DNS server](/configuration/dns/server/mdns/) sends queries via
+multicast on the local network. The default
+[local DNS server](/configuration/dns/server/local/) also routes queries for
+`*.local.` and IPv4/IPv6 link-local reverse zones via mDNS on non-Apple
+platforms (and via the system resolver on Apple), so an explicit `mdns`
+server is only needed to reference it from
+[`preferred_by`](/configuration/dns/rule/#preferred_by) or to use it
+standalone.
+
+**3**:
+
+The new [`preferred_by`](/configuration/dns/rule/#preferred_by) DNS rule
+item matches domains that the listed DNS servers consider their preferred
+names. Supported server types are `hosts`, `local`, `mdns`, `tailscale`, and
+`resolved`. The [Tailscale](/configuration/dns/server/tailscale/),
+[Hosts](/configuration/dns/server/hosts/) and
+[Resolved](/configuration/dns/server/resolved/) example pages have been
+updated to use this rule item in place of the previous `evaluate` +
+`ip_accept_any` + `respond` pattern.
+
+**4**:
+
+Adds [`neighbor_domain`](/configuration/dns/server/local/#neighbor_domain)
+on the local DNS server. Listed suffixes (each starting with `.`) cause
+A/AAAA queries for single-label hosts under those suffixes to be answered
+from the [neighbor resolver](/configuration/shared/neighbor/) instead of
+the upstream (for example `[".", ".lan"]`).
+
+**5**:
+
+Adds `wrong-ack`, `wrong-md5`, and `wrong-timestamp`
+[spoof methods](/configuration/shared/tls/#spoof_method), and adds
+[`tls_spoof`](/configuration/route/rule_action/#tls_spoof) /
+[`tls_spoof_method`](/configuration/route/rule_action/#tls_spoof_method)
+to route rule actions for per-rule TLS spoofing without outbound TLS settings.
+
 #### 1.14.0-alpha.20
 
 ** Fixes and improvements

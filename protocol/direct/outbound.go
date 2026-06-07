@@ -44,8 +44,7 @@ type Outbound struct {
 	directDomainStrategy C.DomainStrategy
 	fallbackDelay        time.Duration
 	isEmpty              bool
-	// loopBack *loopBackDetector
-	proxyProto uint8
+	proxyProto           uint8
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.DirectOutboundOptions) (adapter.Outbound, error) {
@@ -72,8 +71,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		fallbackDelay:        time.Duration(options.FallbackDelay),
 		dialer:               outboundDialer.(dialer.ParallelInterfaceDialer),
 		isEmpty:              reflect.DeepEqual(options.DialerOptions, option.DialerOptions{UDPFragmentDefault: true}),
-		// loopBack:       newLoopBackDetector(router),
-		proxyProto: options.ProxyProtocol,
+		proxyProto:           options.ProxyProtocol,
 	}
 	if options.ProxyProtocol > 2 {
 		return nil, E.New("invalid proxy protocol option: ", options.ProxyProtocol)
@@ -93,11 +91,6 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	case N.NetworkUDP:
 		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
 	}
-	/*conn, err := h.dialer.DialContext(ctx, network, destination)
-	if err != nil {
-		return nil, err
-	}
-	return h.loopBack.NewConn(conn), nil*/
 	conn, err := h.dialer.DialContext(ctx, network, destination)
 	if err != nil {
 		return nil, err
@@ -129,7 +122,6 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if err != nil {
 		return nil, err
 	}
-	// conn = h.loopBack.NewPacketConn(bufio.NewPacketConn(conn), destination)
 	return conn, nil
 }
 
@@ -260,18 +252,3 @@ func (h *Outbound) ListenSerialNetworkPacket(ctx context.Context, destination M.
 func (h *Outbound) IsEmpty() bool {
 	return h.isEmpty
 }
-
-/*func (h *Outbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
-	if h.loopBack.CheckConn(metadata.Source.AddrPort(), M.AddrPortFromNet(conn.LocalAddr())) {
-		return E.New("reject loopback connection to ", metadata.Destination)
-	}
-	return NewConnection(ctx, h, conn, metadata)
-}
-
-func (h *Outbound) NewPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext) error {
-	if h.loopBack.CheckPacketConn(metadata.Source.AddrPort(), M.AddrPortFromNet(conn.LocalAddr())) {
-		return E.New("reject loopback packet connection to ", metadata.Destination)
-	}
-	return NewPacketConnection(ctx, h, conn, metadata)
-}
-*/

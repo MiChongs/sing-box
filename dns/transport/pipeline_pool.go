@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -21,15 +22,16 @@ type pipelinePool struct {
 	connections           *ConnPool[*reuseableDNSConn]
 	activeConns           []*reuseableDNSConn
 	activeAccess          sync.Mutex
-	pipelineDetected      int32
+	pipelineDetected      atomic.Int32
 	consecutiveOutOfOrder int32
 	outOfOrderCount       int32
 	totalResponses        int32
 }
 
-func newReuseableDNSConnPool() *ConnPool[*reuseableDNSConn] {
+func newReuseableDNSConnPool(maxInflight int) *ConnPool[*reuseableDNSConn] {
 	return NewConnPool(ConnPoolOptions[*reuseableDNSConn]{
-		Mode: ConnPoolOrdered,
+		Mode:        ConnPoolOrdered,
+		MaxInflight: maxInflight,
 		IsAlive: func(conn *reuseableDNSConn) bool {
 			select {
 			case <-conn.done:
@@ -121,7 +123,7 @@ func (p *pipelinePool) resetPool() {
 	for _, conn := range activeConns {
 		conn.Close()
 	}
-	atomic.StoreInt32(&p.pipelineDetected, 0)
+	p.pipelineDetected.Store(0)
 	atomic.StoreInt32(&p.consecutiveOutOfOrder, 0)
 	atomic.StoreInt32(&p.outOfOrderCount, 0)
 	atomic.StoreInt32(&p.totalResponses, 0)
@@ -150,8 +152,8 @@ func (p *pipelinePool) findAndReserveActiveConn() *reuseableDNSConn {
 		case <-conn.done:
 			closedCount++
 		default:
-			if conn.maxQueries <= 0 || atomic.LoadInt32(&conn.activeQueries) < int32(conn.maxQueries) {
-				current := atomic.LoadInt32(&conn.activeQueries)
+			if conn.maxQueries <= 0 || conn.activeQueries.Load() < int32(conn.maxQueries) {
+				current := conn.activeQueries.Load()
 				if minQueries == -1 || current < minQueries {
 					minQueries = current
 					bestConn = conn
@@ -161,7 +163,7 @@ func (p *pipelinePool) findAndReserveActiveConn() *reuseableDNSConn {
 	}
 
 	if bestConn != nil && minQueries == 0 && closedCount == 0 {
-		atomic.AddInt32(&bestConn.activeQueries, 1)
+		bestConn.activeQueries.Add(1)
 		return bestConn
 	}
 
@@ -178,7 +180,7 @@ func (p *pipelinePool) findAndReserveActiveConn() *reuseableDNSConn {
 	}
 
 	if bestConn != nil {
-		atomic.AddInt32(&bestConn.activeQueries, 1)
+		bestConn.activeQueries.Add(1)
 	}
 
 	return bestConn
@@ -188,10 +190,8 @@ func (p *pipelinePool) addActiveConn(conn *reuseableDNSConn) {
 	p.activeAccess.Lock()
 	defer p.activeAccess.Unlock()
 
-	for _, c := range p.activeConns {
-		if c == conn {
-			return
-		}
+	if slices.Contains(p.activeConns, conn) {
+		return
 	}
 
 	p.activeConns = append(p.activeConns, conn)
@@ -212,11 +212,11 @@ func (p *pipelinePool) removeActiveConn(conn *reuseableDNSConn) {
 }
 
 func (p *pipelinePool) markPipelineDetected() bool {
-	return atomic.CompareAndSwapInt32(&p.pipelineDetected, 0, 1)
+	return p.pipelineDetected.CompareAndSwap(0, 1)
 }
 
 func (p *pipelinePool) isPipelineDetected() bool {
-	return atomic.LoadInt32(&p.pipelineDetected) != 0
+	return p.pipelineDetected.Load() != 0
 }
 
 func (p *pipelinePool) getDetectionCounters() (*int32, *int32, *int32) {

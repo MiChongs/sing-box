@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -15,6 +16,7 @@ import (
 	R "github.com/sagernet/sing-box/route/rule"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
+	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/task"
 	"github.com/sagernet/sing/contrab/freelru"
 	"github.com/sagernet/sing/contrab/maphash"
@@ -49,6 +51,8 @@ type Router struct {
 	platformInterface adapter.PlatformInterface
 	started           bool
 
+	quicSniffCache sync.Map
+
 	defaultDomainMatchStrategy C.DomainMatchStrategy
 	reloadChan                 chan<- struct{}
 }
@@ -68,7 +72,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 		ruleByUUID:        make(map[string]adapter.Rule),
 		ruleSetMap:        make(map[string]adapter.RuleSet),
 		needFindProcess:   hasRule(options.Rules, isProcessRule) || hasDNSRule(dnsOptions.Rules, isProcessDNSRule) || options.FindProcess,
-		needFindNeighbor:  hasRule(options.Rules, isNeighborRule) || hasDNSRule(dnsOptions.Rules, isNeighborDNSRule) || options.FindNeighbor,
+		needFindNeighbor:  hasRule(options.Rules, isNeighborRule) || hasDNSRule(dnsOptions.Rules, isNeighborDNSRule) || hasLocalNeighborDNSServer(dnsOptions.Servers) || options.FindNeighbor,
 		leaseFiles:        options.DHCPLeaseFiles,
 		pauseManager:      service.FromContext[pause.Manager](ctx),
 		platformInterface: service.FromContext[adapter.PlatformInterface](ctx),
@@ -112,6 +116,36 @@ func (r *Router) Initialize(rules []option.Rule, ruleSets []option.RuleSet) erro
 func (r *Router) Start(stage adapter.StartStage) error {
 	monitor := taskmonitor.New(r.logger, C.StartTimeout)
 	switch stage {
+	case adapter.StartStateInitialize:
+		if r.needFindNeighbor {
+			if r.platformInterface != nil && r.platformInterface.UsePlatformNeighborResolver() {
+				monitor.Start("initialize neighbor resolver")
+				resolver := newPlatformNeighborResolver(r.logger, r.platformInterface)
+				err := resolver.Start()
+				monitor.Finish()
+				if err != nil {
+					r.logger.Error(E.Cause(err, "start neighbor resolver"))
+				} else {
+					r.neighborResolver = resolver
+				}
+			} else {
+				monitor.Start("initialize neighbor resolver")
+				resolver, err := newNeighborResolver(r.logger, r.leaseFiles)
+				monitor.Finish()
+				if err != nil {
+					if err != os.ErrInvalid {
+						r.logger.Error(E.Cause(err, "create neighbor resolver"))
+					}
+				} else {
+					err = resolver.Start()
+					if err != nil {
+						r.logger.Error(E.Cause(err, "start neighbor resolver"))
+					} else {
+						r.neighborResolver = resolver
+					}
+				}
+			}
+		}
 	case adapter.StartStateStart:
 		var startContext *adapter.HTTPStartContext
 		if len(r.ruleSets) > 0 {
@@ -307,9 +341,41 @@ func (r *Router) NeighborResolver() adapter.NeighborResolver {
 }
 
 func (r *Router) ResetNetwork() {
-	r.network.ResetNetwork()
 	r.httpClientManager.ResetNetwork()
 	r.dns.ResetNetwork()
+}
+
+const quicSniffCacheTTL = 5 * time.Minute
+
+type quicSniffCacheKey struct {
+	source      M.Socksaddr
+	destination M.Socksaddr
+}
+
+type quicSniffCacheEntry struct {
+	sniffHost string
+	expiry    time.Time
+}
+
+func (r *Router) cacheQUICSniff(source, destination M.Socksaddr, sniffHost string) {
+	r.quicSniffCache.Store(quicSniffCacheKey{source, destination}, quicSniffCacheEntry{
+		sniffHost: sniffHost,
+		expiry:    time.Now().Add(quicSniffCacheTTL),
+	})
+}
+
+func (r *Router) lookupQUICSniff(source, destination M.Socksaddr) (string, bool) {
+	key := quicSniffCacheKey{source, destination}
+	v, ok := r.quicSniffCache.Load(key)
+	if !ok {
+		return "", false
+	}
+	entry := v.(quicSniffCacheEntry)
+	if time.Now().After(entry.expiry) {
+		r.quicSniffCache.Delete(key)
+		return "", false
+	}
+	return entry.sniffHost, true
 }
 
 func (r *Router) DefaultDomainMatchStrategy() C.DomainMatchStrategy {

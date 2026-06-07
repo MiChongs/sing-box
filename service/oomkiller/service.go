@@ -27,10 +27,11 @@ type Service struct {
 	boxService.Adapter
 	ctx            context.Context
 	logger         log.ContextLogger
-	router         adapter.Router
+	network        adapter.NetworkManager
 	timerConfig    timerConfig
 	adaptiveTimer  *adaptiveTimer
 	lastReportTime atomic.Int64
+	//nolint:unused // touched only on darwin && cgo via writeOOMDraft/discardOOMDraft.
 	draftCancelled atomic.Bool
 }
 
@@ -44,13 +45,13 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		Adapter:     boxService.NewAdapter(boxConstant.TypeOOMKiller, tag),
 		ctx:         ctx,
 		logger:      logger,
-		router:      service.FromContext[adapter.Router](ctx),
+		network:     service.FromContext[adapter.NetworkManager](ctx),
 		timerConfig: config,
 	}, nil
 }
 
 func (s *Service) createTimer() {
-	s.adaptiveTimer = newAdaptiveTimer(s.logger, s.router, s.timerConfig, s.writeOOMReport)
+	s.adaptiveTimer = newAdaptiveTimer(s.logger, s.network, s.timerConfig, s.writeOOMReport)
 }
 
 func (s *Service) startTimer() {
@@ -82,39 +83,5 @@ func (s *Service) writeOOMReport(memoryUsage uint64) {
 		s.logger.Warn("failed to write OOM report: ", err)
 	} else {
 		s.logger.Info("OOM report saved")
-	}
-}
-
-func (s *Service) writeOOMDraft(memoryUsage uint64) {
-	if s.draftCancelled.Load() {
-		return
-	}
-	reporter := service.FromContext[OOMReporter](s.ctx)
-	if reporter == nil {
-		return
-	}
-	err := reporter.WriteDraft(memoryUsage)
-	if s.draftCancelled.Load() {
-		reporter.DiscardDraft()
-		return
-	}
-	if err != nil {
-		s.logger.Warn("failed to write OOM draft: ", err)
-	} else {
-		s.logger.Warn("OOM draft saved")
-	}
-}
-
-func (s *Service) discardOOMDraft() {
-	s.draftCancelled.Store(true)
-	reporter := service.FromContext[OOMReporter](s.ctx)
-	if reporter == nil {
-		return
-	}
-	err := reporter.DiscardDraft()
-	if err != nil {
-		s.logger.Warn("failed to discard OOM draft: ", err)
-	} else {
-		s.logger.Info("OOM draft discarded")
 	}
 }

@@ -153,20 +153,6 @@ func (m *Manager) resolveShared(tag string) (*sharedManagedTransport, error) {
 	return sharedTransport, nil
 }
 
-// LookupDetour returns the configured Detour outbound tag for the http_client
-// referenced by tag. Returns "" if the tag is unknown or no detour is set.
-// Used by the smart service to resolve which outbound to use for asset
-// downloads when an http_client tag (rather than inline options) is provided.
-func (m *Manager) LookupDetour(tag string) string {
-	m.access.Lock()
-	defer m.access.Unlock()
-	define, loaded := m.defines[tag]
-	if !loaded {
-		return ""
-	}
-	return define.Options().Detour
-}
-
 func (m *Manager) ResetNetwork() {
 	m.access.Lock()
 	defer m.access.Unlock()

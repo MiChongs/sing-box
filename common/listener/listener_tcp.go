@@ -46,10 +46,7 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 		if keepInterval == 0 {
 			keepInterval = C.TCPKeepAliveInterval
 		}
-		keepCount := l.listenOptions.TCPKeepAliveCount
-		if keepCount < 0 {
-			keepCount = 0
-		}
+		keepCount := max(l.listenOptions.TCPKeepAliveCount, 0)
 		listenConfig.KeepAliveConfig = net.KeepAliveConfig{
 			Enable:   true,
 			Idle:     keepIdle,
