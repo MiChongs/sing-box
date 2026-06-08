@@ -143,63 +143,64 @@ func (s *Service) initModel() error {
 
 	s.model = lightgbm.NewWeightModel(modelPath)
 	if err := s.model.Load(); err != nil {
-		// Not fatal: downloader may fetch soon. Fallback to CalculateWeight
-		// happens inside WeightModel.PredictWeight when model is not loaded.
 		s.logger.Debug("lightgbm model not yet available (", err, "); will fallback to traditional algorithm until downloaded")
 	} else {
 		s.logger.Info("lightgbm model loaded from ", modelPath)
 	}
 
-	if opts.AutoUpdate {
-		url := opts.URL
-		if url == "" {
-			url = lightgbm.DefaultModelURL
-		}
-		interval := defaultDuration(opts.UpdateInterval, lightgbm.DefaultUpdateInterval)
+	url := opts.URL
+	if url == "" {
+		url = lightgbm.DefaultModelURL
+	}
+	interval := defaultDuration(opts.UpdateInterval, lightgbm.DefaultUpdateInterval)
 
-		// Resolve detour outbound tag (assetdl wants an adapter.Outbound as Dialer).
-		// Preferred source: http_client (tag ref → Manager.LookupDetour, or inline .Detour).
-		// Legacy fallback: download_detour.
-		detourTag := resolveHTTPClientDetour(s.ctx, opts.HTTPClient)
-		if detourTag == "" {
-			detourTag = opts.DownloadDetour //nolint:staticcheck
-		}
-		var dialer assetdl.Dialer
-		if detourTag != "" {
-			if mgr := service.FromContext[adapter.OutboundManager](s.ctx); mgr != nil {
-				if ob, loaded := mgr.Outbound(detourTag); loaded {
-					dialer = ob
-				} else {
-					s.logger.Warn("lightgbm: detour=[", detourTag, "] not found; using direct")
-				}
+	detourTag := resolveHTTPClientDetour(s.ctx, opts.HTTPClient)
+	if detourTag == "" {
+		detourTag = opts.DownloadDetour //nolint:staticcheck
+	}
+	var dialer assetdl.Dialer
+	if detourTag != "" {
+		if mgr := service.FromContext[adapter.OutboundManager](s.ctx); mgr != nil {
+			if ob, loaded := mgr.Outbound(detourTag); loaded {
+				dialer = ob
 			} else {
-				s.logger.Warn("lightgbm: outbound manager unavailable; using direct")
+				s.logger.Warn("lightgbm: detour=[", detourTag, "] not found; using direct")
 			}
 		}
+	}
 
-		dl, err := assetdl.New(assetdl.Options{
-			Context:  s.ctx,
-			Logger:   s.logger,
-			Name:     "lightgbm",
-			URL:      url,
-			Interval: interval,
-			Path:     modelPath,
-			Dialer:   dialer,
-			OnUpdate: func(path string) error {
-				return s.model.Reload()
-			},
-		})
-		if err != nil {
-			s.logger.Warn("lightgbm downloader init failed: ", err)
-			return err
-		}
-		s.dl = dl
+	dl, err := assetdl.New(assetdl.Options{
+		Context:  s.ctx,
+		Logger:   s.logger,
+		Name:     "lightgbm",
+		URL:      url,
+		Interval: interval,
+		Path:     modelPath,
+		Dialer:   dialer,
+		OnUpdate: func(path string) error {
+			return s.model.Reload()
+		},
+	})
+	if err != nil {
+		s.logger.Warn("lightgbm downloader init failed: ", err)
+		return err
+	}
+	s.dl = dl
+
+	if opts.AutoUpdate {
 		via := "direct"
 		if detourTag != "" && dialer != nil {
 			via = detourTag
 		}
 		s.logger.Info("lightgbm: auto-update enabled (interval=", interval, ", via=", via, ")")
 		s.dl.Start()
+	} else if !s.model.IsLoaded() {
+		s.logger.Info("lightgbm: model file missing, fetching once from ", url)
+		go func() {
+			if fetchErr := s.dl.FetchOnce(s.ctx); fetchErr != nil {
+				s.logger.Warn("lightgbm: initial download failed: ", fetchErr)
+			}
+		}()
 	}
 	return nil
 }

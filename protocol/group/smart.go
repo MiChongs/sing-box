@@ -8,6 +8,7 @@ import (
 	"math"
 	"math/rand"
 	"net"
+	"os"
 	"net/netip"
 	"regexp"
 	"sort"
@@ -26,6 +27,7 @@ import (
 	"github.com/sagernet/sing-box/common/smart"
 	"github.com/sagernet/sing-box/common/urltest"
 	"github.com/sagernet/sing-box/common/smart/lightgbm"
+	"github.com/sagernet/sing-box/common/assetdl"
 	smartservice "github.com/sagernet/sing-box/experimental/smart"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
@@ -34,6 +36,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/service/filemanager"
 )
 
 const (
@@ -733,8 +736,29 @@ func (s *Smart) PostStart() error {
 			}
 		}
 		if len(paths) == 0 {
-			s.logger.Warn("smart: use_asn is true but no ASN database resolved (set asn_database or experimental.geox.url.asn); ASN features disabled")
-		} else {
+			s.logger.Info("smart: no ASN database configured; auto-downloading default")
+			defaultPath := filemanager.BasePath(s.ctx, "GeoLite2-ASN.mmdb")
+			const defaultASNURL = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb"
+			dl, dlErr := assetdl.New(assetdl.Options{
+				Context:  s.ctx,
+				Logger:   s.logger,
+				Name:     "smart/asn",
+				URL:      defaultASNURL,
+				Interval: 24 * time.Hour,
+				Path:     defaultPath,
+			})
+			if dlErr == nil {
+				if fetchErr := dl.FetchOnce(s.ctx); fetchErr == nil {
+					paths = []string{defaultPath}
+				} else {
+					s.logger.Warn("smart: auto-download ASN failed: ", fetchErr)
+				}
+			}
+			if len(paths) == 0 {
+				s.logger.Warn("smart: use_asn is true but no ASN database available; ASN features disabled")
+			}
+		}
+		if len(paths) > 0 {
 			for _, p := range paths {
 				db, err := getSharedMMDB(p)
 				if err != nil {
@@ -753,11 +777,37 @@ func (s *Smart) PostStart() error {
 	// Optional country mmdb — feeds ModelInput.DestGeoIP (LightGBM features
 	// 17 and 26). When the GeoX service has downloaded country.mmdb we use
 	// it; otherwise DestGeoIP stays nil and those features fall back to 0.
-	if geoSvc := service.FromContext[adapter.GeoXService](s.ctx); geoSvc != nil {
-		if mmdbPath := geoSvc.MMDBPath(); mmdbPath != "" {
+	{
+		mmdbPath := ""
+		if geoSvc := service.FromContext[adapter.GeoXService](s.ctx); geoSvc != nil {
+			mmdbPath = geoSvc.MMDBPath()
+		}
+		if mmdbPath == "" {
+			mmdbPath = filemanager.BasePath(s.ctx, "country.mmdb")
+			const defaultMMDBURL = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"
+			if _, statErr := os.Stat(mmdbPath); os.IsNotExist(statErr) {
+				dl, dlErr := assetdl.New(assetdl.Options{
+					Context:  s.ctx,
+					Logger:   s.logger,
+					Name:     "smart/country",
+					URL:      defaultMMDBURL,
+					Interval: 24 * time.Hour,
+					Path:     mmdbPath,
+				})
+				if dlErr == nil {
+					if fetchErr := dl.FetchOnce(s.ctx); fetchErr != nil {
+						s.logger.Debug("smart: country mmdb auto-download failed: ", fetchErr)
+						mmdbPath = ""
+					}
+				} else {
+					mmdbPath = ""
+				}
+			}
+		}
+		if mmdbPath != "" {
 			if db, err := getSharedMMDB(mmdbPath); err == nil {
 				s.countryDB = db
-				s.logger.Info("smart: country mmdb loaded from ", mmdbPath, " (shared via mmdbPool)")
+				s.logger.Info("smart: country mmdb loaded from ", mmdbPath)
 			} else {
 				s.logger.Debug("smart: country mmdb not yet available: ", err)
 			}
