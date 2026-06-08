@@ -289,6 +289,16 @@ func PrepareFeatures(input *smart.ModelInput) []float64 {
 	}
 	features = append(features, geoHash)
 
+	// 27-34: extended dimensions (v2 model)
+	features = append(features, math.Log1p(input.LatencyStdDev))
+	features = append(features, math.Log1p(input.ConnectTimeStdDev))
+	features = append(features, input.ShortRTT-input.LongRTT)
+	features = append(features, input.ShortSuccessRate)
+	features = append(features, math.Log1p(float64(input.ActiveConns)))
+	features = append(features, math.Log1p(float64(input.TLSHandshakeTime)))
+	features = append(features, float64(input.HourBucket)/24.0)
+	features = append(features, math.Log1p(float64(input.TCPRetransmissions)))
+
 	if len(features) > MaxFeatureSize {
 		features = features[:MaxFeatureSize]
 	}

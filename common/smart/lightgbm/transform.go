@@ -8,8 +8,13 @@ import (
 	"sync"
 )
 
-// MaxFeatureSize is the fixed 27-dim feature vector size (mihomo parity).
-const MaxFeatureSize = 27
+// LegacyFeatureSize is the original 27-dim feature vector (mihomo parity).
+// Models trained with 27 features still work — PredictWeight auto-truncates.
+const LegacyFeatureSize = 27
+
+// MaxFeatureSize is the extended 35-dim feature vector with jitter, TCP,
+// and temporal signals. New models should be trained against 35 features.
+const MaxFeatureSize = 35
 
 // parseTransformsContent parses the [transforms] section from the model file.
 // Format documented in mihomo's transform.go — preserved byte-identical for model compatibility.
@@ -288,6 +293,14 @@ func getDefaultFeatureOrder() map[int]string {
 		24: "host_hash",
 		25: "ip_hash",
 		26: "geoip_hash",
+		27: "latency_stddev",
+		28: "connect_time_stddev",
+		29: "short_long_rtt_delta",
+		30: "short_success_rate",
+		31: "active_conns",
+		32: "tls_handshake_time",
+		33: "hour_bucket",
+		34: "tcp_retransmissions",
 	}
 }
 

@@ -149,6 +149,13 @@ func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor floa
 		return w, p, 0
 	}
 
+	// Backward compat: if model was trained with fewer features (e.g. 27-dim
+	// legacy), truncate to what the model expects. New 35-dim models use the
+	// full vector.
+	if numFeat := model.NFeatures(); numFeat > 0 && numFeat < len(features) {
+		features = features[:numFeat]
+	}
+
 	if transforms != nil && transforms.TransformsEnabled {
 		features = transforms.ApplyTransforms(features)
 	}

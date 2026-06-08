@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/smart"
 	"github.com/sagernet/sing-box/protocol/group"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service"
 
 	"github.com/go-chi/chi/v5"
@@ -31,6 +32,8 @@ func smartRouter(ctx context.Context) http.Handler {
 	r.Get("/groups/{name}/diag", smartGroupDiag(ctx))
 	r.Post("/groups/{name}/block/{node}", blockSmartNode(ctx))
 	r.Put("/groups/{name}/algorithm", setSmartAlgorithm(ctx))
+	r.Post("/groups/{name}/recompute", recomputeSmartWeights(ctx))
+	r.Post("/groups/{name}/clear-selection", clearSmartSelection(ctx))
 	return r
 }
 
@@ -196,19 +199,21 @@ func listSmartGroups(ctx context.Context) func(w http.ResponseWriter, r *http.Re
 			return
 		}
 		type groupInfo struct {
-			Name           string           `json:"name"`
-			TestURL        string           `json:"testUrl"`
-			UseASN         bool             `json:"useASN"`
-			UseLightGBM    bool             `json:"useLightGBM"`
-			CollectData    bool             `json:"collectData"`
-			Fixed          string           `json:"fixed"`
-			Now            string           `json:"now"`
-			LGBMModelAge   string           `json:"lgbmModelAge,omitempty"`
-			Members        int              `json:"members"`
-			PolicyPriority []map[string]any `json:"policyPriority,omitempty"`
-			PinEndorsements []map[string]any `json:"pinEndorsements,omitempty"`
-			Algorithm      string           `json:"algorithm"`
-			Hysteresis     string           `json:"hysteresis,omitempty"`
+			Name               string           `json:"name"`
+			TestURL            string           `json:"testUrl"`
+			UseASN             bool             `json:"useASN"`
+			UseLightGBM        bool             `json:"useLightGBM"`
+			CollectData        bool             `json:"collectData"`
+			Fixed              string           `json:"fixed"`
+			Now                string           `json:"now"`
+			LGBMModelAge       string           `json:"lgbmModelAge,omitempty"`
+			Members            int              `json:"members"`
+			PolicyPriority     []map[string]any `json:"policyPriority,omitempty"`
+			PinEndorsements    []map[string]any `json:"pinEndorsements,omitempty"`
+			Algorithm          string           `json:"algorithm"`
+			Hysteresis         string           `json:"hysteresis,omitempty"`
+			PinSuspended       bool             `json:"pinSuspended"`
+			HTTP3FallbackNodes int              `json:"http3FallbackNodes"`
 		}
 		out := []groupInfo{}
 		for _, ob := range outboundMgr.Outbounds() {
@@ -234,6 +239,8 @@ func listSmartGroups(ctx context.Context) func(w http.ResponseWriter, r *http.Re
 				// SetAlgorithm calls, not just the start-up config.
 				Algorithm: sg.CurrentAlgorithm(),
 			}
+			gi.PinSuspended = sg.PinSuspended()
+			gi.HTTP3FallbackNodes = sg.HTTP3FallbackNodeCount()
 			if h := sg.HysteresisDuration(); h > 0 {
 				gi.Hysteresis = h.String()
 			}
@@ -244,6 +251,57 @@ func listSmartGroups(ctx context.Context) func(w http.ResponseWriter, r *http.Re
 		}
 		render.JSON(w, r, render.M{"groups": out})
 	}
+}
+
+func recomputeSmartWeights(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := chi.URLParam(r, "name")
+		sg, err := resolveSmartGroup(ctx, name)
+		if err != nil {
+			render.Status(r, http.StatusNotFound)
+			render.JSON(w, r, newError(err.Error()))
+			return
+		}
+		sg.RecomputeWeights()
+		weights, _ := sg.WeightRanking(true)
+		render.JSON(w, r, render.M{
+			"group":   name,
+			"ranking": weights,
+		})
+	}
+}
+
+func clearSmartSelection(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		name := chi.URLParam(r, "name")
+		sg, err := resolveSmartGroup(ctx, name)
+		if err != nil {
+			render.Status(r, http.StatusNotFound)
+			render.JSON(w, r, newError(err.Error()))
+			return
+		}
+		sg.ClearSelection()
+		render.JSON(w, r, render.M{
+			"group":   name,
+			"cleared": true,
+		})
+	}
+}
+
+func resolveSmartGroup(ctx context.Context, name string) (*group.Smart, error) {
+	outboundMgr := service.FromContext[adapter.OutboundManager](ctx)
+	if outboundMgr == nil {
+		return nil, E.New("outbound manager unavailable")
+	}
+	ob, loaded := outboundMgr.Outbound(name)
+	if !loaded {
+		return nil, E.New("group not found: " + name)
+	}
+	sg, ok := ob.(*group.Smart)
+	if !ok {
+		return nil, E.New("not a Smart group: " + name)
+	}
+	return sg, nil
 }
 
 // blockSmartNode marks a node inside a specific Smart group as blocked for

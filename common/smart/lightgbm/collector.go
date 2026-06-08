@@ -25,7 +25,7 @@ const DefaultCollectorSizeMB = 100
 // Bumped when the column list changes at all — new columns append to the
 // right, never insert in the middle, to keep forward-compatible string
 // parsing in downstream tools.
-const collectorSchemaVersion = "3"
+const collectorSchemaVersion = "4"
 
 // collectorV2ExtraColumns is the xiaobaf14g phase-A column count: 9
 // ModelInput dimensions appended after the original 10 metadata columns.

@@ -239,6 +239,24 @@ func (s *Smart) http3FallbackCount(tag string) int32 {
 	return 0
 }
 
+func (s *Smart) HTTP3FallbackNodeCount() int {
+	if s == nil {
+		return 0
+	}
+	m := s.nodeHTTP3Fallbacks.Load()
+	if m == nil {
+		return 0
+	}
+	count := 0
+	m.Range(func(_ string, v *atomic.Int32) bool {
+		if v.Load() > 0 {
+			count++
+		}
+		return true
+	})
+	return count
+}
+
 // nodeLoadCounter is the global "active connections per node tag"
 // counter consulted by the least-loaded algorithm. xsync.MapOf gives
 // us zero-alloc atomic increments without a fat lock.
