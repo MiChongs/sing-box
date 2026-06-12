@@ -53,6 +53,17 @@ type lruCache[K lruKey, V any] struct {
 	inner *ristretto.Cache[K, V]
 	ttl   time.Duration // 0 = no TTL
 
+	// cost computes the byte cost of a value so ristretto's MaxCost budget
+	// is a TRUE memory ceiling rather than an entry count. nil → every
+	// entry costs 1 (the legacy "MaxCost = number of entries" contract,
+	// kept for callers that genuinely want count-based bounding). When set,
+	// MaxCost is interpreted as a byte budget and eviction tracks real
+	// heap footprint, so a few large entries correctly displace many small
+	// ones instead of all five caches silently overshooting the configured
+	// SMART_CACHE_BUDGET_MB by the variance between assumed and actual
+	// entry size.
+	cost func(V) int64
+
 	// keysIndex tracks every key we have successfully passed to inner.Set.
 	// It is the ONLY way to implement RemoveByPrefix because ristretto has
 	// no Keys() iterator. See the "Key-iteration gap" note above.
@@ -60,43 +71,54 @@ type lruCache[K lruKey, V any] struct {
 
 	// capacity shadows ristretto.MaxCost() for cheap Cap() reads. Stored
 	// as atomic.Int64 instead of a mutex because it is written on Resize
-	// and read on ad-hoc debug paths — contention-free either way.
+	// and read on ad-hoc debug paths — contention-free either way. Holds
+	// the byte budget when a cost fn is set, else the entry count.
 	capacity atomic.Int64
 }
 
-// newLRU creates a concurrency-safe cache without TTL. The capacity is
-// interpreted as the MAX NUMBER OF ENTRIES (unit cost per entry), matching
-// the legacy hashicorp/golang-lru semantics callers assume.
-func newLRU[K lruKey, V any](capacity int) *lruCache[K, V] {
-	return newCache[K, V](capacity, 0)
+// newLRUBytes creates a byte-budgeted cache: maxBytes is a real memory
+// ceiling and costFn returns each value's approximate heap footprint.
+func newLRUBytes[K lruKey, V any](maxBytes int64, costFn func(V) int64) *lruCache[K, V] {
+	return newCacheCost[K, V](maxBytes, 0, byteBudgetCounters(maxBytes), costFn)
 }
 
-// newLRUWithTTL creates a concurrency-safe cache with per-entry expiration.
-// A Get on an expired entry returns miss (ristretto's GC tick reclaims the
-// row in the background).
-func newLRUWithTTL[K lruKey, V any](capacity int, ttl time.Duration) *lruCache[K, V] {
-	return newCache[K, V](capacity, ttl)
+// newLRUBytesWithTTL is newLRUBytes with per-entry expiration. A Get on an
+// expired entry returns miss (ristretto's GC tick reclaims the row in the
+// background).
+func newLRUBytesWithTTL[K lruKey, V any](maxBytes int64, ttl time.Duration, costFn func(V) int64) *lruCache[K, V] {
+	return newCacheCost[K, V](maxBytes, ttl, byteBudgetCounters(maxBytes), costFn)
 }
 
-func newCache[K lruKey, V any](capacity int, ttl time.Duration) *lruCache[K, V] {
-	if capacity <= 0 {
-		capacity = 1
+// byteBudgetCounters picks a TinyLFU counter count for a byte budget.
+// ristretto wants ~10× the expected item count; we estimate item count
+// from a conservative ~256 B average so admission accuracy stays high
+// without over-allocating the 4-bit counter sketch.
+func byteBudgetCounters(maxBytes int64) int64 {
+	n := maxBytes / 26 // ≈ (maxBytes/256)*10
+	if n < 1024 {
+		n = 1024
 	}
-	// NumCounters: ristretto recommends ~10× expected cache size for good
-	// TinyLFU admission accuracy. We clamp below to avoid pathological 0/1
-	// cases on tiny caches.
-	numCounters := int64(capacity) * 10
+	return n
+}
+
+func newCacheCost[K lruKey, V any](maxCost int64, ttl time.Duration, numCounters int64, costFn func(V) int64) *lruCache[K, V] {
+	if maxCost <= 0 {
+		maxCost = 1
+	}
 	if numCounters < 128 {
 		numCounters = 128
 	}
 	c, err := ristretto.NewCache(&ristretto.Config[K, V]{
 		NumCounters: numCounters,
-		MaxCost:     int64(capacity),
+		MaxCost:     maxCost,
 		BufferItems: 64,
-		// IgnoreInternalCost: ristretto normally adds ~56 B per entry to
-		// account for its own bookkeeping; our callers pass Cost=1 and
-		// treat MaxCost as "number of entries", so we turn the internal
-		// accounting off to preserve that contract.
+		// IgnoreInternalCost: ristretto normally adds ~56 B per entry for
+		// its own bookkeeping. In entry-count mode (costFn==nil) callers
+		// pass Cost=1 and treat MaxCost as "number of entries", so we keep
+		// the internal accounting OFF to preserve that contract. In
+		// byte-budget mode our cost fn already folds a per-entry overhead
+		// into the returned cost, so we likewise keep it off and own the
+		// full accounting ourselves — keeps the math predictable.
 		IgnoreInternalCost: true,
 	})
 	if err != nil {
@@ -109,9 +131,10 @@ func newCache[K lruKey, V any](capacity int, ttl time.Duration) *lruCache[K, V] 
 	lc := &lruCache[K, V]{
 		inner:     c,
 		ttl:       ttl,
+		cost:      costFn,
 		keysIndex: xsync.NewMapOf[K, struct{}](),
 	}
-	lc.capacity.Store(int64(capacity))
+	lc.capacity.Store(maxCost)
 	return lc
 }
 
@@ -128,11 +151,18 @@ func (c *lruCache[K, V]) Get(key K) (V, bool) {
 // ring buffer drains (sub-millisecond). Call Wait() if you need sync.
 func (c *lruCache[K, V]) Set(key K, value V) {
 	c.keysIndex.Store(key, struct{}{})
+	cost := int64(1)
+	if c.cost != nil {
+		cost = c.cost(value)
+		if cost < 1 {
+			cost = 1
+		}
+	}
 	if c.ttl > 0 {
-		c.inner.SetWithTTL(key, value, 1, c.ttl)
+		c.inner.SetWithTTL(key, value, cost, c.ttl)
 		return
 	}
-	c.inner.Set(key, value, 1)
+	c.inner.Set(key, value, cost)
 }
 
 // Delete removes an entry; no-op when missing.
@@ -155,14 +185,21 @@ func (c *lruCache[K, V]) Clear() {
 	})
 }
 
-// Resize changes the cost budget. ristretto evicts in the background
-// until the total cost drops under the new ceiling.
+// Resize changes the cost budget (entry-count mode). ristretto evicts in
+// the background until the total cost drops under the new ceiling.
 func (c *lruCache[K, V]) Resize(newCapacity int) {
-	if newCapacity <= 0 {
-		newCapacity = 1
+	c.ResizeBytes(int64(newCapacity))
+}
+
+// ResizeBytes changes the MaxCost budget using an int64 so byte budgets
+// that exceed an int on 32-bit platforms are handled cleanly. Same effect
+// as Resize otherwise.
+func (c *lruCache[K, V]) ResizeBytes(newMaxCost int64) {
+	if newMaxCost <= 0 {
+		newMaxCost = 1
 	}
-	c.capacity.Store(int64(newCapacity))
-	c.inner.UpdateMaxCost(int64(newCapacity))
+	c.capacity.Store(newMaxCost)
+	c.inner.UpdateMaxCost(newMaxCost)
 }
 
 // Cap returns the current configured capacity. Surfaced for ops/debug.

@@ -91,34 +91,86 @@ func GetOrInitStore(db *bbolt.DB) *Store {
 }
 
 func initCaches() {
-	sz, batch := resolveCacheBudget()
+	sz, bytesPer, batch := resolveCacheBudget()
 
 	globalCacheParams.mu.Lock()
 	globalCacheParams.BatchSaveThreshold = batch
 	globalCacheParams.MaxTargets = sz * 4
 	globalCacheParams.mu.Unlock()
 
-	targetCache = newLRU[string, string](sz)
-	unwrapCache = newLRU[string, UnwrapMap](sz)
-	recordCache = newLRU[string, *AtomicStatsRecord](sz)
-	dbResultCache = newLRUWithTTL[string, map[string][]byte](sz, 300*time.Second)
-	blockedNodesCache = newLRUWithTTL[string, map[string]bool](sz, 300*time.Second)
+	// Byte-budgeted caches: MaxCost is real memory, cost fns return each
+	// value's heap footprint. The configured SMART_CACHE_BUDGET_MB is thus
+	// a true ceiling instead of an entry count derived from a 2 KiB/entry
+	// guess that the actual values rarely match.
+	targetCache = newLRUBytes[string, string](bytesPer, costString)
+	unwrapCache = newLRUBytes[string, UnwrapMap](bytesPer, costUnwrapMap)
+	recordCache = newLRUBytes[string, *AtomicStatsRecord](bytesPer, costRecord)
+	dbResultCache = newLRUBytesWithTTL[string, map[string][]byte](bytesPer, 300*time.Second, costDBResult)
+	blockedNodesCache = newLRUBytesWithTTL[string, map[string]bool](bytesPer, 300*time.Second, costBlocked)
 }
 
-// resolveCacheBudget returns (per-cache capacity in number-of-entries,
-// batch-save threshold). It honours two env-var overrides:
+// Per-entry overhead folded into every cost estimate: the bbolt-style key
+// string (≈ "smart/stats/<cfg>/<grp>/<target>/<node>", 40–90 B), the
+// keysIndex map slot, and ristretto's row bookkeeping. Approximate but
+// keeps small entries from being costed as near-free.
+const cacheEntryOverhead = 96
+
+// atomicRecordCost is the representative footprint charged for one
+// *AtomicStatsRecord at insert time. The struct's atomic/mutex/float
+// fields are ~320 B; on top of that each record lazily grows a weights
+// map and an eventual ~1.2 KiB t-digest that ristretto cannot re-cost
+// after insertion (records are mutated in place). We charge the upper
+// bound so a busy group's record cache honours the byte budget rather
+// than overshooting it once every record has accreted its digest.
+const atomicRecordCost = 1280
+
+func costString(v string) int64 { return int64(len(v)) + cacheEntryOverhead }
+
+func costUnwrapMap(v UnwrapMap) int64 {
+	n := int64(len(v.RefTCP) + len(v.RefUDP))
+	for _, s := range v.TCP {
+		n += int64(len(s)) + 16 // string header + bytes
+	}
+	for _, s := range v.UDP {
+		n += int64(len(s)) + 16
+	}
+	return n + cacheEntryOverhead
+}
+
+func costRecord(*AtomicStatsRecord) int64 { return atomicRecordCost }
+
+func costDBResult(v map[string][]byte) int64 {
+	n := int64(0)
+	for k, b := range v {
+		n += int64(len(k)) + int64(len(b)) + 24 // key + value + map-bucket overhead
+	}
+	return n + cacheEntryOverhead
+}
+
+func costBlocked(v map[string]bool) int64 {
+	n := int64(0)
+	for k := range v {
+		n += int64(len(k)) + 9 // key + bool + bucket overhead
+	}
+	return n + cacheEntryOverhead
+}
+
+// resolveCacheBudget returns (per-cache entry budget for scan/prefetch
+// limits, per-cache BYTE budget for the ristretto MaxCost, batch-save
+// threshold). It honours one env-var override:
 //
-//   - SMART_CACHE_BUDGET_MB: total memory budget across all five caches,
-//     interpreted as an approximate byte-cost MaxCost divided five ways.
-//     We convert it back to an entry count by assuming a ~2 KiB typical
-//     entry size (empirical from a 16-group production profile).
-//   - SMART_LEGACY: keeps a single floor value regardless of platform —
-//     used for A/B comparison during the ristretto rollout.
+//   - SMART_CACHE_BUDGET_MB: total memory budget across all five caches.
+//     This is now a REAL byte ceiling: each cache gets mb/5 MiB of
+//     MaxCost and evicts by measured value footprint (see the cost fns in
+//     initCaches), so the configured number tracks actual RSS instead of
+//     an entry count derived from a 2 KiB/entry assumption that the live
+//     values rarely match.
 //
-// Defaults: desktop 32 MB → ~1600 entries per cache; Android 8 MB → ~400.
-// Both numbers respect the MinTargetsLimit / MaxTargetsLimit bounds the
-// rest of the store assumes.
-func resolveCacheBudget() (perCacheEntries, batchThreshold int) {
+// perCacheEntries is retained ONLY to size MaxTargets (the prefetch /
+// bbolt-scan target cap), which is a count, not a memory figure.
+//
+// Defaults: desktop 32 MB, Android/iOS 8 MB, split five ways.
+func resolveCacheBudget() (perCacheEntries int, perCacheBytes int64, batchThreshold int) {
 	mb := defaultCacheBudgetMB()
 	if raw := os.Getenv("SMART_CACHE_BUDGET_MB"); raw != "" {
 		if v, err := strconv.Atoi(raw); err == nil && v > 0 {
@@ -126,7 +178,10 @@ func resolveCacheBudget() (perCacheEntries, batchThreshold int) {
 		}
 	}
 
-	// ~2 KiB per entry, 5 caches share the budget.
+	// Real byte budget per cache.
+	perCacheBytes = int64(mb) * 1024 * 1024 / 5
+
+	// Entry budget (for MaxTargets only): ~2 KiB per entry, 5 caches share.
 	entriesTotal := (mb * 1024) / 2
 	perCacheEntries = entriesTotal / 5
 	if perCacheEntries < MinTargetsLimit/4 {
@@ -151,7 +206,7 @@ func resolveCacheBudget() (perCacheEntries, batchThreshold int) {
 	if batchThreshold > MaxBatchThreshLimit {
 		batchThreshold = MaxBatchThreshLimit
 	}
-	return perCacheEntries, batchThreshold
+	return perCacheEntries, perCacheBytes, batchThreshold
 }
 
 // defaultCacheBudgetMB returns the platform-default cache budget. Android
@@ -642,12 +697,21 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 
 // DBViewPrefixScan scans bbolt for keys with the given prefix.
 // maxResults=-1 means unlimited; reservoir sampling applied when over limit.
+//
+// The reservoir is maintained ONLINE (Algorithm R) while the cursor walks:
+// only entries currently inside the reservoir hold copied key/value bytes.
+// The previous implementation materialised EVERY matching entry first and
+// sampled afterwards — on a stats table with hundreds of nodes × hundreds
+// of targets that was a multi-hundred-MB allocation spike per scan, fired
+// every ranking/prefetch cycle, and the dominant GC-pressure source users
+// observed as sustained CPU heat on large subscriptions.
 func (s *Store) DBViewPrefixScan(prefix string, maxResults int, strict bool) (map[string][]byte, error) {
 	type kv struct {
 		key string
 		val []byte
 	}
-	var kvs []kv
+	var reservoir []kv
+	seen := 0
 
 	err := globalDB.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(bucketSmartStats)
@@ -660,9 +724,16 @@ func (s *Store) DBViewPrefixScan(prefix string, maxResults int, strict bool) (ma
 			if strict && len(k) > len(prefixBytes) && k[len(prefixBytes)] != '/' {
 				continue
 			}
-			valCopy := make([]byte, len(v))
-			copy(valCopy, v)
-			kvs = append(kvs, kv{string(k), valCopy})
+			if maxResults < 0 || len(reservoir) < maxResults {
+				valCopy := make([]byte, len(v))
+				copy(valCopy, v)
+				reservoir = append(reservoir, kv{string(k), valCopy})
+			} else if j := rand.Intn(seen + 1); j < maxResults {
+				valCopy := make([]byte, len(v))
+				copy(valCopy, v)
+				reservoir[j] = kv{string(k), valCopy}
+			}
+			seen++
 		}
 		return nil
 	})
@@ -670,22 +741,9 @@ func (s *Store) DBViewPrefixScan(prefix string, maxResults int, strict bool) (ma
 		return nil, err
 	}
 
-	result := make(map[string][]byte)
-	if maxResults < 0 || len(kvs) <= maxResults {
-		for _, item := range kvs {
-			result[item.key] = item.val
-		}
-	} else {
-		reservoir := kvs[:maxResults]
-		for i := maxResults; i < len(kvs); i++ {
-			j := rand.Intn(i + 1)
-			if j < maxResults {
-				reservoir[j] = kvs[i]
-			}
-		}
-		for _, item := range reservoir {
-			result[item.key] = item.val
-		}
+	result := make(map[string][]byte, len(reservoir))
+	for _, item := range reservoir {
+		result[item.key] = item.val
 	}
 	return result, nil
 }
@@ -1531,10 +1589,17 @@ func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string
 		sampleCount int
 		lastUsed    int64
 	}
+	// Set-based membership test — the previous contains() linear scan made
+	// this loop O(records × N): with 300 tags over a 150k-record stats
+	// table that's ~45M string compares per ranking refresh.
+	wantSet := make(map[string]struct{}, len(allTags))
+	for _, t := range allTags {
+		wantSet[t] = struct{}{}
+	}
 	accs := make(map[string]*acc, len(allTags))
 	for _, nodeStats := range allStats {
 		for nodeName, data := range nodeStats {
-			if !contains(allTags, nodeName) {
+			if _, want := wantSet[nodeName]; !want {
 				continue
 			}
 			var record StatsRecord
@@ -1867,11 +1932,17 @@ func (s *Store) GetNodeWeightRanking(group, config, testURL string, isAlive func
 		weightSum   float64
 		targetCount int
 	}
+	// Set lookup instead of contains() — avoids O(targets × 10 × N)
+	// string compares on large subscriptions.
+	wantSet := make(map[string]struct{}, len(allTags))
+	for _, t := range allTags {
+		wantSet[t] = struct{}{}
+	}
 	accs := make(map[string]*acc, len(allTags))
 	for _, ad := range activeTargets {
 		nodes, weights := s.GetPrefetchResult(group, config, ad.Target, ad.ASN, ad.IsUDP)
 		for i := 0; i < len(nodes) && i < 10; i++ {
-			if !contains(allTags, nodes[i]) {
+			if _, want := wantSet[nodes[i]]; !want {
 				continue
 			}
 			w := 0.0
@@ -2559,27 +2630,32 @@ func (s *Store) CleanupOldRecords(group, config string) error {
 // defaults to a smaller cap than desktops) to ristretto via
 // UpdateMaxCost. Idempotent and allocation-free.
 func (s *Store) AdjustCacheParameters() {
-	sz, batch := resolveCacheBudget()
+	sz, bytesPer, batch := resolveCacheBudget()
 
 	globalCacheParams.mu.Lock()
 	globalCacheParams.MaxTargets = sz * 4 // legacy consumers expect MaxTargets ≈ 4×per-cache capacity
 	globalCacheParams.BatchSaveThreshold = batch
 	globalCacheParams.mu.Unlock()
 
+	// Resize the byte budget — cost fns are unchanged, so eviction keeps
+	// honouring real footprint at the new ceiling.
+	if bytesPer < 1 {
+		bytesPer = 1
+	}
 	if targetCache != nil {
-		targetCache.Resize(sz)
+		targetCache.ResizeBytes(bytesPer)
 	}
 	if unwrapCache != nil {
-		unwrapCache.Resize(sz)
+		unwrapCache.ResizeBytes(bytesPer)
 	}
 	if recordCache != nil {
-		recordCache.Resize(sz)
+		recordCache.ResizeBytes(bytesPer)
 	}
 	if dbResultCache != nil {
-		dbResultCache.Resize(sz)
+		dbResultCache.ResizeBytes(bytesPer)
 	}
 	if blockedNodesCache != nil {
-		blockedNodesCache.Resize(sz)
+		blockedNodesCache.ResizeBytes(bytesPer)
 	}
 }
 

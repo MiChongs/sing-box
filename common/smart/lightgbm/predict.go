@@ -23,6 +23,26 @@ type WeightModel struct {
 
 	// reloadInFlight guards against concurrent reload requests.
 	reloadInFlight atomic.Bool
+
+	// predCache memoises recent inference results keyed by a caller-
+	// supplied (node|target) string. On a busy group the SAME (node,
+	// target) pair closes many connections per second, and its feature
+	// vector barely moves between them — recomputing the full tree walk
+	// each time was a top CPU consumer at high QPS. Entries carry a
+	// timestamp; PredictWeightCached treats them as valid for a short
+	// TTL chosen by the caller. sync.Map keeps reads lock-free; values
+	// are small predCacheEntry structs stored by value.
+	predCache sync.Map // map[string]predCacheEntry
+}
+
+// predCacheEntry is one memoised inference: the priority-INDEPENDENT base
+// prediction plus its confidence and capture time. priorityFactor is
+// applied by the caller after the cache lookup so per-dial priority/pin
+// boosts still compose correctly on top of a cached base.
+type predCacheEntry struct {
+	base       float64
+	confidence float64
+	atNS       int64
 }
 
 // NewWeightModel creates an empty WeightModel bound to a model file path.
@@ -122,6 +142,67 @@ func (m *WeightModel) Reload() error {
 //	             may down-weight the prediction or fall back to delay-based
 //	             ranking. Returns 0 when no prediction was made.
 func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor float64) (weight float64, predicted bool, confidence float64) {
+	base, predicted, confidence := m.predictBase(input, priorityFactor)
+	if !predicted {
+		return base, predicted, confidence
+	}
+	return base * priorityFactor, true, confidence
+}
+
+// PredictWeightCached is PredictWeight with a short-TTL memo keyed by
+// `key` (caller composes it from node+target so distinct destinations
+// don't collide). On a hit within ttl it skips the tree walk entirely and
+// just re-applies priorityFactor to the cached base prediction. ttl<=0 or
+// an empty key disables caching and falls through to PredictWeight.
+//
+// Correctness note: the cached base is priority-independent, so per-dial
+// pin/priority boosts still apply on top. The only staleness is in the
+// feature-derived base, which moves negligibly over a few-second TTL given
+// the EWMA smoothing the caller already applies downstream.
+func (m *WeightModel) PredictWeightCached(input *smart.ModelInput, priorityFactor float64, key string, ttl time.Duration) (weight float64, predicted bool, confidence float64) {
+	if m == nil || key == "" || ttl <= 0 {
+		return m.PredictWeight(input, priorityFactor)
+	}
+	nowNS := time.Now().UnixNano()
+	if v, ok := m.predCache.Load(key); ok {
+		e := v.(predCacheEntry)
+		if nowNS-e.atNS < int64(ttl) {
+			return e.base * priorityFactor, true, e.confidence
+		}
+	}
+	base, ok, conf := m.predictBase(input, priorityFactor)
+	if !ok {
+		// Don't cache fallbacks/gated results — they must re-evaluate
+		// as soon as the node accrues enough samples.
+		return base, ok, conf
+	}
+	m.predCache.Store(key, predCacheEntry{base: base, confidence: conf, atNS: nowNS})
+	return base * priorityFactor, true, conf
+}
+
+// PrunePredCache drops memoised inference entries older than maxAge so the
+// cache can't retain tags for nodes/targets that have gone quiet. Cheap
+// O(entries) sweep; intended to be called from an existing janitor tick.
+func (m *WeightModel) PrunePredCache(maxAge time.Duration) {
+	if m == nil || maxAge <= 0 {
+		return
+	}
+	cutoff := time.Now().UnixNano() - int64(maxAge)
+	m.predCache.Range(func(k, v any) bool {
+		if v.(predCacheEntry).atNS < cutoff {
+			m.predCache.Delete(k)
+		}
+		return true
+	})
+}
+
+// predictBase runs the model and returns the priority-INDEPENDENT base
+// prediction (predFull, before any priorityFactor multiply), along with
+// whether the model produced it and the confidence. The non-ML fallback
+// path returns the already-priority-applied CalculateWeight value with
+// predicted=false — callers must NOT multiply by priorityFactor again in
+// that case (PredictWeight / PredictWeightCached both guard on the flag).
+func (m *WeightModel) predictBase(input *smart.ModelInput, priorityFactor float64) (base float64, predicted bool, confidence float64) {
 	if m == nil {
 		w, p := smart.CalculateWeight(input, priorityFactor)
 		return w, p, 0
@@ -191,5 +272,6 @@ func (m *WeightModel) PredictWeight(input *smart.ModelInput, priorityFactor floa
 	// not move the prediction at all, and approaches 0 as the correction
 	// magnitude grows. Bounded in (0, 1]; never NaN.
 	confidence = 1.0 / (1.0 + math.Abs(predFull-predHalf))
-	return predFull * priorityFactor, true, confidence
+	// Return the priority-INDEPENDENT base; callers apply priorityFactor.
+	return predFull, true, confidence
 }
