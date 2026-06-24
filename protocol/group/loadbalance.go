@@ -360,8 +360,6 @@ func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundMa
 	var history adapter.URLTestHistoryStorage
 	if historyFromCtx := service.PtrFromContext[urltest.HistoryStorage](ctx); historyFromCtx != nil {
 		history = historyFromCtx
-	} else if clashServer := service.FromContext[adapter.ClashServer](ctx); clashServer != nil {
-		history = clashServer.HistoryStorage()
 	} else {
 		history = urltest.NewHistoryStorage()
 	}

@@ -73,12 +73,18 @@ func (c *ClashProxy) UnmarshalYAML(value *yaml.Node) error {
 	case "ssh":
 		c.SingType = C.TypeSSH
 		options = &SSHOption{}
+	case "snell":
+		c.SingType = C.TypeSnell
+		options = &SnellOption{}
 	case "anytls":
 		c.SingType = C.TypeAnyTLS
 		options = &AnyTLSOption{}
 	case "wireguard":
 		c.SingType = C.TypeWireGuard
 		options = &ClashWireGuardOption{}
+	case "tailscale":
+		c.SingType = C.TypeTailscale
+		options = &ClashTailscaleOption{}
 	default:
 		return nil
 	}
@@ -119,16 +125,19 @@ func ParseClashSubscription(_ context.Context, content string) ([]option.Outboun
 		return nil, nil, E.Cause(err, "parse clash config")
 	}
 	outbounds := common.FilterIsInstance(config.Proxies, func(proxy ClashProxy) (option.Outbound, bool) {
-		if proxy.SingType == "" || proxy.SingType == C.TypeWireGuard {
+		if proxy.SingType == "" || proxy.SingType == C.TypeWireGuard || proxy.SingType == C.TypeTailscale {
 			return option.Outbound{}, false
 		}
 		return proxy.Build(), true
 	})
 	endpoints := common.FilterIsInstance(config.Proxies, func(proxy ClashProxy) (option.Endpoint, bool) {
-		if proxy.SingType != C.TypeWireGuard {
-			return option.Endpoint{}, false
-		}
-		if wgOpt, ok := proxy.Options.(*ClashWireGuardOption); ok && wgOpt.AmneziaWGOption != nil {
+		switch proxy.SingType {
+		case C.TypeWireGuard:
+			if wgOpt, ok := proxy.Options.(*ClashWireGuardOption); ok && wgOpt.AmneziaWGOption != nil {
+				return option.Endpoint{}, false
+			}
+		case C.TypeTailscale:
+		default:
 			return option.Endpoint{}, false
 		}
 		return proxy.BuildEndpoint(), true
@@ -466,6 +475,33 @@ func (s *SSHOption) Build() any {
 	return options
 }
 
+type SnellOption struct {
+	DialerOptions `yaml:",inline"`
+	ServerOptions `yaml:",inline"`
+	PSK           string         `yaml:"psk"`
+	UDP           bool           `yaml:"udp,omitempty"`
+	Version       int            `yaml:"version,omitempty"`
+	Reuse         bool           `yaml:"reuse,omitempty"`
+	ObfsOpts      map[string]any `yaml:"obfs-opts,omitempty"`
+}
+
+func (s *SnellOption) Build() any {
+	version := s.Version
+	if version == 5 {
+		version = 4
+	}
+	return &option.SnellOutboundOptions{
+		DialerOptions: s.DialerOptions.Build(),
+		ServerOptions: s.ServerOptions.Build(),
+		PSK:           s.PSK,
+		Version:       version,
+		Reuse:         s.Reuse,
+		Network:       clashSnellNetworks(s.UDP),
+		ObfsMode:      clashStringOption(s.ObfsOpts, "mode"),
+		ObfsHost:      clashStringOption(s.ObfsOpts, "host"),
+	}
+}
+
 type AnyTLSOption struct {
 	DialerOptions            `yaml:",inline"`
 	ServerOptions            `yaml:",inline"`
@@ -487,6 +523,41 @@ func (a *AnyTLSOption) Build() any {
 		IdleSessionCheckInterval:    badoption.Duration(a.IdleSessionCheckInterval),
 		IdleSessionTimeout:          badoption.Duration(a.IdleSessionTimeout),
 		MinIdleSession:              a.MinIdleSession,
+	}
+}
+
+type ClashTailscaleOption struct {
+	DialerOptions          `yaml:",inline"`
+	Hostname               string `yaml:"hostname,omitempty"`
+	AuthKey                string `yaml:"auth-key,omitempty"`
+	ControlURL             string `yaml:"control-url,omitempty"`
+	StateDir               string `yaml:"state-dir,omitempty"`
+	Ephemeral              bool   `yaml:"ephemeral,omitempty"`
+	UDP                    bool   `yaml:"udp,omitempty"`
+	AcceptRoutes           *bool  `yaml:"accept-routes,omitempty"`
+	ExitNode               string `yaml:"exit-node,omitempty"`
+	ExitNodeAllowLANAccess *bool  `yaml:"exit-node-allow-lan-access,omitempty"`
+}
+
+func (t *ClashTailscaleOption) Build() any {
+	var acceptRoutes bool
+	if t.AcceptRoutes != nil {
+		acceptRoutes = *t.AcceptRoutes
+	}
+	var exitNodeAllowLANAccess bool
+	if t.ExitNodeAllowLANAccess != nil {
+		exitNodeAllowLANAccess = *t.ExitNodeAllowLANAccess
+	}
+	return &option.TailscaleEndpointOptions{
+		DialerOptions:          t.DialerOptions.Build(),
+		StateDirectory:         t.StateDir,
+		AuthKey:                t.AuthKey,
+		ControlURL:             t.ControlURL,
+		Ephemeral:              t.Ephemeral,
+		Hostname:               t.Hostname,
+		AcceptRoutes:           acceptRoutes,
+		ExitNode:               t.ExitNode,
+		ExitNodeAllowLANAccess: exitNodeAllowLANAccess,
 	}
 }
 
@@ -801,6 +872,24 @@ func clashNetworks(udpEnabled bool) option.NetworkList {
 		return N.NetworkTCP
 	}
 	return ""
+}
+
+func clashSnellNetworks(udpEnabled bool) option.NetworkList {
+	if !udpEnabled {
+		return N.NetworkTCP
+	}
+	return option.NetworkList(strings.Join([]string{N.NetworkTCP, N.NetworkUDP}, "\n"))
+}
+
+func clashStringOption(options map[string]any, key string) string {
+	if options == nil {
+		return ""
+	}
+	value, loaded := options[key]
+	if !loaded || value == nil {
+		return ""
+	}
+	return F.ToString(value)
 }
 
 func clashPluginName(plugin string) string {

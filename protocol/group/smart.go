@@ -737,9 +737,9 @@ func (s *Smart) PostStart() error {
 		s.SetAlgorithm(s.configAlgorithm)
 	}
 
-	// Get history storage from Clash server (for alive-checking)
-	if clashServer := service.FromContext[adapter.ClashServer](s.ctx); clashServer != nil {
-		s.history = clashServer.HistoryStorage()
+	// Get history storage (alpha34 layout: service ptr; pre-alpha34 fallback: ClashServer)
+	if hp := service.PtrFromContext[urltest.HistoryStorage](s.ctx); hp != nil {
+		s.history = hp
 	}
 
 	// Get cache file and init store

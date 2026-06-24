@@ -9,6 +9,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
+	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -37,6 +38,7 @@ type Selector struct {
 	defaultTag                   string
 	outbounds                    map[string]adapter.Outbound
 	selected                     common.TypedValue[adapter.Outbound]
+	history                      *urltest.HistoryStorage
 	interruptGroup               *interrupt.Group
 	interruptExternalConnections bool
 
@@ -63,6 +65,7 @@ func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextL
 		tags:                         options.Outbounds,
 		defaultTag:                   options.Default,
 		outbounds:                    make(map[string]adapter.Outbound),
+		history:                      service.PtrFromContext[urltest.HistoryStorage](ctx),
 		interruptGroup:               interrupt.NewGroup(),
 		interruptExternalConnections: options.InterruptExistConnections,
 
@@ -170,6 +173,9 @@ func (s *Selector) SelectOutbound(tag string) bool {
 		}
 	}
 	s.interruptGroup.Interrupt(s.interruptExternalConnections)
+	if s.history != nil {
+		s.history.NotifyUpdated()
+	}
 	return true
 }
 

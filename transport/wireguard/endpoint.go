@@ -222,6 +222,9 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
 	}
+	if err := e.ensureDeviceStarted(); err != nil {
+		return nil, err
+	}
 	return e.tunDevice.DialContext(ctx, network, destination)
 }
 
@@ -229,7 +232,27 @@ func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	if !destination.Addr.IsValid() {
 		return nil, E.Cause(os.ErrInvalid, "invalid non-IP destination")
 	}
+	if err := e.ensureDeviceStarted(); err != nil {
+		return nil, err
+	}
 	return e.tunDevice.ListenPacket(ctx, destination)
+}
+
+func (e *Endpoint) ensureDeviceStarted() error {
+	if e.device == nil || e.pause != nil && e.pause.IsPaused() {
+		return net.ErrClosed
+	}
+	return e.device.Up()
+}
+
+func (e *Endpoint) BindUpdate() error {
+	if e.device == nil {
+		return net.ErrClosed
+	}
+	if e.pause != nil && e.pause.IsPaused() {
+		return nil
+	}
+	return e.device.BindUpdate()
 }
 
 func (e *Endpoint) Close() error {
@@ -256,15 +279,28 @@ func (e *Endpoint) NewDirectRouteConnection(metadata adapter.InboundContext, rou
 	if e.natDevice == nil {
 		return nil, os.ErrInvalid
 	}
+	if err := e.ensureDeviceStarted(); err != nil {
+		return nil, err
+	}
 	return e.natDevice.CreateDestination(metadata, routeContext, timeout)
 }
 
 func (e *Endpoint) onPauseUpdated(event int) {
+	if e.device == nil {
+		return
+	}
+	var err error
 	switch event {
 	case pause.EventDevicePaused, pause.EventNetworkPause:
-		e.device.Down()
+		err = e.device.Down()
 	case pause.EventDeviceWake, pause.EventNetworkWake:
-		e.device.Up()
+		if e.pause.IsPaused() {
+			return
+		}
+		err = e.device.Up()
+	}
+	if err != nil {
+		e.options.Logger.Warn(E.Cause(err, "update WireGuard device state"))
 	}
 }
 

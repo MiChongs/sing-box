@@ -74,8 +74,9 @@ func NewAdapter(ctx context.Context, router adapter.Router, outbound adapter.Out
 func (a *Adapter) Start() error {
 	a.history = service.FromContext[adapter.URLTestHistoryStorage](a.ctx)
 	if a.history == nil {
-		if clashServer := service.FromContext[adapter.ClashServer](a.ctx); clashServer != nil {
-			a.history = clashServer.HistoryStorage()
+		// Fallback to context-pointer (upstream alpha34 layout) or new storage.
+		if hp := service.PtrFromContext[urltest.HistoryStorage](a.ctx); hp != nil {
+			a.history = hp
 		} else {
 			a.history = urltest.NewHistoryStorage()
 		}

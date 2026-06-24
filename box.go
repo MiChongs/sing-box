@@ -20,6 +20,8 @@ import (
 	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/trafficcontrol"
+	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/experimental"
@@ -170,6 +172,12 @@ func New(options Options) (*Box, error) {
 	if experimentalOptions.V2RayAPI != nil && experimentalOptions.V2RayAPI.Listen != "" {
 		needV2RayAPI = true
 	}
+	needAPIService := common.Any(options.Services, func(it option.Service) bool {
+		return it.Type == C.TypeAPI
+	})
+	if service.PtrFromContext[urltest.HistoryStorage](ctx) == nil {
+		ctx = service.ContextWithPtr(ctx, urltest.NewHistoryStorage())
+	}
 	platformInterface := service.FromContext[adapter.PlatformInterface](ctx)
 	var defaultLogWriter io.Writer
 	if platformInterface != nil {
@@ -178,7 +186,7 @@ func New(options Options) (*Box, error) {
 	logFactory, err := log.New(log.Options{
 		Context:        ctx,
 		Options:        common.PtrValueOrDefault(options.Log),
-		Observable:     needClashAPI,
+		Observable:     needClashAPI || needAPIService,
 		DefaultWriter:  defaultLogWriter,
 		BaseTime:       createdAt,
 		PlatformWriter: options.PlatformLogWriter,
@@ -186,6 +194,9 @@ func New(options Options) (*Box, error) {
 	if err != nil {
 		return nil, E.Cause(err, "create log factory")
 	}
+	service.MustRegister[log.Factory](ctx, logFactory)
+
+	C.URLTestUnifiedDelay = experimentalOptions.URLTestUnifiedDelay
 
 	C.URLTestUnifiedDelay = experimentalOptions.URLTestUnifiedDelay
 
@@ -196,7 +207,7 @@ func New(options Options) (*Box, error) {
 		len(certificateOptions.Certificate) > 0 ||
 		len(certificateOptions.CertificatePath) > 0 ||
 		len(certificateOptions.CertificateDirectoryPath) > 0 {
-		certificateStore, err := certificate.NewStore(ctx, logFactory.NewLogger("certificate"), certificateOptions)
+		certificateStore, err := certificate.NewStore(logFactory.NewLogger("certificate"), certificateOptions)
 		if err != nil {
 			return nil, err
 		}
@@ -240,6 +251,12 @@ func New(options Options) (*Box, error) {
 	err = router.Initialize(routeOptions.Rules, routeOptions.RuleSet)
 	if err != nil {
 		return nil, E.Cause(err, "initialize router")
+	}
+	if needClashAPI || needAPIService {
+		trafficManager := trafficcontrol.NewManager(outboundManager)
+		service.MustRegisterPtr(ctx, trafficManager)
+		router.AppendTracker(trafficManager)
+		internalServices = append(internalServices, trafficManager)
 	}
 	ntpOptions := common.PtrValueOrDefault(options.NTP)
 	var timeService *tls.TimeServiceWrapper
@@ -462,7 +479,6 @@ func New(options Options) (*Box, error) {
 		if err != nil {
 			return nil, E.Cause(err, "create clash-server")
 		}
-		router.AppendTracker(clashServer)
 		service.MustRegister[adapter.ClashServer](ctx, clashServer)
 		internalServices = append(internalServices, clashServer)
 	}

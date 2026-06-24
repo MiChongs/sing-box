@@ -22,8 +22,9 @@ func ParseSubscription(ctx context.Context, content string, overrideDialerOption
 	for _, parser := range subscriptionParsers {
 		outbounds, endpoints, err := parser(ctx, content)
 		if len(outbounds) > 0 || len(endpoints) > 0 {
-			return overrideOutbounds(outbounds, overrideDialerOptions, overrideTLSOptions, providerTag),
-				overrideEndpoints(endpoints, overrideDialerOptions, providerTag),
+			tags := providerTags(outbounds, endpoints)
+			return overrideOutbounds(outbounds, overrideDialerOptions, overrideTLSOptions, tags, providerTag),
+				overrideEndpoints(endpoints, overrideDialerOptions, tags, providerTag),
 				nil
 		}
 		pErr = E.Errors(pErr, err)
@@ -31,11 +32,18 @@ func ParseSubscription(ctx context.Context, content string, overrideDialerOption
 	return nil, nil, E.Cause(pErr, "no servers found")
 }
 
-func overrideOutbounds(outbounds []option.Outbound, overrideDialerOptions *option.OverrideDialerOptions, overrideTLSOptions *option.OverrideTLSOptions, providerTag string) []option.Outbound {
-	var tags []string
+func providerTags(outbounds []option.Outbound, endpoints []option.Endpoint) []string {
+	tags := make([]string, 0, len(outbounds)+len(endpoints))
 	for _, outbound := range outbounds {
 		tags = append(tags, outbound.Tag)
 	}
+	for _, endpoint := range endpoints {
+		tags = append(tags, endpoint.Tag)
+	}
+	return tags
+}
+
+func overrideOutbounds(outbounds []option.Outbound, overrideDialerOptions *option.OverrideDialerOptions, overrideTLSOptions *option.OverrideTLSOptions, tags []string, providerTag string) []option.Outbound {
 	var parsedOutbounds []option.Outbound
 	for _, outbound := range outbounds {
 		switch outbound.Type {
@@ -92,25 +100,29 @@ func overrideOutbounds(outbounds []option.Outbound, overrideDialerOptions *optio
 			options := outbound.Options.(*option.ShadowsocksOutboundOptions)
 			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
 			outbound.Options = options
+		case C.TypeSnell:
+			options := outbound.Options.(*option.SnellOutboundOptions)
+			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
+			outbound.Options = options
 		}
 		parsedOutbounds = append(parsedOutbounds, outbound)
 	}
 	return parsedOutbounds
 }
 
-func overrideEndpoints(endpoints []option.Endpoint, overrideDialerOptions *option.OverrideDialerOptions, providerTag string) []option.Endpoint {
+func overrideEndpoints(endpoints []option.Endpoint, overrideDialerOptions *option.OverrideDialerOptions, tags []string, providerTag string) []option.Endpoint {
 	if len(endpoints) == 0 {
 		return nil
-	}
-	var tags []string
-	for _, ep := range endpoints {
-		tags = append(tags, ep.Tag)
 	}
 	var parsedEndpoints []option.Endpoint
 	for _, ep := range endpoints {
 		switch ep.Type {
 		case C.TypeWireGuard:
 			options := ep.Options.(*option.WireGuardEndpointOptions)
+			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
+			ep.Options = options
+		case C.TypeTailscale:
+			options := ep.Options.(*option.TailscaleEndpointOptions)
 			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
 			ep.Options = options
 		}

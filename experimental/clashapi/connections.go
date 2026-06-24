@@ -4,12 +4,16 @@ import (
 	"bytes"
 	"context"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/experimental/clashapi/trafficontrol"
+	"github.com/sagernet/sing-box/common/trafficcontrol"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/protocol/group"
+	"github.com/sagernet/sing/common"
+	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/ws"
@@ -20,7 +24,7 @@ import (
 	"github.com/gofrs/uuid/v5"
 )
 
-func connectionRouter(ctx context.Context, network adapter.NetworkManager, trafficManager *trafficontrol.Manager) http.Handler {
+func connectionRouter(ctx context.Context, network adapter.NetworkManager, trafficManager *trafficcontrol.Manager) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getConnections(ctx, trafficManager))
 	r.Delete("/", closeAllConnections(network, trafficManager))
@@ -32,11 +36,93 @@ func connectionRouter(ctx context.Context, network adapter.NetworkManager, traff
 	return r
 }
 
-func getConnections(ctx context.Context, trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
+func connectionsSnapshot(trafficManager *trafficcontrol.Manager) render.M {
+	uplinkTotal, downlinkTotal := trafficManager.Total()
+	connections := common.Filter(trafficManager.Connections(), func(metadata *trafficcontrol.TrackerMetadata) bool {
+		return metadata.OutboundType != C.TypeDNS
+	})
+	return render.M{
+		"downloadTotal": downlinkTotal,
+		"uploadTotal":   uplinkTotal,
+		"connections": common.Map(connections, func(metadata *trafficcontrol.TrackerMetadata) connectionObject {
+			return connectionObject(*metadata)
+		}),
+		"memory": inuseMemory(),
+	}
+}
+
+type connectionObject trafficcontrol.TrackerMetadata
+
+func (c connectionObject) MarshalJSON() ([]byte, error) {
+	var inbound string
+	if c.Metadata.Inbound != "" {
+		inbound = c.Metadata.InboundType + "/" + c.Metadata.Inbound
+	} else {
+		inbound = c.Metadata.InboundType
+	}
+	var domain string
+	if c.Metadata.Destination.Fqdn != "" {
+		domain = c.Metadata.Destination.Fqdn
+	} else {
+		domain = c.Metadata.Domain
+	}
+	var destinationAddr netip.Addr
+	if len(c.Metadata.DestinationAddresses) > 0 {
+		destinationAddr = c.Metadata.DestinationAddresses[0]
+	} else {
+		destinationAddr = c.Metadata.Destination.Addr
+	}
+	var processPath string
+	if c.Metadata.ProcessInfo != nil {
+		if c.Metadata.ProcessInfo.ProcessPath != "" {
+			processPath = c.Metadata.ProcessInfo.ProcessPath
+		} else if len(c.Metadata.ProcessInfo.AndroidPackageNames) > 0 {
+			processPath = c.Metadata.ProcessInfo.AndroidPackageNames[0]
+		}
+		if processPath == "" {
+			if c.Metadata.ProcessInfo.UserId != -1 {
+				processPath = F.ToString(c.Metadata.ProcessInfo.UserId)
+			}
+		} else if c.Metadata.ProcessInfo.UserName != "" {
+			processPath = F.ToString(processPath, " (", c.Metadata.ProcessInfo.UserName, ")")
+		} else if c.Metadata.ProcessInfo.UserId != -1 {
+			processPath = F.ToString(processPath, " (", c.Metadata.ProcessInfo.UserId, ")")
+		}
+	}
+	var rule string
+	if c.Rule != nil {
+		rule = F.ToString(c.Rule, " => ", c.Rule.Action())
+	} else {
+		rule = "final"
+	}
+	chains := trafficcontrol.TrackerMetadata(c).Chains()
+	return json.Marshal(map[string]any{
+		"id": c.ID,
+		"metadata": map[string]any{
+			"network":         c.Metadata.Network,
+			"type":            inbound,
+			"sourceIP":        c.Metadata.Source.Addr,
+			"destinationIP":   destinationAddr,
+			"sourcePort":      F.ToString(c.Metadata.Source.Port),
+			"destinationPort": F.ToString(c.Metadata.Destination.Port),
+			"host":            domain,
+			"sniffHost":       c.Metadata.SniffHost,
+			"dnsMode":         "normal",
+			"processPath":     processPath,
+		},
+		"upload":      c.Upload.Load(),
+		"download":    c.Download.Load(),
+		"start":       c.CreatedAt,
+		"chains":      chains,
+		"rule":        rule,
+		"rulePayload": "",
+	})
+}
+
+func getConnections(ctx context.Context, trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") != "websocket" {
-			snapshot := trafficManager.Snapshot()
-			render.JSON(w, r, snapshot)
+			render.JSON(w, r, connectionsSnapshot(trafficManager))
 			return
 		}
 
@@ -62,9 +148,9 @@ func getConnections(ctx context.Context, trafficManager *trafficontrol.Manager) 
 		buf := &bytes.Buffer{}
 		sendSnapshot := func() error {
 			buf.Reset()
-			snapshot := trafficManager.Snapshot()
-			if err := json.NewEncoder(buf).Encode(snapshot); err != nil {
-				return err
+			encodeErr := json.NewEncoder(buf).Encode(connectionsSnapshot(trafficManager))
+			if encodeErr != nil {
+				return encodeErr
 			}
 			return wsutil.WriteServerText(conn, buf.Bytes())
 		}
@@ -88,26 +174,20 @@ func getConnections(ctx context.Context, trafficManager *trafficontrol.Manager) 
 	}
 }
 
-func closeConnection(trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
+func closeConnection(trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := uuid.FromStringOrNil(chi.URLParam(r, "id"))
-		snapshot := trafficManager.Snapshot()
-		for _, c := range snapshot.Connections {
-			if id == c.Metadata().ID {
-				c.Close()
-				break
-			}
+		targetConnection := trafficManager.Connection(id)
+		if targetConnection != nil {
+			targetConnection.Close()
 		}
 		render.NoContent(w, r)
 	}
 }
 
-func closeAllConnections(network adapter.NetworkManager, trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
+func closeAllConnections(network adapter.NetworkManager, trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		snapshot := trafficManager.Snapshot()
-		for _, c := range snapshot.Connections {
-			c.Close()
-		}
+		trafficManager.CloseAllConnections()
 		network.ResetNetwork()
 		render.NoContent(w, r)
 	}
@@ -117,7 +197,7 @@ func closeAllConnections(network adapter.NetworkManager, trafficManager *traffic
 // routed through a Smart group, additionally marks the selected node as
 // blocked within that group. Looks up the group and its downstream node via
 // the connection's RealOutboundChain.
-func smartBlockConnection(ctx context.Context, trafficManager *trafficontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
+func smartBlockConnection(ctx context.Context, trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := uuid.FromStringOrNil(chi.URLParam(r, "id"))
 		if id == uuid.Nil {
@@ -125,16 +205,14 @@ func smartBlockConnection(ctx context.Context, trafficManager *trafficontrol.Man
 			render.JSON(w, r, ErrBadRequest)
 			return
 		}
-		snapshot := trafficManager.Snapshot()
-		var target *trafficontrol.TrackerMetadata
-		for _, c := range snapshot.Connections {
-			meta := c.Metadata()
-			if meta != nil && meta.ID == id {
-				target = meta
-				c.Close()
-				break
-			}
+		tracker := trafficManager.Connection(id)
+		if tracker == nil {
+			render.Status(r, http.StatusNotFound)
+			render.JSON(w, r, ErrNotFound)
+			return
 		}
+		target := tracker.Metadata()
+		tracker.Close()
 		if target == nil {
 			render.Status(r, http.StatusNotFound)
 			render.JSON(w, r, ErrNotFound)

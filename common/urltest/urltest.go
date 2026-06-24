@@ -28,19 +28,27 @@ import (
 // ════════════════ HistoryStorage ════════════════
 
 var _ adapter.URLTestHistoryStorage = (*HistoryStorage)(nil)
-
 type HistoryStorage struct {
 	delayHistory sync.Map
-	updateHook   *observable.Subscriber[struct{}]
+	updateHooks  []*observable.Subscriber[struct{}]
 	hookAccess   sync.Mutex
 }
 
 func NewHistoryStorage() *HistoryStorage { return &HistoryStorage{} }
 
-func (s *HistoryStorage) SetHook(h *observable.Subscriber[struct{}]) {
+func (s *HistoryStorage) AddUpdateHook(hook *observable.Subscriber[struct{}]) {
 	s.hookAccess.Lock()
-	s.updateHook = h
+	defer s.hookAccess.Unlock()
+	s.updateHooks = append(s.updateHooks, hook)
+}
+
+func (s *HistoryStorage) NotifyUpdated() {
+	s.hookAccess.Lock()
+	hooks := s.updateHooks
 	s.hookAccess.Unlock()
+	for _, h := range hooks {
+		h.Emit(struct{}{})
+	}
 }
 
 func (s *HistoryStorage) LoadURLTestHistory(tag string) *adapter.URLTestHistory {
@@ -66,16 +74,16 @@ func (s *HistoryStorage) StoreURLTestHistory(tag string, h *adapter.URLTestHisto
 
 func (s *HistoryStorage) notifyUpdated() {
 	s.hookAccess.Lock()
-	h := s.updateHook
+	hooks := s.updateHooks
 	s.hookAccess.Unlock()
-	if h != nil {
+	for _, h := range hooks {
 		h.Emit(struct{}{})
 	}
 }
 
 func (s *HistoryStorage) Close() error {
 	s.hookAccess.Lock()
-	s.updateHook = nil
+	s.updateHooks = nil
 	s.hookAccess.Unlock()
 	return nil
 }
@@ -300,6 +308,7 @@ func URLTestWithDetailAndStatus(ctx context.Context, link string, detour N.Diale
 			detail.PathMTU = tinfo.PathMTU
 		}
 	}
+
 	return
 }
 

@@ -120,11 +120,11 @@ func (s *LocalRuleSet) getPath(ctx context.Context, path string) (string, error)
 	return path, nil
 }
 
-func (s *LocalRuleSet) PostStart() error {
+func (s *LocalRuleSet) Update(ctx context.Context) error {
 	return nil
 }
 
-func (s *LocalRuleSet) Update(ctx context.Context) error {
+func (s *LocalRuleSet) PostStart() error {
 	return nil
 }
 

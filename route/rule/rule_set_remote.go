@@ -6,7 +6,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 
@@ -40,7 +39,6 @@ type RemoteRuleSet struct {
 	httpClient     *http.Client
 	hash           hash.HashType
 	lastEtag       string
-	updateTicker   *time.Ticker
 	cacheFile      adapter.CacheFile
 	pauseManager   pause.Manager
 }
@@ -95,28 +93,11 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 			s.logger.Warn(E.Cause(err, "initial rule-set fetch failed, starting empty: ", s.tag))
 		}
 	}
-	s.updateTicker = time.NewTicker(s.updateInterval)
 	return nil
 }
 
 func (s *RemoteRuleSet) PostStart() error {
-	go s.loopUpdate()
 	return nil
-}
-
-func (s *RemoteRuleSet) loopUpdate() {
-	if time.Since(s.lastUpdated) > s.updateInterval {
-		s.update()
-	}
-	for {
-		runtime.GC()
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-s.updateTicker.C:
-			s.update()
-		}
-	}
 }
 
 func (s *RemoteRuleSet) update() {
@@ -319,8 +300,5 @@ func (s *RemoteRuleSet) saveCacheFile(contentRaw []byte) {
 func (s *RemoteRuleSet) Close() error {
 	s.rules = nil
 	s.cancel()
-	if s.updateTicker != nil {
-		s.updateTicker.Stop()
-	}
 	return nil
 }

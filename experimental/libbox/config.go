@@ -131,10 +131,6 @@ func (s *platformInterfaceStub) ReadWIFIState() adapter.WIFIState {
 	return adapter.WIFIState{}
 }
 
-func (s *platformInterfaceStub) SystemCertificates() []string {
-	return nil
-}
-
 func (s *platformInterfaceStub) UsePlatformConnectionOwnerFinder() bool {
 	return false
 }
@@ -235,8 +231,8 @@ func (s *interfaceMonitorStub) UnregisterCallback(element *list.Element[tun.Defa
 func (s *interfaceMonitorStub) RegisterMyInterface(interfaceName string) {
 }
 
-func (s *interfaceMonitorStub) MyInterface() string {
-	return ""
+func (s *interfaceMonitorStub) MyInterfaces() []string {
+	return nil
 }
 
 func (s *interfaceMonitorStub) ForceUpdate() {}

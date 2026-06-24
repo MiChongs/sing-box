@@ -56,7 +56,6 @@ type RuleSet interface {
 	UpdatedTime() time.Time
 	Update(ctx context.Context) error
 	StartContext(ctx context.Context, startContext *HTTPStartContext) error
-	PostStart() error
 	Metadata() RuleSetMetadata
 	ExtractIPSet() []*netipx.IPSet
 	IncRef()
