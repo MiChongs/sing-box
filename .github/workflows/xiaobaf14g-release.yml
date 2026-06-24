@@ -105,6 +105,12 @@ jobs:
         include:
           # Windows
           - { goos: windows, goarch: amd64,    ext: .exe, tags_src: windows, suffix: '' }
+          # AMD64 v3 — Haswell+ (Intel 2013+) / Excavator+ (AMD 2015+). 启用 AVX/AVX2/BMI1/BMI2/F16C/FMA/LZCNT/MOVBE。
+          # 纯 Go CGO=0，没有 glibc 依赖，单文件运行。
+          - { goos: windows, goarch: amd64,    ext: .exe, tags_src: windows, suffix: -v3,  goamd64: v3 }
+          # AMD64 v4 — Skylake-X+ (Intel 2017+) / Zen 4+ (AMD 2022+). 在 v3 之上启用 AVX-512。
+          # 适合现代 Xeon / EPYC / 高端桌面 CPU；老 CPU 跑会 SIGILL。
+          - { goos: windows, goarch: amd64,    ext: .exe, tags_src: windows, suffix: -v4,  goamd64: v4 }
           - { goos: windows, goarch: arm64,    ext: .exe, tags_src: windows, suffix: '' }
           - { goos: windows, goarch: '386',    ext: .exe, tags_src: windows, suffix: '' }
           # Linux

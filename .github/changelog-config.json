@@ -82,9 +82,9 @@
     "on_property": "mergedAt"
   },
   "template": "#{{CHANGELOG}}\n#{{UNCATEGORIZED}}",
-  "pr_template": "- #{{TITLE}} ([`#{{COMMIT_SHA}}`](#{{URL}}))",
+  "pr_template": "- #{{TITLE}} (#{{URL}})",
   "empty_template": "_No noteworthy changes in this range._",
-  "commit_template": "- #{{TITLE}} ([`#{{COMMIT_SHA}}`](https://github.com/#{{OWNER}}/#{{REPO}}/commit/#{{COMMIT_SHA}}))",
+  "commit_template": "- #{{TITLE}} ([`#{{MERGE_SHA}}`](https://github.com/#{{OWNER}}/#{{REPO}}/commit/#{{MERGE_SHA}}))",
   "trim_values": true,
   "max_tags_to_fetch": 200,
   "max_pull_requests": 300,
