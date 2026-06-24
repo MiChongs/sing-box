@@ -94,14 +94,25 @@ type V2RayXHTTPOptions struct {
 	// SeqKey: seq 字段名。默认按 placement 取 "x_seq" / "X-Seq"。
 	SeqKey string `json:"seq_key,omitempty"`
 
-	// UplinkDataPlacement: 上行数据放在哪。"body" (默认) / "cookie" / "header"。
+	// UplinkDataPlacement: 上行数据放在哪。"body" / "auto" (默认) / "cookie" / "header"。
+	// auto 在客户端等同 body，服务端会从 header+cookie+body 三处收集拼接。
 	// 设为 cookie / header 时仅 packet-up 模式有效。
 	UplinkDataPlacement string `json:"uplink_data_placement,omitempty"`
 	// UplinkDataKey: 上行数据字段基名。默认按 placement 取 "x_data" / "X-Data"。
 	UplinkDataKey string `json:"uplink_data_key,omitempty"`
-	// UplinkChunkSize: 上行数据每片最大字节 (placement != body 时生效)。
-	// 默认 cookie=3KB / header=4KB；最小 64 字节。
-	UplinkChunkSize uint32 `json:"uplink_chunk_size,omitempty"`
+	// UplinkChunkSize: 上行数据每片字节范围 "min-max" (placement != body 时生效)。
+	// 默认 cookie=2048-3072 / header=3000-4000；From < 64 时强制提到 64。
+	// 单值如 "1024" 等同 "1024-1024"。
+	UplinkChunkSize string `json:"uplink_chunk_size,omitempty"`
+
+	// UserAgent: 浏览器伪装策略 (XTLS/Xray-core#5802)。
+	//   "" / "chrome"  — Sec-CH-UA + Sec-Fetch-* + Chrome UA (默认)
+	//   "firefox"      — Firefox UA + DNT + 'en;q=0.5' Accept-Language
+	//   "edge"         — Microsoft Edge UA + Sec-CH-UA
+	//   "golang"       — 暴露 net/http 默认 UA (Go-http-client/1.1)，用于完全不伪装
+	// 若用户在 headers 里显式塞了 User-Agent，会按该值（chrome/firefox/edge/golang）派发
+	// header 集合；其他值会被当作字面 UA 字符串，不再补 Sec-CH-UA。
+	UserAgent string `json:"user_agent,omitempty"`
 
 	// ── 下列字段对齐 Xray 但本实现暂不使用 ──
 	ScStreamUpServerSecs int `json:"sc_stream_up_server_secs,omitempty"`

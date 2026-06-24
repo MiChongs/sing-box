@@ -146,7 +146,10 @@ type config struct {
 
 	uplinkDataPlacement string
 	uplinkDataKey       string
-	uplinkChunkSize     int
+	uplinkChunkSize     xhttpRange
+
+	// PR#5802 浏览器伪装类型: "" / "chrome" / "firefox" / "edge" / "golang"
+	userAgent string
 
 	// 服务端地址（用于缺 Host 时的 fallback）
 	serverHost string
@@ -238,15 +241,18 @@ func newConfig(opts *option.V2RayXHTTPOptions, serverAddr M.Socksaddr, hasRealit
 		c.uplinkHTTPMethod = strings.ToUpper(opts.UplinkHTTPMethod)
 	}
 
+	// PR#5720: 默认改为 PlacementAuto (与 PlacementBody 在客户端等价)。
+	// auto 让服务端能从 header+cookie+body 三处拼接 payload，client 这边仍走 body。
 	if opts.UplinkDataPlacement == "" {
-		c.uplinkDataPlacement = PlacementBody
+		c.uplinkDataPlacement = PlacementAuto
 	} else {
 		c.uplinkDataPlacement, err = validatePlacement("uplink_data_placement", opts.UplinkDataPlacement,
-			PlacementBody, PlacementCookie, PlacementHeader)
+			PlacementAuto, PlacementBody, PlacementCookie, PlacementHeader)
 		if err != nil {
 			return nil, err
 		}
-		if c.uplinkDataPlacement != PlacementBody && c.mode != ModePacketUp {
+		// auto/body 任何 mode 都允许；cookie/header 必须 packet-up。
+		if (c.uplinkDataPlacement == PlacementCookie || c.uplinkDataPlacement == PlacementHeader) && c.mode != ModePacketUp {
 			return nil, E.New("xhttp: uplink_data_placement=", c.uplinkDataPlacement,
 				" requires mode=packet-up (got ", c.mode, ")")
 		}
@@ -274,9 +280,8 @@ func newConfig(opts *option.V2RayXHTTPOptions, serverAddr M.Socksaddr, hasRealit
 		if err != nil {
 			return nil, err
 		}
-		if c.sessionPlacement == PlacementPath && c.seqPlacement != PlacementPath {
-			return nil, E.New("xhttp: seq_placement must be path when session_placement is path (got ", c.seqPlacement, ")")
-		}
+		// PR#5720 移除了 "session=path 强制 seq=path" 约束。允许 session 在 path、seq 在
+		// header/cookie/query，xray 服务端的 ExtractMetaFromRequest 也按 placement 独立解析。
 	}
 
 	c.sessionKey = opts.SessionKey
@@ -298,7 +303,7 @@ func newConfig(opts *option.V2RayXHTTPOptions, serverAddr M.Socksaddr, hasRealit
 		}
 	}
 	c.uplinkDataKey = opts.UplinkDataKey
-	if c.uplinkDataKey == "" && c.uplinkDataPlacement != PlacementBody {
+	if c.uplinkDataKey == "" && c.uplinkDataPlacement != PlacementBody && c.uplinkDataPlacement != PlacementAuto {
 		switch c.uplinkDataPlacement {
 		case PlacementCookie:
 			c.uplinkDataKey = "x_data"
@@ -306,17 +311,38 @@ func newConfig(opts *option.V2RayXHTTPOptions, serverAddr M.Socksaddr, hasRealit
 			c.uplinkDataKey = "X-Data"
 		}
 	}
-	if opts.UplinkChunkSize == 0 {
+	// UplinkChunkSize 从 v26.3.27 起改为 range。默认值与 Xray 一致：
+	//   cookie  → 2048-3072 (~2-3 KiB)
+	//   header  → 3000-4000 (~3-4 KB)
+	//   其他    → 留空 (走 scMaxEachPostBytes，仅 body 模式相关)
+	// From < 64 时强制提到 64（chunk 太小会产生过多 header / cookie）。
+	chunkRange, err := parseRange(opts.UplinkChunkSize, "")
+	if err != nil {
+		return nil, E.Cause(err, "xhttp: invalid uplink_chunk_size")
+	}
+	if chunkRange.Max == 0 {
 		switch c.uplinkDataPlacement {
 		case PlacementCookie:
-			c.uplinkChunkSize = 3 * 1024
+			chunkRange = xhttpRange{Min: 2048, Max: 3072}
 		case PlacementHeader:
-			c.uplinkChunkSize = 4 * 1024
+			chunkRange = xhttpRange{Min: 3000, Max: 4000}
 		}
-	} else if opts.UplinkChunkSize < 64 {
-		c.uplinkChunkSize = 64
-	} else {
-		c.uplinkChunkSize = int(opts.UplinkChunkSize)
+	} else if chunkRange.Min < 64 {
+		chunkRange.Min = 64
+		if chunkRange.Max < 64 {
+			chunkRange.Max = 64
+		}
+	}
+	c.uplinkChunkSize = chunkRange
+
+	// PR#5802 浏览器伪装。默认 "chrome"；"" / "chrome" / "firefox" / "edge" / "golang"
+	// 之外的值当作用户自定义 UA 字符串，由 caller 直接写到 headers 里，
+	// tryDefaultHeadersWith 不再附加 Sec-CH-UA / Sec-Fetch-*。
+	switch opts.UserAgent {
+	case "", "chrome", "firefox", "edge", "golang":
+		c.userAgent = opts.UserAgent
+	default:
+		return nil, E.New("xhttp: unsupported user_agent: ", opts.UserAgent)
 	}
 
 	return c, nil
@@ -411,57 +437,6 @@ func appendPath(p string, segs ...string) string {
 // Browser masquerade (Chrome fetch variant) — headers 默认值
 // ──────────────────────────────────────────────────────────────────────
 
-var cachedChromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" +
-	chromeMajorVersion() + ".0.0.0 Safari/537.36"
-
-// chromeMajorVersion 用日期外推出一个"合理的"版本号（和 mihomo 思路一致），
-// 避免 UA 永远停在编译期常量（那会留下指纹）。
-func chromeMajorVersion() string {
-	// 基准：Chrome 120 (2023-12-06)。每 ~4 周一个大版本。
-	const baseline = 120
-	const baselineTs = int64(1701820800) // 2023-12-06 UTC
-	elapsed := time.Now().Unix() - baselineTs
-	if elapsed <= 0 {
-		return strconv.Itoa(baseline)
-	}
-	weeks := elapsed / (7 * 86400)
-	return strconv.Itoa(baseline + int(weeks/4))
-}
-
-// applyDefaultHeaders 在 Chrome "fetch" 语义下补齐 header；不覆盖用户已有值。
-func applyDefaultHeaders(h http.Header) {
-	if h.Get("User-Agent") == "" {
-		h.Set("User-Agent", cachedChromeUA)
-	}
-	if h.Get("Accept") == "" {
-		h.Set("Accept", "*/*")
-	}
-	if h.Get("Accept-Language") == "" {
-		h.Set("Accept-Language", "en-US,en;q=0.9")
-	}
-	if h.Get("Cache-Control") == "" {
-		h.Set("Cache-Control", "no-cache")
-	}
-	if h.Get("Pragma") == "" {
-		h.Set("Pragma", "no-cache")
-	}
-	if h.Get("Sec-Fetch-Mode") == "" {
-		h.Set("Sec-Fetch-Mode", "cors")
-	}
-	if h.Get("Sec-Fetch-Dest") == "" {
-		h.Set("Sec-Fetch-Dest", "empty")
-	}
-	if h.Get("Sec-Fetch-Site") == "" {
-		h.Set("Sec-Fetch-Site", "same-origin")
-	}
-	if h.Get("Priority") == "" {
-		h.Set("Priority", "u=1, i")
-	}
-	// X-Requested-With 被某些 Xray 服务端日志期望存在（标记 CORS 预检已通过）
-	if h.Get("X-Requested-With") == "" {
-		h.Set("X-Requested-With", "XMLHttpRequest")
-	}
-}
 
 // applyXPadding 把 padding 写进 request。两条路径：
 //
@@ -553,36 +528,51 @@ func (c *config) applyMetaToRequest(req *http.Request, sessionId, seqStr string)
 //
 // 返回 true 表示数据已塞进 header/cookie（caller 应把 req.Body 置 nil）。
 func (c *config) applyUplinkData(req *http.Request, data []byte) bool {
-	if c.uplinkDataPlacement == PlacementBody || len(data) == 0 {
+	// PlacementBody / PlacementAuto: 客户端走 body，由 caller 写 req.Body。
+	if c.uplinkDataPlacement == PlacementBody || c.uplinkDataPlacement == PlacementAuto || len(data) == 0 {
 		return false
 	}
 	encoded := base64.RawURLEncoding.EncodeToString(data)
-	chunk := c.uplinkChunkSize
-	if chunk <= 0 {
-		chunk = len(encoded)
-	}
+	// Xray v26.3.27 PR#5720 把 UplinkChunkSize 改成 Range，每片大小在区间里随机抽。
+	// 这模仿真实 CDN 用户上传分块时大小自然抖动，避免每片都是死板的 4KB 留指纹。
 	switch c.uplinkDataPlacement {
 	case PlacementHeader:
-		for i := 0; i < len(encoded); i += chunk {
-			end := i + chunk
+		i := 0
+		idx := 0
+		for i < len(encoded) {
+			step := c.uplinkChunkSize.rand()
+			if step <= 0 {
+				step = len(encoded) - i
+			}
+			end := i + step
 			if end > len(encoded) {
 				end = len(encoded)
 			}
-			req.Header.Set(fmt.Sprintf("%s-%d", c.uplinkDataKey, i/chunk), encoded[i:end])
+			req.Header.Set(fmt.Sprintf("%s-%d", c.uplinkDataKey, idx), encoded[i:end])
+			i = end
+			idx++
 		}
 		req.Header.Set(c.uplinkDataKey+"-Length", strconv.Itoa(len(encoded)))
 		req.Header.Set(c.uplinkDataKey+"-Upstream", "1")
 	case PlacementCookie:
-		for i := 0; i < len(encoded); i += chunk {
-			end := i + chunk
+		i := 0
+		idx := 0
+		for i < len(encoded) {
+			step := c.uplinkChunkSize.rand()
+			if step <= 0 {
+				step = len(encoded) - i
+			}
+			end := i + step
 			if end > len(encoded) {
 				end = len(encoded)
 			}
 			req.AddCookie(&http.Cookie{
-				Name:  fmt.Sprintf("%s_%d", c.uplinkDataKey, i/chunk),
+				Name:  fmt.Sprintf("%s_%d", c.uplinkDataKey, idx),
 				Value: encoded[i:end],
 				Path:  "/",
 			})
+			i = end
+			idx++
 		}
 		req.AddCookie(&http.Cookie{Name: c.uplinkDataKey + "_upstream", Value: "1", Path: "/"})
 	}
@@ -1081,7 +1071,13 @@ func (c *config) fillRequest(req *http.Request, host, sessionId, seqStr string) 
 	if h == nil {
 		h = http.Header{}
 	}
-	applyDefaultHeaders(h)
+	// 把 config 里的 user_agent 选项推到 header 里给 tryDefaultHeadersWith 派发：
+	//   "" / "chrome" / "firefox" / "edge" / "golang" → masquerade 集合
+	//   用户在 headers 里直接写了一个 UA 字符串 → 不动 (走 default chrome 集合)
+	if c.userAgent != "" && h.Get("User-Agent") == "" {
+		h.Set("User-Agent", c.userAgent)
+	}
+	tryDefaultHeadersWith(h, "fetch")
 	if req.Body != nil {
 		h.Set("Content-Type", contentTypeGRPC)
 	}
@@ -1190,7 +1186,10 @@ func (w *packetUpWriter) post(data []byte) error {
 	if h == nil {
 		h = http.Header{}
 	}
-	applyDefaultHeaders(h)
+	if w.cfg.userAgent != "" && h.Get("User-Agent") == "" {
+		h.Set("User-Agent", w.cfg.userAgent)
+	}
+	tryDefaultHeadersWith(h, "fetch")
 	// packet-up 上行默认不带 Content-Type（与 Xray 一致；服务端按长度读）
 	req.Header = h
 	req.Host = w.host

@@ -155,8 +155,8 @@ func TestConfig_NormalizeDefaults(t *testing.T) {
 	if c.sessionPlacement != PlacementPath {
 		t.Errorf("sessionPlacement=%q want path", c.sessionPlacement)
 	}
-	if c.uplinkDataPlacement != PlacementBody {
-		t.Errorf("uplinkDataPlacement=%q want body", c.uplinkDataPlacement)
+	if c.uplinkDataPlacement != PlacementAuto {
+		t.Errorf("uplinkDataPlacement=%q want auto (PR#5720 default)", c.uplinkDataPlacement)
 	}
 }
 
@@ -174,7 +174,7 @@ func TestConfig_AllPR5414(t *testing.T) {
 		// SessionKey omitted to trigger default
 		SeqPlacement:        PlacementHeader,
 		UplinkDataPlacement: PlacementHeader,
-		UplinkChunkSize:     2048,
+		UplinkChunkSize:     "2048-2048",
 	}
 	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
 	if err != nil {
@@ -198,25 +198,27 @@ func TestConfig_AllPR5414(t *testing.T) {
 	if c.uplinkDataKey != "X-Data" {
 		t.Errorf("default uplinkDataKey=%q want X-Data", c.uplinkDataKey)
 	}
-	if c.uplinkChunkSize != 2048 {
-		t.Errorf("uplinkChunkSize=%d want 2048", c.uplinkChunkSize)
+	if r := c.uplinkChunkSize.rand(); r != 2048 {
+		t.Errorf("uplinkChunkSize range mid=%d want 2048", r)
 	}
 }
 
-// TestConfig_ValidateConstraint_PathSeq verifies SessionPlacement=path forces SeqPlacement=path.
-func TestConfig_ValidateConstraint_PathSeq(t *testing.T) {
+// TestConfig_PathSessionAllowsNonPathSeq verifies that PR#5720 removed the
+// "SessionPlacement=path forces SeqPlacement=path" constraint. Path+header
+// combo must now build cleanly.
+func TestConfig_PathSessionAllowsNonPathSeq(t *testing.T) {
 	opts := &option.V2RayXHTTPOptions{
 		Path:             "/p",
 		Mode:             "packet-up",
 		SessionPlacement: PlacementPath,
-		SeqPlacement:     PlacementHeader, // 必须报错
+		SeqPlacement:     PlacementHeader,
 	}
-	_, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err == nil {
-		t.Fatal("expected error when session=path but seq=header")
+	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
+	if err != nil {
+		t.Fatalf("PR#5720 dropped this constraint: %v", err)
 	}
-	if !strings.Contains(err.Error(), "seq_placement") {
-		t.Errorf("err=%v want seq_placement msg", err)
+	if c.sessionPlacement != PlacementPath || c.seqPlacement != PlacementHeader {
+		t.Errorf("placements lost: session=%q seq=%q", c.sessionPlacement, c.seqPlacement)
 	}
 }
 
@@ -294,7 +296,7 @@ func TestApplyUplinkData_Header(t *testing.T) {
 		Path:                "/base/",
 		Mode:                "packet-up",
 		UplinkDataPlacement: PlacementHeader,
-		UplinkChunkSize:     64, // 最小允许值；测试会喂 > 64 的数据强制切多片
+		UplinkChunkSize:     "64-64", // 最小允许值；测试会喂 > 64 的数据强制切多片
 	}
 	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
 	if err != nil {

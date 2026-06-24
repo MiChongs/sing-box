@@ -11,7 +11,6 @@ import (
 )
 
 // Placement constants — 对齐 XTLS/Xray-core PR#5414 transport/internet/splithttp/common.go。
-// 用作 XPaddingPlacement / SessionPlacement / SeqPlacement / UplinkDataPlacement 的取值。
 const (
 	PlacementQueryInHeader = "queryInHeader"
 	PlacementCookie        = "cookie"
@@ -19,6 +18,9 @@ const (
 	PlacementQuery         = "query"
 	PlacementPath          = "path"
 	PlacementBody          = "body"
+	// PlacementAuto: PR#5720 引入。客户端 = body；服务端 = 从 header+cookie+body
+	// 三处拼 payload。让用户配 auto 时，旧版客户端只发 body 也能与新版服务端工作。
+	PlacementAuto = "auto"
 )
 
 // PaddingMethod 控制 padding 字节怎么生成。
