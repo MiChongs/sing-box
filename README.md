@@ -24,7 +24,197 @@
 
 ### XHTTP 传输 (v2rayxhttp)
 
-客户端按 XTLS/Xray 和 mihomo 的协议规范重写。接入 quic-go 跑 HTTP/3 (`alpn: ["h3"]`)，按 ALPN 派发底层 RoundTripper，避免 `http/1.1` 配置下整组节点 dial 不通。修了 `GotConn` 回调与错误路径 `close(chan)` 的 race 导致的 "send on closed channel" panic。
+完整对齐 XTLS/Xray-core v26.3.27 (PR#5414 / #5711 / #5720 / #5802 / #5803 / #5689)。同时支持 inbound (服务端) 和 outbound (客户端)。
+
+**三种 mode**：`stream-one` (H2 全双工单流) / `stream-up` (POST 上行 + GET SSE 下行) / `packet-up` (每片 POST + GET SSE，兼容性最好)
+
+**反 CDN 探测扩展 (PR#5414)**：
+- `x_padding_obfs_mode`：把 padding 改名 / 改位置 / 改字符集，绕开按 `x_padding=XXX...` 匹配的 CDN 规则
+- `uplink_http_method`：切换上行方法 (PUT / PATCH / GET)，绕开禁 POST 的 CDN
+- `session_placement` / `seq_placement`：把 session UUID 和 seq 从 path 移到 header / cookie / query
+- `uplink_data_placement`：上行数据走 header / cookie 切片 (GET-only CDN 兜底)
+- `x_padding_method`：`tokenish` 模式用 base62 随机字符 + huffman 长度修正
+
+**浏览器伪装 (PR#5802)**：`user_agent` 支持 `chrome` / `firefox` / `edge` / `golang`，配合 GREASE Sec-CH-UA 客户端提示。
+
+**HTTP/3 拥塞控制 (PR#5711)**：`quic_congestion` 支持 `bbr` (默认) / `reno` / `force-brutal`。
+
+**H1 手写序列化 + 连接池 (PR#5803)**：ALPN=`http/1.1` 时 packet-up 用预序列化 + sync.Pool 连接复用，支持安全重试。
+
+#### 服务端示例 (inbound)
+
+```jsonc
+{
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [{ "name": "user1", "uuid": "00000000-0000-0000-0000-000000000000" }],
+      "tls": {
+        "enabled": true,
+        "server_name": "example.com",
+        "alpn": ["h2", "http/1.1"],
+        "certificate_path": "cert.pem",
+        "key_path": "key.pem"
+      },
+      "transport": {
+        "type": "xhttp",
+        "xhttp_settings": {
+          "path": "/your-path",
+          "host": "example.com",
+          "mode": "auto"
+        }
+      }
+    }
+  ]
+}
+```
+
+#### 客户端示例 (outbound)：基础
+
+```jsonc
+{
+  "outbounds": [
+    {
+      "type": "vless",
+      "tag": "proxy",
+      "server": "example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "tls": { "enabled": true, "server_name": "example.com" },
+      "transport": {
+        "type": "xhttp",
+        "xhttp_settings": {
+          "path": "/your-path",
+          "host": "example.com",
+          "mode": "auto"
+        }
+      }
+    }
+  ]
+}
+```
+
+#### 客户端示例：HTTP/3 + BBR
+
+```jsonc
+{
+  "type": "vless",
+  "tag": "proxy-h3",
+  "server": "example.com",
+  "server_port": 443,
+  "uuid": "00000000-0000-0000-0000-000000000000",
+  "tls": { "enabled": true, "server_name": "example.com", "alpn": ["h3"] },
+  "transport": {
+    "type": "xhttp",
+    "xhttp_settings": {
+      "path": "/your-path",
+      "host": "example.com",
+      "mode": "auto",
+      "quic_congestion": "bbr"
+    }
+  }
+}
+```
+
+#### 客户端示例：绕 CDN 检测 (全混淆)
+
+```jsonc
+{
+  "type": "vless",
+  "tag": "proxy-obfs",
+  "server": "cdn.example.com",
+  "server_port": 443,
+  "uuid": "00000000-0000-0000-0000-000000000000",
+  "tls": { "enabled": true, "server_name": "cdn.example.com" },
+  "transport": {
+    "type": "xhttp",
+    "xhttp_settings": {
+      "path": "/api",
+      "host": "cdn.example.com",
+      "mode": "packet-up",
+
+      "x_padding_obfs_mode": true,
+      "x_padding_method": "tokenish",
+      "x_padding_placement": "queryInHeader",
+      "x_padding_key": "_dc",
+      "x_padding_header": "X-Cache",
+
+      "uplink_http_method": "PUT",
+      "session_placement": "header",
+      "session_key": "X-Auth-Token",
+      "seq_placement": "cookie",
+      "seq_key": "chunk",
+
+      "user_agent": "chrome"
+    }
+  }
+}
+```
+
+#### 客户端示例：GET-only CDN (上行数据走 header)
+
+```jsonc
+{
+  "type": "vless",
+  "tag": "proxy-get-only",
+  "server": "cdn.example.com",
+  "server_port": 443,
+  "uuid": "00000000-0000-0000-0000-000000000000",
+  "tls": { "enabled": true, "server_name": "cdn.example.com" },
+  "transport": {
+    "type": "xhttp",
+    "xhttp_settings": {
+      "path": "/api",
+      "host": "cdn.example.com",
+      "mode": "packet-up",
+
+      "uplink_http_method": "GET",
+      "uplink_data_placement": "header",
+      "uplink_data_key": "X-Payload",
+      "uplink_chunk_size": "3000-4000",
+
+      "session_placement": "header",
+      "seq_placement": "query",
+      "seq_key": "page"
+    }
+  }
+}
+```
+
+#### `xhttp_settings` 完整字段参考
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `host` | string / list | server addr | Host header，多值时随机轮选 |
+| `path` | string | `/` | URL 路径前缀 |
+| `headers` | map | | 额外请求头 |
+| `mode` | string | `auto` | `auto` / `stream-one` / `stream-up` / `packet-up` |
+| `no_sse_header` | bool | false | stream-up 下行不用 `text/event-stream` |
+| `sc_max_each_post_bytes` | int | 1000000 | packet-up 单次 POST 最大字节 |
+| `sc_min_posts_interval_ms` | int | 30 | packet-up POST 最小间隔 |
+| `sc_max_buffered_posts` | int | 30 | 服务端乱序缓冲上限 |
+| `x_padding_bytes` | string | `100-1000` | padding 长度范围 |
+| `x_padding_obfs_mode` | bool | false | 启用 padding 混淆 |
+| `x_padding_key` | string | `x_padding` | padding 字段名 |
+| `x_padding_header` | string | `X-Padding` | 承载 padding 的 header |
+| `x_padding_placement` | string | `queryInHeader` | `queryInHeader` / `cookie` / `header` / `query` |
+| `x_padding_method` | string | `repeat-x` | `repeat-x` / `tokenish` |
+| `uplink_http_method` | string | `POST` | `POST` / `PUT` / `PATCH` / `GET` |
+| `session_placement` | string | `path` | `path` / `cookie` / `header` / `query` |
+| `session_key` | string | 自动 | 默认 `x_session` / `X-Session` |
+| `seq_placement` | string | `path` | `path` / `cookie` / `header` / `query` |
+| `seq_key` | string | 自动 | 默认 `x_seq` / `X-Seq` |
+| `uplink_data_placement` | string | `auto` | `auto` / `body` / `cookie` / `header` |
+| `uplink_data_key` | string | 自动 | 默认 `x_data` / `X-Data` |
+| `uplink_chunk_size` | string | 自动 | `min-max` 范围，cookie 默认 2048-3072，header 3000-4000 |
+| `user_agent` | string | `chrome` | `chrome` / `firefox` / `edge` / `golang` |
+| `no_grpc_header` | bool | false | 不设 `Content-Type: application/grpc` |
+| `server_max_header_bytes` | int | 8192 | 服务端 `http.Server.MaxHeaderBytes` |
+| `quic_congestion` | string | `bbr` | `bbr` / `reno` / `force-brutal` (仅 H3) |
+| `quic_up` | uint64 | 0 | `force-brutal` 带宽 bytes/s，最小 65536 |
 
 ### URLTest Fallback
 
