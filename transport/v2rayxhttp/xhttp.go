@@ -152,14 +152,13 @@ type config struct {
 	userAgent string
 
 	// ─── 服务端 (inbound) 字段 ───
-	// scMaxBufferedPosts: packet-up 模式下 uploadQueue 的 heap 容量上限。
-	// 超出该值说明乱序太严重，断流让客户端重连。默认 30。
-	scMaxBufferedPosts int
-	// serverMaxHeaderBytes: http.Server.MaxHeaderBytes。默认 8192。
+	scMaxBufferedPosts  int
 	serverMaxHeaderBytes int
-	// noGRPCHeader: 上行 stream 不带 application/grpc Content-Type。
-	noGRPCHeader bool
+	noGRPCHeader         bool
 
+	// PR#5711 XHTTP/3 拥塞控制
+	quicCongestion string // "bbr" / "reno" / "force-brutal"
+	quicUp         uint64 // force-brutal 带宽 bytes/sec
 	// 服务端地址（用于缺 Host 时的 fallback）
 	serverHost string
 	serverAddr M.Socksaddr
@@ -359,8 +358,28 @@ func newConfig(opts *option.V2RayXHTTPOptions, serverAddr M.Socksaddr, hasRealit
 	if c.scMaxBufferedPosts <= 0 {
 		c.scMaxBufferedPosts = defaultScMaxBufferedPosts
 	}
-	c.serverMaxHeaderBytes = 8192 // 默认，与 Xray / http.Server 一致
+	c.serverMaxHeaderBytes = int(opts.ServerMaxHeaderBytes)
+	if c.serverMaxHeaderBytes <= 0 {
+		c.serverMaxHeaderBytes = 8192
+	}
 	c.noGRPCHeader = opts.NoGRPCHeader
+
+	// PR#5711 QUIC 拥塞控制
+	c.quicCongestion = opts.QuicCongestion
+	c.quicUp = opts.QuicUp
+	switch c.quicCongestion {
+	case "", "bbr", "reno":
+	case "force-brutal":
+		if c.quicUp > 0 && c.quicUp < 65536 {
+			return nil, E.New("xhttp: quic_up must be at least 65536 bytes/s")
+		}
+		if c.quicUp == 0 {
+			return nil, E.New("xhttp: quic_congestion=force-brutal requires quic_up")
+		}
+	default:
+		return nil, E.New("xhttp: unknown quic_congestion: ", c.quicCongestion,
+			" (valid: bbr, reno, force-brutal)")
+	}
 
 	return c, nil
 }
@@ -639,7 +658,7 @@ func NewClient(
 		return nil, err
 	}
 
-	transport, err := buildTransport(dialer, serverAddr, tlsConfig)
+	transport, err := buildTransport(dialer, serverAddr, tlsConfig, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -667,6 +686,7 @@ func buildTransport(
 	dialer N.Dialer,
 	serverAddr M.Socksaddr,
 	tlsConfig boxtls.Config,
+	cfg *config,
 ) (http.RoundTripper, error) {
 	if tlsConfig == nil {
 		return &http.Transport{
@@ -701,7 +721,7 @@ func buildTransport(
 	// alpn = ["h3"] → HTTP/3，由 buildH3Transport 实现（with_quic 构建标签）。
 	// 未启用 with_quic 时返回明确错误信息（见 h3_stub.go）。
 	if len(alpn) == 1 && alpn[0] == "h3" {
-		return buildH3Transport(dialer, serverAddr, tlsConfig)
+		return buildH3Transport(dialer, serverAddr, tlsConfig, cfg)
 	}
 
 	// 默认 / 多值 → H2。若 ALPN 完全为空（未配置），补 ["h2", "http/1.1"]
@@ -1095,7 +1115,7 @@ func (c *config) fillRequest(req *http.Request, host, sessionId, seqStr string) 
 		h.Set("User-Agent", c.userAgent)
 	}
 	tryDefaultHeadersWith(h, "fetch")
-	if req.Body != nil {
+	if req.Body != nil && !c.noGRPCHeader {
 		h.Set("Content-Type", contentTypeGRPC)
 	}
 	req.Header = h

@@ -117,7 +117,18 @@ type V2RayXHTTPOptions struct {
 	// ── 下列字段对齐 Xray 但本实现暂不使用 ──
 	ScStreamUpServerSecs int `json:"sc_stream_up_server_secs,omitempty"`
 	NoGRPCHeader         bool `json:"no_grpc_header,omitempty"`
+	// ServerMaxHeaderBytes: http.Server.MaxHeaderBytes，默认 8192。
+	// 限制入站请求 header 总大小，防恶意客户端发超大 header 打满内存。
+	ServerMaxHeaderBytes int32 `json:"server_max_header_bytes,omitempty"`
 	DownloadSettings     map[string]any `json:"downloadSettings,omitempty"`
 	Xmux                 map[string]any `json:"xmux,omitempty"`
-	Extra                map[string]any `json:"extra,omitempty"`
+
+	// ── XHTTP/3 QUIC 拥塞控制 (XTLS/Xray-core v26.3.27 PR#5711) ──
+	// QuicCongestion: "bbr" (默认 H3) / "reno" / "force-brutal"。
+	// 仅 alpn=["h3"] 时生效。
+	QuicCongestion string `json:"quic_congestion,omitempty"`
+	// QuicUp: force-brutal 模式的上行带宽 (bytes/sec)，最小 65536。
+	// 仅 QuicCongestion="force-brutal" 时必须。
+	QuicUp uint64 `json:"quic_up,omitempty"`
+
 }
