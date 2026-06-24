@@ -40,6 +40,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -114,7 +115,6 @@ func parseRange(s, fallback string) (xhttpRange, error) {
 }
 
 type config struct {
-	// Host 头（多个时每次随机挑一个）
 	hosts []string
 	// 基础路径，恒以 / 开头且以 / 结尾
 	path string
@@ -130,6 +130,24 @@ type config struct {
 	scMaxEachPostBytes   int
 	scMinPostsIntervalMs xhttpRange
 
+	// ─── XTLS/Xray PR#5414 反 CDN 探测扩展 ───
+	xPaddingObfsMode  bool
+	xPaddingKey       string
+	xPaddingHeader    string
+	xPaddingPlacement string
+	xPaddingMethod    PaddingMethod
+
+	uplinkHTTPMethod string
+
+	sessionPlacement string
+	sessionKey       string
+	seqPlacement     string
+	seqKey           string
+
+	uplinkDataPlacement string
+	uplinkDataKey       string
+	uplinkChunkSize     int
+
 	// 服务端地址（用于缺 Host 时的 fallback）
 	serverHost string
 	serverAddr M.Socksaddr
@@ -138,6 +156,16 @@ type config struct {
 	useTLS bool
 	// 是否启用了 Reality（影响 auto mode 选择）
 	hasReality bool
+}
+
+// validatePlacement 包装 switch 风格的合法值校验。
+func validatePlacement(field, value string, allowed ...string) (string, error) {
+	for _, a := range allowed {
+		if value == a {
+			return value, nil
+		}
+	}
+	return "", E.New("xhttp: unsupported ", field, ": ", value)
 }
 
 func newConfig(opts *option.V2RayXHTTPOptions, serverAddr M.Socksaddr, hasReality bool, useTLS bool) (*config, error) {
@@ -175,6 +203,122 @@ func newConfig(opts *option.V2RayXHTTPOptions, serverAddr M.Socksaddr, hasRealit
 	if len(c.hosts) == 0 {
 		c.hosts = []string{serverAddr.AddrString()}
 	}
+
+	// ── PR#5414 字段规范化：与 Xray Build() 一致 ──
+	c.xPaddingObfsMode = opts.XPaddingObfsMode
+	c.xPaddingKey = opts.XPaddingKey
+	if c.xPaddingKey == "" {
+		c.xPaddingKey = paddingQueryKey
+	}
+	c.xPaddingHeader = opts.XPaddingHeader
+	if c.xPaddingHeader == "" {
+		c.xPaddingHeader = "X-Padding"
+	}
+	if opts.XPaddingPlacement == "" {
+		c.xPaddingPlacement = PlacementQueryInHeader
+	} else {
+		c.xPaddingPlacement, err = validatePlacement("x_padding_placement", opts.XPaddingPlacement,
+			PlacementQueryInHeader, PlacementCookie, PlacementHeader, PlacementQuery)
+		if err != nil {
+			return nil, err
+		}
+	}
+	switch opts.XPaddingMethod {
+	case "":
+		c.xPaddingMethod = PaddingMethodRepeatX
+	case string(PaddingMethodRepeatX), string(PaddingMethodTokenish):
+		c.xPaddingMethod = PaddingMethod(opts.XPaddingMethod)
+	default:
+		return nil, E.New("xhttp: unsupported x_padding_method: ", opts.XPaddingMethod)
+	}
+
+	if opts.UplinkHTTPMethod == "" {
+		c.uplinkHTTPMethod = methodPost
+	} else {
+		c.uplinkHTTPMethod = strings.ToUpper(opts.UplinkHTTPMethod)
+	}
+
+	if opts.UplinkDataPlacement == "" {
+		c.uplinkDataPlacement = PlacementBody
+	} else {
+		c.uplinkDataPlacement, err = validatePlacement("uplink_data_placement", opts.UplinkDataPlacement,
+			PlacementBody, PlacementCookie, PlacementHeader)
+		if err != nil {
+			return nil, err
+		}
+		if c.uplinkDataPlacement != PlacementBody && c.mode != ModePacketUp {
+			return nil, E.New("xhttp: uplink_data_placement=", c.uplinkDataPlacement,
+				" requires mode=packet-up (got ", c.mode, ")")
+		}
+	}
+
+	if c.uplinkHTTPMethod == methodGet && c.mode != ModePacketUp {
+		return nil, E.New("xhttp: uplink_http_method=GET requires mode=packet-up (got ", c.mode, ")")
+	}
+
+	if opts.SessionPlacement == "" {
+		c.sessionPlacement = PlacementPath
+	} else {
+		c.sessionPlacement, err = validatePlacement("session_placement", opts.SessionPlacement,
+			PlacementPath, PlacementCookie, PlacementHeader, PlacementQuery)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if opts.SeqPlacement == "" {
+		c.seqPlacement = PlacementPath
+	} else {
+		c.seqPlacement, err = validatePlacement("seq_placement", opts.SeqPlacement,
+			PlacementPath, PlacementCookie, PlacementHeader, PlacementQuery)
+		if err != nil {
+			return nil, err
+		}
+		if c.sessionPlacement == PlacementPath && c.seqPlacement != PlacementPath {
+			return nil, E.New("xhttp: seq_placement must be path when session_placement is path (got ", c.seqPlacement, ")")
+		}
+	}
+
+	c.sessionKey = opts.SessionKey
+	if c.sessionKey == "" && c.sessionPlacement != PlacementPath {
+		switch c.sessionPlacement {
+		case PlacementCookie, PlacementQuery:
+			c.sessionKey = "x_session"
+		case PlacementHeader:
+			c.sessionKey = "X-Session"
+		}
+	}
+	c.seqKey = opts.SeqKey
+	if c.seqKey == "" && c.seqPlacement != PlacementPath {
+		switch c.seqPlacement {
+		case PlacementCookie, PlacementQuery:
+			c.seqKey = "x_seq"
+		case PlacementHeader:
+			c.seqKey = "X-Seq"
+		}
+	}
+	c.uplinkDataKey = opts.UplinkDataKey
+	if c.uplinkDataKey == "" && c.uplinkDataPlacement != PlacementBody {
+		switch c.uplinkDataPlacement {
+		case PlacementCookie:
+			c.uplinkDataKey = "x_data"
+		case PlacementHeader:
+			c.uplinkDataKey = "X-Data"
+		}
+	}
+	if opts.UplinkChunkSize == 0 {
+		switch c.uplinkDataPlacement {
+		case PlacementCookie:
+			c.uplinkChunkSize = 3 * 1024
+		case PlacementHeader:
+			c.uplinkChunkSize = 4 * 1024
+		}
+	} else if opts.UplinkChunkSize < 64 {
+		c.uplinkChunkSize = 64
+	} else {
+		c.uplinkChunkSize = int(opts.UplinkChunkSize)
+	}
+
 	return c, nil
 }
 
@@ -319,34 +463,130 @@ func applyDefaultHeaders(h http.Header) {
 	}
 }
 
-// applyRefererPadding 把 padding 塞进 Referer header 里（默认 placement）。
-// 格式: Referer: <absolute-request-url>?x_padding=<random>
-func (c *config) applyRefererPadding(req *http.Request) {
+// applyXPadding 把 padding 写进 request。两条路径：
+//
+//  1. 默认 (xPaddingObfsMode=false)：保留与 mihomo / 老 Xray 兼容的行为 —
+//     padding 塞进 Referer header 里的 query (Referer: <URL>?x_padding=XXX...)
+//     字符是重复 X（HPACK 静态 huffman 给 'X' 8-bit 编码，wire 长度恒等）。
+//
+//  2. obfsMode=true：按配置的 xPaddingPlacement / Key / Header / Method 走
+//     —— 对齐 XTLS/Xray-core PR#5414 (https://github.com/XTLS/Xray-core/pull/5414)
+//     绕开 CDN 对 "x_padding=XXXX..." 的精确字符串匹配。
+func (c *config) applyXPadding(req *http.Request) {
 	length := c.padding.rand()
 	if length <= 0 {
 		return
 	}
-	refURL := *req.URL // shallow copy
-	q := refURL.Query()
-	q.Set(paddingQueryKey, generatePadding(length))
-	refURL.RawQuery = q.Encode()
-	req.Header.Set(paddingRefererHD, refURL.String())
+	pc := XPaddingConfig{Length: length}
+	if c.xPaddingObfsMode {
+		pc.Placement = XPaddingPlacement{
+			Placement: c.xPaddingPlacement,
+			Key:       c.xPaddingKey,
+			Header:    c.xPaddingHeader,
+			RawURL:    req.URL.String(),
+		}
+		pc.Method = c.xPaddingMethod
+	} else {
+		pc.Placement = XPaddingPlacement{
+			Placement: PlacementQueryInHeader,
+			Key:       paddingQueryKey,
+			Header:    paddingRefererHD,
+			RawURL:    req.URL.String(),
+		}
+		pc.Method = PaddingMethodRepeatX
+	}
+	applyPaddingToRequest(req, pc)
 }
 
-// generatePadding 产生长度为 n 的可打印 ASCII 字符串（Xray Tokenish 近似）。
-// 用 crypto/rand 避免被流量分析者通过 RNG 特征反推。
-func generatePadding(n int) string {
-	if n <= 0 {
-		return ""
+// appendURLPath 把一个段追加到 req.URL.Path，保证段间正好一个斜杠。
+func appendURLPath(u *url.URL, value string) {
+	if value == "" {
+		return
 	}
-	const charset = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-	buf := make([]byte, n)
-	raw := make([]byte, n)
-	_, _ = rand.Read(raw)
-	for i, b := range raw {
-		buf[i] = charset[int(b)%len(charset)]
+	if strings.HasSuffix(u.Path, "/") {
+		u.Path += value
+	} else {
+		u.Path += "/" + value
 	}
-	return string(buf)
+}
+
+// applyMetaToRequest 按 sessionPlacement / seqPlacement 把 sessionId / seqStr
+// 装进 path / query / header / cookie。
+//
+// stream-one 模式不需要 session（H2 stream 自带隔离），sessionId 传 ""。
+// packet-up 模式两个都有；stream-up 只有 sessionId（无 seq）。
+func (c *config) applyMetaToRequest(req *http.Request, sessionId, seqStr string) {
+	if sessionId != "" {
+		switch c.sessionPlacement {
+		case PlacementPath:
+			appendURLPath(req.URL, sessionId)
+		case PlacementQuery:
+			q := req.URL.Query()
+			q.Set(c.sessionKey, sessionId)
+			req.URL.RawQuery = q.Encode()
+		case PlacementHeader:
+			req.Header.Set(c.sessionKey, sessionId)
+		case PlacementCookie:
+			req.AddCookie(&http.Cookie{Name: c.sessionKey, Value: sessionId, Path: "/"})
+		}
+	}
+	if seqStr != "" {
+		switch c.seqPlacement {
+		case PlacementPath:
+			appendURLPath(req.URL, seqStr)
+		case PlacementQuery:
+			q := req.URL.Query()
+			q.Set(c.seqKey, seqStr)
+			req.URL.RawQuery = q.Encode()
+		case PlacementHeader:
+			req.Header.Set(c.seqKey, seqStr)
+		case PlacementCookie:
+			req.AddCookie(&http.Cookie{Name: c.seqKey, Value: seqStr, Path: "/"})
+		}
+	}
+}
+
+// applyUplinkData 当 uplinkDataPlacement != body 时，把 base64(data) 切片塞进
+// header 或 cookie。对齐 PR#5414 服务端拼装规则：
+//   - header: <key>-0, <key>-1, ... + <key>-Length: <total> + <key>-Upstream: 1
+//   - cookie: <key>_0, <key>_1, ... + <key>_upstream=1
+//
+// 返回 true 表示数据已塞进 header/cookie（caller 应把 req.Body 置 nil）。
+func (c *config) applyUplinkData(req *http.Request, data []byte) bool {
+	if c.uplinkDataPlacement == PlacementBody || len(data) == 0 {
+		return false
+	}
+	encoded := base64.RawURLEncoding.EncodeToString(data)
+	chunk := c.uplinkChunkSize
+	if chunk <= 0 {
+		chunk = len(encoded)
+	}
+	switch c.uplinkDataPlacement {
+	case PlacementHeader:
+		for i := 0; i < len(encoded); i += chunk {
+			end := i + chunk
+			if end > len(encoded) {
+				end = len(encoded)
+			}
+			req.Header.Set(fmt.Sprintf("%s-%d", c.uplinkDataKey, i/chunk), encoded[i:end])
+		}
+		req.Header.Set(c.uplinkDataKey+"-Length", strconv.Itoa(len(encoded)))
+		req.Header.Set(c.uplinkDataKey+"-Upstream", "1")
+	case PlacementCookie:
+		for i := 0; i < len(encoded); i += chunk {
+			end := i + chunk
+			if end > len(encoded) {
+				end = len(encoded)
+			}
+			req.AddCookie(&http.Cookie{
+				Name:  fmt.Sprintf("%s_%d", c.uplinkDataKey, i/chunk),
+				Value: encoded[i:end],
+				Path:  "/",
+			})
+		}
+		req.AddCookie(&http.Cookie{Name: c.uplinkDataKey + "_upstream", Value: "1", Path: "/"})
+	}
+	return true
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -582,14 +822,14 @@ func (c *Client) dialStreamOne(ctx context.Context) (net.Conn, error) {
 		GotConn: func(httptrace.GotConnInfo) { gotConn.signal() },
 	})
 
-	req, err := http.NewRequestWithContext(traceCtx, methodPost, u.String(), pr)
+	req, err := http.NewRequestWithContext(traceCtx, c.cfg.uplinkHTTPMethod, u.String(), pr)
 	if err != nil {
 		reqCancel()
 		_ = pr.Close()
 		_ = pw.Close()
 		return nil, err
 	}
-	c.fillStreamRequest(req, host)
+	c.cfg.fillRequest(req, host, "", "")
 
 	wrc := newWaitReadCloser()
 	setupErr := make(chan error, 1)
@@ -655,7 +895,6 @@ func (c *Client) dialStreamUp(ctx context.Context) (net.Conn, error) {
 	host := c.cfg.pickHost()
 
 	uStream := c.cfg.baseURL(host)
-	uStream.Path = appendPath(uStream.Path, session)
 
 	pr, pw := io.Pipe()
 	conn := newLateXHTTPConn(pw, c.cfg.serverAddr.TCPAddr())
@@ -678,7 +917,7 @@ func (c *Client) dialStreamUp(ctx context.Context) (net.Conn, error) {
 		_ = pw.Close()
 		return nil, err
 	}
-	c.fillStreamRequest(downReq, host)
+	c.cfg.fillRequest(downReq, host, session, "")
 
 	wrc := newWaitReadCloser()
 	downErr := make(chan error, 1)
@@ -714,14 +953,14 @@ func (c *Client) dialStreamUp(ctx context.Context) (net.Conn, error) {
 	}
 
 	// 上行：body = pipeR。Write 到 pw 即流向 upload 请求。
-	upReq, err := http.NewRequestWithContext(reqCtx, methodPost, uStream.String(), pr)
+	upReq, err := http.NewRequestWithContext(reqCtx, c.cfg.uplinkHTTPMethod, uStream.String(), pr)
 	if err != nil {
 		reqCancel()
 		_ = pr.Close()
 		_ = pw.Close()
 		return nil, err
 	}
-	c.fillStreamRequest(upReq, host)
+	c.cfg.fillRequest(upReq, host, session, "")
 
 	go func() {
 		resp, err := c.transport.RoundTrip(upReq)
@@ -753,7 +992,6 @@ func (c *Client) dialPacketUp(ctx context.Context) (net.Conn, error) {
 	host := c.cfg.pickHost()
 
 	uDown := c.cfg.baseURL(host)
-	uDown.Path = appendPath(uDown.Path, session)
 
 	writerCtx, writerCancel := context.WithCancel(c.ctx)
 	writer := &packetUpWriter{
@@ -784,7 +1022,7 @@ func (c *Client) dialPacketUp(ctx context.Context) (net.Conn, error) {
 		writerCancel()
 		return nil, err
 	}
-	c.fillStreamRequest(downReq, host)
+	c.cfg.fillRequest(downReq, host, session, "")
 	downReq.Header.Set("Accept", contentTypeSSE)
 
 	wrc := newWaitReadCloser()
@@ -826,26 +1064,32 @@ func (c *Client) dialPacketUp(ctx context.Context) (net.Conn, error) {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// fillStreamRequest — 公共 header + padding 填充
+// fillRequest — 公共 header + session/seq + padding 填充
 // ──────────────────────────────────────────────────────────────────────
 
-func (c *Client) fillStreamRequest(req *http.Request, host string) {
-	// 1) 用户配置的 headers 作为基底
-	h := cloneHeader(c.cfg.headers)
+// fillRequest 在 net/http.Request 上铺好头、塞 session/seq、再加 padding。
+// 顺序敏感：padding 的 queryInHeader 模式会读 req.URL.String()，所以必须在
+// applyMetaToRequest 之后再做，否则 Referer 里少 session id。
+//
+// 调用约定:
+//   stream-one:        fillRequest(req, host, "",        "")
+//   stream-up down/up: fillRequest(req, host, sessionId, "")
+//   packet-up down:    fillRequest(req, host, sessionId, "")
+//   packet-up post:    fillRequest(req, host, sessionId, seqStr)
+func (c *config) fillRequest(req *http.Request, host, sessionId, seqStr string) {
+	h := cloneHeader(c.headers)
 	if h == nil {
 		h = http.Header{}
 	}
-	// 2) Chrome fetch 默认 headers
 	applyDefaultHeaders(h)
-	// 3) stream mode 的 body 设 grpc（packet-up 时 body 由 packetUpWriter 单独管理）
 	if req.Body != nil {
 		h.Set("Content-Type", contentTypeGRPC)
 	}
 	req.Header = h
 	req.Host = host
 
-	// 4) padding
-	c.cfg.applyRefererPadding(req)
+	c.applyMetaToRequest(req, sessionId, seqStr)
+	c.applyXPadding(req)
 }
 
 // ──────────────────────────────────────────────────────────────────────
@@ -925,13 +1169,22 @@ func (w *packetUpWriter) post(data []byte) error {
 	w.seq++
 
 	u := w.cfg.baseURL(w.host)
-	u.Path = appendPath(u.Path, w.session, seqStr)
 
-	req, err := http.NewRequestWithContext(w.ctx, methodPost, u.String(), bytes.NewReader(data))
+	// 当 uplinkDataPlacement != body 时数据走 header/cookie，请求体置空。
+	// 这是为 GET-only CDN 准备的：method=GET 时 net/http 拒绝带 body。
+	var bodyReader io.Reader = bytes.NewReader(data)
+	var contentLength int64 = int64(len(data))
+	willPlaceInHeaderOrCookie := w.cfg.uplinkDataPlacement != PlacementBody
+	if willPlaceInHeaderOrCookie {
+		bodyReader = nil
+		contentLength = 0
+	}
+
+	req, err := http.NewRequestWithContext(w.ctx, w.cfg.uplinkHTTPMethod, u.String(), bodyReader)
 	if err != nil {
 		return err
 	}
-	req.ContentLength = int64(len(data))
+	req.ContentLength = contentLength
 
 	h := cloneHeader(w.cfg.headers)
 	if h == nil {
@@ -941,7 +1194,15 @@ func (w *packetUpWriter) post(data []byte) error {
 	// packet-up 上行默认不带 Content-Type（与 Xray 一致；服务端按长度读）
 	req.Header = h
 	req.Host = w.host
-	w.cfg.applyRefererPadding(req)
+
+	// session + seq 进 path/cookie/header/query（默认 path 兼容旧版）
+	w.cfg.applyMetaToRequest(req, w.session, seqStr)
+	// uplink data 进 header/cookie（如果配置了）
+	if willPlaceInHeaderOrCookie {
+		w.cfg.applyUplinkData(req, data)
+	}
+	// padding 最后 — 让 queryInHeader 能捕到完整最终 URL
+	w.cfg.applyXPadding(req)
 
 	resp, err := w.transport.RoundTrip(req)
 	if err != nil {

@@ -7,37 +7,47 @@ import (
 // V2RayXHTTPOptions 对应 XTLS/Xray XHTTP 协议的配置项。
 // Spec: https://github.com/XTLS/Xray-core/discussions/4113
 //       https://github.com/XTLS/Xray-core/discussions/5716
+//       https://github.com/XTLS/Xray-core/pull/5414  (advanced obfuscation)
 //       https://www.xhttp.org/
 //
 // 字段命名与 Xray 官方 config 对齐，方便用户直接搬运 Xray 配置文件里
-// 的 xhttpSettings 过来，只需改外层协议名。
+// 的 xhttpSettings 过来。
 //
 // Mode 解释（同 Xray）:
 //   - "auto" (默认): 按传输层能力自动挑选；优先 stream-one > stream-up > packet-up
-//   - "stream-one": HTTP/2 全双工单流（CONNECT-like），开销最小，要求 H2 服务端
-//     + 客户端都支持请求体流式写。客户端必须同时支持 HTTP/2，不能退到 HTTP/1.1。
-//   - "stream-up": 客户端用一条长 POST 上传 + 服务端用一条长 GET/POST 下发（SSE）。
-//     HTTP/1.1 也能用，适合中间盒吃掉 H2 的场景。
-//   - "packet-up": 客户端每个数据包一个 POST（带 seq 号），服务端用 SSE 或者
-//     每次 POST 单独 response 下发。兼容性最好（穿透 CDN、WAF），开销也最大。
+//   - "stream-one": HTTP/2 全双工单流（CONNECT-like），开销最小，要求 H2
+//   - "stream-up":  POST 上行长流 + 单独 GET/SSE 下行长流
+//   - "packet-up":  每条数据 POST + SSE 下行，兼容性最好
 //
-// ScMaxEachPostBytes / ScMinPostsIntervalMs / ScMaxBufferedPosts 控制 packet-up 模式
-// 下的上行限流与缓冲，单位为字节 / 毫秒 / 个。客户端/服务端侧含义一致。
+// ScMaxEachPostBytes / ScMinPostsIntervalMs / ScMaxBufferedPosts 控制 packet-up
+// 模式下的上行限流与缓冲，单位为字节 / 毫秒 / 个。
 //
-// XPaddingBytes 为单条消息附加的 padding 字节范围（"min-max"，随机化），
-// 客户端在 URL query 加 "x_padding=..." 或 header "X-Padding: ..." 对抗流量指纹。
-// 服务端无需解析 —— padding 只是作为 URL/header 字节填充，逻辑上被忽略。
+// XPaddingBytes 为单条消息附加的 padding 字节范围 ("min-max"，随机化)。
 //
-// NoSSEHeader = true 时 stream-up 下行用普通 chunked 而非 text/event-stream，
-// 绕过某些会重写 SSE 的 proxy。
+// NoSSEHeader = true 时 stream-up 下行用普通 chunked 而非 text/event-stream。
+//
+// XPaddingObfsMode / XPaddingKey / XPaddingHeader / XPaddingPlacement /
+// XPaddingMethod 是 XTLS/Xray-core#5414 引入的反 CDN 探测扩展，允许把
+// padding 改名、改位置、改字符集，绕开按 "x_padding=XXX..." 直字符串
+// 匹配的 CDN 规则（如 CDNVideo / Cloudflare）。
+//
+// UplinkHTTPMethod 切换上行 HTTP 方法 (默认 POST)，绕开禁 POST 的 CDN
+// (Yandex Cloud / VK Cloud 等)。GET 时数据不能在 body，必须配合
+// UplinkDataPlacement 走 header / cookie。
+//
+// Session{Placement,Key} / Seq{Placement,Key} 控制 session UUID 和包序号
+// 在请求里的位置 (默认拼在 path：/path/<uuid>/<seq>)。改成 cookie / header /
+// query 后这些值看着像一般 Web 请求的 session token 而非 XHTTP 指纹。
+//
+// UplinkData{Placement,Key} + UplinkChunkSize: 当 CDN 完全禁用带 body 的方法
+// 时把上行数据 base64 编码后切片塞 cookie 或 header (例 X-Data-0, X-Data-1
+// + X-Data-Length + X-Data-Upstream)。仅 packet-up 模式有意义。
 type V2RayXHTTPOptions struct {
 	// Host override. 为空时用 serverAddr 的 hostname。Listable 支持多值轮询。
 	Host badoption.Listable[string] `json:"host,omitempty"`
-	// Path（URL 路径前缀）。必填；客户端会在其后拼 "/<session-id>" 之类后缀。
-	// 例："/your-path-here"。结尾斜杠会被自动补齐。
+	// Path（URL 路径前缀）。
 	Path string `json:"path,omitempty"`
-	// Headers 客户端每次请求带的额外 header。常用:
-	//   User-Agent（伪装浏览器），Cookie（透过 CDN 粘性路由）
+	// Headers 客户端每次请求带的额外 header。
 	Headers badoption.HTTPHeader `json:"headers,omitempty"`
 	// Mode: "auto" / "packet-up" / "stream-up" / "stream-one"。默认 "auto"。
 	Mode string `json:"mode,omitempty"`
@@ -45,26 +55,58 @@ type V2RayXHTTPOptions struct {
 	// NoSSEHeader: stream-up 模式下降级不用 text/event-stream 响应。
 	NoSSEHeader bool `json:"no_sse_header,omitempty"`
 
-	// ── packet-up 模式参数（其它模式下忽略）──
-	// ScMaxEachPostBytes: 单次 POST 最大字节数，超出会拆成多个 POST。
-	ScMaxEachPostBytes int `json:"sc_max_each_post_bytes,omitempty"`
-	// ScMinPostsIntervalMs: 相邻 POST 最小间隔毫秒，0 = 无限制。
+	// ── packet-up 模式参数 ──
+	ScMaxEachPostBytes   int `json:"sc_max_each_post_bytes,omitempty"`
 	ScMinPostsIntervalMs int `json:"sc_min_posts_interval_ms,omitempty"`
-	// ScMaxBufferedPosts: 服务端对乱序 POST 允许的最大缓冲数，默认 30。
-	ScMaxBufferedPosts int `json:"sc_max_buffered_posts,omitempty"`
+	ScMaxBufferedPosts   int `json:"sc_max_buffered_posts,omitempty"`
 
 	// XPaddingBytes: 每请求 padding 范围 "min-max"（字节）。默认 "100-1000"。
 	// 为 "0" 或 "0-0" 关闭 padding。
 	XPaddingBytes string `json:"x_padding_bytes,omitempty"`
 
+	// ─── XTLS/Xray PR#5414: 反 CDN 探测扩展 ───
+	// XPaddingObfsMode: 启用 padding 混淆模式 (允许改 key/header/placement/method)。
+	// 默认 false (向后兼容：x_padding=XXX 放在 Referer 的 query 里)。
+	XPaddingObfsMode bool `json:"x_padding_obfs_mode,omitempty"`
+	// XPaddingKey: padding 字段名 (默认 "x_padding")。
+	XPaddingKey string `json:"x_padding_key,omitempty"`
+	// XPaddingHeader: 承载 padding 的 header 名 (默认 "X-Padding")。
+	// 仅当 placement = "header" / "queryInHeader" 时使用。
+	XPaddingHeader string `json:"x_padding_header,omitempty"`
+	// XPaddingPlacement: padding 放在哪。可选 "queryInHeader" / "cookie" /
+	// "header" / "query"。默认 "queryInHeader"。
+	XPaddingPlacement string `json:"x_padding_placement,omitempty"`
+	// XPaddingMethod: padding 生成方式。"repeat-x" (重复 X 字符，默认) /
+	// "tokenish" (base62 随机 + huffman 长度修正)。
+	XPaddingMethod string `json:"x_padding_method,omitempty"`
+
+	// UplinkHTTPMethod: 上行 HTTP 方法 (默认 POST)。可设 PUT / PATCH / GET。
+	// 当设为 "GET" 时必须 Mode = "packet-up" + UplinkDataPlacement != "body"。
+	UplinkHTTPMethod string `json:"uplink_http_method,omitempty"`
+
+	// SessionPlacement: session UUID 放在哪。"path" (默认) / "cookie" / "header" / "query"。
+	SessionPlacement string `json:"session_placement,omitempty"`
+	// SessionKey: session 字段名。默认按 placement 取 "x_session" / "X-Session"。
+	SessionKey string `json:"session_key,omitempty"`
+	// SeqPlacement: seq 序号放在哪。"path" (默认) / "cookie" / "header" / "query"。
+	// 当 SessionPlacement = "path" 时 SeqPlacement 也必须是 "path"。
+	SeqPlacement string `json:"seq_placement,omitempty"`
+	// SeqKey: seq 字段名。默认按 placement 取 "x_seq" / "X-Seq"。
+	SeqKey string `json:"seq_key,omitempty"`
+
+	// UplinkDataPlacement: 上行数据放在哪。"body" (默认) / "cookie" / "header"。
+	// 设为 cookie / header 时仅 packet-up 模式有效。
+	UplinkDataPlacement string `json:"uplink_data_placement,omitempty"`
+	// UplinkDataKey: 上行数据字段基名。默认按 placement 取 "x_data" / "X-Data"。
+	UplinkDataKey string `json:"uplink_data_key,omitempty"`
+	// UplinkChunkSize: 上行数据每片最大字节 (placement != body 时生效)。
+	// 默认 cookie=3KB / header=4KB；最小 64 字节。
+	UplinkChunkSize uint32 `json:"uplink_chunk_size,omitempty"`
+
 	// ── 下列字段对齐 Xray 但本实现暂不使用 ──
-	// （保留 JSON 解析以免用户配置报 "unknown field" 错）
-	// 仅 packet-up: 服务端会限制单连接持续时间，默认无限。
 	ScStreamUpServerSecs int `json:"sc_stream_up_server_secs,omitempty"`
-	// 仅 stream-up 多端口：服务端额外监听端口，客户端随机选一个分流下行。
-	DownloadSettings map[string]any `json:"downloadSettings,omitempty"`
-	// xmux 选项对象，当前实现不拆分 mux，配置仍能解析但被忽略。
-	Xmux map[string]any `json:"xmux,omitempty"`
-	// 允许扩展的其他字段（兼容 Xray 升级新增字段不报错）
-	Extra map[string]any `json:"extra,omitempty"`
+	NoGRPCHeader         bool `json:"no_grpc_header,omitempty"`
+	DownloadSettings     map[string]any `json:"downloadSettings,omitempty"`
+	Xmux                 map[string]any `json:"xmux,omitempty"`
+	Extra                map[string]any `json:"extra,omitempty"`
 }
