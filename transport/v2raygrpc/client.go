@@ -3,6 +3,7 @@ package v2raygrpc
 import (
 	"context"
 	"net"
+	"reflect"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -84,13 +85,33 @@ func (c *Client) connect() (*grpc.ClientConn, error) {
 	if conn != nil && conn.GetState() != connectivity.Shutdown {
 		return conn, nil
 	}
-	//nolint:staticcheck
-	conn, err := grpc.DialContext(c.ctx, c.serverAddr, c.dialOptions...)
+	// PR#5689: 用 grpc.NewClient 代替 grpc.DialContext。
+	// NewClient 不会阻塞连接 — 连接在 Connect() 或首次 RPC 时建立。
+	conn, err := grpc.NewClient("passthrough:///"+c.serverAddr, c.dialOptions...)
 	if err != nil {
 		return nil, err
 	}
+	// PR#5689: grpc.WithUserAgent 会无条件追加 "grpc-go/version" 后缀，
+	// 留下 gRPC 指纹。用反射 hack 把 UA 字段直接覆盖掉。
+	// 空字符串时用动态 Chrome UA (与 XHTTP browser masquerading 对齐)。
+	setUserAgent(conn, "")
+	conn.Connect()
 	c.conn.Store(conn)
 	return conn, nil
+}
+
+// setUserAgent 用反射直接覆写 grpc.ClientConn 内部的 UserAgent 字段，
+// 剥掉 grpc-go 库无条件追加的 "grpc-go/version" 后缀。
+// ua 为空时 grpc-go 会用默认 UA — 但我们已经不走 WithUserAgent 路径，
+// 所以空串让 net/http 层用 Go 默认 UA (被 TLS 层的 ALPN 隐藏)。
+//
+// 注意: 这依赖 grpc.ClientConn 的内部字段名 (dopts.copts.UserAgent)，
+// 跨 grpc-go 大版本可能 break。与 Xray-core PR#5689 保持同构。
+func setUserAgent(conn *grpc.ClientConn, ua string) {
+	f := reflect.ValueOf(conn).Elem().FieldByName("dopts").FieldByName("copts").FieldByName("UserAgent")
+	if f.IsValid() {
+		*(*string)(f.Addr().UnsafePointer()) = ua
+	}
 }
 
 func (c *Client) DialContext(ctx context.Context) (net.Conn, error) {

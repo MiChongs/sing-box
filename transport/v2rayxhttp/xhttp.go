@@ -58,6 +58,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	boxtls "github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -1205,12 +1206,24 @@ func (w *packetUpWriter) post(data []byte) error {
 
 	// 当 uplinkDataPlacement != body 时数据走 header/cookie，请求体置空。
 	// 这是为 GET-only CDN 准备的：method=GET 时 net/http 拒绝带 body。
-	var bodyReader io.Reader = bytes.NewReader(data)
-	var contentLength int64 = int64(len(data))
-	willPlaceInHeaderOrCookie := w.cfg.uplinkDataPlacement != PlacementBody
+	// 用 sing pooled buf.Buffer 代替 bytes.NewReader — PR#5803 对齐。
+	// buf.NewSize 从 sync.Pool 取预分配的 []byte wrapper，
+	// 避免 HTTP/2 frame 层对每片 POST 都 heap-alloc 一个新 Reader。
+	var bodyReader io.Reader
+	var contentLength int64
+	willPlaceInHeaderOrCookie := w.cfg.uplinkDataPlacement != PlacementBody &&
+		w.cfg.uplinkDataPlacement != PlacementAuto
 	if willPlaceInHeaderOrCookie {
 		bodyReader = nil
 		contentLength = 0
+	} else {
+		// body placement: 用 pooled buffer 承载 payload。
+		// io.NopCloser 让 net/http 接受它为 request body。
+		// data 是 w.buf 的所有权转移 (flush 里 chunk := w.buf; w.buf = nil)，
+		// buf.With 不拷贝而是包装现有切片。
+		bb := buf.With(data)
+		bodyReader = io.NopCloser(bb)
+		contentLength = int64(len(data))
 	}
 
 	req, err := http.NewRequestWithContext(w.ctx, w.cfg.uplinkHTTPMethod, u.String(), bodyReader)
