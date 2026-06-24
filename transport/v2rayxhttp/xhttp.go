@@ -626,8 +626,9 @@ type Client struct {
 	dialer N.Dialer
 
 	transport http.RoundTripper
-	// packetUp seq 在多条连接间不复用；每条 Dial 新开一个 PacketUpWriter，
-	// 但底层 transport 共享 —— h2 下这样能 H2-multiplex 到同一 TCP 上。
+	// h1Pool: 当 ALPN = http/1.1 时，packet-up 模式用手写 H1 序列化 + 连接池
+	// 代替 http.Transport.RoundTrip。对齐 Xray PR#5803 的 H1 路径。
+	h1Pool    *h1UploadPool
 	closeOnce sync.Once
 }
 
@@ -664,12 +665,28 @@ func NewClient(
 		return nil, err
 	}
 
-	return &Client{
+	client := &Client{
 		ctx:       ctx,
 		cfg:       cfg,
 		dialer:    dialer,
 		transport: transport,
-	}, nil
+	}
+	// PR#5803 H1 手写序列化路径：仅 ALPN=http/1.1 + 有 TLS 时启用。
+	// 无 TLS 时 buildTransport 走纯 H1 http.Transport，pool 也一样有效。
+	if tlsConfig != nil {
+		if alpn := tlsConfig.NextProtos(); len(alpn) == 1 && alpn[0] == "http/1.1" {
+			tlsDialer := boxtls.NewDialer(dialer, tlsConfig)
+			client.h1Pool = newH1UploadPool(func(ctx context.Context) (net.Conn, error) {
+				return tlsDialer.DialTLSContext(ctx, serverAddr)
+			})
+		}
+	} else {
+		// 无 TLS 纯 H1 — pool 用裸 TCP dial
+		client.h1Pool = newH1UploadPool(func(ctx context.Context) (net.Conn, error) {
+			return dialer.DialContext(ctx, N.NetworkTCP, serverAddr)
+		})
+	}
+	return client, nil
 }
 
 // buildTransport 按 ALPN 派发底层 RoundTripper（与 mihomo / Xray 对齐）：
@@ -1027,6 +1044,7 @@ func (c *Client) dialPacketUp(ctx context.Context) (net.Conn, error) {
 		cancel:    writerCancel,
 		cfg:       c.cfg,
 		transport: c.transport,
+		h1Pool:    c.h1Pool,
 		session:   session,
 		host:      host,
 	}
@@ -1136,6 +1154,7 @@ type packetUpWriter struct {
 
 	cfg       *config
 	transport http.RoundTripper
+	h1Pool   *h1UploadPool // 非 nil 时 packet-up 走 H1 手写序列化 + 连接池
 	session   string
 	host      string
 
@@ -1253,6 +1272,10 @@ func (w *packetUpWriter) post(data []byte) error {
 	// padding 最后 — 让 queryInHeader 能捕到完整最终 URL
 	w.cfg.applyXPadding(req)
 
+	// PR#5803: H1 时走手写序列化 + 连接池 (可安全重试)；否则走 RoundTripper。
+	if w.h1Pool != nil {
+		return w.h1Pool.postH1Packet(w.ctx, req)
+	}
 	resp, err := w.transport.RoundTrip(req)
 	if err != nil {
 		return err
