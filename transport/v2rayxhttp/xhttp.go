@@ -151,6 +151,15 @@ type config struct {
 	// PR#5802 浏览器伪装类型: "" / "chrome" / "firefox" / "edge" / "golang"
 	userAgent string
 
+	// ─── 服务端 (inbound) 字段 ───
+	// scMaxBufferedPosts: packet-up 模式下 uploadQueue 的 heap 容量上限。
+	// 超出该值说明乱序太严重，断流让客户端重连。默认 30。
+	scMaxBufferedPosts int
+	// serverMaxHeaderBytes: http.Server.MaxHeaderBytes。默认 8192。
+	serverMaxHeaderBytes int
+	// noGRPCHeader: 上行 stream 不带 application/grpc Content-Type。
+	noGRPCHeader bool
+
 	// 服务端地址（用于缺 Host 时的 fallback）
 	serverHost string
 	serverAddr M.Socksaddr
@@ -344,6 +353,14 @@ func newConfig(opts *option.V2RayXHTTPOptions, serverAddr M.Socksaddr, hasRealit
 	default:
 		return nil, E.New("xhttp: unsupported user_agent: ", opts.UserAgent)
 	}
+
+	// ── 服务端字段 ──
+	c.scMaxBufferedPosts = opts.ScMaxBufferedPosts
+	if c.scMaxBufferedPosts <= 0 {
+		c.scMaxBufferedPosts = defaultScMaxBufferedPosts
+	}
+	c.serverMaxHeaderBytes = 8192 // 默认，与 Xray / http.Server 一致
+	c.noGRPCHeader = opts.NoGRPCHeader
 
 	return c, nil
 }

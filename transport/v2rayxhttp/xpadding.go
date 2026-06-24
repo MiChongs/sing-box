@@ -213,3 +213,145 @@ func applyPaddingToRequest(req *http.Request, cfg XPaddingConfig) {
 		req.URL.RawQuery = q.Encode()
 	}
 }
+
+
+// ──────────────────────────────────────────────────────────────────────
+// 服务端专用 helpers — 从入站 request 里反解 padding / session / seq，
+// 以及把 padding 写回 response header。对齐 Xray hub.go 的同名方法。
+// ──────────────────────────────────────────────────────────────────────
+
+// extractXPaddingFromRequest 从入站 request 里把客户端塞进去的 padding 值捞出来。
+// 返回 (paddingValue, placementDesc)。placementDesc 仅用于日志。
+//
+// obfsMode=false 时走默认路径: 先看 Referer 里的 x_padding query，再看 URL query。
+// obfsMode=true 时按配置的 placement / key / header 反查。
+func extractXPaddingFromRequest(req *http.Request, obfsMode bool, key, header, placement string) (string, string) {
+	if req == nil {
+		return "", ""
+	}
+	if !obfsMode {
+		referrer := req.Header.Get("Referer")
+		if referrer != "" {
+			if u, err := url.Parse(referrer); err == nil {
+				return u.Query().Get("x_padding"), PlacementQueryInHeader + "=Referer, key=x_padding"
+			}
+		}
+		return req.URL.Query().Get("x_padding"), PlacementQuery + ", key=x_padding"
+	}
+
+	// obfsMode: 按 placement 顺序探查 cookie → header → query
+	if cookie, err := req.Cookie(key); err == nil && cookie != nil && cookie.Value != "" {
+		return cookie.Value, PlacementCookie + ", key=" + key
+	}
+	headerValue := req.Header.Get(header)
+	if headerValue != "" {
+		if placement == PlacementHeader {
+			return headerValue, PlacementHeader + "=" + header
+		}
+		if u, err := url.Parse(headerValue); err == nil {
+			return u.Query().Get(key), PlacementQueryInHeader + "=" + header + ", key=" + key
+		}
+	}
+	if q := req.URL.Query().Get(key); q != "" {
+		return q, PlacementQuery + ", key=" + key
+	}
+	return "", ""
+}
+
+// isPaddingValid 校验客户端发来的 padding 是否在合法范围。
+//   repeat-x: 直接量字符串长度
+//   tokenish: 量 huffman 编码后长度（因为 base62 字符 huffman 后 ≠ 字符串长度）
+func isPaddingValid(paddingValue string, from, to int32, method PaddingMethod) bool {
+	if paddingValue == "" {
+		return false
+	}
+	switch method {
+	case PaddingMethodTokenish:
+		n := int32(hpack.HuffmanEncodeLength(paddingValue))
+		lo := from - paddingValidationTolerance
+		hi := to + paddingValidationTolerance
+		if lo < 0 {
+			lo = 0
+		}
+		return n >= lo && n <= hi
+	default: // repeat-x
+		n := int32(len(paddingValue))
+		return n >= from && n <= to
+	}
+}
+
+// applyXPaddingToResponse 把 padding 值写到 response header。
+// 服务端响应路径: 默认放 X-Padding header (repeat-x)；obfsMode 下按 placement。
+func applyXPaddingToResponse(h http.Header, cfg XPaddingConfig) {
+	if h == nil || cfg.Length <= 0 {
+		return
+	}
+	value := generatePaddingValue(cfg.Method, cfg.Length)
+	if value == "" {
+		return
+	}
+	// 响应端只支持 header / queryInHeader 两种 placement
+	switch cfg.Placement.Placement {
+	case PlacementHeader:
+		if cfg.Placement.Header != "" {
+			h.Set(cfg.Placement.Header, value)
+		}
+	case PlacementQueryInHeader:
+		// 响应端没有自然的 "URL in header" 语义，退化成直接 header
+		if cfg.Placement.Header != "" {
+			h.Set(cfg.Placement.Header, value)
+		}
+	default:
+		// cookie / query 在 response 端没法天然表达，退化到 header
+		h.Set("X-Padding", value)
+	}
+}
+
+// extractMetaFromRequest 从入站 request 里解出 sessionId 和 seqStr。
+//
+// 默认 (path placement): 从 URL path 的 <base>/<session>/<seq> 拆。
+// 其他 placement: 按 sessionPlacement / seqPlacement 从 query/header/cookie 取。
+// path 是 base path（已 normalize 过带尾斜杠），用来 trim 前缀。
+func extractMetaFromRequest(req *http.Request, basePath, sessionPlacement, sessionKey, seqPlacement, seqKey string) (sessionId, seqStr string) {
+	var subpath []string
+	pathPart := 0
+	if sessionPlacement == PlacementPath || seqPlacement == PlacementPath {
+		// trim basePath 前缀，剩 /<session>/<seq> 或 /<session>
+		rest := strings.TrimPrefix(req.URL.Path, basePath)
+		subpath = strings.Split(strings.TrimPrefix(rest, "/"), "/")
+		// 如果 rest 是空或 "/"，subpath 会含一个空串，跳过
+	}
+
+	switch sessionPlacement {
+	case PlacementPath, "":
+		if len(subpath) > pathPart && subpath[pathPart] != "" {
+			sessionId = subpath[pathPart]
+			pathPart++
+		}
+	case PlacementQuery:
+		sessionId = req.URL.Query().Get(sessionKey)
+	case PlacementHeader:
+		sessionId = req.Header.Get(sessionKey)
+	case PlacementCookie:
+		if c, e := req.Cookie(sessionKey); e == nil {
+			sessionId = c.Value
+		}
+	}
+
+	switch seqPlacement {
+	case PlacementPath, "":
+		if len(subpath) > pathPart && subpath[pathPart] != "" {
+			seqStr = subpath[pathPart]
+		}
+	case PlacementQuery:
+		seqStr = req.URL.Query().Get(seqKey)
+	case PlacementHeader:
+		seqStr = req.Header.Get(seqKey)
+	case PlacementCookie:
+		if c, e := req.Cookie(seqKey); e == nil {
+			seqStr = c.Value
+		}
+	}
+
+	return sessionId, seqStr
+}
