@@ -1,0 +1,574 @@
+name: xiaobaf14g release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (不含 v 前缀, 例如 1.14.1-xiaobaf14g.1)'
+        required: true
+        type: string
+      prerelease:
+        description: '标记为 prerelease'
+        required: false
+        type: boolean
+        default: false
+      skip_android:
+        description: '跳过 Android 构建'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+# 同一 tag 重 push / 多次 workflow_dispatch 时，自动取消前一次仍在跑的运行。
+# 避免两次构建把 Release assets 互相覆盖，也省 Actions 用量。
+concurrency:
+  group: xiaobaf14g-release-${{ github.event_name == 'push' && github.ref_name || inputs.version }}
+  cancel-in-progress: true
+
+env:
+  # 与上游 stable 的 build.yml 保持同一 Go 版本。
+  GO_VERSION: '1.26.8'
+
+jobs:
+  # ───────────────────────────────────────────────────────────────────
+  # 1) 解析触发源 + 决定版本 / prerelease / 是否跳过 Android
+  # ───────────────────────────────────────────────────────────────────
+  prepare:
+    name: prepare metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version:      ${{ steps.meta.outputs.version }}
+      tag:          ${{ steps.meta.outputs.tag }}
+      prerelease:   ${{ steps.meta.outputs.prerelease }}
+      skip_android: ${{ steps.meta.outputs.skip_android }}
+    steps:
+      - name: Parse trigger
+        id: meta
+        env:
+          EVENT:           ${{ github.event_name }}
+          INPUT_VERSION:   ${{ inputs.version }}
+          INPUT_PRE:       ${{ inputs.prerelease }}
+          INPUT_SKIP:      ${{ inputs.skip_android }}
+          REF_NAME:        ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            VERSION="${INPUT_VERSION#v}"
+            TAG="v${VERSION}"
+            PRE="$INPUT_PRE"
+            SKIP_ANDROID="$INPUT_SKIP"
+          else
+            TAG="$REF_NAME"
+            VERSION="${TAG#v}"
+            # stable 版本号本身带 -xiaobaf14g.N 后缀，不能按 "含 -" 判断；
+            # 只有 alpha / beta / rc 才是 prerelease。
+            if [[ "$VERSION" =~ -(alpha|beta|rc) ]]; then
+              PRE=true
+            else
+              PRE=false
+            fi
+            SKIP_ANDROID=false
+          fi
+          {
+            echo "version=$VERSION"
+            echo "tag=$TAG"
+            echo "prerelease=$PRE"
+            echo "skip_android=$SKIP_ANDROID"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  # ───────────────────────────────────────────────────────────────────
+  # 2) Desktop 多平台并行编译
+  #    tag 集合取自 release/DEFAULT_BUILD_TAGS_*（随上游同步），CGO=0 的
+  #    target 去掉依赖 cronet 的 with_naive_outbound。
+  #    ebpf: true 的 target 额外带 with_ebpf，产物名带 -ebpf 后缀，与普通
+  #    构建并列发布。
+  #
+  #    缓存策略:
+  #    - Go module cache (~/go/pkg/mod): setup-go 按 go.sum 缓存，所有 target 共享
+  #    - Go build cache (~/.cache/go-build): key by go.sum + target 三元组，
+  #      确保交叉编译产物不互相污染
+  # ───────────────────────────────────────────────────────────────────
+  desktop:
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.suffix }}
+    runs-on: ubuntu-latest
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Windows
+          - { goos: windows, goarch: amd64,    ext: .exe, tags_src: windows, suffix: '' }
+          # AMD64 v3 — Haswell+ (Intel 2013+) / Excavator+ (AMD 2015+)。启用 AVX/AVX2/BMI1/BMI2/F16C/FMA/LZCNT/MOVBE。
+          - { goos: windows, goarch: amd64,    ext: .exe, tags_src: windows, suffix: -v3,  goamd64: v3 }
+          # AMD64 v4 — Skylake-X+ (Intel 2017+) / Zen 4+ (AMD 2022+)。在 v3 之上启用 AVX-512，老 CPU 会 SIGILL。
+          - { goos: windows, goarch: amd64,    ext: .exe, tags_src: windows, suffix: -v4,  goamd64: v4 }
+          - { goos: windows, goarch: arm64,    ext: .exe, tags_src: windows, suffix: '' }
+          - { goos: windows, goarch: '386',    ext: .exe, tags_src: windows, suffix: '' }
+          # Linux
+          - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: '' }
+          # AMD64 v3 + glibc — CGO=1 动态链接宿主 glibc（ubuntu-latest 的 glibc 版本即最低要求）。
+          - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: -v3-glibc, goamd64: v3, cgo: '1' }
+          - { goos: linux,   goarch: arm64,    ext: '',   tags_src: others,  suffix: '' }
+          # ARM64 + musl — CGO=1 交叉到 aarch64-linux-musl（zig cc），-extldflags=-static 链出完全静态产物。
+          - { goos: linux,   goarch: arm64,    ext: '',   tags_src: others,  suffix: -musl, cgo: '1', cc_target: aarch64-linux-musl }
+          - { goos: linux,   goarch: '386',    ext: '',   tags_src: others,  suffix: '' }
+          - { goos: linux,   goarch: arm,      ext: '',   tags_src: others,  suffix: -v7,  goarm: '7' }
+          - { goos: linux,   goarch: mipsle,   ext: '',   tags_src: others,  suffix: -softfloat, gomips: softfloat }
+          - { goos: linux,   goarch: mips64le, ext: '',   tags_src: others,  suffix: -softfloat, gomips: softfloat }
+          - { goos: linux,   goarch: riscv64,  ext: '',   tags_src: others,  suffix: '' }
+          - { goos: linux,   goarch: loong64,  ext: '',   tags_src: others,  suffix: '' }
+          # Linux + eBPF 入站（with_ebpf，纯 Go 运行时，CGO=0 静态产物）
+          - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: -ebpf, ebpf: true }
+          - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: -v3-ebpf, goamd64: v3, ebpf: true }
+          - { goos: linux,   goarch: arm64,    ext: '',   tags_src: others,  suffix: -ebpf, ebpf: true }
+          - { goos: linux,   goarch: '386',    ext: '',   tags_src: others,  suffix: -ebpf, ebpf: true }
+          - { goos: linux,   goarch: arm,      ext: '',   tags_src: others,  suffix: -v7-ebpf, goarm: '7', ebpf: true }
+          - { goos: linux,   goarch: mipsle,   ext: '',   tags_src: others,  suffix: -softfloat-ebpf, gomips: softfloat, ebpf: true }
+          - { goos: linux,   goarch: mips64le, ext: '',   tags_src: others,  suffix: -softfloat-ebpf, gomips: softfloat, ebpf: true }
+          - { goos: linux,   goarch: riscv64,  ext: '',   tags_src: others,  suffix: -ebpf, ebpf: true }
+          - { goos: linux,   goarch: loong64,  ext: '',   tags_src: others,  suffix: -ebpf, ebpf: true }
+          # macOS
+          - { goos: darwin,  goarch: amd64,    ext: '',   tags_src: others,  suffix: '' }
+          - { goos: darwin,  goarch: arm64,    ext: '',   tags_src: others,  suffix: '' }
+          # FreeBSD
+          - { goos: freebsd, goarch: amd64,    ext: '',   tags_src: others,  suffix: '' }
+          - { goos: freebsd, goarch: arm64,    ext: '',   tags_src: others,  suffix: '' }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      # 独立的 build cache（~/.cache/go-build）。key 精确到 target 三元组，
+      # restore-keys 前缀匹配：同一 target 不同 go.sum 版本能拿上次增量。
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+          key: go-build-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}-${{ env.GO_VERSION }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}-${{ env.GO_VERSION }}-
+            go-build-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}-
+
+      # Zig 只给需要 musl 交叉 CC 的 target 装（linux/arm64-musl）。
+      - name: Setup Zig (musl cross CC)
+        if: matrix.cc_target
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.0
+
+      - name: Resolve build tags
+        id: tags
+        env:
+          TAGS_SRC: ${{ matrix.tags_src }}
+          EBPF:     ${{ matrix.ebpf }}
+        run: |
+          set -euo pipefail
+          case "$TAGS_SRC" in
+            windows) TAGS=$(cat release/DEFAULT_BUILD_TAGS_WINDOWS) ;;
+            *)       TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS) ;;
+          esac
+          # with_naive_outbound 需要 cronet-go 预编译 C 库，这里的 target
+          # 不链接 cronet，去掉它（Android 构建单独带 naive）。
+          TAGS=$(echo "$TAGS" | tr ',' '\n' | grep -vx 'with_naive_outbound' | paste -sd, -)
+          if [[ "$EBPF" == "true" ]]; then
+            TAGS="${TAGS},with_ebpf"
+          fi
+          echo "tags=$TAGS" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: ${{ matrix.cgo || '0' }}
+          GOOS:        ${{ matrix.goos }}
+          GOARCH:      ${{ matrix.goarch }}
+          GOARM:       ${{ matrix.goarm }}
+          GOMIPS:      ${{ matrix.gomips }}
+          GOMIPS64:    ${{ matrix.gomips }}
+          GOAMD64:     ${{ matrix.goamd64 }}
+          CC_TARGET:   ${{ matrix.cc_target }}
+          TAGS:        ${{ steps.tags.outputs.tags }}
+          VERSION:     ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          NAME="sing-box-${VERSION}-${GOOS}-${GOARCH}${{ matrix.suffix }}"
+          BIN="${NAME}${{ matrix.ext }}"
+          # Musl 静态构建：zig cc 提供 musl headers + libc.a；Go 内部链接器
+          # 不支持 musl 静态合并，需 -linkmode=external -extldflags=-static。
+          EXTRA_LDFLAGS=""
+          if [ -n "${CC_TARGET}" ]; then
+            export CC="zig cc -target ${CC_TARGET}"
+            export CXX="zig c++ -target ${CC_TARGET}"
+            EXTRA_LDFLAGS=" -linkmode=external -extldflags=-static"
+            echo "Cross CGO via zig: CC='${CC}' (external linkmode, static)"
+          fi
+          # release/LDFLAGS 随上游同步（godebug 默认值、checklinkname 等）。
+          LDFLAGS="-s -w -buildid= $(cat release/LDFLAGS) -X github.com/sagernet/sing-box/constant.Version=${VERSION}${EXTRA_LDFLAGS}"
+          echo "::group::Build $BIN"
+          echo "tags=${TAGS}"
+          echo "ldflags=${LDFLAGS}"
+          echo "CGO=${CGO_ENABLED} GOAMD64=${GOAMD64:-default} CC_TARGET=${CC_TARGET:-none}"
+          go build -trimpath -buildvcs=false \
+            -tags "${TAGS}" \
+            -ldflags "${LDFLAGS}" \
+            -o "$BIN" ./cmd/sing-box
+          echo "::endgroup::"
+          ls -lh "$BIN"
+          # glibc 动态构建列出运行时 ELF 依赖；musl 静态构建确认无动态依赖。
+          if [ "${CGO_ENABLED}" = "1" ]; then
+            echo "--- ELF dynamic dependencies ---"
+            DEPS=$(objdump -p "$BIN" | grep -E '(NEEDED|GLIBC_)' | sort -u || true)
+            echo "${DEPS}"
+            if [ -n "${CC_TARGET}" ]; then
+              if echo "${DEPS}" | grep -q "NEEDED"; then
+                echo "ERROR: musl build has dynamic NEEDED deps — expected fully static"
+                exit 1
+              fi
+              echo "musl static build OK — no dynamic deps"
+            fi
+          fi
+          echo "BIN=$BIN"   >> "$GITHUB_ENV"
+          echo "NAME=$NAME" >> "$GITHUB_ENV"
+
+      # pigz 并行压缩，保留 -9 最高压缩率。
+      - name: Pack with tar.gz (pigz parallel)
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends pigz >/dev/null 2>&1 || \
+            { command -v pigz || (echo "pigz not available, falling back to gzip" && sudo ln -sf /bin/gzip /usr/local/bin/pigz); }
+          tar cf - "${BIN}" | pigz -9 > "${NAME}.tar.gz"
+          ls -lh "${NAME}.tar.gz"
+
+      # compression-level: 0 禁用 upload-artifact 内置二次压缩（tar.gz 已压）。
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: desktop-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
+          path: sing-box-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  # ───────────────────────────────────────────────────────────────────
+  # 3) Android arm64-v8a (CGO + NDK + naive，走 cmd/internal/build_libbox
+  #    android-bin 入口)，普通版与 eBPF 版各一个。
+  #    continue-on-error 让 Android 失败不阻塞 desktop 的发布。
+  # ───────────────────────────────────────────────────────────────────
+  android:
+    name: android/arm64-v8a${{ matrix.suffix }}
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.skip_android != 'true'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { suffix: '',      extra_tags: '' }
+          - { suffix: '-ebpf', extra_tags: with_ebpf }
+    env:
+      NDK_VERSION: r28c
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+          key: go-build-android-arm64${{ matrix.suffix }}-${{ env.GO_VERSION }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-build-android-arm64${{ matrix.suffix }}-${{ env.GO_VERSION }}-
+            go-build-android-arm64${{ matrix.suffix }}-
+
+      # NDK 不缓存：clang wrapper 依赖的软链在 cp -a / actions/cache 后会被
+      # 固化成绝对路径，恢复到新 runner 后找不到 clang。
+      # r28+ (LLVM 19+) 必需 —— libcronet.a 使用 R_AARCH64_AUTH_ABS64
+      # (relocation 315)，NDK r27 及更早的 lld 不认识。
+      - name: Setup NDK
+        id: ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+
+      - name: Verify NDK toolchain (sanity check)
+        run: |
+          set -euo pipefail
+          NDK_BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          "$NDK_BIN/aarch64-linux-android24-clang" --version || {
+            echo "::error::NDK clang wrapper cannot resolve its target clang binary"
+            cat "$NDK_BIN/aarch64-linux-android24-clang"
+            readlink -f "$NDK_BIN/clang" || echo "clang missing"
+            exit 1
+          }
+          echo "ANDROID_NDK_HOME=${{ steps.ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+
+      - name: Build via build_libbox
+        env:
+          VERSION:    ${{ needs.prepare.outputs.version }}
+          EXTRA_TAGS: ${{ matrix.extra_tags }}
+        run: |
+          set -euo pipefail
+          echo "::group::build_libbox android/arm64 ${EXTRA_TAGS}"
+          go run ./cmd/internal/build_libbox -target android-bin -platform android/arm64 \
+            -version "${VERSION}" -tags "${EXTRA_TAGS}"
+          echo "::endgroup::"
+          ls -lh sing-box-android-arm64-v8a
+          # NDK strip 减体积（约 -30%）
+          STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          if [ -x "$STRIP" ]; then
+            "$STRIP" --strip-all sing-box-android-arm64-v8a || true
+            ls -lh sing-box-android-arm64-v8a
+          fi
+          NAME="sing-box-${VERSION}-android-arm64-v8a${{ matrix.suffix }}"
+          sudo apt-get install -y --no-install-recommends pigz >/dev/null 2>&1 || \
+            { command -v pigz || sudo ln -sf /bin/gzip /usr/local/bin/pigz; }
+          # 归档内用无后缀名字
+          cp sing-box-android-arm64-v8a sing-box
+          tar cf - sing-box | pigz -9 > "${NAME}.tar.gz"
+          ls -lh "${NAME}.tar.gz"
+          rm -f sing-box sing-box-android-arm64-v8a
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: android-arm64-v8a${{ matrix.suffix }}
+          path: sing-box-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  # ───────────────────────────────────────────────────────────────────
+  # 4) 收集所有 artifact + 生成 changelog + 创建 / 更新 Release
+  #    android 失败或被跳过时只要 desktop 成功就发布。
+  # ───────────────────────────────────────────────────────────────────
+  publish:
+    name: publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - desktop
+      - android
+    if: always() && needs.desktop.result == 'success'
+    steps:
+      - name: Checkout (全量历史用于 changelog)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v5
+        with:
+          path: builds/
+          merge-multiple: true
+
+      - name: Inspect artifacts + 生成 SHA256 清单
+        run: |
+          set -euo pipefail
+          cd builds
+          ls -lh
+          echo "---"
+          echo "total: $(ls | wc -l) artifact(s)"
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # 上一个版本只在当前提交的祖先里找，避免跨分支（testing 的 tag）比较。
+      # 还没有 xiaobaf14g tag 时（stable 首次发布），从与上游 reF1nd-stable
+      # 的分叉点算起，只列出本 fork 的改动。
+      - name: Resolve previous tag
+        id: prevtag
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          PREV=$(git describe --tags --abbrev=0 --match 'v*-xiaobaf14g*' --exclude "$TAG" "$GITHUB_SHA" 2>/dev/null || true)
+          if [ -z "$PREV" ] && git fetch --quiet --no-tags https://github.com/reF1nd/sing-box.git reF1nd-stable; then
+            PREV=$(git merge-base "$GITHUB_SHA" FETCH_HEAD || true)
+          fi
+          echo "prev=$PREV" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Build categorized changelog (external)
+        id: cl
+        uses: mikepenz/release-changelog-builder-action@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          configuration: .github/changelog-config.json
+          fromTag: ${{ steps.prevtag.outputs.prev }}
+          # workflow_dispatch 发布新版本时 tag 尚未创建，用提交 SHA 比较。
+          toTag:   ${{ github.sha }}
+          failOnError: false
+          mode: COMMIT
+          fetchReleaseInformation: false
+          commitMode: true
+
+      - name: Assemble Release notes
+        env:
+          TAG:          ${{ needs.prepare.outputs.tag }}
+          PREV:         ${{ steps.prevtag.outputs.prev }}
+          SKIP_ANDROID: ${{ needs.prepare.outputs.skip_android }}
+          ANDROID_RES:  ${{ needs.android.result }}
+          REPO:         ${{ github.repository }}
+          SERVER_URL:   ${{ github.server_url }}
+          RUN_ID:       ${{ github.run_id }}
+          IS_PRE:       ${{ needs.prepare.outputs.prerelease }}
+          CL_BODY:      ${{ steps.cl.outputs.changelog }}
+        run: |
+          set -euo pipefail
+          BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M UTC')
+          # release-changelog-builder-action 没有提交数输出，直接数提交。
+          if [ -n "$PREV" ]; then
+            CL_COUNT=$(git rev-list --count "${PREV}..${GITHUB_SHA}")
+          else
+            CL_COUNT=$(git rev-list --count "${GITHUB_SHA}")
+          fi
+
+          if [ -n "$PREV" ]; then
+            # 分叉点是提交 SHA，显示时缩短
+            PREV_LABEL="$PREV"
+            if [[ "$PREV" =~ ^[0-9a-f]{40}$ ]]; then
+              PREV_LABEL="${PREV:0:9}"
+            fi
+            PREV_CELL="\`$PREV_LABEL\`"
+            COMPARE_URL="${SERVER_URL}/${REPO}/compare/${PREV}...${TAG}"
+            RANGE_LINE="[\`$PREV_LABEL\` … \`$TAG\`]($COMPARE_URL)"
+          else
+            PREV_CELL="(initial)"
+            RANGE_LINE="(initial release)"
+          fi
+          if [ "$IS_PRE" = 'true' ]; then
+            CHANNEL_CELL="pre-release"
+          else
+            CHANNEL_CELL="stable"
+          fi
+
+          {
+            echo "# sing-box xiaobaf14g &mdash; \`$TAG\`"
+            echo ""
+            echo "> $RANGE_LINE"
+            echo ""
+            echo "| Field | Value |"
+            echo "|---|---|"
+            echo "| Tag | \`$TAG\` |"
+            echo "| Previous | $PREV_CELL |"
+            echo "| Commits | ${CL_COUNT:-0} |"
+            echo "| Channel | $CHANNEL_CELL |"
+            echo "| Built | $BUILD_DATE |"
+            echo ""
+            echo "---"
+            echo ""
+            if [ -n "${CL_BODY:-}" ]; then
+              printf '%s\n' "$CL_BODY"
+            else
+              echo "_No noteworthy changes in this range._"
+            fi
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Artifacts"
+            echo ""
+            if ls builds/*.tar.gz >/dev/null 2>&1; then
+              echo "| File | Size |"
+              echo "|---|---:|"
+              for f in builds/*.tar.gz; do
+                SIZE=$(du -h "$f" | cut -f1 | tr -d ' ')
+                printf '| `%s` | %s |\n' "$(basename "$f")" "$SIZE"
+              done
+            else
+              echo "_No artifacts produced._"
+            fi
+            echo ""
+            echo "<details><summary><b>SHA256SUMS</b></summary>"
+            echo ""
+            echo '```'
+            cat builds/SHA256SUMS 2>/dev/null || echo '(no checksum manifest)'
+            echo '```'
+            echo ""
+            echo "</details>"
+            echo ""
+            echo "---"
+            echo ""
+            echo "## eBPF builds"
+            echo ""
+            echo "Files ending in \`-ebpf\` are built with \`with_ebpf\` and include the"
+            echo "[eBPF inbound](https://github.com/${REPO}/blob/${TAG}/docs/configuration/inbound/ebpf.md)"
+            echo "(Linux / Android only). Run \`sing-box tools ebpf status\` on the target machine to check"
+            echo "kernel support before enabling it. The other builds are identical without the eBPF inbound."
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Android Client"
+            echo ""
+            if [ "$SKIP_ANDROID" = 'true' ]; then
+              echo "> Skipped — disabled via workflow input."
+            elif [ "$ANDROID_RES" = 'success' ]; then
+              echo "> Built successfully (standard and eBPF) and attached above."
+            else
+              echo "> At least one Android build failed. Inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) for logs."
+            fi
+            echo ""
+            echo "---"
+            echo ""
+            echo "<sub>Generated by xiaobaf14g release workflow · <a href=\"${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}\">run #${RUN_ID}</a></sub>"
+          } > CHANGELOG_RELEASE.md
+
+          echo "--- CHANGELOG_RELEASE.md ---"
+          cat CHANGELOG_RELEASE.md
+
+      # 幂等发布：先删除任何已存在的同 tag Release（含 draft 与其 assets），
+      # 防止旧二进制和新二进制混在一起。只删 Release，不删 tag。
+      - name: Delete existing Release (idempotent, handles draft)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG:      ${{ needs.prepare.outputs.tag }}
+          REPO:     ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          echo "Looking for any Release (draft or published) with tag=$TAG"
+          IDS=$(gh api "repos/${REPO}/releases?per_page=100" \
+            --jq ".[] | select(.tag_name == \"$TAG\") | .id" || true)
+          if [ -z "$IDS" ]; then
+            echo "No existing Release for $TAG, nothing to delete."
+          else
+            for id in $IDS; do
+              echo "::notice::Deleting Release id=$id (tag=$TAG)"
+              gh api -X DELETE "repos/${REPO}/releases/$id"
+            done
+          fi
+
+      - name: Create or Update Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name:   ${{ needs.prepare.outputs.tag }}
+          # workflow_dispatch 新建 tag 时建在本次构建的提交上，而不是仓库默认分支。
+          target_commitish: ${{ github.sha }}
+          name:       sing-box xiaobaf14g ${{ needs.prepare.outputs.tag }}
+          prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
+          draft:      false
+          body_path:  CHANGELOG_RELEASE.md
+          files: |
+            builds/*.tar.gz
+            builds/SHA256SUMS
+          fail_on_unmatched_files: true
