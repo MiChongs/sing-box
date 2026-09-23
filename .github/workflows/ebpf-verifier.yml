@@ -1,11 +1,13 @@
-name: Verify eBPF program loading
+name: Verify eBPF integration
 
 on:
   workflow_dispatch:
   push:
     paths:
       - '.github/workflows/ebpf-verifier.yml'
+      - 'adapter/ebpf.go'
       - 'box.go'
+      - 'cmd/sing-box/cmd_api_ebpf.go'
       - 'cmd/sing-box/cmd_tools_ebpf.go'
       - 'constant/proxy.go'
       - 'option/ebpf.go'
@@ -13,8 +15,10 @@ on:
       - 'common/listener/**'
       - 'common/process/**'
       - 'common/udpio/**'
+      - 'daemon/instance.go'
+      - 'daemon/started_service*.go'
+      - 'daemon/started_service.proto'
       - 'dns/transport/fakeip/store_ebpf.go'
-      - 'experimental/clashapi/ebpf*.go'
       - 'go.mod'
       - 'go.sum'
       - 'include/ebpf*.go'
@@ -28,7 +32,7 @@ concurrency:
 
 jobs:
   verifier:
-    name: Linux kernel verifier
+    name: Linux integration
     runs-on: ubuntu-24.04
     steps:
       - name: Checkout
@@ -45,32 +49,18 @@ jobs:
             ./adapter ./common/dialer ./common/listener ./protocol/ebpf .
           go test -run '^$' -tags with_ebpf,with_gvisor ./protocol/tailscale
 
-      # protocol/ebpf's own real-kernel tests (network namespaces, real TC
-      # attachments, real packets) are gated at runtime by os.Geteuid() == 0,
-      # not by a build tag, so the unprivileged "Test sing-box integration"
-      # step above only ever exercises their skip path. Without a privileged
-      # run of this package specifically, netns/TCX/real-ping/real-repair
-      # coverage never actually executes in CI at all.
-      #
-      # SING_BOX_EBPF_REQUIRE_TCX=1 turns every TCX attachment test's
-      # fallback-to-clsact-or-skip path into a hard failure instead (see
-      # requireOrSkipTCX in tc_fakeip_icmp_tcx_netns_test.go). ubuntu-24.04's
-      # kernel (6.8+, TCX has shipped since 6.6) is expected to support TCX,
-      # so on this specific runner a TCX test quietly degrading to clsact --
-      # or skipping outright -- is a regression to catch, not a legitimate
-      # environment limitation to route around. This is deliberately not set
-      # for any environment whose kernel is not already known to support
-      # TCX; those still skip cleanly with the variable unset.
-      - name: Run protocol/ebpf real-kernel tests
+      # sing-ebpf owns verifier, program-run, attachment and packet-path tests.
+      # This repository owns the sing-box integration around that library.
+      # Run this package as root so its namespace and route-conflict tests do
+      # not silently take their unprivileged skip paths.
+      - name: Run privileged sing-box integration tests
         shell: bash
         run: |
           set -euo pipefail
           sudo env \
             "PATH=$PATH" \
-            SING_BOX_EBPF_INTEGRATION=1 \
-            SING_BOX_EBPF_REQUIRE_TCX=1 \
             go test -v -count=1 -race \
-              -tags with_ebpf,ebpf_integration \
+              -tags with_ebpf \
               ./protocol/ebpf 2>&1 | tee verifier.log
 
       - name: Upload verifier log

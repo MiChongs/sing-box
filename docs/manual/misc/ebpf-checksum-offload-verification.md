@@ -1,3 +1,7 @@
+---
+icon: material/check-decagram
+---
+
 # eBPF checksum/offload verification
 
 This procedure verifies that packets rewritten by the eBPF TC data planes
@@ -22,7 +26,8 @@ driver, firmware, and kernel with the report.
   cannot exercise shared ingress.
 
 For unambiguous attribution, enable only the role under test. If both roles
-are active, `/ebpf` counters are aggregated across their backends.
+are active, the counters reported by `sing-box api ebpf` are aggregated across
+their backends.
 
 ## Prerequisites
 
@@ -32,7 +37,7 @@ are active, `/ebpf` counters are aggregated across their backends.
 - A running sing-box eBPF inbound attached to `LOCAL_IFACE`.
 - `fakeip_icmp: reply` for ICMP checks.
 - `shared.data_plane: packet_rewrite` for shared TCP/UDP checks.
-- Optionally, the Clash API `/ebpf` endpoint for counter-based attribution.
+- Optionally, the sing-box API service for counter-based attribution.
 
 Confirm that the interface uses a hardware driver:
 
@@ -67,8 +72,6 @@ Optional variables:
 | `REMOTE_IPV6` | — | FakeIP IPv6 target; enables IPv6 ping checks |
 | `REMOTE_PORT_TCP` | — | Enables TCP content verification |
 | `REMOTE_PORT_UDP` | — | Enables UDP content verification |
-| `DUT_DIAGNOSTICS_URL` | — | Clash API `/ebpf` URL |
-| `DUT_DIAGNOSTICS_TOKEN` | — | Optional bearer token |
 | `PING_COUNT` | `20` | Pings per ICMP check |
 | `TRANSFER_BYTES` | `8388608` | TCP payload size |
 | `OUT_DIR` | `./checksum-offload-report` | Report and capture directory |
@@ -88,7 +91,6 @@ sudo LOCAL_IFACE=eth0 \
     REMOTE_SSH_USER=root \
     DOWNSTREAM_HOST=192.0.2.20 \
     DOWNSTREAM_SSH_USER=root \
-    DUT_DIAGNOSTICS_URL=http://127.0.0.1:9090/ebpf \
     FAKEIP_PREFIX=198.18.0.0/15 \
     REMOTE_FAKEIP_TARGET=198.18.0.1 \
     REMOTE_IPV6=fdfe:dcba:9876::1 \
@@ -116,8 +118,11 @@ For each applied combination the tool:
 2. Verifies an untouched SSH control flow.
 3. Runs local and/or downstream-originated FakeIP ICMP checks.
 4. Runs optional TCP and UDP transfers and compares full SHA-256 payloads.
-5. Checks shared FakeIP and rewrite counters when diagnostics are configured.
-6. Writes `report.tsv` and local/remote PCAP files under `OUT_DIR`.
+5. Writes `report.tsv` and local/remote PCAP files under `OUT_DIR`.
+
+When the sing-box API service is available, run `sing-box api ebpf` separately
+before and after the tool to save counter snapshots for shared FakeIP and
+rewrite attribution. The test tool remains independent of sing-box's API.
 
 The receiving payload is authoritative. A sending-side capture can report an
 incorrect checksum before the NIC has completed TX offload.

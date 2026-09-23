@@ -3,6 +3,7 @@
 package dialer
 
 import (
+	"runtime"
 	"syscall"
 
 	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
@@ -34,7 +35,13 @@ func PrepareEBPFSelfBypass(networkManager adapter.NetworkManager, inbounds []opt
 	if localInstances == 0 {
 		return nil
 	}
-	tracker, err := commonEBPF.NewSelfBypass()
+	var tracker *commonEBPF.SelfBypass
+	var err error
+	if runtime.GOOS == "android" {
+		tracker, err = commonEBPF.NewSelfBypassWithCapacity(commonEBPF.CompactSelfBypassSocketCapacity)
+	} else {
+		tracker, err = commonEBPF.NewSelfBypass()
+	}
 	if err != nil {
 		return err
 	}

@@ -110,7 +110,8 @@ func validateLocalOptions(enabled bool, options option.EBPFLocalOptions) error {
 	if len(options.IncludeUID) > 0 || len(options.IncludeUIDRange) > 0 ||
 		len(options.ExcludeUID) > 0 || len(options.ExcludeUIDRange) > 0 ||
 		len(options.IncludeAndroidUser) > 0 || len(options.IncludePackage) > 0 ||
-		len(options.ExcludePackage) > 0 || len(options.BypassPort) > 0 || len(options.BypassPortRange) > 0 {
+		len(options.ExcludePackage) > 0 || len(options.BypassPort) > 0 || len(options.BypassPortRange) > 0 ||
+		len(options.BypassRuleSet) > 0 {
 		return E.New("local options require local interception")
 	}
 	return nil
@@ -214,34 +215,34 @@ func enabledByDefault(value *bool) bool {
 	return value == nil || *value
 }
 
-func parseUIDRanges(uidList []uint32, rangeList []string) ([]commonEBPF.UIDRange, error) {
-	uidRanges := make([]commonEBPF.UIDRange, 0, len(uidList)+len(rangeList))
+func parseUIDRanges(uidList []uint32, rangeList []string) ([]uidRange, error) {
+	uidRanges := make([]uidRange, 0, len(uidList)+len(rangeList))
 	for _, uid := range uidList {
-		uidRanges = append(uidRanges, commonEBPF.UIDRange{Start: uid, End: uid})
+		uidRanges = append(uidRanges, uidRange{Start: uid, End: uid})
 	}
-	for _, uidRange := range rangeList {
-		separator := strings.IndexByte(uidRange, ':')
+	for _, value := range rangeList {
+		separator := strings.IndexByte(value, ':')
 		if separator < 0 {
-			return nil, E.New("missing ':' in range: ", uidRange)
+			return nil, E.New("missing ':' in range: ", value)
 		}
 		if separator == 0 {
-			return nil, E.New("missing range start: ", uidRange)
+			return nil, E.New("missing range start: ", value)
 		}
-		if separator == len(uidRange)-1 {
-			return nil, E.New("missing range end: ", uidRange)
+		if separator == len(value)-1 {
+			return nil, E.New("missing range end: ", value)
 		}
-		start, err := strconv.ParseUint(uidRange[:separator], 0, 32)
+		start, err := strconv.ParseUint(value[:separator], 0, 32)
 		if err != nil {
 			return nil, E.Cause(err, "parse range start")
 		}
-		end, err := strconv.ParseUint(uidRange[separator+1:], 0, 32)
+		end, err := strconv.ParseUint(value[separator+1:], 0, 32)
 		if err != nil {
 			return nil, E.Cause(err, "parse range end")
 		}
 		if start > end {
-			return nil, E.New("range start is greater than range end: ", uidRange)
+			return nil, E.New("range start is greater than range end: ", value)
 		}
-		uidRanges = append(uidRanges, commonEBPF.UIDRange{Start: uint32(start), End: uint32(end)})
+		uidRanges = append(uidRanges, uidRange{Start: uint32(start), End: uint32(end)})
 	}
 	return uidRanges, nil
 }
@@ -251,6 +252,7 @@ func validateSharedOptions(enabled bool, options option.EBPFSharedOptions) error
 		return nil
 	}
 	if options.DataPlane != "" || options.DNSMode != "" || len(options.Interface) > 0 || options.IPv6 != nil || options.BypassPrivateAddress != nil ||
+		len(options.BypassRuleSet) > 0 ||
 		len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
 		len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0 ||
 		len(options.BypassPort) > 0 || len(options.BypassPortRange) > 0 {
@@ -259,13 +261,13 @@ func validateSharedOptions(enabled bool, options option.EBPFSharedOptions) error
 	return nil
 }
 
-func parsePortRanges(name string, ports []uint16, ranges []string) ([]commonEBPF.PortRange, error) {
-	result := make([]commonEBPF.PortRange, 0, len(ports)+len(ranges))
+func parsePortRanges(name string, ports []uint16, ranges []string) ([]portRange, error) {
+	result := make([]portRange, 0, len(ports)+len(ranges))
 	for _, port := range ports {
 		if port == 0 {
 			return nil, E.New(name, " contains port 0")
 		}
-		result = append(result, commonEBPF.PortRange{Start: port, End: port})
+		result = append(result, portRange{Start: port, End: port})
 	}
 	for _, value := range ranges {
 		separator := strings.IndexByte(value, ':')
@@ -280,7 +282,7 @@ func parsePortRanges(name string, ports []uint16, ranges []string) ([]commonEBPF
 		if err != nil || end == 0 || start > end {
 			return nil, E.New(name, " invalid range end: ", value)
 		}
-		result = append(result, commonEBPF.PortRange{Start: uint16(start), End: uint16(end)})
+		result = append(result, portRange{Start: uint16(start), End: uint16(end)})
 	}
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].Start != result[j].Start {

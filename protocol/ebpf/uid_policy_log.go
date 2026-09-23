@@ -5,11 +5,9 @@ package ebpf
 import (
 	"strconv"
 	"strings"
-
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
-func formatUIDRanges(ranges []commonEBPF.UIDRange) string {
+func formatUIDRanges(ranges []uidRange) string {
 	if len(ranges) == 0 {
 		return "[]"
 	}

@@ -64,17 +64,20 @@ func (i *Inbound) NewConnection(
 }
 
 func (i *Inbound) NewPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) {
+	i.handlePacket(buffer, oob, source, false)
+}
+
+func (i *Inbound) handlePacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr, takeOwnership bool) bool {
 	if i.localCgroupEnabled() {
 		if redirectAddress, err := redirectAddressFromOOB(oob); err == nil && i.isCgroupRedirectAddress(redirectAddress) {
-			i.newCgroupPacket(buffer, oob, source)
-			return
+			return i.newCgroupPacket(buffer, oob, source, takeOwnership)
 		}
 	}
 	backend := i.tcBackend()
 	if backend == nil {
-		return
+		return false
 	}
-	i.newTCPacket(backend, buffer, oob, source)
+	return i.newTCPacket(backend, buffer, oob, source, takeOwnership)
 }
 
 func (i *Inbound) NewOOBPacketBatch(buffers []*buf.Buffer, oobs [][]byte, sources []M.Socksaddr) {
@@ -83,21 +86,22 @@ func (i *Inbound) NewOOBPacketBatch(buffers []*buf.Buffer, oobs [][]byte, source
 		return
 	}
 	for index, buffer := range buffers {
-		i.NewPacket(buffer, oobs[index], sources[index])
-		buffer.Release()
+		if !i.handlePacket(buffer, oobs[index], sources[index], true) {
+			buffer.Release()
+		}
 	}
 }
 
-func (i *Inbound) newCgroupPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr) {
+func (i *Inbound) newCgroupPacket(buffer *buf.Buffer, oob []byte, source M.Socksaddr, takeOwnership bool) bool {
 	redirectAddress, _, _, err := packetDestinationsFromOOB(oob)
 	if err != nil {
 		i.udpWarnings.packetInfo.warn(i.logger, "read cgroup eBPF UDP redirect address: ", err)
-		return
+		return false
 	}
 	backend := i.cgroupBackendInstance()
 	if backend == nil || !i.isCgroupRedirectAddress(redirectAddress) {
 		i.udpWarnings.originalDestination.warn(i.logger, "cgroup eBPF UDP redirect address is not owned: ", redirectAddress)
-		return
+		return false
 	}
 	client := source.AddrPort()
 	redirectDestination := netip.AddrPortFrom(redirectAddress, i.listeners.selectedPort())
@@ -112,7 +116,7 @@ func (i *Inbound) newCgroupPacket(buffer *buf.Buffer, oob []byte, source M.Socks
 		}
 		if err != nil {
 			i.udpWarnings.originalDestination.warn(i.logger, "lookup cgroup eBPF UDP original destination: ", err)
-			return
+			return false
 		}
 		key = udpSessionKey{
 			Source:       client,
@@ -121,7 +125,12 @@ func (i *Inbound) newCgroupPacket(buffer *buf.Buffer, oob []byte, source M.Socks
 		}
 		i.udpClientTable.setCgroupBinding(key, original, redirectAddress)
 	}
+	if takeOwnership {
+		i.udpNat.NewPacketBuffer(key, buffer, source, M.SocksaddrFromNetIP(original.Destination), nil)
+		return true
+	}
 	i.udpNat.NewPacket(key, [][]byte{buffer.Bytes()}, source, M.SocksaddrFromNetIP(original.Destination), nil)
+	return false
 }
 
 func (i *Inbound) NewPacketConnectionEx(

@@ -3,7 +3,10 @@
 package ebpf
 
 import (
+	"errors"
 	"net/netip"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -45,23 +48,7 @@ func (i *Inbound) startInbound() error {
 			return E.Cause(err, "resolve Android UID policy")
 		}
 	}
-	policy := i.localPolicy
-	policy.EnableBypassCIDR = i.localCgroupEnabled()
-	compiledPolicy, err := commonEBPF.CompilePolicy(commonEBPF.PolicyConfig{
-		EnableTCP:           i.enableTCP,
-		EnableUDP:           i.enableUDP,
-		Local:               policy,
-		SharedDNSMode:       toCommonDNSMode(i.sharedDNSMode),
-		SharedBypassPrivate: i.sharedBypassPrivate,
-		ForceInterceptIPv4:  i.fakeIPIPv4Prefix,
-		ForceInterceptIPv6:  i.fakeIPIPv6Prefix,
-		IncludeSourceCIDR:   i.sharedOptions.IncludeSourceCIDR,
-		ExcludeSourceCIDR:   i.sharedOptions.ExcludeSourceCIDR,
-		IncludeSourceMAC:    i.sharedIncludeMAC,
-		ExcludeSourceMAC:    i.sharedExcludeMAC,
-		LocalBypassPort:     i.localBypassPort,
-		SharedBypassPort:    i.sharedBypassPort,
-	})
+	compiledPolicy, err := i.compileActionPolicy()
 	if err != nil {
 		return E.Cause(err, "compile eBPF policy")
 	}
@@ -125,6 +112,9 @@ func (i *Inbound) startInbound() error {
 		TrackProcess:     i.processTracker != nil,
 		ICMPEchoReply:    i.fakeIPICMPReply,
 	}
+	if runtime.GOOS == "android" {
+		backendConfig.AssignmentCapacity = commonEBPF.CompactTCAssignmentCapacity
+	}
 	var backend *commonEBPF.TCBackend
 	if localTCEnabled || sharedSocketAssignEnabled {
 		backend, err = commonEBPF.PrepareTC(backendConfig)
@@ -184,6 +174,7 @@ func (i *Inbound) startInbound() error {
 		if err = cgroupBackend.Attach(); err != nil {
 			return err
 		}
+		i.startCgroupUDPReleaseReader(cgroupBackend)
 	}
 	if backend != nil {
 		if err = backend.Enable(); err != nil {
@@ -211,6 +202,7 @@ func (i *Inbound) startInbound() error {
 			", udp_cleanup=", cgroupBackend.UDPCleanupMode(),
 			", udp_time=", cgroupBackend.UDPTimeMode(),
 			", udp_storage=", cgroupBackend.UDPStorageMode(),
+			", userspace_udp_cleanup=", cgroupBackend.UDPUserspaceCleanupMode(),
 			", local_uid_include=", formatUIDRanges(i.localPolicy.IncludeUID),
 			", local_uid_exclude=", formatUIDRanges(i.localPolicy.ExcludeUID),
 			", self_bypass=", i.selfBypassMode(),
@@ -253,6 +245,12 @@ func (i *Inbound) startInbound() error {
 				return cgroupBackend.UDPStorageMode()
 			}
 			return "disabled"
+		}(),
+		", local_cgroup_userspace_udp_cleanup=", func() string {
+			if cgroupBackend := i.cgroupBackendInstance(); cgroupBackend != nil {
+				return cgroupBackend.UDPUserspaceCleanupMode()
+			}
+			return "deadline"
 		}(),
 		", shared_data_plane=", func() string {
 			if !i.sharedEnabled {
@@ -329,12 +327,14 @@ func (i *Inbound) startProcessTracker() error {
 		i.processTracker != nil || i.processTrackerRollback != nil {
 		return nil
 	}
+	uidDecisions, defaultAction := i.compileProcessUIDPolicy()
 	tracker, err := commonEBPF.AttachProcessTracker(commonEBPF.ProcessTrackerConfig{
-		EnableTCP:   i.enableTCP,
-		EnableUDP:   i.enableUDP,
-		EnableIPv6:  i.localIPv6,
-		LocalPolicy: i.localPolicy,
-		SelfBypass:  i.selfBypass,
+		EnableTCP:    i.enableTCP,
+		EnableUDP:    i.enableUDP,
+		EnableIPv6:   i.localIPv6,
+		UIDDecisions: uidDecisions,
+		Default:      defaultAction,
+		SelfBypass:   i.selfBypass,
 	})
 	if err != nil {
 		if tracker != nil {
@@ -362,6 +362,26 @@ func (i *Inbound) processTrackingMode() string {
 		return "cgroup_socket_lru"
 	}
 	return "userspace"
+}
+
+func (i *Inbound) startCgroupUDPReleaseReader(backend *commonEBPF.CgroupBackend) {
+	if backend == nil || backend.UDPUserspaceCleanupMode() != "ringbuf" {
+		return
+	}
+	i.cgroupReleaseWait.Add(1)
+	go func() {
+		defer i.cgroupReleaseWait.Done()
+		for {
+			socketCookie, err := backend.ReadUDPRelease()
+			if err != nil {
+				if !errors.Is(err, os.ErrClosed) {
+					i.logger.Warn("read cgroup eBPF UDP socket-release event: ", err)
+				}
+				return
+			}
+			i.udpNat.ReleaseSocket(socketCookie)
+		}
+	}()
 }
 
 func (i *Inbound) selfBypassMode() string {
@@ -450,10 +470,12 @@ func (i *Inbound) needsLPMPolicy() bool {
 		(len(i.sharedOptions.IncludeSourceCIDR) > 0 || len(i.sharedOptions.ExcludeSourceCIDR) > 0) {
 		return true
 	}
-	for _, ruleSet := range i.bypassRuleSet {
-		for _, ipSet := range ruleSet.ExtractIPSet() {
-			if len(ipSet.Prefixes()) > 0 {
-				return true
+	for _, ruleSets := range [][]adapter.RuleSet{i.bypassRuleSet, i.sharedBypassRuleSet} {
+		for _, ruleSet := range ruleSets {
+			for _, ipSet := range ruleSet.ExtractIPSet() {
+				if len(ipSet.Prefixes()) > 0 {
+					return true
+				}
 			}
 		}
 	}
@@ -493,6 +515,7 @@ func (i *Inbound) closeResources() error {
 	cgroupErr := error(nil)
 	if cgroupBackend != nil {
 		cgroupErr = cgroupBackend.Close()
+		i.cgroupReleaseWait.Wait()
 		// Close keeps the runtime when a program could not be detached, because a
 		// legacy cgroup attachment is owned by the cgroup rather than by the
 		// program handle: dropping the handles would leave that program attached
@@ -506,7 +529,7 @@ func (i *Inbound) closeResources() error {
 		}
 	}
 	listenerErr := i.closeListeners()
-	i.udpNat.Purge()
+	udpNATErr := i.udpNat.Close()
 	i.udpReplySockets.stopSweeper()
 	udpReplySocketErr := i.udpReplySockets.close()
 	dataPlaneErr := i.closeTakenTCDataPlane(dataPlane)
@@ -533,7 +556,7 @@ func (i *Inbound) closeResources() error {
 	if i.processTrackerRollback != nil {
 		i.processTrackerRollback, processTrackerRollbackErr = closeProcessTrackerOwner(i.processTrackerRollback)
 	}
-	return E.Errors(monitorErr, sharedRewriteErr, disableErr, listenerErr, udpReplySocketErr, dataPlaneErr, cgroupErr, routeErr, processTrackerErr, processTrackerRollbackErr, selfBypassErr)
+	return E.Errors(monitorErr, sharedRewriteErr, disableErr, listenerErr, udpNATErr, udpReplySocketErr, dataPlaneErr, cgroupErr, routeErr, processTrackerErr, processTrackerRollbackErr, selfBypassErr)
 }
 
 func closeProcessTrackerOwner(tracker processTrackerOwner) (processTrackerOwner, error) {
@@ -554,6 +577,10 @@ func (i *Inbound) prepareCgroupBackend() error {
 	if err := i.reclaimCgroupBackend(); err != nil {
 		return err
 	}
+	mapCapacity := commonEBPF.DefaultCgroupMapCapacity()
+	if runtime.GOOS == "android" {
+		mapCapacity = commonEBPF.CompactCgroupMapCapacity()
+	}
 	backend, err := commonEBPF.PrepareCgroup(commonEBPF.CgroupConfig{
 		Path:         i.cgroupPath,
 		EnableTCP:    i.enableTCP,
@@ -561,7 +588,7 @@ func (i *Inbound) prepareCgroupBackend() error {
 		EnableIPv6:   i.cgroupIPv6Enabled(),
 		RedirectIPv4: i.redirectIPv4Prefix,
 		RedirectIPv6: i.redirectIPv6Prefix,
-		MapCapacity:  commonEBPF.DefaultCgroupMapCapacity(),
+		MapCapacity:  mapCapacity,
 		UDPTimeout:   i.udpTimeout,
 		Policy:       i.compiledPolicy,
 		SelfBypass:   i.selfBypass,

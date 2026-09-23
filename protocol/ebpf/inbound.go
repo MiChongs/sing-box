@@ -59,64 +59,64 @@ func RegisterInbound(registry *inbound.Registry) {
 
 type Inbound struct {
 	inbound.Adapter
-	ctx                      context.Context
-	router                   adapter.Router
-	logger                   log.ContextLogger
-	networkManager           adapter.NetworkManager
-	localEnabled             bool
-	localDataPlane           string
-	cgroupPath               string
-	cgroupBackend            *commonEBPF.CgroupBackend
-	localRoutes              *commonEBPF.LocalRouteSet
-	redirectIPv4Prefix       netip.Prefix
-	redirectIPv6Prefix       netip.Prefix
-	selfBypass               *commonEBPF.SelfBypass
-	selfBypassCgroup         bool
-	processTracker           processTrackerOwner
-	processTrackerRollback   processTrackerOwner
-	processInfoCache         *processInfoCache
-	usePlatformProcessFinder bool
-	listeners                internalListenerSet
-	udpNat                   *udpNATService
-	tcDataPlane              tcRuntime
-	udpTimeout               time.Duration
-	enableTCP                bool
-	enableUDP                bool
-	localDNSMode             string
-	sharedDNSMode            string
-	localIPv6                bool
-	localPolicy              commonEBPF.LocalPolicy
-	compiledPolicy           commonEBPF.CompiledPolicy
-	androidUIDOptions        *androidUIDOptions
-	sharedOptions            option.EBPFSharedOptions
-	sharedEnabled            bool
-	sharedDataPlane          string
-	sharedRewrite            *sharedRewrite
-	sharedRewriteAccess      sync.RWMutex
-	sharedIPv6               bool
-	sharedBypassPrivate      bool
-	localBypassPort          []commonEBPF.PortRange
-	sharedBypassPort         []commonEBPF.PortRange
-	tcPriority               uint16
-	fakeIPIPv4Prefix         netip.Prefix
-	fakeIPIPv6Prefix         netip.Prefix
-	fakeIPICMPReply          bool
-	sharedIncludeMAC         []commonEBPF.MACAddress
-	sharedExcludeMAC         []commonEBPF.MACAddress
-	tcDataPlaneAccess        sync.RWMutex
-	cgroupBackendAccess      sync.RWMutex
-	lifecycleAccess          sync.Mutex
-	interfaceMonitor         tcInterfaceMonitor
-	networkStateInitialized  bool
-	networkStateDefault      string
-	networkStateAddresses    []netip.Addr
-	networkStateInterfaces   []string
+	ctx                       context.Context
+	router                    adapter.Router
+	logger                    log.ContextLogger
+	networkManager            adapter.NetworkManager
+	localEnabled              bool
+	localDataPlane            string
+	cgroupPath                string
+	cgroupBackend             *commonEBPF.CgroupBackend
+	localRoutes               *commonEBPF.LocalRouteSet
+	redirectIPv4Prefix        netip.Prefix
+	redirectIPv6Prefix        netip.Prefix
+	selfBypass                *commonEBPF.SelfBypass
+	selfBypassCgroup          bool
+	processTracker            processTrackerOwner
+	processTrackerRollback    processTrackerOwner
+	processInfoCache          *processInfoCache
+	usePlatformProcessFinder  bool
+	listeners                 internalListenerSet
+	udpNat                    *udpNATService
+	tcDataPlane               tcRuntime
+	udpTimeout                time.Duration
+	enableTCP                 bool
+	enableUDP                 bool
+	localDNSMode              string
+	sharedDNSMode             string
+	localIPv6                 bool
+	localPolicy               localUIDPolicy
+	compiledPolicy            commonEBPF.CompiledPolicy
+	androidUIDOptions         *androidUIDOptions
+	sharedOptions             option.EBPFSharedOptions
+	sharedEnabled             bool
+	sharedDataPlane           string
+	sharedRewrite             *sharedRewrite
+	sharedRewriteAccess       sync.RWMutex
+	sharedIPv6                bool
+	sharedBypassPrivate       bool
+	localBypassPort           []portRange
+	sharedBypassPort          []portRange
+	tcPriority                uint16
+	networkGeneration         uint64
+	fakeIPIPv4Prefix          netip.Prefix
+	fakeIPIPv6Prefix          netip.Prefix
+	fakeIPICMPReply           bool
+	sharedIncludeMAC          []commonEBPF.MACAddress
+	sharedExcludeMAC          []commonEBPF.MACAddress
+	localInitialDestinations  []commonEBPF.CIDRDecision
+	sharedInitialDestinations []commonEBPF.CIDRDecision
+	tcDataPlaneAccess         sync.RWMutex
+	cgroupBackendAccess       sync.RWMutex
+	cgroupReleaseWait         sync.WaitGroup
+	lifecycleAccess           sync.Mutex
+	interfaceMonitor          tcInterfaceMonitor
 
 	bypassRuleSetAccess       sync.Mutex
 	bypassRuleSet             []adapter.RuleSet
 	bypassRuleSetCallbacks    []*list.Element[adapter.RuleSetUpdateCallback]
 	bypassRuleSetStarted      bool
-	bypassRuleSetPolicy       commonEBPF.BypassCIDRPolicy
+	bypassRuleSetPolicy       []commonEBPF.CIDRDecision
 	bypassRuleSetNeedsRetry   bool
 	bypassRuleSetInconsistent bool
 	// bypassRuleSetExpectedPolicy is the content applyBypassCIDRPolicyLocked
@@ -124,7 +124,7 @@ type Inbound struct {
 	// bypassRuleSetExpectedVersion's doc comment below for why a version
 	// number needs its own content to compare each new attempt against,
 	// distinct from bypassRuleSetPolicy (the last CONFIRMED content).
-	bypassRuleSetExpectedPolicy commonEBPF.BypassCIDRPolicy
+	bypassRuleSetExpectedPolicy []commonEBPF.CIDRDecision
 	// bypassRuleSetPolicyVersion is the compiled bypass_rule_set policy's own
 	// content-based version: it advances only when a newly compiled policy
 	// actually differs (by value, via reflect.DeepEqual) from the one
@@ -159,12 +159,24 @@ type Inbound struct {
 	// bypassRuleSetPolicyVersion, not bypassRuleSetExpectedVersion) -- see
 	// bypassRuleSetBackendVersion's doc comment for what "confirmed" means
 	// and does not mean once a compensating revert has failed.
-	bypassRuleSetPolicyVersion   uint64
-	bypassRuleSetExpectedVersion uint64
-	bypassRuleSetRetryCount      uint64
-	bypassRuleSetTC              bypassRuleSetBackendVersion
-	bypassRuleSetCgroup          bypassRuleSetBackendVersion
-	bypassRuleSetShared          bypassRuleSetBackendVersion
+	bypassRuleSetPolicyVersion         uint64
+	bypassRuleSetExpectedVersion       uint64
+	bypassRuleSetRetryCount            uint64
+	bypassRuleSetTC                    bypassRuleSetBackendVersion
+	bypassRuleSetCgroup                bypassRuleSetBackendVersion
+	bypassRuleSetShared                bypassRuleSetBackendVersion
+	sharedBypassRuleSet                []adapter.RuleSet
+	sharedBypassRuleSetCallbacks       []*list.Element[adapter.RuleSetUpdateCallback]
+	sharedBypassRuleSetStarted         bool
+	sharedBypassRuleSetPolicy          []commonEBPF.CIDRDecision
+	sharedBypassRuleSetNeedsRetry      bool
+	sharedBypassRuleSetInconsistent    bool
+	sharedBypassRuleSetExpectedPolicy  []commonEBPF.CIDRDecision
+	sharedBypassRuleSetPolicyVersion   uint64
+	sharedBypassRuleSetExpectedVersion uint64
+	sharedBypassRuleSetRetryCount      uint64
+	sharedBypassRuleSetTC              bypassRuleSetBackendVersion
+	sharedBypassRuleSetShared          bypassRuleSetBackendVersion
 
 	udpClientTable    udpClientTable
 	udpReplySockets   udpReplySocketPool
@@ -174,6 +186,17 @@ type Inbound struct {
 	interfaceWarnings interfaceWarningLimiters
 	diagnostics       tcOutcomeHistory
 	counters          ebpfCounters
+	// diagnosticsAPICache is request-driven only. API polling can be frequent,
+	// so native per-CPU counter reads are coalesced for a short
+	// window without adding a timer or background wakeup.
+	diagnosticsAPIAccess sync.Mutex
+	diagnosticsAPIAt     time.Time
+	diagnosticsAPIValue  adapter.EBPFRuntimeDiagnostics
+	// kernelRuntimeAPICache protects the more expensive global program/map
+	// enumeration. It remains request-driven and never starts a timer.
+	kernelRuntimeAPIAccess sync.Mutex
+	kernelRuntimeAPIAt     time.Time
+	kernelRuntimeAPIValue  adapter.EBPFKernelRuntimeDiagnostics
 }
 
 func (i *Inbound) localTCEnabled() bool {
@@ -305,8 +328,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		tcPriority:          uint16(options.TCPriority),
 		sharedIncludeMAC:    sharedIncludeMAC,
 		sharedExcludeMAC:    sharedExcludeMAC,
-		localPolicy: commonEBPF.LocalPolicy{
-			DNSMode:              toCommonDNSMode(localDNSMode),
+		localPolicy: localUIDPolicy{
 			BypassPrivateAddress: options.Local.BypassPrivateAddress == nil || *options.Local.BypassPrivateAddress,
 			IncludeUIDConfigured: len(options.Local.IncludeUID) > 0 ||
 				len(options.Local.IncludeUIDRange) > 0 || len(options.Local.IncludePackage) > 0,
@@ -337,12 +359,28 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	warnBypassPortConflicts(logger, "local", localDNSMode, localBypassPort)
 	warnBypassPortConflicts(logger, "shared", sharedDNSMode, sharedBypassPort)
-	for _, ruleSetTag := range options.BypassRuleSet {
-		ruleSet, loaded := router.RuleSet(ruleSetTag)
-		if !loaded {
-			return nil, E.New("parse bypass_rule_set: rule-set not found: ", ruleSetTag)
+	loadRuleSets := func(scope string, target *[]adapter.RuleSet, tags ...[]string) error {
+		seen := make(map[string]struct{})
+		for _, tagList := range tags {
+			for _, ruleSetTag := range tagList {
+				if _, ok := seen[ruleSetTag]; ok {
+					continue
+				}
+				seen[ruleSetTag] = struct{}{}
+				ruleSet, loaded := router.RuleSet(ruleSetTag)
+				if !loaded {
+					return E.New("parse ", scope, ".bypass_rule_set: rule-set not found: ", ruleSetTag)
+				}
+				*target = append(*target, ruleSet)
+			}
 		}
-		inbound.bypassRuleSet = append(inbound.bypassRuleSet, ruleSet)
+		return nil
+	}
+	if err = loadRuleSets("local", &inbound.bypassRuleSet, options.BypassRuleSet, options.Local.BypassRuleSet); err != nil {
+		return nil, err
+	}
+	if err = loadRuleSets("shared", &inbound.sharedBypassRuleSet, options.BypassRuleSet, options.Shared.BypassRuleSet); err != nil {
+		return nil, err
 	}
 	udpTimeout := C.UDPTimeout
 	if options.UDPTimeout != 0 {
@@ -353,7 +391,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	return inbound, nil
 }
 
-func warnBypassPortConflicts(logger log.ContextLogger, scope, dnsMode string, ports []commonEBPF.PortRange) {
+func warnBypassPortConflicts(logger log.ContextLogger, scope, dnsMode string, ports []portRange) {
 	if logger == nil || len(ports) == 0 {
 		return
 	}
@@ -370,16 +408,5 @@ func warnBypassPortConflicts(logger log.ContextLogger, scope, dnsMode string, po
 			logger.Warn("eBPF ", scope, ".bypass_port includes DNS port 53, but dns_mode=off already bypasses DNS")
 		}
 		break
-	}
-}
-
-func toCommonDNSMode(mode string) commonEBPF.DNSMode {
-	switch mode {
-	case dnsModeRespectPolicy:
-		return commonEBPF.DNSModeRespectPolicy
-	case dnsModeOff:
-		return commonEBPF.DNSModeOff
-	default:
-		return commonEBPF.DNSModeHijack
 	}
 }

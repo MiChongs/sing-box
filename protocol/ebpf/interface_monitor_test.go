@@ -6,10 +6,13 @@ import (
 	"context"
 	"slices"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/control"
+	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
 )
 
@@ -71,6 +74,70 @@ func TestTCInterfaceNotificationsCoalesce(t *testing.T) {
 	inbound.notifyTCInterfaceUpdate()
 	if len(updates) != 1 {
 		t.Fatalf("unexpected pending update count: %d", len(updates))
+	}
+}
+
+func TestNetworkStateResetUsesCoordinatedInterfaceUpdate(t *testing.T) {
+	handler := &udpNATTestHandler{connections: make(chan udpNATTestConnection, 1)}
+	service := newUDPNATService(
+		handler,
+		func(key udpSessionKey, _ M.Socksaddr, _ M.Socksaddr, _ any) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc) {
+			return true, context.WithValue(context.Background(), udpNATContextKey{}, key), udpNATTestWriter{}, nil
+		},
+		time.Minute,
+	)
+	t.Cleanup(func() { _ = service.Close() })
+
+	defaultMonitor := &testDefaultInterfaceMonitor{current: &control.Interface{Name: "wlan0", Index: 8}}
+	inbound := &Inbound{
+		networkManager: &testInterfaceNetworkManager{defaultMonitor: defaultMonitor},
+		udpNat:         service,
+	}
+	source := M.ParseSocksaddr("192.0.2.10:53000")
+	destination := M.ParseSocksaddr("198.51.100.1:443")
+	key := udpSessionKey{Source: source.AddrPort(), Scope: udpSessionScopeLocalCgroup, SocketCookie: 1}
+	service.NewPacket(key, [][]byte{[]byte("test")}, source, destination, nil)
+	if count := service.cache.Len(); count != 1 {
+		t.Fatalf("unexpected initial UDP session count: %d", count)
+	}
+
+	// Raw monitor observations may describe an intermediate handover state and
+	// must only schedule topology reconciliation, not tear down live flows.
+	inbound.defaultInterfaceUpdated(&control.Interface{Name: "rmnet_data0", Index: 19}, 0)
+	if count := service.cache.Len(); count != 1 {
+		t.Fatalf("raw interface update purged UDP sessions: %d", count)
+	}
+
+	defaultMonitor.current = &control.Interface{Name: "rmnet_data0", Index: 19}
+	inbound.InterfaceUpdated(context.Background())
+	if count := service.cache.Len(); count != 0 {
+		t.Fatalf("coordinated interface update retained UDP sessions: %d", count)
+	}
+	if current := inbound.monitoredDefaultInterfaceName(); current != "rmnet_data0" {
+		t.Fatalf("unexpected coordinated default interface: %q", current)
+	}
+}
+
+func TestInterfaceDriftCheckOnlyTracksTCState(t *testing.T) {
+	inbound := &Inbound{}
+	if interval := inbound.interfaceDriftCheckInterval(); interval != 0 {
+		t.Fatalf("pure cgroup drift interval = %s, want disabled", interval)
+	}
+
+	inbound.setTCDataPlane(&retryTestTCRuntime{})
+	if interval := inbound.interfaceDriftCheckInterval(); interval != tcDriftCheckInterval {
+		t.Fatalf("TC drift interval = %s, want %s", interval, tcDriftCheckInterval)
+	}
+	inbound.takeTCDataPlane()
+
+	inbound.setSharedRewrite(&sharedRewrite{})
+	if interval := inbound.interfaceDriftCheckInterval(); interval != tcDriftCheckInterval {
+		t.Fatalf("shared rewrite drift interval = %s, want %s", interval, tcDriftCheckInterval)
+	}
+	inbound.takeSharedRewrite()
+
+	if interval := inbound.interfaceDriftCheckInterval(); interval != time.Duration(0) {
+		t.Fatalf("cleared data-plane drift interval = %s, want disabled", interval)
 	}
 }
 

@@ -5,6 +5,7 @@ package ebpf
 import (
 	"context"
 	"net/netip"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -45,9 +46,13 @@ type sharedRewrite struct {
 }
 
 func newSharedRewrite(inbound *Inbound, options option.EBPFSharedOptions) *sharedRewrite {
+	defaultMapCapacity := ECommon.DefaultSharedPacketRewriteMapCapacity()
+	if runtime.GOOS == "android" {
+		defaultMapCapacity = ECommon.CompactSharedPacketRewriteMapCapacity()
+	}
 	mapCapacity := effectiveSharedPacketRewriteMapCapacity(
-		ECommon.DefaultSharedPacketRewriteMapCapacity(),
-		len(inbound.bypassRuleSet) > 0 ||
+		defaultMapCapacity,
+		len(inbound.sharedBypassRuleSet) > 0 ||
 			len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
 			len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0,
 	)
@@ -110,11 +115,14 @@ func (s *sharedRewrite) prepareBackend() (*ECommon.SharedPacketRewriteBackend, e
 		return nil, err
 	}
 	s.inbound.bypassRuleSetAccess.Lock()
-	if cgroupBackend != nil {
-		ipv4Count, ipv6Count := cgroupBackend.BypassCIDRCount()
-		err = backend.SetBypassCIDRState(ipv4Count, ipv6Count)
+	initialPolicy, policyErr := s.inbound.combineDestinationDecisions(
+		s.inbound.sharedInitialDestinations,
+		s.inbound.sharedBypassRuleSetPolicy,
+	)
+	if policyErr == nil {
+		_, err = backend.UpdateDestinationDecisions(initialPolicy)
 	} else {
-		_, err = backend.UpdateCompiledBypassCIDR(s.inbound.bypassRuleSetPolicy)
+		err = policyErr
 	}
 	s.inbound.bypassRuleSetAccess.Unlock()
 	if err != nil {
@@ -176,8 +184,8 @@ func (s *sharedRewrite) Close() error {
 		}
 	}
 	listenerErr := s.closeListeners()
-	s.udpNat.Purge()
-	return E.Errors(closeErr, listenerErr)
+	udpNATErr := s.udpNat.Close()
+	return E.Errors(closeErr, listenerErr, udpNATErr)
 }
 
 func (s *sharedRewrite) closeListeners() error {

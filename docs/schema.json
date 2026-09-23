@@ -3582,6 +3582,21 @@
         "bypass_private_address": {
           "type": "boolean"
         },
+        "bypass_rule_set": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-tag-reference": "rule_set"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "x-tag-reference": "rule_set"
+              }
+            }
+          ]
+        },
         "include_uid": {
           "anyOf": [
             {
@@ -3753,6 +3768,21 @@
         },
         "bypass_private_address": {
           "type": "boolean"
+        },
+        "bypass_rule_set": {
+          "anyOf": [
+            {
+              "type": "string",
+              "x-tag-reference": "rule_set"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "x-tag-reference": "rule_set"
+              }
+            }
+          ]
         },
         "include_source_cidr": {
           "anyOf": [

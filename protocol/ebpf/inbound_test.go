@@ -275,7 +275,7 @@ func TestParsePortRanges(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []commonEBPF.PortRange{{Start: 80, End: 83}, {Start: 443, End: 443}, {Start: 8000, End: 8002}}
+	want := []portRange{{Start: 80, End: 83}, {Start: 443, End: 443}, {Start: 8000, End: 8002}}
 	if !slices.Equal(ranges, want) {
 		t.Fatalf("unexpected port ranges: got %v, want %v", ranges, want)
 	}

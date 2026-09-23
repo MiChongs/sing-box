@@ -119,7 +119,7 @@ func newRetryLoopHarness(t *testing.T) *retryLoopHarness {
 		// pinned to Settled so they never affect the arm/disarm sequence
 		// these tests assert on. interface_monitor_retry_components_test.go
 		// covers those two components' own independence directly.
-		runTCInterfaceUpdateLoop(ctx, harness.updates, func(context.Context) tcUpdateOutcome {
+		runTCInterfaceUpdateLoop(ctx, harness.updates, time.Hour, func(context.Context) tcUpdateOutcome {
 			outcome := harness.update()
 			harness.ran <- struct{}{}
 			return tcUpdateOutcome{sharedRewrite: outcome, general: tcSharedRewriteSettled, bypassRuleSet: tcSharedRewriteSettled}
@@ -337,16 +337,6 @@ func TestRetryLoopStopsWhenUnrecoverable(t *testing.T) {
 	}
 	if _, armed := harness.timer.snapshot(); armed {
 		t.Fatal("the retry timer is still armed after an unrecoverable failure")
-	}
-}
-
-func TestRetryLoopStopsWhenTargetSettles(t *testing.T) {
-	harness := newRetryLoopHarness(t)
-
-	harness.round(t, harness.notify, tcSharedRewriteRecoverable)
-	action := harness.round(t, harness.fire(t), tcSharedRewriteSettled)
-	if action.armed {
-		t.Fatalf("action = %+v, want disarmed once the target settled", action)
 	}
 }
 

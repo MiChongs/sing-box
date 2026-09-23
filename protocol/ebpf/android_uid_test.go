@@ -5,7 +5,6 @@ package ebpf
 import (
 	"testing"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -58,9 +57,9 @@ func TestResolveAndroidUIDPolicy(t *testing.T) {
 			includePackage:     []string{"com.example.include", "com.example.shared"},
 			excludePackage:     []string{"com.example.exclude"},
 		},
-		localPolicy: commonEBPF.LocalPolicy{
-			IncludeUID: []commonEBPF.UIDRange{{Start: 2000, End: 2000}},
-			ExcludeUID: []commonEBPF.UIDRange{{Start: 3000, End: 3000}},
+		localPolicy: localUIDPolicy{
+			IncludeUID: []uidRange{{Start: 2000, End: 2000}},
+			ExcludeUID: []uidRange{{Start: 3000, End: 3000}},
 		},
 	}
 	if err := inbound.resolveAndroidUIDPolicy(); err != nil {
@@ -94,7 +93,7 @@ func TestResolveAndroidUIDPolicyRequiresPackageManager(t *testing.T) {
 	}
 }
 
-func uidInRanges(uid uint32, uidRanges []commonEBPF.UIDRange) bool {
+func uidInRanges(uid uint32, uidRanges []uidRange) bool {
 	for _, uidRange := range uidRanges {
 		if uid >= uidRange.Start && uid <= uidRange.End {
 			return true

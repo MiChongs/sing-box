@@ -4,15 +4,50 @@ package ebpf
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/netip"
 	"strings"
 	"testing"
 	"time"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/option"
+
+	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
+
+type captureLogger struct {
+	debugMessages []string
+	infoMessages  []string
+}
+
+func (l *captureLogger) Trace(args ...any) {}
+func (l *captureLogger) Debug(args ...any) {
+	var builder strings.Builder
+	for _, arg := range args {
+		if text, ok := arg.(string); ok {
+			builder.WriteString(text)
+		}
+	}
+	l.debugMessages = append(l.debugMessages, builder.String())
+}
+func (l *captureLogger) Info(args ...any)  { l.infoMessages = append(l.infoMessages, "called") }
+func (l *captureLogger) Warn(args ...any)  {}
+func (l *captureLogger) Error(args ...any) {}
+func (l *captureLogger) Fatal(args ...any) {}
+func (l *captureLogger) Panic(args ...any) {}
+
+func (l *captureLogger) TraceContext(context.Context, ...any)        {}
+func (l *captureLogger) DebugContext(_ context.Context, args ...any) { l.Debug(args...) }
+func (l *captureLogger) InfoContext(ctx context.Context, args ...any) {
+	l.Info(args...)
+}
+func (l *captureLogger) WarnContext(context.Context, ...any)  {}
+func (l *captureLogger) ErrorContext(context.Context, ...any) {}
+func (l *captureLogger) FatalContext(context.Context, ...any) {}
+func (l *captureLogger) PanicContext(context.Context, ...any) {}
 
 // TestDiagnosticsReportsWaitingForInterfaceWhenNothingIsAttachedYet covers
 // the state that is not a failure at all: a data plane is configured but no
@@ -20,11 +55,117 @@ import (
 func TestDiagnosticsReportsWaitingForInterfaceWhenNothingIsAttachedYet(t *testing.T) {
 	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneTC}
 	diagnostics := inbound.Diagnostics()
+	if diagnostics.SchemaVersion != adapter.EBPFDiagnosticsSchemaVersion || diagnostics.ObservedAt.IsZero() {
+		t.Fatalf("diagnostics metadata = version %d at %v, want schema version %d and timestamp", diagnostics.SchemaVersion, diagnostics.ObservedAt, adapter.EBPFDiagnosticsSchemaVersion)
+	}
 	if diagnostics.State != EBPFDiagnosticsStateWaitingForInterface {
 		t.Fatalf("state = %s, want %s", diagnostics.State, EBPFDiagnosticsStateWaitingForInterface)
 	}
 	if len(diagnostics.Attachments) != 0 {
 		t.Fatalf("attachments = %v, want none", diagnostics.Attachments)
+	}
+}
+
+func TestEBPFDiagnosticsUsesShortRequestDrivenCache(t *testing.T) {
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneTC}
+	first := inbound.EBPFDiagnostics()
+	second := inbound.EBPFDiagnostics()
+	if !first.ObservedAt.Equal(second.ObservedAt) {
+		t.Fatalf("cache miss inside TTL: first=%v second=%v", first.ObservedAt, second.ObservedAt)
+	}
+	firstRuntime := inbound.EBPFKernelRuntime()
+	secondRuntime := inbound.EBPFKernelRuntime()
+	if !firstRuntime.ObservedAt.Equal(secondRuntime.ObservedAt) {
+		t.Fatalf("kernel runtime cache miss inside TTL: first=%v second=%v", firstRuntime.ObservedAt, secondRuntime.ObservedAt)
+	}
+}
+
+func TestEBPFDiagnosticsIncludesEffectiveCgroupPaths(t *testing.T) {
+	diagnostics := diagnosticsForAPI(EBPFDiagnostics{
+		LocalCgroupAttachMode:        "legacy_exclusive",
+		LocalUDPCleanupMode:          "lru_fallback",
+		LocalUDPUserspaceCleanupMode: "deadline",
+		LocalUDPStorageMode:          "socket_storage",
+		LocalUDPTimeMode:             "coarse",
+	})
+	if diagnostics.LocalCgroupAttachMode != "legacy_exclusive" ||
+		diagnostics.LocalUDPCleanupMode != "lru_fallback" ||
+		diagnostics.LocalUDPUserspaceCleanupMode != "deadline" ||
+		diagnostics.LocalUDPStorageMode != "socket_storage" ||
+		diagnostics.LocalUDPTimeMode != "coarse" {
+		t.Fatalf("effective cgroup paths were not propagated: %+v", diagnostics)
+	}
+}
+
+func TestEBPFDiagnosticsIncludesEffectiveTCState(t *testing.T) {
+	observedHealth := time.Unix(1700000000, 0)
+	observedReconcile := observedHealth.Add(time.Second)
+	diagnostics := diagnosticsForAPI(EBPFDiagnostics{
+		SchemaVersion:            adapter.EBPFDiagnosticsSchemaVersion,
+		TCBackendMode:            "socket_assign",
+		TCListenerLookupMode:     "sockmap",
+		TCAttachmentMode:         "tcx",
+		TCDeliveryInterface:      "sb-delivery0",
+		TCDeliveryInterfaceIndex: 42,
+		TCRoutingMark:            1 << 29,
+		TCRoutingTable:           2022,
+		TCRoutingPriority:        10000,
+		TCAttachmentCount:        2,
+		TCRetiredAttachmentCount: 1,
+		TCRetiredDeliveryCount:   1,
+		TCRequiresRebuild:        false,
+		TCHealthStatus:           "attached",
+		TCLastHealthCheckAt:      &observedHealth,
+		TCLastReconcileAt:        &observedReconcile,
+		TCNetworkGeneration:      3,
+	})
+	if diagnostics.SchemaVersion != 6 || diagnostics.TCBackendMode != "socket_assign" ||
+		diagnostics.TCListenerLookupMode != "sockmap" || diagnostics.TCAttachmentMode != "tcx" ||
+		diagnostics.TCDeliveryInterfaceIndex != 42 || diagnostics.TCAttachmentCount != 2 ||
+		diagnostics.TCNetworkGeneration != 3 || diagnostics.TCLastHealthCheckAt == nil ||
+		!diagnostics.TCLastHealthCheckAt.Equal(observedHealth) || diagnostics.TCLastReconcileAt == nil ||
+		!diagnostics.TCLastReconcileAt.Equal(observedReconcile) {
+		t.Fatalf("effective TC state was not propagated: %+v", diagnostics)
+	}
+}
+
+func TestEBPFDiagnosticsSchemaVersionIncludesEffectiveRuntimeFields(t *testing.T) {
+	if adapter.EBPFDiagnosticsSchemaVersion != 6 {
+		t.Fatalf("schema version = %d, want 6 after adding effective TC runtime fields", adapter.EBPFDiagnosticsSchemaVersion)
+	}
+	diagnostics := diagnosticsForAPI(EBPFDiagnostics{SchemaVersion: adapter.EBPFDiagnosticsSchemaVersion, LocalCgroupAttachMode: "link_create"})
+	if diagnostics.SchemaVersion != 6 {
+		t.Fatalf("diagnostics schema version = %d, want 6", diagnostics.SchemaVersion)
+	}
+}
+
+func TestKernelRuntimeForAPI(t *testing.T) {
+	observedAt := time.UnixMilli(1700000000123)
+	diagnostics := kernelRuntimeForAPI(observedAt, commonEBPF.RuntimeState{
+		Programs: []commonEBPF.RuntimeProgram{{
+			ID:       42,
+			Name:     "sb_share_ingress",
+			MapCount: 2,
+		}},
+		ProgramsError: errors.New("program enumeration denied"),
+		MapOccupancy: commonEBPF.MapOccupancyReport{
+			Status: "unknown",
+			Maps: []commonEBPF.MapOccupancy{{
+				ID: 9, Name: "sb_shared_flows", Type: "LRUHash", MaxEntries: 4096,
+				Entries: 3, Supported: true,
+			}},
+			Error: "map enumeration incomplete",
+		},
+	})
+	if !diagnostics.ObservedAt.Equal(observedAt) || diagnostics.ProgramsError != "program enumeration denied" {
+		t.Fatalf("unexpected runtime metadata: %+v", diagnostics)
+	}
+	if len(diagnostics.Programs) != 1 || diagnostics.Programs[0].ID != 42 || diagnostics.Programs[0].MapCount != 2 {
+		t.Fatalf("unexpected programs: %+v", diagnostics.Programs)
+	}
+	if diagnostics.MapOccupancy.Status != "unknown" || diagnostics.MapOccupancy.Error != "map enumeration incomplete" ||
+		len(diagnostics.MapOccupancy.Maps) != 1 || diagnostics.MapOccupancy.Maps[0].Entries != 3 {
+		t.Fatalf("unexpected map occupancy: %+v", diagnostics.MapOccupancy)
 	}
 }
 
@@ -217,8 +358,8 @@ func TestDiagnosticsReportsNeedsAttentionWhenBypassRuleSetIsInconsistent(t *test
 	inbound := &Inbound{}
 	inbound.bypassRuleSetInconsistent = true
 	diagnostics := inbound.Diagnostics()
-	if diagnostics.BypassRuleSetConsistent {
-		t.Fatal("BypassRuleSetConsistent = true, want false")
+	if diagnostics.LocalBypassRuleSet.Consistent {
+		t.Fatal("LocalBypassRuleSet.Consistent = true, want false")
 	}
 	if diagnostics.State != EBPFDiagnosticsStateNeedsAttention {
 		t.Fatalf("state = %s, want %s", diagnostics.State, EBPFDiagnosticsStateNeedsAttention)
@@ -266,9 +407,166 @@ func TestDiagnosticsWriteTextIncludesTheKeyFields(t *testing.T) {
 		t.Fatalf("WriteText: %v", err)
 	}
 	text := buffer.String()
-	for _, want := range []string{"Tag:", "State:", "Attachments:", "Recovery pending:", "UDP sessions:", "UDP reply sockets:"} {
+	for _, want := range []string{
+		"Tag:", "State:", "Attachments:", "Recovery pending:", "UDP sessions:", "UDP NAT:", "UDP reply sockets:",
+		"tc_socket_lookup_failures=", "tc_sk_assign_failures=", "tc_assignment_update_failures=",
+		"tc_local_fragment_passes=", "tc_shared_fragment_passes=",
+		"shared_ingress_passes=", "shared_egress_passes=", "shared_ingress_fragment_passes=", "shared_egress_fragment_passes=",
+	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("text output missing %q; got:\n%s", want, text)
 		}
+	}
+}
+
+// TestLogStartupSummaryNamesEachRequiredFact checks enabled paths, mounts,
+// waiting interfaces, and FakeIP coverage in the single Debug line.
+func TestLogStartupSummaryNamesEachRequiredFact(t *testing.T) {
+	logger := &captureLogger{}
+	inbound := &Inbound{
+		localEnabled:    true,
+		localDataPlane:  localDataPlaneTC,
+		fakeIPICMPReply: true,
+		logger:          logger,
+	}
+	inbound.logStartupSummary()
+
+	if len(logger.debugMessages) != 1 || len(logger.infoMessages) != 0 {
+		t.Fatalf("log calls: Debug=%d Info=%d, want Debug=1 Info=0", len(logger.debugMessages), len(logger.infoMessages))
+	}
+	message := logger.debugMessages[0]
+	for _, want := range []string{"local=tc", "waiting_for_interface=[local]", "fakeip_icmp=[enabled, not yet covering any attachment]"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("summary %q missing %q", message, want)
+		}
+	}
+}
+
+// TestLogStartupSummaryReportsAnActualAttachmentAndItsFakeIPICMPCoverage
+// covers the other half: a real attachment gets named by interface and
+// mechanism, and when fakeip_icmp actually covers it, that attachment name
+// appears rather than the "not yet covering" fallback.
+func TestLogStartupSummaryReportsAnActualAttachmentAndItsFakeIPICMPCoverage(t *testing.T) {
+	logger := &captureLogger{}
+	inbound := &Inbound{
+		localEnabled:    true,
+		localDataPlane:  localDataPlaneTC,
+		fakeIPICMPReply: true,
+		logger:          logger,
+	}
+	inbound.tcDataPlane = &testTCRuntime{
+		attachments: []commonEBPF.AttachmentInfo{{
+			InterfaceName: "eth0",
+			Role:          "local",
+			Mechanism:     "tcx",
+			ICMPEchoReply: true,
+		}},
+	}
+	inbound.logStartupSummary()
+
+	if len(logger.debugMessages) != 1 || len(logger.infoMessages) != 0 {
+		t.Fatalf("log calls: Debug=%d Info=%d, want Debug=1 Info=0", len(logger.debugMessages), len(logger.infoMessages))
+	}
+	message := logger.debugMessages[0]
+	for _, want := range []string{"mounts=[eth0(local,tcx)]", "waiting_for_interface=[none]", "fakeip_icmp=[eth0(local)]"} {
+		if !strings.Contains(message, want) {
+			t.Fatalf("summary %q missing %q", message, want)
+		}
+	}
+}
+
+// TestRecordTCUpdateOutcomeCountsRecoveryAttempts proves a round in which
+// any component reports Recoverable counts as one attempt, whether or not
+// any other component is settled at the same time.
+func TestRecordTCUpdateOutcomeCountsRecoveryAttempts(t *testing.T) {
+	inbound := &Inbound{}
+	inbound.recordTCUpdateOutcome(tcUpdateOutcome{
+		sharedRewrite: tcSharedRewriteSettled,
+		general:       tcSharedRewriteRecoverable,
+		bypassRuleSet: tcSharedRewriteSettled,
+	})
+	if attempts := inbound.counters.recoveryAttempts.Load(); attempts != 1 {
+		t.Fatalf("recoveryAttempts = %d, want 1", attempts)
+	}
+	inbound.recordTCUpdateOutcome(tcUpdateOutcome{
+		sharedRewrite: tcSharedRewriteSettled,
+		general:       tcSharedRewriteSettled,
+		bypassRuleSet: tcSharedRewriteSettled,
+	})
+	if attempts := inbound.counters.recoveryAttempts.Load(); attempts != 1 {
+		t.Fatalf("recoveryAttempts = %d, want still 1 after an all-settled round", attempts)
+	}
+}
+
+// TestRecordTCUpdateOutcomeCountsRecoverySuccessPerComponent proves each
+// component transitioning from Recoverable to Settled counts its own
+// success -- two components recovering in the same round count as two.
+func TestRecordTCUpdateOutcomeCountsRecoverySuccessPerComponent(t *testing.T) {
+	inbound := &Inbound{}
+	inbound.recordTCUpdateOutcome(tcUpdateOutcome{
+		sharedRewrite: tcSharedRewriteRecoverable,
+		general:       tcSharedRewriteRecoverable,
+		bypassRuleSet: tcSharedRewriteSettled,
+	})
+	if successes := inbound.counters.recoverySuccesses.Load(); successes != 0 {
+		t.Fatalf("recoverySuccesses = %d, want 0 before anything has settled", successes)
+	}
+	inbound.recordTCUpdateOutcome(tcUpdateOutcome{
+		sharedRewrite: tcSharedRewriteSettled,
+		general:       tcSharedRewriteSettled,
+		bypassRuleSet: tcSharedRewriteSettled,
+	})
+	if successes := inbound.counters.recoverySuccesses.Load(); successes != 2 {
+		t.Fatalf("recoverySuccesses = %d, want 2 (both sharedRewrite and general settled)", successes)
+	}
+}
+
+// TestRecordTCUpdateOutcomeCountsRecoveryFailureOnUnrecoverable proves a
+// transition to Unrecoverable counts as a failure exactly once, not on
+// every subsequent round it stays Unrecoverable.
+func TestRecordTCUpdateOutcomeCountsRecoveryFailureOnUnrecoverable(t *testing.T) {
+	inbound := &Inbound{}
+	inbound.recordTCUpdateOutcome(tcUpdateOutcome{
+		sharedRewrite: tcSharedRewriteSettled,
+		general:       tcSharedRewriteRecoverable,
+		bypassRuleSet: tcSharedRewriteSettled,
+	})
+	inbound.recordTCUpdateOutcome(tcUpdateOutcome{
+		sharedRewrite: tcSharedRewriteSettled,
+		general:       tcSharedRewriteUnrecoverable,
+		bypassRuleSet: tcSharedRewriteSettled,
+	})
+	if failures := inbound.counters.recoveryFailures.Load(); failures != 1 {
+		t.Fatalf("recoveryFailures = %d, want 1", failures)
+	}
+	inbound.recordTCUpdateOutcome(tcUpdateOutcome{
+		sharedRewrite: tcSharedRewriteSettled,
+		general:       tcSharedRewriteUnrecoverable,
+		bypassRuleSet: tcSharedRewriteSettled,
+	})
+	if failures := inbound.counters.recoveryFailures.Load(); failures != 1 {
+		t.Fatalf("recoveryFailures = %d, want still 1 while it stays Unrecoverable", failures)
+	}
+}
+
+// TestAssignmentLookupFailureCounterInDiagnostics proves the counter
+// incremented at tc_connection.go's failure sites is what Diagnostics
+// reports -- exercised directly here rather than through a real lookup,
+// since the counter itself, not the lookup, is what this test is about.
+func TestAssignmentLookupFailureCounterInDiagnostics(t *testing.T) {
+	inbound := &Inbound{}
+	inbound.counters.assignmentLookupFailures.Add(3)
+	if got := inbound.Diagnostics().Counters.AssignmentLookupFailures; got != 3 {
+		t.Fatalf("Counters.AssignmentLookupFailures = %d, want 3", got)
+	}
+}
+
+// TestSharedReconcileFailureCounterInDiagnostics is the same proof for the
+// shared packet-rewrite reconcile-failure counter.
+func TestSharedReconcileFailureCounterInDiagnostics(t *testing.T) {
+	inbound := &Inbound{}
+	inbound.counters.sharedReconcileFailures.Add(2)
+	if got := inbound.Diagnostics().Counters.SharedReconcileFailures; got != 2 {
+		t.Fatalf("Counters.SharedReconcileFailures = %d, want 2", got)
 	}
 }

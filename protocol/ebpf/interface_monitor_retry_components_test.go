@@ -5,6 +5,7 @@ package ebpf
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -56,12 +57,6 @@ func newComponentRetryLoopHarness(t *testing.T) *componentRetryLoopHarness {
 	tcRetryTimerFactory = func() tcRetryTimer { return timer }
 	t.Cleanup(func() { tcRetryTimerFactory = previousFactory })
 
-	// A health check this short would otherwise fire spuriously mid-test;
-	// tests that want to exercise it set it back down explicitly.
-	previousInterval := tcDriftCheckInterval
-	tcDriftCheckInterval = time.Hour
-	t.Cleanup(func() { tcDriftCheckInterval = previousInterval })
-
 	harness := &componentRetryLoopHarness{
 		updates:  make(chan struct{}, 1),
 		timer:    timer,
@@ -76,7 +71,7 @@ func newComponentRetryLoopHarness(t *testing.T) *componentRetryLoopHarness {
 	}
 	go func() {
 		defer close(harness.finished)
-		runTCInterfaceUpdateLoop(ctx, harness.updates, func(context.Context) tcUpdateOutcome {
+		runTCInterfaceUpdateLoop(ctx, harness.updates, time.Hour, func(context.Context) tcUpdateOutcome {
 			harness.access.Lock()
 			outcome := harness.outcome
 			harness.access.Unlock()
@@ -280,15 +275,11 @@ func TestRetryLoopHealthCheckRunsWithNothingOutstanding(t *testing.T) {
 	previousFactory := tcRetryTimerFactory
 	tcRetryTimerFactory = func() tcRetryTimer { return timer }
 	t.Cleanup(func() { tcRetryTimerFactory = previousFactory })
-	previousInterval := tcDriftCheckInterval
-	tcDriftCheckInterval = 10 * time.Millisecond
-	t.Cleanup(func() { tcDriftCheckInterval = previousInterval })
-
 	ran := make(chan struct{}, 64)
 	finished := make(chan struct{})
 	go func() {
 		defer close(finished)
-		runTCInterfaceUpdateLoop(ctx, nil, func(context.Context) tcUpdateOutcome {
+		runTCInterfaceUpdateLoop(ctx, nil, 10*time.Millisecond, func(context.Context) tcUpdateOutcome {
 			ran <- struct{}{}
 			return allSettled()
 		}, nil)
@@ -313,5 +304,92 @@ func TestRetryLoopHealthCheckRunsWithNothingOutstanding(t *testing.T) {
 	case <-ran:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the health check did not recur")
+	}
+}
+
+func TestRetryLoopHealthyWatchdogSkipsFullReconcile(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	var healthy atomic.Bool
+	healthy.Store(true)
+	healthChecks := make(chan struct{}, 64)
+	updates := make(chan struct{}, 64)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		runTCInterfaceUpdateLoopWithHealth(
+			ctx,
+			nil,
+			10*time.Millisecond,
+			func(context.Context) bool {
+				healthChecks <- struct{}{}
+				return healthy.Load()
+			},
+			func(context.Context) tcUpdateOutcome {
+				updates <- struct{}{}
+				return allSettled()
+			},
+			nil,
+		)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(2 * time.Second):
+			t.Error("two-stage watchdog did not exit after cancellation")
+		}
+	})
+
+	select {
+	case <-healthChecks:
+	case <-time.After(2 * time.Second):
+		t.Fatal("two-stage watchdog did not run its health check")
+	}
+	select {
+	case <-updates:
+		t.Fatal("healthy watchdog tick ran a full reconcile")
+	case <-time.After(25 * time.Millisecond):
+	}
+
+	healthy.Store(false)
+	select {
+	case <-updates:
+	case <-time.After(2 * time.Second):
+		t.Fatal("unhealthy watchdog tick did not run a full reconcile")
+	}
+}
+
+func TestRetryLoopWithoutHealthCheckWaitsForEvent(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	updates := make(chan struct{}, 1)
+	ran := make(chan struct{}, 1)
+	finished := make(chan struct{})
+	go func() {
+		defer close(finished)
+		runTCInterfaceUpdateLoop(ctx, updates, 0, func(context.Context) tcUpdateOutcome {
+			ran <- struct{}{}
+			return allSettled()
+		}, nil)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-finished:
+		case <-time.After(2 * time.Second):
+			t.Error("update loop without a health check did not exit")
+		}
+	})
+
+	select {
+	case <-ran:
+		t.Fatal("disabled health check drove an update without an event")
+	case <-time.After(50 * time.Millisecond):
+	}
+	updates <- struct{}{}
+	select {
+	case <-ran:
+	case <-time.After(2 * time.Second):
+		t.Fatal("event did not drive an update while the health check was disabled")
 	}
 }

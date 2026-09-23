@@ -11,12 +11,13 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/x/list"
+	"go4.org/netipx"
 )
 
 func (i *Inbound) startBypassRuleSets() error {
 	i.bypassRuleSetAccess.Lock()
 	defer i.bypassRuleSetAccess.Unlock()
-	if i.bypassRuleSetStarted {
+	if i.bypassRuleSetStarted || i.sharedBypassRuleSetStarted {
 		return nil
 	}
 	i.bypassRuleSetCallbacks = make([]*list.Element[adapter.RuleSetUpdateCallback], 0, len(i.bypassRuleSet))
@@ -24,8 +25,17 @@ func (i *Inbound) startBypassRuleSets() error {
 		ruleSet.IncRef()
 		i.bypassRuleSetCallbacks = append(i.bypassRuleSetCallbacks, ruleSet.RegisterCallback(i.updateBypassRuleSet))
 	}
+	i.sharedBypassRuleSetCallbacks = make([]*list.Element[adapter.RuleSetUpdateCallback], 0, len(i.sharedBypassRuleSet))
+	for _, ruleSet := range i.sharedBypassRuleSet {
+		ruleSet.IncRef()
+		i.sharedBypassRuleSetCallbacks = append(i.sharedBypassRuleSetCallbacks, ruleSet.RegisterCallback(i.updateSharedBypassRuleSet))
+	}
 	i.bypassRuleSetStarted = true
+	i.sharedBypassRuleSetStarted = true
 	err := i.refreshBypassRuleSetsLocked(true)
+	if err == nil {
+		err = i.refreshSharedBypassRuleSetsLocked(true)
+	}
 	if err != nil {
 		i.stopBypassRuleSetsLocked()
 		return err
@@ -40,7 +50,7 @@ func (i *Inbound) stopBypassRuleSets() {
 }
 
 func (i *Inbound) stopBypassRuleSetsLocked() {
-	if !i.bypassRuleSetStarted {
+	if !i.bypassRuleSetStarted && !i.sharedBypassRuleSetStarted {
 		return
 	}
 	for ruleSetIndex, ruleSet := range i.bypassRuleSet {
@@ -49,8 +59,16 @@ func (i *Inbound) stopBypassRuleSetsLocked() {
 		}
 		ruleSet.DecRef()
 	}
+	for ruleSetIndex, ruleSet := range i.sharedBypassRuleSet {
+		if ruleSetIndex < len(i.sharedBypassRuleSetCallbacks) {
+			ruleSet.UnregisterCallback(i.sharedBypassRuleSetCallbacks[ruleSetIndex])
+		}
+		ruleSet.DecRef()
+	}
 	i.bypassRuleSetCallbacks = nil
+	i.sharedBypassRuleSetCallbacks = nil
 	i.bypassRuleSetStarted = false
+	i.sharedBypassRuleSetStarted = false
 }
 
 func (i *Inbound) updateBypassRuleSet(adapter.RuleSet) {
@@ -86,6 +104,21 @@ func (i *Inbound) updateBypassRuleSet(adapter.RuleSet) {
 	i.bypassRuleSetNeedsRetry = false
 }
 
+func (i *Inbound) updateSharedBypassRuleSet(adapter.RuleSet) {
+	i.bypassRuleSetAccess.Lock()
+	defer i.bypassRuleSetAccess.Unlock()
+	if !i.sharedBypassRuleSetStarted {
+		return
+	}
+	if err := i.refreshSharedBypassRuleSetsLocked(false); err != nil {
+		i.policyWarnings.warn(i.logger, "refresh shared eBPF bypass_rule_set: ", err)
+		i.sharedBypassRuleSetNeedsRetry = true
+		i.notifyTCInterfaceUpdate()
+		return
+	}
+	i.sharedBypassRuleSetNeedsRetry = false
+}
+
 // retryBypassRuleSetIfNeededLocked is updateTCInterfaces' hook into the
 // bypass_rule_set half of this file: it does nothing (and reports settled)
 // unless a previous refreshBypassRuleSetsLocked call actually failed, so a
@@ -94,6 +127,15 @@ func (i *Inbound) updateBypassRuleSet(adapter.RuleSet) {
 func (i *Inbound) retryBypassRuleSetIfNeededLocked() tcSharedRewriteOutcome {
 	i.bypassRuleSetAccess.Lock()
 	defer i.bypassRuleSetAccess.Unlock()
+	localOutcome := i.retryLocalBypassRuleSetIfNeededLocked()
+	sharedOutcome := i.retrySharedBypassRuleSetIfNeededLocked()
+	if sharedOutcome > localOutcome {
+		return sharedOutcome
+	}
+	return localOutcome
+}
+
+func (i *Inbound) retryLocalBypassRuleSetIfNeededLocked() tcSharedRewriteOutcome {
 	if !i.bypassRuleSetStarted {
 		return tcSharedRewriteSettled
 	}
@@ -124,12 +166,49 @@ func (i *Inbound) retryBypassRuleSetIfNeededLocked() tcSharedRewriteOutcome {
 	return tcSharedRewriteSettled
 }
 
-func (i *Inbound) bypassRuleSetBackendRequiresRebuildLocked() bool {
-	if backend := i.tcBackend(); backend != nil && backend.RequiresRebuild() {
-		return true
+func (i *Inbound) retrySharedBypassRuleSetIfNeededLocked() tcSharedRewriteOutcome {
+	if !i.sharedBypassRuleSetStarted {
+		return tcSharedRewriteSettled
 	}
-	if backend := i.cgroupBackendInstance(); backend != nil && backend.RequiresRebuild() {
-		return true
+	if i.sharedBypassRuleSetBackendRequiresRebuildLocked() {
+		i.sharedBypassRuleSetNeedsRetry = false
+		return tcSharedRewriteUnrecoverable
+	}
+	if !i.sharedBypassRuleSetNeedsRetry {
+		return tcSharedRewriteSettled
+	}
+	i.sharedBypassRuleSetRetryCount++
+	if err := i.refreshSharedBypassRuleSetsLocked(false); err != nil {
+		i.policyWarnings.warn(i.logger, "retry shared eBPF bypass_rule_set refresh: ", err)
+		if i.sharedBypassRuleSetBackendRequiresRebuildLocked() {
+			i.sharedBypassRuleSetNeedsRetry = false
+			return tcSharedRewriteUnrecoverable
+		}
+		return tcSharedRewriteRecoverable
+	}
+	i.sharedBypassRuleSetNeedsRetry = false
+	return tcSharedRewriteSettled
+}
+
+func (i *Inbound) bypassRuleSetBackendRequiresRebuildLocked() bool {
+	if i.localTCEnabled() {
+		if backend := i.tcBackend(); backend != nil && backend.RequiresRebuild() {
+			return true
+		}
+	}
+	if i.localCgroupEnabled() {
+		if backend := i.cgroupBackendInstance(); backend != nil && backend.RequiresRebuild() {
+			return true
+		}
+	}
+	return false
+}
+
+func (i *Inbound) sharedBypassRuleSetBackendRequiresRebuildLocked() bool {
+	if i.sharedSocketAssignEnabled() {
+		if backend := i.tcBackend(); backend != nil && backend.RequiresRebuild() {
+			return true
+		}
 	}
 	if shared := i.sharedRewriteInstance(); shared != nil {
 		if backend := shared.sharedBackendInstance(); backend != nil && backend.RequiresRebuild() {
@@ -164,22 +243,20 @@ type bypassRuleSetBackendVersion struct {
 	known   bool
 }
 
-type bypassCIDRPolicyBackend interface {
-	UpdateCompiledBypassCIDR(policy commonEBPF.BypassCIDRPolicy) (bool, error)
-	RequiresRebuild() bool
-}
+type destinationDecisionApply func([]commonEBPF.CIDRDecision) (bool, error)
 
-func (i *Inbound) applyBypassCIDRBackend(
+func (i *Inbound) applyDestinationDecisionBackend(
 	name string,
-	backend bypassCIDRPolicyBackend,
+	apply destinationDecisionApply,
+	requiresRebuild func() bool,
 	state *bypassRuleSetBackendVersion,
-	policy commonEBPF.BypassCIDRPolicy,
-	previous commonEBPF.BypassCIDRPolicy,
+	policy []commonEBPF.CIDRDecision,
+	previous []commonEBPF.CIDRDecision,
 	version uint64,
 	previousVersion uint64,
 ) (bypassCIDRAppliedBackend, error) {
-	if _, err := backend.UpdateCompiledBypassCIDR(policy); err != nil {
-		if backend.RequiresRebuild() {
+	if _, err := apply(policy); err != nil {
+		if requiresRebuild() {
 			state.known = false
 			i.bypassRuleSetInconsistent = true
 		}
@@ -189,8 +266,7 @@ func (i *Inbound) applyBypassCIDRBackend(
 	return bypassCIDRAppliedBackend{
 		name: name,
 		revert: func() error {
-			_, err := backend.UpdateCompiledBypassCIDR(previous)
-			if err != nil {
+			if _, err := apply(previous); err != nil {
 				state.known = false
 				return err
 			}
@@ -230,11 +306,87 @@ func (i *Inbound) refreshBypassRuleSetsLocked(startup bool) error {
 			prefixes = append(prefixes, ipSet.Prefixes()...)
 		}
 	}
-	policy, err := i.compileBypassCIDRPolicy(prefixes)
+	dynamic, err := i.compileBypassCIDRDecisions(prefixes)
+	if err != nil {
+		return err
+	}
+	policy, err := i.combineDestinationDecisions(i.localInitialDestinations, dynamic)
 	if err != nil {
 		return err
 	}
 	return i.applyBypassCIDRPolicyLocked(policy)
+}
+
+func (i *Inbound) refreshSharedBypassRuleSetsLocked(startup bool) error {
+	var prefixes []netip.Prefix
+	for _, ruleSet := range i.sharedBypassRuleSet {
+		ipSets := ruleSet.ExtractIPSet()
+		if startup && len(ipSets) == 0 {
+			i.logger.Warn("shared.bypass_rule_set: no destination IP CIDR rules found in rule-set: ", ruleSet.Name())
+		}
+		for _, ipSet := range ipSets {
+			prefixes = append(prefixes, ipSet.Prefixes()...)
+		}
+	}
+	dynamic, err := i.compileBypassCIDRDecisions(prefixes)
+	if err != nil {
+		return err
+	}
+	policy, err := i.combineDestinationDecisions(i.sharedInitialDestinations, dynamic)
+	if err != nil {
+		return err
+	}
+	return i.applySharedBypassCIDRPolicyLocked(policy)
+}
+
+func (i *Inbound) applySharedBypassCIDRPolicyLocked(policy []commonEBPF.CIDRDecision) error {
+	previous := i.sharedBypassRuleSetPolicy
+	previousVersion := i.sharedBypassRuleSetPolicyVersion
+	previousExpected := i.sharedBypassRuleSetExpectedPolicy
+	previousExpectedVersion := i.sharedBypassRuleSetExpectedVersion
+	version := previousExpectedVersion
+	if !reflect.DeepEqual(previousExpected, policy) {
+		version++
+	}
+	i.sharedBypassRuleSetExpectedPolicy = policy
+	i.sharedBypassRuleSetExpectedVersion = version
+	var applied []bypassCIDRAppliedBackend
+	fail := func(cause error) error {
+		failed := revertBypassCIDRBackends(applied, func(name string, err error) {
+			i.policyWarnings.warn(i.logger, "shared.bypass_rule_set: revert ", name, ": ", err)
+		})
+		if len(failed) > 0 {
+			i.sharedBypassRuleSetInconsistent = true
+			return E.Cause(cause, "shared.bypass_rule_set left inconsistent on: "+strings.Join(failed, ", "))
+		}
+		return cause
+	}
+	if backend := i.tcBackend(); backend != nil {
+		appliedBackend, err := i.applyDestinationDecisionBackend(
+			"shared-TC", backend.UpdateSharedDestinationDecisions, backend.RequiresRebuild,
+			&i.sharedBypassRuleSetTC, policy, previous, version, previousVersion,
+		)
+		if err != nil {
+			return fail(err)
+		}
+		applied = append(applied, appliedBackend)
+	}
+	if shared := i.sharedRewriteInstance(); shared != nil {
+		if backend := shared.sharedBackendInstance(); backend != nil {
+			appliedBackend, err := i.applyDestinationDecisionBackend(
+				"shared-packet-rewrite", backend.UpdateDestinationDecisions, backend.RequiresRebuild,
+				&i.sharedBypassRuleSetShared, policy, previous, version, previousVersion,
+			)
+			if err != nil {
+				return fail(err)
+			}
+			applied = append(applied, appliedBackend)
+		}
+	}
+	i.sharedBypassRuleSetPolicy = policy
+	i.sharedBypassRuleSetPolicyVersion = version
+	i.sharedBypassRuleSetInconsistent = false
+	return nil
 }
 
 // applyBypassCIDRPolicyLocked applies one compiled policy to every backend
@@ -255,7 +407,7 @@ func (i *Inbound) refreshBypassRuleSetsLocked(startup bool) error {
 // which backend by name rather than claiming a global "kept previous policy"
 // that would no longer be true for it; bypassRuleSetInconsistent records the
 // anomaly for diagnostics until a later call applies cleanly everywhere.
-func (i *Inbound) applyBypassCIDRPolicyLocked(policy commonEBPF.BypassCIDRPolicy) error {
+func (i *Inbound) applyBypassCIDRPolicyLocked(policy []commonEBPF.CIDRDecision) error {
 	previous := i.bypassRuleSetPolicy
 	previousVersion := i.bypassRuleSetPolicyVersion
 	// version identifies this call's own content, computed against the
@@ -266,10 +418,8 @@ func (i *Inbound) applyBypassCIDRPolicyLocked(policy commonEBPF.BypassCIDRPolicy
 	// neither had yet succeeded -- confirmed state only advances on
 	// success, so it can lag behind an arbitrary number of distinct failed
 	// attempts, each of which still needs its own, distinguishable version.
-	// BypassCIDRPolicy's fields are unexported outside sing-ebpf, but
-	// reflect.DeepEqual compares them by value regardless of visibility
-	// (the same pattern the tests in inbound_policy_test.go already rely
-	// on).
+	// The action decisions are exported values, so a deep comparison also
+	// serves as the content identity for retry generations.
 	previousExpected := i.bypassRuleSetExpectedPolicy
 	previousExpectedVersion := i.bypassRuleSetExpectedVersion
 	version := previousExpectedVersion
@@ -309,8 +459,9 @@ func (i *Inbound) applyBypassCIDRPolicyLocked(policy commonEBPF.BypassCIDRPolicy
 	var err error
 	if backend := i.tcBackend(); backend != nil {
 		var appliedBackend bypassCIDRAppliedBackend
-		appliedBackend, err = i.applyBypassCIDRBackend(
-			"TC", backend, &i.bypassRuleSetTC, policy, previous, version, previousVersion,
+		appliedBackend, err = i.applyDestinationDecisionBackend(
+			"TC", backend.UpdateLocalDestinationDecisions, backend.RequiresRebuild,
+			&i.bypassRuleSetTC, policy, previous, version, previousVersion,
 		)
 		if err != nil {
 			return fail(err)
@@ -319,8 +470,9 @@ func (i *Inbound) applyBypassCIDRPolicyLocked(policy commonEBPF.BypassCIDRPolicy
 	}
 	if backend := i.cgroupBackendInstance(); backend != nil {
 		var appliedBackend bypassCIDRAppliedBackend
-		appliedBackend, err = i.applyBypassCIDRBackend(
-			"cgroup", backend, &i.bypassRuleSetCgroup, policy, previous, version, previousVersion,
+		appliedBackend, err = i.applyDestinationDecisionBackend(
+			"cgroup", backend.UpdateDestinationDecisions, backend.RequiresRebuild,
+			&i.bypassRuleSetCgroup, policy, previous, version, previousVersion,
 		)
 		if err != nil {
 			return fail(err)
@@ -329,35 +481,15 @@ func (i *Inbound) applyBypassCIDRPolicyLocked(policy commonEBPF.BypassCIDRPolicy
 	}
 	if shared := i.sharedRewriteInstance(); shared != nil {
 		if backend := shared.sharedBackendInstance(); backend != nil {
-			if cgroupBackend := i.cgroupBackendInstance(); cgroupBackend != nil {
-				ipv4Count, ipv6Count := cgroupBackend.BypassCIDRCount()
-				if err = backend.SetBypassCIDRState(ipv4Count, ipv6Count); err != nil {
-					return fail(err)
-				}
-				i.bypassRuleSetShared = bypassRuleSetBackendVersion{version: version, known: true}
-				previousIPv4Count, previousIPv6Count := previous.Counts()
-				applied = append(applied, bypassCIDRAppliedBackend{
-					name: "shared",
-					revert: func() error {
-						revertErr := backend.SetBypassCIDRState(previousIPv4Count, previousIPv6Count)
-						if revertErr == nil {
-							i.bypassRuleSetShared = bypassRuleSetBackendVersion{version: previousVersion, known: true}
-						} else {
-							i.bypassRuleSetShared.known = false
-						}
-						return revertErr
-					},
-				})
-			} else {
-				var appliedBackend bypassCIDRAppliedBackend
-				appliedBackend, err = i.applyBypassCIDRBackend(
-					"shared", backend, &i.bypassRuleSetShared, policy, previous, version, previousVersion,
-				)
-				if err != nil {
-					return fail(err)
-				}
-				applied = append(applied, appliedBackend)
+			var appliedBackend bypassCIDRAppliedBackend
+			appliedBackend, err = i.applyDestinationDecisionBackend(
+				"shared", backend.UpdateDestinationDecisions, backend.RequiresRebuild,
+				&i.bypassRuleSetShared, policy, previous, version, previousVersion,
+			)
+			if err != nil {
+				return fail(err)
 			}
+			applied = append(applied, appliedBackend)
 		}
 	}
 	i.bypassRuleSetPolicy = policy
@@ -366,10 +498,35 @@ func (i *Inbound) applyBypassCIDRPolicyLocked(policy commonEBPF.BypassCIDRPolicy
 	return nil
 }
 
-func (i *Inbound) compileBypassCIDRPolicy(prefixes []netip.Prefix) (commonEBPF.BypassCIDRPolicy, error) {
-	policy, err := commonEBPF.CompileBypassCIDRPolicy(prefixes)
-	if err != nil {
-		return policy, E.Cause(err, "compile TC eBPF bypass CIDR policy")
+func (i *Inbound) compileBypassCIDRDecisions(prefixes []netip.Prefix) ([]commonEBPF.CIDRDecision, error) {
+	var builder netipx.IPSetBuilder
+	for _, prefix := range prefixes {
+		if !prefix.IsValid() {
+			continue
+		}
+		builder.AddPrefix(prefix.Masked())
 	}
-	return policy, nil
+	set, err := builder.IPSet()
+	if err != nil {
+		return nil, E.Cause(err, "compile eBPF bypass CIDR decisions")
+	}
+	canonical := set.Prefixes()
+	decisions := make([]commonEBPF.CIDRDecision, 0, len(canonical))
+	for _, prefix := range canonical {
+		decisions = append(decisions, commonEBPF.CIDRDecision{Prefix: prefix, Action: commonEBPF.DecisionPass})
+	}
+	return decisions, nil
+}
+
+func (i *Inbound) combineDestinationDecisions(
+	static, dynamic []commonEBPF.CIDRDecision,
+) ([]commonEBPF.CIDRDecision, error) {
+	prefixes := make([]netip.Prefix, 0, len(static)+len(dynamic))
+	for _, decision := range append(append([]commonEBPF.CIDRDecision(nil), static...), dynamic...) {
+		if decision.Action != commonEBPF.DecisionPass || !decision.Prefix.IsValid() {
+			return nil, E.New("invalid eBPF destination pass decision")
+		}
+		prefixes = append(prefixes, decision.Prefix)
+	}
+	return i.compileBypassCIDRDecisions(prefixes)
 }

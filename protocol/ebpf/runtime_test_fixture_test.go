@@ -15,9 +15,15 @@ type testTCRuntime struct {
 	closed      bool
 }
 
-func (r *testTCRuntime) Backend() *commonEBPF.TCBackend                        { return r.backend }
-func (r *testTCRuntime) NetworkInfo() commonEBPF.TCNetworkInfo                 { return r.networkInfo }
-func (r *testTCRuntime) Reconcile(string, []string, []netip.Addr) error        { return nil }
+func (r *testTCRuntime) Backend() *commonEBPF.TCBackend        { return r.backend }
+func (r *testTCRuntime) NetworkInfo() commonEBPF.TCNetworkInfo { return r.networkInfo }
+func (r *testTCRuntime) TCDiagnostics() commonEBPF.TCDiagnostics {
+	return commonEBPF.TCDiagnostics{NetworkInfo: r.networkInfo}
+}
+func (r *testTCRuntime) Reconcile(string, []string, []netip.Addr) error { return nil }
+func (r *testTCRuntime) HealthCheck(string, []string, []netip.Addr) (bool, error) {
+	return true, nil
+}
 func (r *testTCRuntime) RepairInfrastructure() (bool, error)                   { return false, nil }
 func (r *testTCRuntime) AttachmentStateChanged(string, []string) (bool, error) { return false, nil }
 func (r *testTCRuntime) AttachmentDescriptions() []string {
@@ -45,7 +51,10 @@ type testSharedKernelRuntime struct {
 
 func (r *testSharedKernelRuntime) Backend() *commonEBPF.SharedPacketRewriteBackend { return r.backend }
 func (r *testSharedKernelRuntime) Reconcile([]string, []netip.Addr) error          { return nil }
-func (r *testSharedKernelRuntime) IsEnabled() bool                                 { return r.enabled }
+func (r *testSharedKernelRuntime) HealthCheck([]string, []netip.Addr) (bool, error) {
+	return true, nil
+}
+func (r *testSharedKernelRuntime) IsEnabled() bool { return r.enabled }
 func (r *testSharedKernelRuntime) AttachmentDescriptions() []string {
 	descriptions := make([]string, 0, len(r.attachments))
 	for _, attachment := range r.attachments {

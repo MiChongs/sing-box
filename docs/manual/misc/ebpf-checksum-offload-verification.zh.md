@@ -1,3 +1,7 @@
+---
+icon: material/check-decagram
+---
+
 # eBPF 校验和/卸载验证
 
 本流程验证 eBPF TC 数据面改写后的报文在启用校验和与分段卸载时仍然能以正确
@@ -17,8 +21,8 @@
 - **DOWNSTREAM_HOST**：shared 测试必需。它从 DUT 的 shared 接口一侧发起
   流量；DUT 自己发出的流量无法覆盖 shared ingress。
 
-需要明确归因时，仅启用被测角色。同时启用 local 和 shared 时，`/ebpf` 计数器
-会汇总多个后端。
+需要明确归因时，仅启用被测角色。同时启用 local 和 shared 时，
+`sing-box api ebpf` 报告的计数器会汇总多个后端。
 
 ## 前置条件
 
@@ -28,7 +32,7 @@
 - sing-box eBPF 入站已运行并挂载到 `LOCAL_IFACE`。
 - ICMP 检查要求启用 `fakeip_icmp: reply`。
 - shared TCP/UDP 检查要求 `shared.data_plane: packet_rewrite`。
-- 可选启用 Clash API `/ebpf`，用于计数器归因。
+- 可选启用 sing-box API 服务，用于计数器归因。
 
 先确认接口使用真实硬件驱动：
 
@@ -63,8 +67,6 @@ ethtool -i eth0
 | `REMOTE_IPV6` | — | FakeIP IPv6 目标；启用 IPv6 ping |
 | `REMOTE_PORT_TCP` | — | 启用 TCP 内容校验 |
 | `REMOTE_PORT_UDP` | — | 启用 UDP 内容校验 |
-| `DUT_DIAGNOSTICS_URL` | — | Clash API `/ebpf` 地址 |
-| `DUT_DIAGNOSTICS_TOKEN` | — | 可选 bearer token |
 | `PING_COUNT` | `20` | 每组 ICMP 的请求数 |
 | `TRANSFER_BYTES` | `8388608` | TCP payload 大小 |
 | `OUT_DIR` | `./checksum-offload-report` | 报告和抓包目录 |
@@ -84,7 +86,6 @@ sudo LOCAL_IFACE=eth0 \
     REMOTE_SSH_USER=root \
     DOWNSTREAM_HOST=192.0.2.20 \
     DOWNSTREAM_SSH_USER=root \
-    DUT_DIAGNOSTICS_URL=http://127.0.0.1:9090/ebpf \
     FAKEIP_PREFIX=198.18.0.0/15 \
     REMOTE_FAKEIP_TARGET=198.18.0.1 \
     REMOTE_IPV6=fdfe:dcba:9876::1 \
@@ -111,8 +112,10 @@ sudo LOCAL_IFACE=eth0 \
 2. 验证完全不改写的 SSH 对照流。
 3. 执行 local 和/或下游发起的 FakeIP ICMP 检查。
 4. 执行可选 TCP/UDP 传输并比较完整 payload 的 SHA-256。
-5. 配置诊断接口时检查 shared FakeIP 和 rewrite 计数器。
-6. 在 `OUT_DIR` 写入 `report.tsv` 和两端 PCAP。
+5. 在 `OUT_DIR` 写入 `report.tsv` 和两端 PCAP。
+
+sing-box API 服务可用时，请在运行工具前后另行执行 `sing-box api ebpf`，保存计数器
+快照，以便归因 shared FakeIP 和 rewrite 行为。测试工具本身仍与 sing-box API 解耦。
 
 以接收端 payload 为准。发送侧抓包发生在网卡完成 TX offload 之前，可能把正常
 报文标成 checksum incorrect。

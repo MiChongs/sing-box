@@ -6,7 +6,6 @@ import (
 	"slices"
 	"strings"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-tun"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -82,7 +81,7 @@ func (i *Inbound) inspectAndroidPackages(packageManager tun.PackageManager, mode
 	}
 }
 
-func toTunUIDRanges(uidRanges []commonEBPF.UIDRange) []ranges.Range[uint32] {
+func toTunUIDRanges(uidRanges []uidRange) []ranges.Range[uint32] {
 	converted := make([]ranges.Range[uint32], 0, len(uidRanges))
 	for _, uidRange := range uidRanges {
 		converted = append(converted, ranges.New(uidRange.Start, uidRange.End))
@@ -90,10 +89,10 @@ func toTunUIDRanges(uidRanges []commonEBPF.UIDRange) []ranges.Range[uint32] {
 	return converted
 }
 
-func fromTunUIDRanges(uidRanges []ranges.Range[uint32]) []commonEBPF.UIDRange {
-	converted := make([]commonEBPF.UIDRange, 0, len(uidRanges))
-	for _, uidRange := range uidRanges {
-		converted = append(converted, commonEBPF.UIDRange{Start: uidRange.Start, End: uidRange.End})
+func fromTunUIDRanges(uidRanges []ranges.Range[uint32]) []uidRange {
+	converted := make([]uidRange, 0, len(uidRanges))
+	for _, item := range uidRanges {
+		converted = append(converted, uidRange{Start: item.Start, End: item.End})
 	}
 	return converted
 }

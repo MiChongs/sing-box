@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
+
 	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
@@ -24,6 +26,8 @@ type EBPFAttachmentDiagnostics = commonEBPF.AttachmentInfo
 // below into the one value most operators actually want at a glance; the
 // individual fields remain available for anything more specific.
 const (
+	ebpfDiagnosticsAPICacheTTL = 500 * time.Millisecond
+
 	// EBPFDiagnosticsStateNormal is every configured data plane attached and
 	// no recovery outstanding.
 	EBPFDiagnosticsStateNormal = "normal"
@@ -45,12 +49,47 @@ const (
 	EBPFDiagnosticsStateNeedsAttention = "needs_attention"
 )
 
-// BypassRuleSetBackendState is one backend's own confirmed position in the
-// bypass_rule_set policy version sequence -- see EBPFDiagnostics'
-// BypassRuleSetBackendState field doc comment for what Known=false means.
+// BypassRuleSetBackendState is one backend's own confirmed position in a
+// path-scoped bypass_rule_set policy version sequence.
 type BypassRuleSetBackendState struct {
 	Version uint64 `json:"version"`
 	Known   bool   `json:"known"`
+}
+
+type scopedBypassRuleSetDiagnostics struct {
+	Consistent            bool
+	Pending               bool
+	PolicyVersion         uint64
+	ExpectedPolicyVersion uint64
+	RetryCount            uint64
+	BackendState          map[string]BypassRuleSetBackendState
+}
+
+// UDPNATDiagnostics reports event-driven userspace UDP NAT state. Cache
+// insertion and capacity-eviction totals come from sing/freelru's existing
+// metrics and therefore restart when the cache is purged (for example after a
+// network change). The remaining counters are touched only on drops or
+// socket-release events, so collecting them adds no packet-path polling.
+type UDPNATDiagnostics struct {
+	ActiveSessions                 int    `json:"active_sessions"`
+	CreatedSessions                uint64 `json:"created_sessions"`
+	CapacityEvictions              uint64 `json:"capacity_evictions"`
+	QueueDrops                     uint64 `json:"queue_drops"`
+	SocketReleaseEvents            uint64 `json:"socket_release_events"`
+	SocketReleaseMatched           uint64 `json:"socket_release_matched"`
+	PendingReleaseCapacityRejected uint64 `json:"pending_release_capacity_rejected"`
+	ReleaseNotificationDrops       uint64 `json:"release_notification_drops"`
+}
+
+func (d *UDPNATDiagnostics) add(other UDPNATDiagnostics) {
+	d.ActiveSessions += other.ActiveSessions
+	d.CreatedSessions += other.CreatedSessions
+	d.CapacityEvictions += other.CapacityEvictions
+	d.QueueDrops += other.QueueDrops
+	d.SocketReleaseEvents += other.SocketReleaseEvents
+	d.SocketReleaseMatched += other.SocketReleaseMatched
+	d.PendingReleaseCapacityRejected += other.PendingReleaseCapacityRejected
+	d.ReleaseNotificationDrops += other.ReleaseNotificationDrops
 }
 
 // EBPFDiagnostics is one running eBPF inbound's actual interception state,
@@ -60,14 +99,37 @@ type BypassRuleSetBackendState struct {
 // this is computed from live state (Inbound.Diagnostics), not probed from a
 // separate process.
 type EBPFDiagnostics struct {
-	Tag   string `json:"tag"`
-	State string `json:"state"`
+	SchemaVersion int       `json:"schema_version"`
+	ObservedAt    time.Time `json:"observed_at"`
+	Tag           string    `json:"tag"`
+	State         string    `json:"state"`
 
-	LocalEnabled    bool   `json:"local_enabled"`
-	LocalDataPlane  string `json:"local_data_plane,omitempty"`
-	SharedEnabled   bool   `json:"shared_enabled"`
-	SharedDataPlane string `json:"shared_data_plane,omitempty"`
-	FakeIPICMPReply bool   `json:"fakeip_icmp_reply"`
+	LocalEnabled                 bool       `json:"local_enabled"`
+	LocalDataPlane               string     `json:"local_data_plane,omitempty"`
+	LocalCgroupAttachMode        string     `json:"local_cgroup_attach_mode,omitempty"`
+	LocalUDPCleanupMode          string     `json:"local_udp_cleanup_mode,omitempty"`
+	LocalUDPUserspaceCleanupMode string     `json:"local_udp_userspace_cleanup_mode,omitempty"`
+	LocalUDPStorageMode          string     `json:"local_udp_storage_mode,omitempty"`
+	LocalUDPTimeMode             string     `json:"local_udp_time_mode,omitempty"`
+	SharedEnabled                bool       `json:"shared_enabled"`
+	SharedDataPlane              string     `json:"shared_data_plane,omitempty"`
+	FakeIPICMPReply              bool       `json:"fakeip_icmp_reply"`
+	TCBackendMode                string     `json:"tc_backend_mode,omitempty"`
+	TCListenerLookupMode         string     `json:"tc_listener_lookup_mode,omitempty"`
+	TCAttachmentMode             string     `json:"tc_attachment_mode,omitempty"`
+	TCDeliveryInterface          string     `json:"tc_delivery_interface,omitempty"`
+	TCDeliveryInterfaceIndex     int        `json:"tc_delivery_interface_index,omitempty"`
+	TCRoutingMark                uint32     `json:"tc_routing_mark,omitempty"`
+	TCRoutingTable               int        `json:"tc_routing_table,omitempty"`
+	TCRoutingPriority            int        `json:"tc_routing_priority,omitempty"`
+	TCAttachmentCount            int        `json:"tc_attachment_count,omitempty"`
+	TCRetiredAttachmentCount     int        `json:"tc_retired_attachment_count,omitempty"`
+	TCRetiredDeliveryCount       int        `json:"tc_retired_delivery_count,omitempty"`
+	TCRequiresRebuild            bool       `json:"tc_requires_rebuild"`
+	TCHealthStatus               string     `json:"tc_health_status,omitempty"`
+	TCLastHealthCheckAt          *time.Time `json:"tc_last_health_check_at,omitempty"`
+	TCLastReconcileAt            *time.Time `json:"tc_last_reconcile_at,omitempty"`
+	TCNetworkGeneration          uint64     `json:"tc_network_generation,omitempty"`
 
 	Attachments []EBPFAttachmentDiagnostics `json:"attachments,omitempty"`
 
@@ -96,61 +158,14 @@ type EBPFDiagnostics struct {
 	// NextRetryAt is when interface_monitor.go's single retry timer is next
 	// armed to fire, across all three of its components (shared
 	// packet-rewrite, general TC, bypass_rule_set) -- nil when nothing is
-	// currently outstanding, matching RecoveryPending/BypassRuleSetPending
+	// currently outstanding, matching RecoveryPending and the scoped
+	// local/shared bypass-rule-set pending fields
 	// both being false. Whichever component's own backoff is soonest is
 	// what actually wakes the loop; this does not say which one.
 	NextRetryAt *time.Time `json:"next_retry_at,omitempty"`
 
-	// BypassRuleSetConsistent is false only when a compensating rollback
-	// itself failed (see Inbound.bypassRuleSetInconsistent in
-	// inbound_policy.go): backends are now known to disagree about the
-	// bypass_rule_set policy, not just temporarily out of date.
-	BypassRuleSetConsistent bool `json:"bypass_rule_set_consistent"`
-	// BypassRuleSetPending is whether a previously-failed bypass_rule_set
-	// refresh is still awaiting retry.
-	BypassRuleSetPending bool `json:"bypass_rule_set_pending"`
-	// BypassRuleSetPolicyVersion is the compiled bypass_rule_set policy's own
-	// content-based version, naming the policy this inbound has last
-	// CONFIRMED applying: it advances only when a fully successful apply's
-	// content actually differs from what was in effect before it, so it
-	// names which policy generation is current, not how many times an apply
-	// has been attempted.
-	//
-	// BypassRuleSetExpectedPolicyVersion is the different thing a reader
-	// needs while BypassRuleSetPending is true: the version of the most
-	// recently ATTEMPTED policy, updated on every apply attempt regardless
-	// of whether it succeeded -- "what this inbound is currently trying to
-	// converge to". The two fields coincide exactly when nothing is
-	// outstanding (BypassRuleSetPending=false and BypassRuleSetConsistent=true);
-	// while a retry is pending, BypassRuleSetExpectedPolicyVersion names the
-	// target a later retry is chasing, and BypassRuleSetPolicyVersion still
-	// names whatever was last actually confirmed, lagging behind it by
-	// construction -- neither value is wrong, they answer different
-	// questions ("what do we want" vs. "what do we know we have").
-	//
-	// BypassRuleSetRetryCount counts a third, unrelated thing: how many
-	// times the TC recovery scheduler has actually retried a
-	// previously-failed apply. It does not include the original attempt for
-	// a policy version, and it does not include a fresh apply triggered by
-	// rule-set content actually changing -- both of those go through the
-	// same apply function but are not retries of anything.
-	BypassRuleSetPolicyVersion         uint64 `json:"bypass_rule_set_policy_version"`
-	BypassRuleSetExpectedPolicyVersion uint64 `json:"bypass_rule_set_expected_policy_version"`
-	BypassRuleSetRetryCount            uint64 `json:"bypass_rule_set_retry_count"`
-	// BypassRuleSetBackendState records, per backend, the highest
-	// BypassRuleSetPolicyVersion that backend's own forward apply or
-	// compensating revert last actually completed successfully (Version), and
-	// whether that is still trustworthy (Known). Known=false means the most
-	// recent operation attempted on that backend -- always a compensating
-	// revert, since a backend whose forward apply itself failed is never
-	// considered "applied" in the first place -- did not complete
-	// successfully: Version then names the last point that backend was
-	// confirmed at, not a claim about what it is actually running now. Treat
-	// Known=false as genuinely unknown, not as "probably still at Version";
-	// this is exactly the condition BypassRuleSetConsistent=false reports at
-	// the whole-inbound level. A backend missing from the map does not exist
-	// for this inbound.
-	BypassRuleSetBackendState map[string]BypassRuleSetBackendState `json:"bypass_rule_set_backend_state,omitempty"`
+	LocalBypassRuleSet  scopedBypassRuleSetDiagnostics `json:"local_bypass_rule_set"`
+	SharedBypassRuleSet scopedBypassRuleSetDiagnostics `json:"shared_bypass_rule_set"`
 
 	// UDPSessionCount is the number of distinct UDP clients (by source
 	// address:port) this inbound is currently tracking state for, summed
@@ -163,6 +178,7 @@ type EBPFDiagnostics struct {
 	// clients, not the number of destination bindings or flows any one
 	// client may have open (a single client can hold several of those).
 	UDPSessionCount int                        `json:"udp_session_count"`
+	UDPNAT          UDPNATDiagnostics          `json:"udp_nat"`
 	UDPReplySockets udpReplySocketPoolSnapshot `json:"udp_reply_sockets"`
 
 	Counters EBPFCounters `json:"counters"`
@@ -180,7 +196,23 @@ type tcOutcomeHistory struct {
 	lastRecoveryAt time.Time
 	// nextRetryAt is the zero time when the retry timer is currently
 	// disarmed (nothing outstanding across any of the three components).
-	nextRetryAt time.Time
+	nextRetryAt       time.Time
+	lastHealthCheckAt time.Time
+	lastHealthHealthy bool
+	lastReconcileAt   time.Time
+}
+
+func (i *Inbound) recordTCHealthCheck(healthy bool) {
+	i.diagnostics.access.Lock()
+	i.diagnostics.lastHealthCheckAt = time.Now()
+	i.diagnostics.lastHealthHealthy = healthy
+	i.diagnostics.access.Unlock()
+}
+
+func (i *Inbound) recordTCReconcile() {
+	i.diagnostics.access.Lock()
+	i.diagnostics.lastReconcileAt = time.Now()
+	i.diagnostics.access.Unlock()
 }
 
 // recordNextRetryDeadline is runTCInterfaceUpdates' onScheduleChange hook:
@@ -259,12 +291,193 @@ func (i *Inbound) recordTCUpdateOutcome(outcome tcUpdateOutcome) {
 	i.diagnostics.haveOutcome = true
 }
 
-// DiagnosticsJSON satisfies experimental/clashapi's duck-typed
-// ebpfDiagnosticsProvider interface, so the running Clash API server (when
-// configured) can report this inbound's status without importing this
-// package or its with_ebpf build tag.
-func (i *Inbound) DiagnosticsJSON() any {
-	return i.Diagnostics()
+// EBPFDiagnostics exposes a request-driven snapshot through the sing-box API.
+// The adapter form keeps daemon and service/api independent of this optional
+// build-tagged package and of sing-ebpf's concrete types.
+func (i *Inbound) EBPFDiagnostics() adapter.EBPFRuntimeDiagnostics {
+	now := time.Now()
+	i.diagnosticsAPIAccess.Lock()
+	defer i.diagnosticsAPIAccess.Unlock()
+	if !i.diagnosticsAPIAt.IsZero() && now.Sub(i.diagnosticsAPIAt) < ebpfDiagnosticsAPICacheTTL {
+		return i.diagnosticsAPIValue
+	}
+	diagnostics := diagnosticsForAPI(i.Diagnostics())
+	i.diagnosticsAPIAt = now
+	i.diagnosticsAPIValue = diagnostics
+	return diagnostics
+}
+
+func diagnosticsForAPI(diagnostics EBPFDiagnostics) adapter.EBPFRuntimeDiagnostics {
+	attachments := make([]adapter.EBPFAttachmentDiagnostics, 0, len(diagnostics.Attachments))
+	for _, attachment := range diagnostics.Attachments {
+		attachments = append(attachments, adapter.EBPFAttachmentDiagnostics{
+			InterfaceName:  attachment.InterfaceName,
+			InterfaceIndex: attachment.InterfaceIndex,
+			Role:           attachment.Role,
+			Framing:        attachment.Framing,
+			Mechanism:      attachment.Mechanism,
+			ICMPEchoReply:  attachment.ICMPEchoReply,
+		})
+	}
+	return adapter.EBPFRuntimeDiagnostics{
+		SchemaVersion:                diagnostics.SchemaVersion,
+		ObservedAt:                   diagnostics.ObservedAt,
+		Tag:                          diagnostics.Tag,
+		State:                        diagnostics.State,
+		LocalEnabled:                 diagnostics.LocalEnabled,
+		LocalDataPlane:               diagnostics.LocalDataPlane,
+		LocalCgroupAttachMode:        diagnostics.LocalCgroupAttachMode,
+		LocalUDPCleanupMode:          diagnostics.LocalUDPCleanupMode,
+		LocalUDPUserspaceCleanupMode: diagnostics.LocalUDPUserspaceCleanupMode,
+		LocalUDPStorageMode:          diagnostics.LocalUDPStorageMode,
+		LocalUDPTimeMode:             diagnostics.LocalUDPTimeMode,
+		SharedEnabled:                diagnostics.SharedEnabled,
+		SharedDataPlane:              diagnostics.SharedDataPlane,
+		FakeIPICMPReply:              diagnostics.FakeIPICMPReply,
+		TCBackendMode:                diagnostics.TCBackendMode,
+		TCListenerLookupMode:         diagnostics.TCListenerLookupMode,
+		TCAttachmentMode:             diagnostics.TCAttachmentMode,
+		TCDeliveryInterface:          diagnostics.TCDeliveryInterface,
+		TCDeliveryInterfaceIndex:     diagnostics.TCDeliveryInterfaceIndex,
+		TCRoutingMark:                diagnostics.TCRoutingMark,
+		TCRoutingTable:               diagnostics.TCRoutingTable,
+		TCRoutingPriority:            diagnostics.TCRoutingPriority,
+		TCAttachmentCount:            diagnostics.TCAttachmentCount,
+		TCRetiredAttachmentCount:     diagnostics.TCRetiredAttachmentCount,
+		TCRetiredDeliveryCount:       diagnostics.TCRetiredDeliveryCount,
+		TCRequiresRebuild:            diagnostics.TCRequiresRebuild,
+		TCHealthStatus:               diagnostics.TCHealthStatus,
+		TCLastHealthCheckAt:          diagnostics.TCLastHealthCheckAt,
+		TCLastReconcileAt:            diagnostics.TCLastReconcileAt,
+		TCNetworkGeneration:          diagnostics.TCNetworkGeneration,
+		Attachments:                  attachments,
+		LastError:                    diagnostics.LastError,
+		LastErrorAt:                  diagnostics.LastErrorAt,
+		LastRecoveryAt:               diagnostics.LastRecoveryAt,
+		RecoveryPending:              diagnostics.RecoveryPending,
+		RecoveryUnrecoverable:        diagnostics.RecoveryUnrecoverable,
+		NextRetryAt:                  diagnostics.NextRetryAt,
+		LocalBypassRuleSet: adapter.EBPFBypassRuleSetDiagnostics{
+			Consistent:            diagnostics.LocalBypassRuleSet.Consistent,
+			Pending:               diagnostics.LocalBypassRuleSet.Pending,
+			PolicyVersion:         diagnostics.LocalBypassRuleSet.PolicyVersion,
+			ExpectedPolicyVersion: diagnostics.LocalBypassRuleSet.ExpectedPolicyVersion,
+			RetryCount:            diagnostics.LocalBypassRuleSet.RetryCount,
+			BackendState:          convertBypassRuleSetBackendState(diagnostics.LocalBypassRuleSet.BackendState),
+		},
+		SharedBypassRuleSet: adapter.EBPFBypassRuleSetDiagnostics{
+			Consistent:            diagnostics.SharedBypassRuleSet.Consistent,
+			Pending:               diagnostics.SharedBypassRuleSet.Pending,
+			PolicyVersion:         diagnostics.SharedBypassRuleSet.PolicyVersion,
+			ExpectedPolicyVersion: diagnostics.SharedBypassRuleSet.ExpectedPolicyVersion,
+			RetryCount:            diagnostics.SharedBypassRuleSet.RetryCount,
+			BackendState:          convertBypassRuleSetBackendState(diagnostics.SharedBypassRuleSet.BackendState),
+		},
+		UDPSessionCount: diagnostics.UDPSessionCount,
+		UDPNAT: adapter.EBPFUDPNATDiagnostics{
+			ActiveSessions:                 diagnostics.UDPNAT.ActiveSessions,
+			CreatedSessions:                diagnostics.UDPNAT.CreatedSessions,
+			CapacityEvictions:              diagnostics.UDPNAT.CapacityEvictions,
+			QueueDrops:                     diagnostics.UDPNAT.QueueDrops,
+			SocketReleaseEvents:            diagnostics.UDPNAT.SocketReleaseEvents,
+			SocketReleaseMatched:           diagnostics.UDPNAT.SocketReleaseMatched,
+			PendingReleaseCapacityRejected: diagnostics.UDPNAT.PendingReleaseCapacityRejected,
+			ReleaseNotificationDrops:       diagnostics.UDPNAT.ReleaseNotificationDrops,
+		},
+		UDPReplySockets: adapter.EBPFUDPReplySocketDiagnostics{
+			Count:            diagnostics.UDPReplySockets.Count,
+			Peak:             diagnostics.UDPReplySockets.Peak,
+			Evicted:          diagnostics.UDPReplySockets.Evicted,
+			CapacityRejected: diagnostics.UDPReplySockets.CapacityRejected,
+		},
+		Counters: adapter.EBPFCounters{
+			AssignmentLookupFailures:      diagnostics.Counters.AssignmentLookupFailures,
+			TCSocketLookupFailures:        diagnostics.Counters.TCSocketLookupFailures,
+			TCSKAssignFailures:            diagnostics.Counters.TCSKAssignFailures,
+			TCAssignmentUpdateFailures:    diagnostics.Counters.TCAssignmentUpdateFailures,
+			TCLocalFragmentPasses:         diagnostics.Counters.TCLocalFragmentPasses,
+			TCSharedFragmentPasses:        diagnostics.Counters.TCSharedFragmentPasses,
+			TokenReservationFailures:      diagnostics.Counters.TokenReservationFailures,
+			RewriteFailures:               diagnostics.Counters.RewriteFailures,
+			SharedIngressPasses:           diagnostics.Counters.SharedIngressPasses,
+			SharedEgressPasses:            diagnostics.Counters.SharedEgressPasses,
+			SharedIngressFragmentPasses:   diagnostics.Counters.SharedIngressFragmentPasses,
+			SharedEgressFragmentPasses:    diagnostics.Counters.SharedEgressFragmentPasses,
+			SharedReconcileFailures:       diagnostics.Counters.SharedReconcileFailures,
+			RecoveryAttempts:              diagnostics.Counters.RecoveryAttempts,
+			RecoverySuccesses:             diagnostics.Counters.RecoverySuccesses,
+			RecoveryFailures:              diagnostics.Counters.RecoveryFailures,
+			FakeIPICMPReplies:             diagnostics.Counters.FakeIPICMPReplies,
+			FakeIPICMPPassThrough:         diagnostics.Counters.FakeIPICMPPassThrough,
+			FakeIPICMPRewriteFailureDrops: diagnostics.Counters.FakeIPICMPRewriteFailureDrops,
+		},
+	}
+}
+
+func convertBypassRuleSetBackendState(states map[string]BypassRuleSetBackendState) map[string]adapter.EBPFBypassRuleSetBackendState {
+	converted := make(map[string]adapter.EBPFBypassRuleSetBackendState, len(states))
+	for name, state := range states {
+		converted[name] = adapter.EBPFBypassRuleSetBackendState{Version: state.Version, Known: state.Known}
+	}
+	return converted
+}
+
+func (i *Inbound) EBPFKernelRuntime() adapter.EBPFKernelRuntimeDiagnostics {
+	now := time.Now()
+	i.kernelRuntimeAPIAccess.Lock()
+	defer i.kernelRuntimeAPIAccess.Unlock()
+	if !i.kernelRuntimeAPIAt.IsZero() && now.Sub(i.kernelRuntimeAPIAt) < ebpfDiagnosticsAPICacheTTL {
+		return i.kernelRuntimeAPIValue
+	}
+	diagnostics := kernelRuntimeForAPI(now, commonEBPF.InspectRuntimeState())
+	i.kernelRuntimeAPIAt = now
+	i.kernelRuntimeAPIValue = diagnostics
+	return diagnostics
+}
+
+func kernelRuntimeForAPI(observedAt time.Time, runtimeState commonEBPF.RuntimeState) adapter.EBPFKernelRuntimeDiagnostics {
+	programs := make([]adapter.EBPFProgramDiagnostics, 0, len(runtimeState.Programs))
+	for _, program := range runtimeState.Programs {
+		mapIDs := make([]uint32, len(program.MapIDs))
+		for index, mapID := range program.MapIDs {
+			mapIDs[index] = uint32(mapID)
+		}
+		programs = append(programs, adapter.EBPFProgramDiagnostics{
+			ID:       uint32(program.ID),
+			Name:     program.Name,
+			Type:     program.Type.String(),
+			MapCount: program.MapCount,
+			MapIDs:   mapIDs,
+		})
+	}
+	maps := make([]adapter.EBPFMapDiagnostics, 0, len(runtimeState.MapOccupancy.Maps))
+	for _, item := range runtimeState.MapOccupancy.Maps {
+		maps = append(maps, adapter.EBPFMapDiagnostics{
+			ID:         uint32(item.ID),
+			Name:       item.Name,
+			Type:       item.Type,
+			MaxEntries: item.MaxEntries,
+			KeySize:    item.KeySize,
+			ValueSize:  item.ValueSize,
+			Flags:      item.Flags,
+			Entries:    item.Entries,
+			Supported:  item.Supported,
+			Error:      item.Error,
+		})
+	}
+	diagnostics := adapter.EBPFKernelRuntimeDiagnostics{
+		ObservedAt: observedAt,
+		Programs:   programs,
+		MapOccupancy: adapter.EBPFMapOccupancyDiagnostics{
+			Status: runtimeState.MapOccupancy.Status,
+			Maps:   maps,
+			Error:  runtimeState.MapOccupancy.Error,
+		},
+	}
+	if runtimeState.ProgramsError != nil {
+		diagnostics.ProgramsError = runtimeState.ProgramsError.Error()
+	}
+	return diagnostics
 }
 
 // Diagnostics reports this inbound's current interception state. Safe to
@@ -273,6 +486,8 @@ func (i *Inbound) DiagnosticsJSON() any {
 // longer than one of those already does elsewhere.
 func (i *Inbound) Diagnostics() EBPFDiagnostics {
 	diagnostics := EBPFDiagnostics{
+		SchemaVersion:   adapter.EBPFDiagnosticsSchemaVersion,
+		ObservedAt:      time.Now(),
 		Tag:             i.Tag(),
 		LocalEnabled:    i.localEnabled,
 		SharedEnabled:   i.sharedEnabled,
@@ -280,6 +495,13 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 	}
 	if i.localEnabled {
 		diagnostics.LocalDataPlane = i.localDataPlane
+	}
+	if backend := i.cgroupBackendInstance(); backend != nil && !backend.IsClosed() {
+		diagnostics.LocalCgroupAttachMode = backend.AttachMode()
+		diagnostics.LocalUDPCleanupMode = backend.UDPCleanupMode()
+		diagnostics.LocalUDPUserspaceCleanupMode = backend.UDPUserspaceCleanupMode()
+		diagnostics.LocalUDPStorageMode = backend.UDPStorageMode()
+		diagnostics.LocalUDPTimeMode = backend.UDPTimeMode()
 	}
 	if i.sharedEnabled {
 		diagnostics.SharedDataPlane = i.sharedDataPlane
@@ -290,6 +512,26 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 	i.tcDataPlaneAccess.RUnlock()
 	if tcDataPlane != nil {
 		diagnostics.Attachments = append(diagnostics.Attachments, tcDataPlane.AttachmentDiagnostics()...)
+		tc := tcDataPlane.TCDiagnostics()
+		diagnostics.TCListenerLookupMode = tc.ListenerLookupMode
+		diagnostics.TCAttachmentMode = tc.AttachmentMode
+		diagnostics.TCDeliveryInterface = tc.NetworkInfo.DeliveryInterface
+		diagnostics.TCDeliveryInterfaceIndex = tc.NetworkInfo.DeliveryInterfaceIndex
+		diagnostics.TCRoutingMark = tc.NetworkInfo.RoutingMark
+		diagnostics.TCRoutingTable = tc.NetworkInfo.RoutingTable
+		diagnostics.TCRoutingPriority = tc.NetworkInfo.RoutingPriority
+		diagnostics.TCAttachmentCount = tc.AttachmentCount
+		diagnostics.TCRetiredAttachmentCount = tc.RetiredAttachmentCount
+		diagnostics.TCRetiredDeliveryCount = tc.RetiredDeliveryCount
+		diagnostics.TCRequiresRebuild = tc.RequiresRebuild
+		diagnostics.TCBackendMode = "socket_assign"
+		if tc.RequiresRebuild {
+			diagnostics.TCHealthStatus = "needs_reconcile"
+		} else if tc.AttachmentCount == 0 {
+			diagnostics.TCHealthStatus = "waiting_for_interface"
+		} else {
+			diagnostics.TCHealthStatus = "attached"
+		}
 	}
 	if shared := i.sharedRewriteInstance(); shared != nil {
 		if sharedDataPlane := shared.dataPlaneInstance(); sharedDataPlane != nil {
@@ -336,6 +578,18 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 	}
 
 	i.diagnostics.access.Lock()
+	if !i.diagnostics.lastHealthCheckAt.IsZero() {
+		healthAt := i.diagnostics.lastHealthCheckAt
+		diagnostics.TCLastHealthCheckAt = &healthAt
+		if !i.diagnostics.lastHealthHealthy && diagnostics.TCHealthStatus == "attached" {
+			diagnostics.TCHealthStatus = "degraded"
+		}
+	}
+	if !i.diagnostics.lastReconcileAt.IsZero() {
+		reconcileAt := i.diagnostics.lastReconcileAt
+		diagnostics.TCLastReconcileAt = &reconcileAt
+	}
+	diagnostics.TCNetworkGeneration = i.networkGeneration
 	if i.diagnostics.haveOutcome {
 		diagnostics.RecoveryPending = i.diagnostics.lastOutcome.general == tcSharedRewriteRecoverable ||
 			i.diagnostics.lastOutcome.sharedRewrite == tcSharedRewriteRecoverable ||
@@ -343,6 +597,13 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 		diagnostics.RecoveryUnrecoverable = i.diagnostics.lastOutcome.general == tcSharedRewriteUnrecoverable ||
 			i.diagnostics.lastOutcome.sharedRewrite == tcSharedRewriteUnrecoverable ||
 			i.diagnostics.lastOutcome.bypassRuleSet == tcSharedRewriteUnrecoverable
+	}
+	if diagnostics.TCHealthStatus != "" {
+		if diagnostics.RecoveryUnrecoverable {
+			diagnostics.TCHealthStatus = "needs_reconcile"
+		} else if diagnostics.RecoveryPending {
+			diagnostics.TCHealthStatus = "recovering"
+		}
 	}
 	if !i.diagnostics.lastRecoveryAt.IsZero() {
 		recoveryAt := i.diagnostics.lastRecoveryAt
@@ -355,29 +616,48 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 	i.diagnostics.access.Unlock()
 
 	i.bypassRuleSetAccess.Lock()
-	diagnostics.BypassRuleSetConsistent = !i.bypassRuleSetInconsistent
-	diagnostics.BypassRuleSetPending = i.bypassRuleSetNeedsRetry
-	diagnostics.BypassRuleSetPolicyVersion = i.bypassRuleSetPolicyVersion
-	diagnostics.BypassRuleSetExpectedPolicyVersion = i.bypassRuleSetExpectedVersion
-	diagnostics.BypassRuleSetRetryCount = i.bypassRuleSetRetryCount
-	backendState := make(map[string]BypassRuleSetBackendState, 3)
-	if i.tcBackend() != nil {
-		backendState["TC"] = BypassRuleSetBackendState{Version: i.bypassRuleSetTC.version, Known: i.bypassRuleSetTC.known}
+	localState := scopedBypassRuleSetDiagnostics{
+		Consistent:            !i.bypassRuleSetInconsistent,
+		Pending:               i.bypassRuleSetNeedsRetry,
+		PolicyVersion:         i.bypassRuleSetPolicyVersion,
+		ExpectedPolicyVersion: i.bypassRuleSetExpectedVersion,
+		RetryCount:            i.bypassRuleSetRetryCount,
+		BackendState:          make(map[string]BypassRuleSetBackendState, 2),
+	}
+	if i.localTCEnabled() && i.tcBackend() != nil {
+		localState.BackendState["TC"] = BypassRuleSetBackendState{Version: i.bypassRuleSetTC.version, Known: i.bypassRuleSetTC.known}
 	}
 	if i.cgroupBackendInstance() != nil {
-		backendState["cgroup"] = BypassRuleSetBackendState{Version: i.bypassRuleSetCgroup.version, Known: i.bypassRuleSetCgroup.known}
+		localState.BackendState["cgroup"] = BypassRuleSetBackendState{Version: i.bypassRuleSetCgroup.version, Known: i.bypassRuleSetCgroup.known}
+	}
+	sharedState := scopedBypassRuleSetDiagnostics{
+		Consistent:            !i.sharedBypassRuleSetInconsistent,
+		Pending:               i.sharedBypassRuleSetNeedsRetry,
+		PolicyVersion:         i.sharedBypassRuleSetPolicyVersion,
+		ExpectedPolicyVersion: i.sharedBypassRuleSetExpectedVersion,
+		RetryCount:            i.sharedBypassRuleSetRetryCount,
+		BackendState:          make(map[string]BypassRuleSetBackendState, 2),
 	}
 	if shared := i.sharedRewriteInstance(); shared != nil && shared.sharedBackendInstance() != nil {
-		backendState["shared"] = BypassRuleSetBackendState{Version: i.bypassRuleSetShared.version, Known: i.bypassRuleSetShared.known}
+		sharedState.BackendState["packet_rewrite"] = BypassRuleSetBackendState{Version: i.bypassRuleSetShared.version, Known: i.bypassRuleSetShared.known}
 	}
-	if len(backendState) > 0 {
-		diagnostics.BypassRuleSetBackendState = backendState
+	if i.sharedSocketAssignEnabled() && i.tcBackend() != nil {
+		sharedState.BackendState["TC"] = BypassRuleSetBackendState{Version: i.sharedBypassRuleSetTC.version, Known: i.sharedBypassRuleSetTC.known}
 	}
+	diagnostics.LocalBypassRuleSet = localState
+	diagnostics.SharedBypassRuleSet = sharedState
 	i.bypassRuleSetAccess.Unlock()
 
 	diagnostics.UDPSessionCount = i.udpClientTable.count()
+	diagnostics.UDPNAT.add(i.udpNat.diagnostics())
 	if shared := i.sharedRewriteInstance(); shared != nil {
 		diagnostics.UDPSessionCount += shared.sharedUDPClientTable.count()
+		diagnostics.UDPNAT.add(shared.udpNat.diagnostics())
+	}
+	if backend := i.cgroupBackendInstance(); backend != nil {
+		if drops, err := backend.UDPReleaseNotificationDrops(); err == nil {
+			diagnostics.UDPNAT.ReleaseNotificationDrops = drops
+		}
 	}
 	diagnostics.UDPReplySockets = i.udpReplySockets.snapshot()
 
@@ -393,15 +673,48 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 		if failures, err := sharedRewriteBackend.RewriteFailures(); err == nil {
 			diagnostics.Counters.RewriteFailures = failures
 		}
+		// These counters were added after the original alpha.9 library API.
+		// Use an optional capability interface so a sing-box binary built with
+		// the older library remains loadable during the dependency update window.
+		if stats, ok := any(sharedRewriteBackend).(sharedNetworkPassStats); ok {
+			if passes, err := stats.IngressPasses(); err == nil {
+				diagnostics.Counters.SharedIngressPasses = passes
+			}
+			if passes, err := stats.EgressPasses(); err == nil {
+				diagnostics.Counters.SharedEgressPasses = passes
+			}
+			if passes, err := stats.IngressFragmentPasses(); err == nil {
+				diagnostics.Counters.SharedIngressFragmentPasses = passes
+			}
+			if passes, err := stats.EgressFragmentPasses(); err == nil {
+				diagnostics.Counters.SharedEgressFragmentPasses = passes
+			}
+		}
 	}
 	// fakeip_icmp can be hosted independently by the TC backend (local TC,
 	// shared socket_assign) and by the shared packet-rewrite backend at the
 	// same time -- each loads its own copy of the object -- so their counts
 	// are summed rather than one overwriting the other.
 	addFakeIPICMPCounters(&diagnostics.Counters, i.tcBackend(), sharedRewriteBackend)
+	if tcBackend := i.tcBackend(); tcBackend != nil {
+		if stats, err := tcBackend.Stats(); err == nil {
+			diagnostics.Counters.TCSocketLookupFailures = stats.SocketLookupFailures
+			diagnostics.Counters.TCSKAssignFailures = stats.SKAssignFailures
+			diagnostics.Counters.TCAssignmentUpdateFailures = stats.AssignmentUpdateFailures
+			diagnostics.Counters.TCLocalFragmentPasses = stats.LocalFragmentPasses
+			diagnostics.Counters.TCSharedFragmentPasses = stats.SharedFragmentPasses
+		}
+	}
 
 	diagnostics.State = deriveDiagnosticsState(diagnostics)
 	return diagnostics
+}
+
+type sharedNetworkPassStats interface {
+	IngressPasses() (uint64, error)
+	EgressPasses() (uint64, error)
+	IngressFragmentPasses() (uint64, error)
+	EgressFragmentPasses() (uint64, error)
 }
 
 type fakeIPICMPCounterSource interface {
@@ -436,7 +749,7 @@ func deriveDiagnosticsState(d EBPFDiagnostics) string {
 	// EBPFDiagnostics.Attachments from before the backend gave up on it
 	// would otherwise let through) would suggest the fix is "wait", when it
 	// is not.
-	if d.RecoveryUnrecoverable || !d.BypassRuleSetConsistent {
+	if d.RecoveryUnrecoverable || !d.LocalBypassRuleSet.Consistent || !d.SharedBypassRuleSet.Consistent {
 		return EBPFDiagnosticsStateNeedsAttention
 	}
 	if d.LocalEnabled && !attachmentHasRole(d.Attachments, "local") {
@@ -445,7 +758,7 @@ func deriveDiagnosticsState(d EBPFDiagnostics) string {
 	if d.SharedEnabled && !attachmentHasRole(d.Attachments, "shared") {
 		return EBPFDiagnosticsStateWaitingForInterface
 	}
-	if d.RecoveryPending || d.BypassRuleSetPending {
+	if d.RecoveryPending || d.LocalBypassRuleSet.Pending || d.SharedBypassRuleSet.Pending {
 		return EBPFDiagnosticsStateRecovering
 	}
 	return EBPFDiagnosticsStateNormal
@@ -480,6 +793,16 @@ func (d EBPFDiagnostics) WriteText(w io.Writer) error {
 	if d.SharedEnabled {
 		lines = append(lines, fmt.Sprintf("Shared data plane: %s", d.SharedDataPlane))
 	}
+	if d.TCBackendMode != "" {
+		lines = append(lines, fmt.Sprintf(
+			"TC runtime: backend=%s listener=%s attachment=%s delivery=%s#%d mark=%d table=%d priority=%d attachments=%d retired_attachments=%d retired_deliveries=%d health=%s generation=%d",
+			d.TCBackendMode, d.TCListenerLookupMode, d.TCAttachmentMode,
+			d.TCDeliveryInterface, d.TCDeliveryInterfaceIndex, d.TCRoutingMark,
+			d.TCRoutingTable, d.TCRoutingPriority, d.TCAttachmentCount,
+			d.TCRetiredAttachmentCount, d.TCRetiredDeliveryCount, d.TCHealthStatus,
+			d.TCNetworkGeneration,
+		))
+	}
 	lines = append(lines, fmt.Sprintf("FakeIP ICMP reply: %t", d.FakeIPICMPReply))
 	if len(d.Attachments) == 0 {
 		lines = append(lines, "Attachments: none")
@@ -506,16 +829,28 @@ func (d EBPFDiagnostics) WriteText(w io.Writer) error {
 	if d.LastError != "" {
 		lines = append(lines, fmt.Sprintf("Last error (%s): %s", d.LastErrorAt.Format(time.RFC3339), d.LastError))
 	}
-	lines = append(lines, fmt.Sprintf("bypass_rule_set: consistent=%t pending=%t", d.BypassRuleSetConsistent, d.BypassRuleSetPending))
+	lines = append(lines, fmt.Sprintf("local.bypass_rule_set: consistent=%t pending=%t version=%d", d.LocalBypassRuleSet.Consistent, d.LocalBypassRuleSet.Pending, d.LocalBypassRuleSet.PolicyVersion))
+	lines = append(lines, fmt.Sprintf("shared.bypass_rule_set: consistent=%t pending=%t version=%d", d.SharedBypassRuleSet.Consistent, d.SharedBypassRuleSet.Pending, d.SharedBypassRuleSet.PolicyVersion))
 	lines = append(lines, fmt.Sprintf("UDP sessions: %d", d.UDPSessionCount))
+	lines = append(lines, fmt.Sprintf(
+		"UDP NAT: active=%d created=%d capacity_evictions=%d queue_drops=%d socket_release_events=%d socket_release_matched=%d pending_release_capacity_rejected=%d release_notification_drops=%d",
+		d.UDPNAT.ActiveSessions, d.UDPNAT.CreatedSessions, d.UDPNAT.CapacityEvictions, d.UDPNAT.QueueDrops,
+		d.UDPNAT.SocketReleaseEvents, d.UDPNAT.SocketReleaseMatched,
+		d.UDPNAT.PendingReleaseCapacityRejected, d.UDPNAT.ReleaseNotificationDrops,
+	))
 	lines = append(lines, fmt.Sprintf(
 		"UDP reply sockets: count=%d peak=%d evicted=%d capacity_rejected=%d",
 		d.UDPReplySockets.Count, d.UDPReplySockets.Peak, d.UDPReplySockets.Evicted, d.UDPReplySockets.CapacityRejected,
 	))
 	lines = append(lines, fmt.Sprintf(
-		"Counters: assignment_lookup_failures=%d token_reservation_failures=%d rewrite_failures=%d "+
+		"Counters: assignment_lookup_failures=%d tc_socket_lookup_failures=%d tc_sk_assign_failures=%d tc_assignment_update_failures=%d tc_local_fragment_passes=%d tc_shared_fragment_passes=%d token_reservation_failures=%d rewrite_failures=%d "+
+			"shared_ingress_passes=%d shared_egress_passes=%d shared_ingress_fragment_passes=%d shared_egress_fragment_passes=%d "+
 			"shared_reconcile_failures=%d recovery_attempts=%d recovery_successes=%d recovery_failures=%d",
-		d.Counters.AssignmentLookupFailures, d.Counters.TokenReservationFailures, d.Counters.RewriteFailures,
+		d.Counters.AssignmentLookupFailures, d.Counters.TCSocketLookupFailures, d.Counters.TCSKAssignFailures, d.Counters.TCAssignmentUpdateFailures,
+		d.Counters.TCLocalFragmentPasses, d.Counters.TCSharedFragmentPasses,
+		d.Counters.TokenReservationFailures, d.Counters.RewriteFailures,
+		d.Counters.SharedIngressPasses, d.Counters.SharedEgressPasses,
+		d.Counters.SharedIngressFragmentPasses, d.Counters.SharedEgressFragmentPasses,
 		d.Counters.SharedReconcileFailures, d.Counters.RecoveryAttempts, d.Counters.RecoverySuccesses, d.Counters.RecoveryFailures,
 	))
 	lines = append(lines, fmt.Sprintf(
@@ -537,7 +872,7 @@ func (d EBPFDiagnostics) WriteText(w io.Writer) error {
 // configured paths have no interface to attach to yet, and which
 // attachments fakeip_icmp actually covers. It is built from the same
 // Diagnostics this inbound already computes for external queries, so the
-// summary can never say something the diagnostics endpoint would disagree
+// summary can never say something the API diagnostics would disagree
 // with a moment later.
 //
 // This does not replace startInbound's existing Debug-level line: that one

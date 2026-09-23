@@ -107,7 +107,7 @@ func TestUDPReplySocketPoolNeverEvictsAnInUseSocket(t *testing.T) {
 	t.Cleanup(func() { _ = pool.close() })
 
 	inUseDestination := destinationOnShard(&pool, 2, 0)
-	inUseSocket, holdRelease, err := pool.get(inUseDestination, newLoopbackUDPSocket)
+	inUseEntry, holdRelease, err := pool.get(inUseDestination, newLoopbackUDPSocket)
 	if err != nil {
 		t.Fatalf("get the socket to hold in use: %v", err)
 	}
@@ -120,7 +120,7 @@ func TestUDPReplySocketPoolNeverEvictsAnInUseSocket(t *testing.T) {
 	if got := pool.snapshot().Count; got != 1 {
 		t.Fatalf("pool count = %d after sweeping with an in-flight socket held, want 1 (it must survive)", got)
 	}
-	if _, err = inUseSocket.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err != nil {
+	if _, err = inUseEntry.conn.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err != nil {
 		t.Fatalf("the held-in-use socket was closed out from under the simulated send: %v", err)
 	}
 
@@ -139,7 +139,7 @@ func TestUDPReplySocketPoolNeverEvictsAnInUseSocket(t *testing.T) {
 		t.Fatalf("shard could not admit a new destination by reclaiming an idle one: %v", err)
 	}
 	extraRelease()
-	if _, err = inUseSocket.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err != nil {
+	if _, err = inUseEntry.conn.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err != nil {
 		t.Fatalf("capacity-triggered eviction closed the in-use socket instead of an idle one: %v", err)
 	}
 
@@ -154,7 +154,7 @@ func TestUDPReplySocketPoolSweepsIdleSockets(t *testing.T) {
 	t.Cleanup(func() { _ = pool.close() })
 
 	destination := destinationOnShard(&pool, 3, 0)
-	socket, release, err := pool.get(destination, newLoopbackUDPSocket)
+	entry, release, err := pool.get(destination, newLoopbackUDPSocket)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -168,8 +168,31 @@ func TestUDPReplySocketPoolSweepsIdleSockets(t *testing.T) {
 	if pool.snapshot().Evicted != 1 {
 		t.Fatalf("evicted = %d, want 1", pool.snapshot().Evicted)
 	}
-	if _, err = socket.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err == nil {
+	if _, err = entry.conn.WriteToUDPAddrPort([]byte{1}, netip.MustParseAddrPort("127.0.0.1:9")); err == nil {
 		t.Fatal("socket the idle sweep should have closed is still usable")
+	}
+}
+
+func TestUDPReplySocketPoolReusesBatchWriter(t *testing.T) {
+	var pool udpReplySocketPool
+	t.Cleanup(func() { _ = pool.close() })
+
+	destination := destinationOnShard(&pool, 3, 0)
+	first, release, err := pool.get(destination, newLoopbackUDPSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	second, release, err := pool.get(destination, newLoopbackUDPSocket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release()
+	if first != second {
+		t.Fatal("reply socket pool replaced an existing entry")
+	}
+	if first.writer == nil || first.writer != second.writer {
+		t.Fatal("reply socket pool did not retain its packet batch writer")
 	}
 }
 
