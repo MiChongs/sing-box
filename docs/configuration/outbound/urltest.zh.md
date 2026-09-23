@@ -18,9 +18,12 @@
   "include": "",
   "url": "",
   "interval": "",
+  "expected_status": "",
   "tolerance": 50,
   "idle_timeout": "",
   "use_all_providers": false,
+  "hidden": false,
+  "icon": "",
   "fallback": {
     "enabled": false,
     "max_delay": ""
@@ -28,6 +31,11 @@
   "interrupt_exist_connections": false
 }
 ```
+
+!!! quote ""
+
+    可以通过 [Clash API](/zh/configuration/experimental/clash-api/) 或图形客户端手动选择成员。
+    手动选择在重启和定期测试后保留，由用户下一次手动触发的组测速解除。
 
 ### 字段
 
@@ -54,6 +62,13 @@
 #### interval
 
 测试间隔。 默认使用 `3m`。
+
+#### expected_status
+
+测试链接被视为成功的 HTTP 状态码，兼容 mihomo 的 `expected-status`：
+单个状态码 `204`、范围 `200-299`、用 `/` 连接的多个值或范围（如 `200/204`、`200-299/301-302`），或 `*` 表示任意状态码。
+
+留空时，`generate_204` 链接必须返回 `204`，其他链接的状态码需低于 `400`。
 
 #### tolerance
 
@@ -88,3 +103,11 @@
 当选定的出站发生更改时，中断现有连接。
 
 仅入站连接受此设置影响，内部连接将始终被中断。
+
+#### hidden
+
+在 [Clash API](/zh/configuration/experimental/clash-api/) 面板的代理切换列表中隐藏此组，不影响路由。
+
+#### icon
+
+[Clash API](/zh/configuration/experimental/clash-api/) 面板中显示的组图标，可以是 URL、data URI 或 emoji。

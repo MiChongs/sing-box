@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/common/tlsspoof"
@@ -126,6 +127,12 @@ type InboundContext struct {
 
 type InboundContextExtended struct {
 	RealOutboundChain []string
+
+	// selectedOutbounds records the member that actually carried the
+	// connection for groups that pick per connection (Smart), where
+	// OutboundGroup.Now() at tracking time may name a different member.
+	selectedAccess    sync.Mutex
+	selectedOutbounds map[string]string
 }
 
 func (c *InboundContext) InitExtended() {
@@ -138,6 +145,27 @@ func (c *InboundContext) AppendRealOutbound(tag string) {
 	if c.Extended != nil {
 		c.Extended.RealOutboundChain = append(c.Extended.RealOutboundChain, tag)
 	}
+}
+
+func (c *InboundContext) SetSelectedOutbound(group string, outbound string) {
+	if c.Extended == nil {
+		return
+	}
+	c.Extended.selectedAccess.Lock()
+	defer c.Extended.selectedAccess.Unlock()
+	if c.Extended.selectedOutbounds == nil {
+		c.Extended.selectedOutbounds = make(map[string]string)
+	}
+	c.Extended.selectedOutbounds[group] = outbound
+}
+
+func (c *InboundContext) SelectedOutbound(group string) string {
+	if c.Extended == nil {
+		return ""
+	}
+	c.Extended.selectedAccess.Lock()
+	defer c.Extended.selectedAccess.Unlock()
+	return c.Extended.selectedOutbounds[group]
 }
 
 func (c *InboundContext) GetRealOutboundChain() []string {

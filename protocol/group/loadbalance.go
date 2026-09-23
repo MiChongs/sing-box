@@ -37,6 +37,7 @@ func RegisterLoadBalance(registry *outbound.Registry) {
 
 var (
 	_ adapter.PreMatchOutboundGroup   = (*LoadBalance)(nil)
+	_ adapter.OutboundGroupHint       = (*LoadBalance)(nil)
 	_ adapter.InterfaceUpdateListener = (*LoadBalance)(nil)
 )
 
@@ -71,6 +72,9 @@ type LoadBalance struct {
 	exclude         *regexp.Regexp
 	include         *regexp.Regexp
 	useAllProviders bool
+	hidden          bool
+	icon            string
+	expectedStatus  *urltest.StatusMatcher
 }
 
 func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.LoadBalanceOutboundOptions) (adapter.Outbound, error) {
@@ -105,8 +109,23 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		exclude:         (*regexp.Regexp)(options.Exclude),
 		include:         (*regexp.Regexp)(options.Include),
 		useAllProviders: options.UseAllProviders,
+		hidden:          options.Hidden,
+		icon:            options.Icon,
 	}
+	expectedStatus, err := urltest.ParseExpectedStatus(options.ExpectedStatus)
+	if err != nil {
+		return nil, err
+	}
+	outbound.expectedStatus = expectedStatus
 	return outbound, nil
+}
+
+func (s *LoadBalance) Hidden() bool {
+	return s.hidden
+}
+
+func (s *LoadBalance) Icon() string {
+	return s.icon
 }
 
 func (s *LoadBalance) Start() error {
@@ -150,6 +169,7 @@ func (s *LoadBalance) Start() error {
 		return err
 	}
 	group.tag = s.Tag()
+	group.expectedStatus = s.expectedStatus
 	s.group = group
 	for _, providerTag := range s.providerTags {
 		s.providers[providerTag].RegisterCallback(s.onProviderUpdated)
@@ -332,6 +352,7 @@ type LoadBalanceGroup struct {
 	started         atomic.Bool
 	lastActive      common.TypedValue[time.Time]
 	strategyFn      strategyFn
+	expectedStatus  *urltest.StatusMatcher
 }
 
 func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, strategy string) (*LoadBalanceGroup, error) {
@@ -462,7 +483,9 @@ func (g *LoadBalanceGroup) urlTestWait(ctx context.Context, force bool) (map[str
 
 func (g *LoadBalanceGroup) urlTestLocked(ctx context.Context, force bool) (map[string]uint16, error) {
 	outbounds := g.loadOutbounds()
-	result := URLTestOutbounds(ctx, g.outbound, g.history, g.logger, outbounds, g.link, g.interval, force)
+	result := urlTestOutbounds(ctx, g.outbound, g.history, g.logger, outbounds, g.link, g.interval, force, urlTestOptions{
+		expectedStatus: g.expectedStatus,
+	})
 	if g.tag != "" {
 		updateLoadBalanceURLTestHistory(g.outbound, g.history, g.tag, outbounds)
 	}

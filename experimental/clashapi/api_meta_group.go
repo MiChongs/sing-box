@@ -88,7 +88,7 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 				itOutbound, _ := server.outbound.Outbound(it)
 				return itOutbound
 			}))
-			result = group.URLTestOutbounds(ctx, server.outbound, server.urlTestHistory, server.logger, outbounds, url, 0, true)
+			result = group.URLTestMembers(ctx, server.outbound, server.urlTestHistory, server.logger, outbounds, url)
 		}
 
 		if err != nil {

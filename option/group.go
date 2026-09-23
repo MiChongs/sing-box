@@ -16,6 +16,7 @@ type URLTestOutboundOptions struct {
 	IdleTimeout               badoption.Duration     `json:"idle_timeout,omitempty"`
 	InterruptExistConnections bool                   `json:"interrupt_exist_connections,omitempty"`
 	Fallback                  URLTestFallbackOptions `json:"fallback,omitempty"`
+	ExpectedStatus            string                 `json:"expected_status,omitempty"`
 }
 
 type GroupCommonOption struct {
@@ -24,6 +25,8 @@ type GroupCommonOption struct {
 	Exclude         *badoption.Regexp `json:"exclude,omitempty"`
 	Include         *badoption.Regexp `json:"include,omitempty"`
 	UseAllProviders bool              `json:"use_all_providers,omitempty"`
+	Hidden          bool              `json:"hidden,omitempty"`
+	Icon            string            `json:"icon,omitempty"`
 }
 
 type URLTestFallbackOptions struct {
@@ -33,9 +36,10 @@ type URLTestFallbackOptions struct {
 
 type LoadBalanceOutboundOptions struct {
 	GroupCommonOption
-	URL         string             `json:"url,omitempty"`
-	Interval    badoption.Duration `json:"interval,omitempty"`
-	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`
-	TTL         badoption.Duration `json:"ttl,omitempty"`
-	Strategy    string             `json:"strategy,omitempty"`
+	URL            string             `json:"url,omitempty"`
+	Interval       badoption.Duration `json:"interval,omitempty"`
+	IdleTimeout    badoption.Duration `json:"idle_timeout,omitempty"`
+	TTL            badoption.Duration `json:"ttl,omitempty"`
+	Strategy       string             `json:"strategy,omitempty"`
+	ExpectedStatus string             `json:"expected_status,omitempty"`
 }

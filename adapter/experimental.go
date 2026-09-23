@@ -22,6 +22,51 @@ type V2RayServer interface {
 	StatsService() ConnectionTracker
 }
 
+// SmartService is the singleton that owns infrastructure shared by all Smart
+// outbound groups: the LightGBM model, its auto-updater, and the training
+// sample collector. It is registered on startup when experimental.smart is
+// configured; Smart groups retrieve it via service.FromContext and opt in
+// per-group via their use_lightgbm / collect_data flags.
+//
+// The concrete type lives in experimental/smart. Callers that need typed
+// accessors (e.g. for LightGBM model / collector) should type-assert to the
+// concrete *smart.Service.
+type SmartService interface {
+	LifecycleService
+	// LightGBMEnabled reports whether the shared ML model is configured.
+	LightGBMEnabled() bool
+	// CollectorEnabled reports whether the shared training-data collector is configured.
+	CollectorEnabled() bool
+}
+
+// GeoXService is the singleton that downloads and tracks global geo data
+// assets (geoip.dat / geosite.dat / country.mmdb / GeoLite2-ASN.mmdb).
+//
+// Other services (currently only Smart group, via use_asn) retrieve local
+// file paths through this service when their per-group config leaves the
+// corresponding path empty.
+type GeoXService interface {
+	LifecycleService
+
+	// Enabled reports whether experimental.geox.enabled was set.
+	Enabled() bool
+
+	// GeoIPPath returns the local path of the downloaded geoip.dat, or
+	// "" if not configured / not yet downloaded.
+	GeoIPPath() string
+	// GeoSitePath returns the local path of the downloaded geosite.dat.
+	GeoSitePath() string
+	// MMDBPath returns the local path of the downloaded country.mmdb.
+	MMDBPath() string
+	// ASNPath returns the FIRST local ASN mmdb path (back-compat with the
+	// single-source API). Empty if no ASN URL is configured. Callers that
+	// want fallback across multiple providers should use ASNPaths().
+	ASNPath() string
+	// ASNPaths returns every configured ASN mmdb path in priority order.
+	// Empty slice when no ASN URL is configured.
+	ASNPaths() []string
+}
+
 type CacheFile interface {
 	LifecycleService
 
@@ -191,6 +236,15 @@ type PreMatchOutboundGroup interface {
 	// Implementations must not advance consumptive selection state when selectOutbound returns nil, but may retain
 	// a stable mapping when it is required for the following L4 selection to replay the same outbound.
 	SelectPreMatchOutbound(metadata *InboundContext, selectOutbound func(Outbound) (Outbound, PreMatchAction)) (Outbound, PreMatchAction)
+}
+
+// OutboundGroupHint exposes the dashboard hints from option.GroupCommonOption.
+// Hidden asks Clash-style front-ends to keep the group out of the proxy
+// switcher (routing is unaffected); Icon is an opaque URL / data URI / emoji,
+// empty when not configured.
+type OutboundGroupHint interface {
+	Hidden() bool
+	Icon() string
 }
 
 type URLTestGroup interface {

@@ -11,9 +11,11 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing/common"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/service"
 	"github.com/sagernet/ws"
 	"github.com/sagernet/ws/wsutil"
 
@@ -27,6 +29,10 @@ func connectionRouter(ctx context.Context, network adapter.NetworkManager, traff
 	r.Get("/", getConnections(ctx, trafficManager))
 	r.Delete("/", closeAllConnections(ctx, network, trafficManager))
 	r.Delete("/{id}", closeConnection(trafficManager))
+	// Smart-block: close the connection AND mark its upstream Smart-selected
+	// node as blocked so the group stops selecting it for a cooldown window.
+	// Mirrors mihomo's `DELETE /connections/smart/{id}`.
+	r.Delete("/smart/{id}", smartBlockConnection(ctx, trafficManager))
 	return r
 }
 
@@ -184,5 +190,71 @@ func closeAllConnections(ctx context.Context, network adapter.NetworkManager, tr
 		trafficManager.CloseAllConnections()
 		network.ResetNetwork(ctx)
 		render.NoContent(w, r)
+	}
+}
+
+// smartBlockConnection closes the connection identified by id and, if it was
+// routed through a Smart group, additionally marks the node that carried it
+// as blocked within that group. The node is the one Smart recorded on the
+// connection metadata at dial time; the group's Now() is only a fallback.
+func smartBlockConnection(ctx context.Context, trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := uuid.FromStringOrNil(chi.URLParam(r, "id"))
+		if id == uuid.Nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, ErrBadRequest)
+			return
+		}
+		tracker := trafficManager.Connection(id)
+		if tracker == nil {
+			render.Status(r, http.StatusNotFound)
+			render.JSON(w, r, ErrNotFound)
+			return
+		}
+		target := tracker.Metadata()
+		tracker.Close()
+		if target == nil {
+			render.Status(r, http.StatusNotFound)
+			render.JSON(w, r, ErrNotFound)
+			return
+		}
+		outboundMgr := service.FromContext[adapter.OutboundManager](ctx)
+		if outboundMgr == nil {
+			render.NoContent(w, r)
+			return
+		}
+		var blocked struct {
+			Group string `json:"group,omitempty"`
+			Node  string `json:"node,omitempty"`
+			Error string `json:"error,omitempty"`
+		}
+		// The tracker chain is stored innermost first; walk it outermost
+		// first, then any groups a LoadBalance selected at dial time.
+		chain := common.Reverse(common.Dup(target.Chain))
+		chain = append(chain, target.Metadata.GetRealOutboundChain()...)
+		for _, tag := range chain {
+			outbound, loaded := outboundMgr.Outbound(tag)
+			if !loaded {
+				continue
+			}
+			smartGroup, isSmart := outbound.(*group.Smart)
+			if !isSmart {
+				continue
+			}
+			nodeTag := target.Metadata.SelectedOutbound(tag)
+			if nodeTag == "" {
+				nodeTag = smartGroup.Now()
+			}
+			if nodeTag == "" {
+				break
+			}
+			blocked.Group = tag
+			blocked.Node = nodeTag
+			if err := smartGroup.MarkBlocked(nodeTag, group.DefaultBlockDuration); err != nil {
+				blocked.Error = err.Error()
+			}
+			break
+		}
+		render.JSON(w, r, blocked)
 	}
 }

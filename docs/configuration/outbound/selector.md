@@ -18,6 +18,8 @@
   "include": "",
   "default": "proxy-c",
   "use_all_providers": false,
+  "hidden": false,
+  "icon": "",
   "interrupt_exist_connections": false
 }
 ```
@@ -61,3 +63,11 @@ Whether to use all providers for testing. `false` will be used if empty.
 Interrupt existing connections when the selected outbound has changed.
 
 Only inbound connections are affected by this setting, internal connections will always be interrupted.
+
+#### hidden
+
+Hide this group from the proxy switcher of [Clash API](/configuration/experimental/clash-api/) dashboards. Routing is not affected.
+
+#### icon
+
+Icon of this group shown by [Clash API](/configuration/experimental/clash-api/) dashboards, as an URL, data URI or emoji.

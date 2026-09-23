@@ -757,12 +757,23 @@ func (s *StartedService) SelectOutbound(ctx context.Context, request *SelectOutb
 	if !isLoaded {
 		return nil, status.Error(codes.NotFound, "selector not found: "+request.GroupTag)
 	}
-	selector, isSelector := outboundGroup.(*group.Selector)
-	if !isSelector {
+	switch selectableGroup := outboundGroup.(type) {
+	case *group.Selector:
+		if !selectableGroup.SelectOutbound(request.OutboundTag) {
+			return nil, status.Error(codes.NotFound, "outbound not found in selector: "+request.OutboundTag)
+		}
+	case *group.Smart:
+		// Pins a node; an empty tag clears the manual pin.
+		if !selectableGroup.SelectOutbound(request.OutboundTag) {
+			return nil, status.Error(codes.NotFound, "outbound not found in smart: "+request.OutboundTag)
+		}
+	case *group.URLTest:
+		// Lasts until the next user-triggered URL test; an empty tag clears it.
+		if !selectableGroup.SelectOutbound(request.OutboundTag) {
+			return nil, status.Error(codes.NotFound, "outbound not found in urltest: "+request.OutboundTag)
+		}
+	default:
 		return nil, status.Error(codes.InvalidArgument, "outbound is not a selector: "+request.GroupTag)
-	}
-	if !selector.SelectOutbound(request.OutboundTag) {
-		return nil, status.Error(codes.NotFound, "outbound not found in selector: "+request.OutboundTag)
 	}
 	return &emptypb.Empty{}, nil
 }

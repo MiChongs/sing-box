@@ -27,6 +27,8 @@ var (
 	bucketRuleSet          = []byte("rule_set")
 	bucketExternalUI       = []byte("external_ui")
 	bucketOutboundProvider = []byte("outbound_provider")
+	// Owned by common/smart (Smart outbound group statistics).
+	bucketSmartStats = []byte("smart_stats")
 
 	bucketNameList = []string{
 		string(bucketSelected),
@@ -37,6 +39,7 @@ var (
 		string(bucketOutboundProvider),
 		string(bucketRDRC),
 		string(bucketDNSCache),
+		string(bucketSmartStats),
 	}
 
 	cacheIDDefault = []byte("default")
@@ -130,6 +133,11 @@ func (c *CacheFile) Name() string {
 
 func (c *CacheFile) Dependencies() []string {
 	return nil
+}
+
+// SmartDB exposes the underlying database to the Smart outbound group store.
+func (c *CacheFile) SmartDB() *bbolt.DB {
+	return c.database()
 }
 
 func (c *CacheFile) CacheID() string {

@@ -19,9 +19,12 @@
   "include": "",
   "url": "",
   "interval": "",
+  "expected_status": "",
   "idle_timeout": "",
   "ttl": "10m",
-  "use_all_providers": false
+  "use_all_providers": false,
+  "hidden": false,
+  "icon": ""
 }
 ```
 
@@ -72,6 +75,13 @@ The test interval. `3m` will be used if empty.
 
 The idle timeout. `30m` will be used if empty.
 
+#### expected_status
+
+HTTP status codes of the test URL treated as success, compatible with `expected-status` of mihomo:
+`204`, a range `200-299`, several values or ranges joined by `/` such as `200/204` or `200-299/301-302`, or `*` for any status.
+
+If empty, a `generate_204` URL must answer `204`, and any other URL must answer below `400`.
+
 #### ttl
 
 The time to live used for `sticky-sessions` strategy  timeout. `10m` will be used if empty.
@@ -79,3 +89,11 @@ The time to live used for `sticky-sessions` strategy  timeout. `10m` will be use
 #### use_all_providers
 
 Whether to use all providers for testing. `false` will be used if empty.
+
+#### hidden
+
+Hide this group from the proxy switcher of [Clash API](/configuration/experimental/clash-api/) dashboards. Routing is not affected.
+
+#### icon
+
+Icon of this group shown by [Clash API](/configuration/experimental/clash-api/) dashboards, as an URL, data URI or emoji.

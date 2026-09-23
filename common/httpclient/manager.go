@@ -51,6 +51,15 @@ func NewManager(ctx context.Context, logger log.ContextLogger, clients []option.
 	}
 }
 
+func (m *Manager) LookupDetour(tag string) string {
+	m.access.Lock()
+	defer m.access.Unlock()
+	if client, ok := m.defines[tag]; ok {
+		return client.Detour
+	}
+	return ""
+}
+
 func (m *Manager) Initialize(defaultTransportFallback func() (*ManagedTransport, error)) {
 	m.defaultTransportFallback = defaultTransportFallback
 }

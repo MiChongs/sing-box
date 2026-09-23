@@ -18,6 +18,8 @@
   "include": "",
   "default": "proxy-c",
   "use_all_providers": false,
+  "hidden": false,
+  "icon": "",
   "interrupt_exist_connections": false
 }
 ```
@@ -57,3 +59,11 @@
 当选定的出站发生更改时，中断现有连接。
 
 仅入站连接受此设置影响，内部连接将始终被中断。
+
+#### hidden
+
+在 [Clash API](/zh/configuration/experimental/clash-api/) 面板的代理切换列表中隐藏此组，不影响路由。
+
+#### icon
+
+[Clash API](/zh/configuration/experimental/clash-api/) 面板中显示的组图标，可以是 URL、data URI 或 emoji。
