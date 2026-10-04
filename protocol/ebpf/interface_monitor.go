@@ -541,7 +541,10 @@ func runTCInterfaceUpdateLoopWithHealth(
 			}
 			continue
 		}
-		delay := max(states[earliest].deadline.Sub(now), 0)
+		delay := states[earliest].deadline.Sub(now)
+		if delay < 0 {
+			delay = 0
+		}
 		retryTimer.Arm(delay)
 		retryChannel = retryTimer.Expired()
 		if onScheduleChange != nil {
@@ -644,7 +647,7 @@ func (i *Inbound) updateTCInterfaces(ctx context.Context) (outcome tcUpdateOutco
 		outcome.general = tcSharedRewriteRecoverable
 		return
 	}
-	if localTCEnabled && localInterface == "" {
+	if localTCEnabled && localInterface == "" && !i.localTCAwaitingInterface.Load() {
 		i.interfaceWarnings.defaultInterface.warn(i.logger, "default interface unavailable; retaining previous local TC attachment")
 	}
 	sharedInterfaces := activeSharedInterfaces(i.sharedOptions.Interface, defaultInterface)
@@ -710,6 +713,9 @@ func (i *Inbound) updateTCInterfaces(ctx context.Context) (outcome tcUpdateOutco
 		i.interfaceWarnings.reconcile.warn(i.logger, "refresh TC eBPF interfaces: ", err)
 		outcome.general = tcSharedRewriteRecoverable
 		return
+	}
+	if localInterface != "" && i.localTCAwaitingInterface.CompareAndSwap(true, false) {
+		i.logger.Info("local TC eBPF interception started on default interface ", localInterface)
 	}
 	i.warnIfLocalFakeIPICMPIPv6Unroutable(localInterface)
 	if err = i.updateCgroupHostAddresses(hostAddresses); err != nil {

@@ -10,11 +10,10 @@ import (
 	"sync"
 	"time"
 
+	ECommon "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
-
-	ECommon "github.com/CHIZI-0618/sing-ebpf"
 )
 
 const (

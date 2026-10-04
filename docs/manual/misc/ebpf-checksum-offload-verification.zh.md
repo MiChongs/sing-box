@@ -79,7 +79,7 @@ ethtool -i eth0
 先以普通用户构建，再以 root 运行产物：
 
 ```sh
-go build -o /tmp/sing-box-checksumoffload github.com/CHIZI-0618/sing-ebpf/testing/checksumoffload
+go build -o /tmp/sing-box-checksumoffload github.com/MiChongs/sing-ebpf/testing/checksumoffload
 
 sudo LOCAL_IFACE=eth0 \
     REMOTE_HOST=192.0.2.10 \

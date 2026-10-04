@@ -848,6 +848,7 @@ message EBPFMapDiagnostics {
   uint32 entries = 8;
   bool supported = 9;
   string error = 10;
+  string pressure = 11;
 }
 
 message EBPFInboundDiagnostics {
@@ -894,6 +895,13 @@ message EBPFInboundDiagnostics {
   optional int64 tcLastHealthCheckAt = 47;
   optional int64 tcLastReconcileAt = 48;
   uint64 tcNetworkGeneration = 49;
+  string localUdpState = 50;
+  string localUdpRecoveryMode = 51;
+  string localUdpMapPressure = 52;
+  uint32 localUdpNetworkGeneration = 53;
+  EBPFPolicyEpochDiagnostics policyEpoch = 54;
+  string localSelfBypassMode = 55;
+  string localSelfBypassCleanupMode = 56;
 }
 
 message EBPFAttachmentDiagnostics {
@@ -956,4 +964,12 @@ message EBPFUDPNATDiagnostics {
   uint64 socketReleaseMatched = 6;
   uint64 pendingReleaseCapacityRejected = 7;
   uint64 releaseNotificationDrops = 8;
+}
+
+message EBPFPolicyEpochDiagnostics {
+  uint64 localConfirmed = 1;
+  uint64 localExpected = 2;
+  uint64 sharedConfirmed = 3;
+  uint64 sharedExpected = 4;
+  bool converged = 5;
 }

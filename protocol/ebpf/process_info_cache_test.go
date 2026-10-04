@@ -73,7 +73,7 @@ func TestProcessInfoCacheIsBounded(t *testing.T) {
 	cache := newProcessInfoCache()
 	now := time.Unix(100, 0)
 	info := &adapter.ConnectionOwner{ProcessPaths: []string{"/bin/client"}}
-	for processID := range uint32(processInfoCacheCapacity + 32) {
+	for processID := uint32(0); processID < processInfoCacheCapacity+32; processID++ {
 		cache.store(processInfoCacheKey{processID: processID}, info, nil, now)
 	}
 	cache.access.Lock()

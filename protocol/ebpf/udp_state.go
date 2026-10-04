@@ -11,10 +11,10 @@ import (
 	"sync/atomic"
 	"time"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing/common/bufio"
 	N "github.com/sagernet/sing/common/network"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
 )
@@ -376,6 +376,7 @@ type udpReplySocketShard struct {
 type udpReplySocketEntry struct {
 	conn     *net.UDPConn
 	writer   N.PacketBatchWriter
+	cleanup  func()
 	lastUsed atomic.Int64 // UnixNano, updated on every get()
 	inUse    atomic.Int32 // active senders; eviction skips entries > 0
 }
@@ -409,7 +410,7 @@ func (p *udpReplySocketPool) snapshot() udpReplySocketPoolSnapshot {
 
 func (p *udpReplySocketPool) get(
 	source netip.AddrPort,
-	create func(netip.AddrPort) (*net.UDPConn, error),
+	create func(netip.AddrPort) (*net.UDPConn, func(), error),
 ) (*udpReplySocketEntry, func(), error) {
 	if p.closed.Load() {
 		return nil, nil, net.ErrClosed
@@ -448,17 +449,21 @@ func (p *udpReplySocketPool) get(
 		p.stats.capacityRejected.Add(1)
 		return nil, nil, errUDPReplySocketCapacity
 	}
-	socket, err := create(source)
+	socket, cleanup, err := create(source)
 	if err != nil {
 		return nil, nil, err
 	}
 	entry := &udpReplySocketEntry{
-		conn:   socket,
-		writer: bufio.NewPacketBatchWriter(bufio.NewPacketConn(socket)),
+		conn:    socket,
+		writer:  bufio.NewPacketBatchWriter(bufio.NewPacketConn(socket)),
+		cleanup: cleanup,
 	}
 	entry.lastUsed.Store(time.Now().UnixNano())
 	entry.inUse.Store(1)
 	if p.closed.Load() {
+		if cleanup != nil {
+			cleanup()
+		}
 		_ = socket.Close()
 		return nil, nil, net.ErrClosed
 	}
@@ -498,7 +503,7 @@ func (p *udpReplySocketPool) addCount(delta int64) {
 // shard lock and validates the selected entry before closing it, so concurrent
 // cache hits cannot lose a socket that became active during the scan.
 func (p *udpReplySocketPool) evictOldestIdle() bool {
-	for range 2 {
+	for attempt := 0; attempt < 2; attempt++ {
 		selectedShard := -1
 		var selectedSource netip.AddrPort
 		var selectedEntry *udpReplySocketEntry
@@ -525,6 +530,9 @@ func (p *udpReplySocketPool) evictOldestIdle() bool {
 		if shard.sockets[selectedSource] != selectedEntry || selectedEntry.inUse.Load() != 0 || selectedEntry.lastUsed.Load() != selectedLastUsed {
 			shard.access.Unlock()
 			continue
+		}
+		if selectedEntry.cleanup != nil {
+			selectedEntry.cleanup()
 		}
 		_ = selectedEntry.conn.Close()
 		delete(shard.sockets, selectedSource)
@@ -620,7 +628,10 @@ func (p *udpReplySocketPool) runSweeper(ctx context.Context, wake <-chan struct{
 			default:
 			}
 		}
-		delay := max(time.Until(next), 0)
+		delay := time.Until(next)
+		if delay < 0 {
+			delay = 0
+		}
 		timer.Reset(delay)
 		timerChannel = timer.C
 	}
@@ -668,6 +679,9 @@ func (p *udpReplySocketPool) sweepIdleAt(now time.Time, idleTimeout time.Duratio
 				}
 				continue
 			}
+			if entry.cleanup != nil {
+				entry.cleanup()
+			}
 			_ = entry.conn.Close()
 			delete(shard.sockets, source)
 			p.stats.count.Add(-1)
@@ -702,6 +716,9 @@ func (p *udpReplySocketPool) closeSockets() error {
 		shard := &p.shards[index]
 		shard.access.Lock()
 		for source, entry := range shard.sockets {
+			if entry.cleanup != nil {
+				entry.cleanup()
+			}
 			closeErr = errors.Join(closeErr, entry.conn.Close())
 			delete(shard.sockets, source)
 			p.stats.count.Add(-1)

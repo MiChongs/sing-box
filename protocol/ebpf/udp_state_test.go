@@ -8,7 +8,7 @@ import (
 	"net/netip"
 	"testing"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 )
 
 func TestUDPDirectBinding(t *testing.T) {
@@ -109,9 +109,10 @@ func TestUDPReplySocketLifecycle(t *testing.T) {
 	var pool udpReplySocketPool
 	destination := netip.MustParseAddrPort("1.1.1.1:53")
 	created := 0
-	create := func(netip.AddrPort) (*net.UDPConn, error) {
+	create := func(netip.AddrPort) (*net.UDPConn, func(), error) {
 		created++
-		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		return socket, nil, err
 	}
 	first, release1, err := pool.get(destination, create)
 	if err != nil {
@@ -141,9 +142,10 @@ func TestUDPReplySocketPoolSharesAcrossClients(t *testing.T) {
 	var pool udpReplySocketPool
 	destination := netip.MustParseAddrPort("1.1.1.1:53")
 	created := 0
-	create := func(netip.AddrPort) (*net.UDPConn, error) {
+	create := func(netip.AddrPort) (*net.UDPConn, func(), error) {
 		created++
-		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		return socket, nil, err
 	}
 	first, release1, err := pool.get(destination, create)
 	if err != nil {
@@ -165,9 +167,10 @@ func TestUDPReplySocketPoolResetsForNetworkChange(t *testing.T) {
 	var pool udpReplySocketPool
 	destination := netip.MustParseAddrPort("1.1.1.1:53")
 	created := 0
-	create := func(netip.AddrPort) (*net.UDPConn, error) {
+	create := func(netip.AddrPort) (*net.UDPConn, func(), error) {
 		created++
-		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		socket, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+		return socket, nil, err
 	}
 	first, release1, err := pool.get(destination, create)
 	if err != nil {
@@ -225,7 +228,7 @@ func TestUDPDirectReplyBindingChecksGeneration(t *testing.T) {
 func TestUDPReplySocketPoolShardsSpreadAcrossDestinationPort(t *testing.T) {
 	var pool udpReplySocketPool
 	counts := make(map[int]int)
-	for i := range 256 {
+	for i := 0; i < 256; i++ {
 		destination := netip.AddrPortFrom(
 			netip.AddrFrom4([4]byte{203, 0, byte(i >> 8), byte(i)}),
 			443,
@@ -251,7 +254,7 @@ func TestUDPReplySocketPoolShardsSpreadAcrossDestinationPort(t *testing.T) {
 func TestUDPClientTableShardsSpreadAcrossClientAddress(t *testing.T) {
 	var table udpClientTable
 	counts := make(map[*udpClientShard]int)
-	for i := range 256 {
+	for i := 0; i < 256; i++ {
 		client := netip.AddrPortFrom(
 			netip.AddrFrom4([4]byte{192, 168, byte(i >> 8), byte(i)}),
 			51413,

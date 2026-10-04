@@ -3,17 +3,126 @@
 package dialer
 
 import (
+	"net"
 	"runtime"
+	"sync"
 	"syscall"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
-
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
+
+// bindEBPFSelfBypassConnLifecycle pairs userspace socket registration with the
+// returned connection's Close method. Kernel sock_release cleanup remains the
+// fast path when available; this closes the gap on kernels where only the
+// userspace registration fallback can be used.
+func bindEBPFSelfBypassConnLifecycle(networkManager adapter.NetworkManager, conn net.Conn) net.Conn {
+	provider, loaded := networkManager.(interface {
+		EBPFSelfBypass() *commonEBPF.SelfBypass
+	})
+	if !loaded || provider.EBPFSelfBypass() == nil {
+		return conn
+	}
+	tracker := provider.EBPFSelfBypass()
+	if tracker.CleanupMode() != "lru_fallback" {
+		return conn
+	}
+	if lazyConn, loaded := conn.(*slowOpenConn); loaded {
+		lazyConn.setCloseHandler(func(tcpConn *net.TCPConn) {
+			rawConn, err := tcpConn.SyscallConn()
+			if err == nil {
+				_ = tracker.UnregisterSocket(rawConn)
+			}
+		})
+		return conn
+	}
+	syscallConn, loaded := conn.(syscall.Conn)
+	if !loaded {
+		return conn
+	}
+	rawConn, err := syscallConn.SyscallConn()
+	if err != nil {
+		return conn
+	}
+	return &selfBypassConn{Conn: conn, cleanup: EBPFSelfBypassCleanup(networkManager, rawConn), rawConn: rawConn}
+}
+
+func bindEBPFSelfBypassPacketConnLifecycle(networkManager adapter.NetworkManager, conn net.PacketConn) net.PacketConn {
+	provider, loaded := networkManager.(interface {
+		EBPFSelfBypass() *commonEBPF.SelfBypass
+	})
+	if !loaded || provider.EBPFSelfBypass() == nil {
+		return conn
+	}
+	tracker := provider.EBPFSelfBypass()
+	if tracker.CleanupMode() != "lru_fallback" {
+		return conn
+	}
+	syscallConn, loaded := conn.(syscall.Conn)
+	if !loaded {
+		return conn
+	}
+	rawConn, err := syscallConn.SyscallConn()
+	if err != nil {
+		return conn
+	}
+	return &selfBypassPacketConn{PacketConn: conn, cleanup: EBPFSelfBypassCleanup(networkManager, rawConn), rawConn: rawConn}
+}
+
+type selfBypassConn struct {
+	net.Conn
+	cleanup func()
+	rawConn syscall.RawConn
+}
+
+func (c *selfBypassConn) Close() error {
+	if c.cleanup != nil {
+		c.cleanup()
+	}
+	return c.Conn.Close()
+}
+
+func (c *selfBypassConn) SyscallConn() (syscall.RawConn, error) { return c.rawConn, nil }
+
+type selfBypassPacketConn struct {
+	net.PacketConn
+	cleanup func()
+	rawConn syscall.RawConn
+}
+
+func (c *selfBypassPacketConn) Close() error {
+	if c.cleanup != nil {
+		c.cleanup()
+	}
+	return c.PacketConn.Close()
+}
+
+func (c *selfBypassPacketConn) SyscallConn() (syscall.RawConn, error) { return c.rawConn, nil }
+
+// EBPFSelfBypassCleanup returns an idempotent cleanup callback for a socket
+// registered by AppendEBPFSelfBypass. External socket owners should invoke it
+// immediately before closing the socket when the runtime has no kernel release
+// hook, such as Tailscale's custom packet listener path.
+func EBPFSelfBypassCleanup(networkManager adapter.NetworkManager, rawConn syscall.RawConn) func() {
+	provider, loaded := networkManager.(interface {
+		EBPFSelfBypass() *commonEBPF.SelfBypass
+	})
+	if !loaded {
+		return nil
+	}
+	tracker := provider.EBPFSelfBypass()
+	if tracker == nil || tracker.CleanupMode() != "lru_fallback" {
+		return nil
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() { _ = tracker.UnregisterSocket(rawConn) })
+	}
+}
 
 func PrepareEBPFSelfBypass(networkManager adapter.NetworkManager, inbounds []option.Inbound) error {
 	localInstances := 0

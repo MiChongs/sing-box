@@ -22,7 +22,7 @@ require (
 	github.com/gofrs/uuid/v5 v5.5.1
 	github.com/opencontainers/image-spec v1.1.1
 	github.com/sagernet/quic-go v0.61.0-sing-box-mod.7
-	github.com/sagernet/sing v0.9.6-0.20260927091435-fcc22e2b9f96
+	github.com/sagernet/sing v0.9.7-0.20260929150544-6f21f2425a95
 	github.com/sagernet/sing-openvpn v0.0.0-20260925112415-fe3a4fdc2e64
 	github.com/sagernet/sing-quic v0.7.1-0.20260924092235-4f371c86a365
 	github.com/sagernet/sing-shadowsocks v0.2.8
@@ -40,7 +40,7 @@ require (
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1 // indirect
-	github.com/CHIZI-0618/sing-ebpf v0.1.0-alpha.10.0.20260925091429-c3e95b329d35 // indirect
+	github.com/MiChongs/sing-ebpf v0.1.0-alpha.13 // indirect
 	github.com/Microsoft/go-winio v0.6.1 // indirect
 	github.com/RussellLuo/timingwheel v0.0.0-20220218152713-54845bda3108 // indirect
 	github.com/RyuaNerin/go-krypto v1.3.0 // indirect

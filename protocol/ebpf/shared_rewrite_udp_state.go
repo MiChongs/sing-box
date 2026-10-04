@@ -8,7 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	ECommon "github.com/CHIZI-0618/sing-ebpf"
+	ECommon "github.com/MiChongs/sing-ebpf"
 )
 
 type sharedUDPClientTable struct {
@@ -91,6 +91,11 @@ func (t *sharedUDPClientTable) load(key udpSessionKey) (*sharedUDPClientState, b
 	return clientState, loaded
 }
 
+func (t *sharedUDPClientTable) current(key udpSessionKey, expectedState *sharedUDPClientState) bool {
+	clientState, loaded := t.load(key)
+	return loaded && clientState == expectedState
+}
+
 func (t *sharedUDPClientTable) loadOrCreate(key udpSessionKey) *sharedUDPClientState {
 	if clientState, loaded := t.load(key); loaded {
 		return clientState
@@ -118,6 +123,11 @@ func (s *sharedUDPClientShard) loadOrCreateLocked(key udpSessionKey) *sharedUDPC
 
 func (t *sharedUDPClientTable) clientShard(key udpSessionKey) *sharedUDPClientShard {
 	return &t.clientShards[shardIndexForAddrPort(key.Source, sharedUDPClientShardCount)]
+}
+
+func (t *sharedUDPClientTable) cachedOriginal(client netip.AddrPort, redirectAddress netip.Addr) (sharedUDPOriginalDestination, bool) {
+	_, original, _, loaded := t.cachedPacketState(client, redirectAddress)
+	return original, loaded
 }
 
 func (t *sharedUDPClientTable) cachedPacketState(
@@ -188,6 +198,29 @@ func (t *sharedUDPClientTable) setSharedBinding(
 			sharedFlow: flow,
 		},
 	)
+}
+
+func (t *sharedUDPClientTable) setReplyBinding(
+	key udpSessionKey,
+	expectedState *sharedUDPClientState,
+	destination netip.AddrPort,
+	redirectAddress netip.Addr,
+) ([]netip.Addr, bool) {
+	releases, installed := t.setExistingBindingState(
+		key,
+		expectedState,
+		redirectAddress,
+		sharedUDPRedirectReference{client: key.Source, address: redirectAddress},
+		sharedUDPOriginalDestination{
+			original:   ECommon.OriginalDestination{Destination: destination},
+			replyAlias: true,
+		},
+	)
+	addresses := make([]netip.Addr, 0, len(releases))
+	for _, release := range releases {
+		addresses = append(addresses, release.reference.address)
+	}
+	return addresses, installed
 }
 
 func (t *sharedUDPClientTable) setSharedReplyBinding(
@@ -333,6 +366,15 @@ func (s *sharedUDPClientState) deleteUnusedOriginalLocked(address netip.Addr) bo
 	return true
 }
 
+func (t *sharedUDPClientTable) delete(key udpSessionKey, expectedState *sharedUDPClientState) []netip.Addr {
+	releases := t.deleteClient(key, expectedState)
+	addresses := make([]netip.Addr, 0, len(releases))
+	for _, release := range releases {
+		addresses = append(addresses, release.reference.address)
+	}
+	return addresses
+}
+
 func (t *sharedUDPClientTable) deleteShared(key udpSessionKey, expectedState *sharedUDPClientState) []sharedUDPRedirectRelease {
 	return t.deleteClient(key, expectedState)
 }
@@ -423,4 +465,29 @@ func (s *sharedUDPClientState) sourceMACAddress() net.HardwareAddr {
 	s.access.RLock()
 	defer s.access.RUnlock()
 	return append(net.HardwareAddr(nil), s.sourceMAC...)
+}
+
+func (s *sharedUDPClientState) setConnected(connected bool, destination netip.AddrPort) {
+	s.access.Lock()
+	s.connected = connected
+	if connected {
+		s.connectedDestination = destination
+		if binding, loaded := s.bindings[destination]; loaded {
+			connectedBinding := binding
+			s.connectedBinding.Store(&connectedBinding)
+		} else {
+			s.connectedBinding.Store(nil)
+		}
+	} else {
+		s.connectedDestination = netip.AddrPort{}
+		s.connectedBinding.Store(nil)
+	}
+	s.access.Unlock()
+}
+
+func (s *sharedUDPClientState) isConnected() bool {
+	s.access.RLock()
+	connected := s.connected
+	s.access.RUnlock()
+	return connected
 }

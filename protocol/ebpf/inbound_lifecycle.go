@@ -10,10 +10,9 @@ import (
 	"strconv"
 	"strings"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	E "github.com/sagernet/sing/common/exceptions"
-
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 func (i *Inbound) Start(stage adapter.StartStage) error {
@@ -68,8 +67,9 @@ func (i *Inbound) startInbound() error {
 	sharedRewriteEnabled := i.sharedRewriteEnabled()
 	if localTCEnabled {
 		localInterface = defaultInterface
+		i.localTCAwaitingInterface.Store(localInterface == "")
 		if localInterface == "" {
-			i.logger.Warn("default interface unavailable; local TC eBPF interception is paused")
+			i.logger.Info("default interface not detected yet; local TC eBPF interception will start once it is available")
 		}
 	}
 	sharedInterfaces := activeSharedInterfaces(i.sharedOptions.Interface, defaultInterface)
@@ -175,6 +175,7 @@ func (i *Inbound) startInbound() error {
 		if err = cgroupBackend.Attach(); err != nil {
 			return err
 		}
+		i.startCgroupRecoveryScheduler(cgroupBackend)
 		i.startCgroupUDPReleaseReader(cgroupBackend)
 	}
 	if backend != nil {
@@ -369,18 +370,21 @@ func (i *Inbound) startCgroupUDPReleaseReader(backend *commonEBPF.CgroupBackend)
 	if backend == nil || backend.UDPUserspaceCleanupMode() != "ringbuf" {
 		return
 	}
-	i.cgroupReleaseWait.Go(func() {
+	i.cgroupReleaseWait.Add(1)
+	go func() {
+		defer i.cgroupReleaseWait.Done()
 		for {
-			socketCookie, err := backend.ReadUDPRelease()
+			event, err := backend.ReadUDPRelease()
 			if err != nil {
 				if !errors.Is(err, os.ErrClosed) {
 					i.logger.Warn("read cgroup eBPF UDP socket-release event: ", err)
 				}
 				return
 			}
-			i.udpNat.ReleaseSocket(socketCookie)
+			i.udpNat.ReleaseSocket(event.SocketCookie)
+			i.enqueueCgroupRecoveryEvent(backend, event)
 		}
-	})
+	}()
 }
 
 func (i *Inbound) selfBypassMode() string {
@@ -513,6 +517,7 @@ func (i *Inbound) closeResources() error {
 	cgroupBackend := i.takeCgroupBackend()
 	cgroupErr := error(nil)
 	if cgroupBackend != nil {
+		i.stopCgroupRecoveryScheduler()
 		cgroupErr = cgroupBackend.Close()
 		i.cgroupReleaseWait.Wait()
 		// Close keeps the runtime when a program could not be detached, because a

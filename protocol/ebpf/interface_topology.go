@@ -6,9 +6,8 @@ import (
 	"net/netip"
 	"slices"
 
+	kernelRuntime "github.com/MiChongs/sing-ebpf/runtime"
 	"github.com/sagernet/sing/common/control"
-
-	kernelRuntime "github.com/CHIZI-0618/sing-ebpf/runtime"
 )
 
 func (i *Inbound) repairTCInfrastructure() (bool, error) {

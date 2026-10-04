@@ -5,6 +5,7 @@ package ebpf
 import (
 	"testing"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -90,6 +91,47 @@ func TestResolveAndroidUIDPolicyRequiresPackageManager(t *testing.T) {
 	}
 	if err := inbound.resolveAndroidUIDPolicy(); err == nil {
 		t.Fatal("expected a missing package manager to be rejected")
+	}
+}
+
+// include_uid_range over every app UID plus exclude_package is the usual way
+// to proxy all apps but a few. The excluded package must reach the data plane
+// as a hole in the intercepted range, not as a separate rule that loses to it.
+func TestExcludePackageInsideIncludedUIDRange(t *testing.T) {
+	inbound := &Inbound{
+		logger: log.NewNOPFactory().Logger(),
+		networkManager: &testNetworkManager{packageManager: &testPackageManager{
+			idByPackage:  map[string]uint32{"com.example.exclude": 10003},
+			packagesByID: map[uint32][]string{10003: {"com.example.exclude"}},
+		}},
+		androidUIDOptions: &androidUIDOptions{excludePackage: []string{"com.example.exclude"}},
+		localPolicy: localUIDPolicy{
+			IncludeUIDConfigured: true,
+			IncludeUID:           []uidRange{{Start: 10000, End: 19999}},
+		},
+	}
+	if err := inbound.resolveAndroidUIDPolicy(); err != nil {
+		t.Fatal(err)
+	}
+	policy, err := inbound.buildActionPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	intercepted := func(uid uint32) bool {
+		for _, decision := range policy.Local.UID {
+			if uid >= decision.Start && uid <= decision.End {
+				return decision.Action == commonEBPF.DecisionIntercept
+			}
+		}
+		return policy.Local.Default == commonEBPF.DecisionIntercept
+	}
+	if intercepted(10003) {
+		t.Fatalf("excluded package UID 10003 is intercepted: %+v", policy.Local.UID)
+	}
+	for _, uid := range []uint32{10000, 10002, 10004, 19999} {
+		if !intercepted(uid) {
+			t.Fatalf("included UID %d is not intercepted: %+v", uid, policy.Local.UID)
+		}
 	}
 }
 

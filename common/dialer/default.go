@@ -437,6 +437,7 @@ func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr, 
 			conn = bufio.NewUDPConnWithoutGSO(udpConn)
 		}
 	}
+	conn = bindEBPFSelfBypassConnLifecycle(d.networkManager, conn)
 	if d.connectionManager != nil {
 		conn = d.connectionManager.TrackConn(conn)
 	}
@@ -472,6 +473,7 @@ func (d *DefaultDialer) trackPacketConn(ctx context.Context, destination M.Socks
 			conn = bufio.NewUDPConnWithoutGSO(udpConn)
 		}
 	}
+	conn = bindEBPFSelfBypassPacketConnLifecycle(d.networkManager, conn)
 	if d.connectionManager != nil {
 		conn = d.connectionManager.TrackPacketConn(conn)
 	}

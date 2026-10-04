@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"os"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/log"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"github.com/spf13/cobra"
 )
 

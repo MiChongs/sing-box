@@ -6,9 +6,8 @@ import (
 	"testing"
 	"time"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/option"
-
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 func TestUpdateSharedRewriteFlowPressure(t *testing.T) {
@@ -96,7 +95,7 @@ func TestSharedRewriteDiagnosticsDoesNotRaceWithClose(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		for range 2000 {
+		for round := 0; round < 2000; round++ {
 			inbound.Diagnostics()
 		}
 	}()

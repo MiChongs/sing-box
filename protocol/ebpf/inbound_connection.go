@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
@@ -18,7 +19,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"golang.org/x/sys/unix"
 )
 

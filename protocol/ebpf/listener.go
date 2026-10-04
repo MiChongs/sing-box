@@ -9,6 +9,7 @@ import (
 	"sync"
 	"syscall"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/udpio"
@@ -20,8 +21,6 @@ import (
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 type internalListenerHandler interface {
@@ -46,6 +45,9 @@ func (i *Inbound) newInternalListener(
 		Listen: option.ListenOptions{
 			Listen:     common.Ptr(badoption.Addr(listenAddress)),
 			ListenPort: port,
+			// Keep the same explicit opt-in semantics as other inbound
+			// listeners; the value comes from ebpf.udp_fragment.
+			UDPFragmentDefault: i.udpFragment,
 		},
 		ConnectionHandler:   handler,
 		OOBPacketHandler:    handler,

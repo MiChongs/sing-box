@@ -3,16 +3,14 @@
 package ebpf
 
 import (
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
-	kernelRuntime "github.com/CHIZI-0618/sing-ebpf/runtime"
+	commonEBPF "github.com/MiChongs/sing-ebpf"
+	kernelRuntime "github.com/MiChongs/sing-ebpf/runtime"
 )
 
 // Consumer-side aliases keep the adapter independent of the implementation
 // package's concrete resource types.
-type (
-	tcRuntime       = kernelRuntime.TCRuntime
-	tcRuntimeConfig = kernelRuntime.TCRuntimeConfig
-)
+type tcRuntime = kernelRuntime.TCRuntime
+type tcRuntimeConfig = kernelRuntime.TCRuntimeConfig
 
 func newTCRuntime(backend *commonEBPF.TCBackend, config tcRuntimeConfig) (tcRuntime, error) {
 	config.Backend = backend

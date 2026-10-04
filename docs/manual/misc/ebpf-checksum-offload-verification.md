@@ -84,7 +84,7 @@ roles are recorded as `NOT_TESTED` rather than silently omitted.
 Build as an ordinary user, then run the resulting tool as root:
 
 ```sh
-go build -o /tmp/sing-box-checksumoffload github.com/CHIZI-0618/sing-ebpf/testing/checksumoffload
+go build -o /tmp/sing-box-checksumoffload github.com/MiChongs/sing-ebpf/testing/checksumoffload
 
 sudo LOCAL_IFACE=eth0 \
     REMOTE_HOST=192.0.2.10 \

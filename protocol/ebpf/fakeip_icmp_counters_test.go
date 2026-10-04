@@ -17,11 +17,9 @@ func (s testFakeIPICMPCounterSource) ICMPEchoReplyEnabled() bool { return s.enab
 func (s testFakeIPICMPCounterSource) ICMPEchoReplyCount() (uint64, error) {
 	return s.replies, nil
 }
-
 func (s testFakeIPICMPCounterSource) ICMPEchoPassThroughCount() (uint64, error) {
 	return s.passThrough, nil
 }
-
 func (s testFakeIPICMPCounterSource) ICMPEchoRewriteFailureCount() (uint64, error) {
 	return s.rewriteFailures, nil
 }

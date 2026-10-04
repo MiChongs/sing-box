@@ -13,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -21,7 +22,6 @@ import (
 	"github.com/sagernet/sing/common/control"
 	"github.com/sagernet/sing/common/json/badoption"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -99,13 +99,15 @@ func TestInternalListenerSetSynchronizesCloseAndUDPWrite(t *testing.T) {
 	source := netip.MustParseAddr("127.0.0.1")
 	var writers sync.WaitGroup
 	for range 8 {
-		writers.Go(func() {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
 			for range 256 {
 				_ = listeners.selectedPort()
 				_ = listeners.String()
 				_ = listeners.writeUDP([]byte{0}, nil, client, source)
 			}
-		})
+		}()
 	}
 	if err := listeners.close(); err != nil {
 		t.Fatal(err)

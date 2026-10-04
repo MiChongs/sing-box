@@ -8,8 +8,8 @@ import (
 	"net/netip"
 
 	"github.com/sagernet/netlink"
-	E "github.com/sagernet/sing/common/exceptions"
 
+	E "github.com/sagernet/sing/common/exceptions"
 	"golang.org/x/sys/unix"
 )
 

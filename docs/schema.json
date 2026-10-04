@@ -853,6 +853,9 @@
         },
         "fallback_delay": {
           "$ref": "#/$defs/Duration"
+        },
+        "resolve_on_detour": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -2116,6 +2119,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "prefer_go": {
               "type": "boolean"
             },
@@ -2304,6 +2310,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -2488,6 +2497,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -2628,6 +2640,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "prefer_go": {
               "type": "boolean"
             },
@@ -2763,6 +2778,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "prefer_go": {
               "type": "boolean"
@@ -2961,6 +2979,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -3137,6 +3158,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -3264,6 +3288,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -3395,6 +3422,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -3557,6 +3587,9 @@
         },
         "fallback_delay": {
           "$ref": "#/$defs/Duration"
+        },
+        "resolve_on_detour": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -3669,6 +3702,19 @@
               "items": {
                 "type": "string",
                 "x-tag-reference": "rule_set"
+              }
+            }
+          ]
+        },
+        "bypass_exclude": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IPPrefix"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/IPPrefix"
               }
             }
           ]
@@ -3856,6 +3902,19 @@
               "items": {
                 "type": "string",
                 "x-tag-reference": "rule_set"
+              }
+            }
+          ]
+        },
+        "bypass_exclude": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IPPrefix"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/IPPrefix"
               }
             }
           ]
@@ -4060,6 +4119,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -4532,6 +4594,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "inner_domain_resolver": {
               "$ref": "#/$defs/DomainResolver"
             },
@@ -4823,6 +4888,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -5545,6 +5613,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "inner_domain_resolver": {
               "$ref": "#/$defs/DomainResolver"
             },
@@ -5556,6 +5627,9 @@
             },
             "control_url": {
               "type": "string"
+            },
+            "control_http_client": {
+              "$ref": "#/$defs/HTTPClientReference"
             },
             "ephemeral": {
               "type": "boolean"
@@ -5853,6 +5927,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -5882,6 +5959,64 @@
         },
         "urltest_unified_delay": {
           "type": "boolean"
+        },
+        "smart": {
+          "$ref": "#/$defs/SmartOptions"
+        },
+        "geox": {
+          "$ref": "#/$defs/GeoXOptions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GeoXOptions": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "url": {
+          "$ref": "#/$defs/GeoXURLOptions"
+        },
+        "auto_update": {
+          "type": "boolean"
+        },
+        "update_interval": {
+          "$ref": "#/$defs/Duration"
+        },
+        "http_client": {
+          "$ref": "#/$defs/HTTPClientReference"
+        },
+        "download_detour": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "GeoXURLOptions": {
+      "type": "object",
+      "properties": {
+        "geoip": {
+          "type": "string"
+        },
+        "geosite": {
+          "type": "string"
+        },
+        "mmdb": {
+          "type": "string"
+        },
+        "asn": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -6021,6 +6156,9 @@
         },
         "fallback_delay": {
           "$ref": "#/$defs/Duration"
+        },
+        "resolve_on_detour": {
+          "type": "boolean"
         },
         "idle_timeout": {
           "$ref": "#/$defs/Duration"
@@ -6200,6 +6338,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "idle_timeout": {
               "$ref": "#/$defs/Duration"
@@ -7160,6 +7301,9 @@
             },
             "udp_timeout": {
               "$ref": "#/$defs/UDPTimeout"
+            },
+            "udp_fragment": {
+              "type": "boolean"
             },
             "tc_priority": {
               "type": "integer",
@@ -8849,6 +8993,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -9978,6 +10125,9 @@
         },
         "fallback_delay": {
           "$ref": "#/$defs/Duration"
+        },
+        "resolve_on_detour": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -10446,6 +10596,9 @@
         },
         "fallback_delay": {
           "$ref": "#/$defs/Duration"
+        },
+        "resolve_on_detour": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -12721,6 +12874,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -12915,6 +13071,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "direct_domain_strategy": {
               "$ref": "#/$defs/DomainStrategy"
             },
@@ -13047,6 +13206,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -13239,6 +13401,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -13494,6 +13659,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -13686,6 +13854,12 @@
             "use_all_providers": {
               "type": "boolean"
             },
+            "hidden": {
+              "type": "boolean"
+            },
+            "icon": {
+              "type": "string"
+            },
             "url": {
               "type": "string"
             },
@@ -13820,6 +13994,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -13956,6 +14133,12 @@
             "use_all_providers": {
               "type": "boolean"
             },
+            "hidden": {
+              "type": "boolean"
+            },
+            "icon": {
+              "type": "string"
+            },
             "default": {
               "type": "string",
               "x-tag-reference": "outbound"
@@ -14082,6 +14265,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -14292,6 +14478,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -14313,6 +14502,102 @@
             },
             "tls": {
               "$ref": "#/$defs/OutboundTLSOptions"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "smart"
+            },
+            "tag": {
+              "type": "string"
+            },
+            "outbounds": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "x-tag-reference": "outbound"
+              }
+            },
+            "providers": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "x-tag-reference": "provider"
+              }
+            },
+            "exclude": {
+              "type": "string"
+            },
+            "include": {
+              "type": "string"
+            },
+            "use_all_providers": {
+              "type": "boolean"
+            },
+            "hidden": {
+              "type": "boolean"
+            },
+            "icon": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            },
+            "interval": {
+              "$ref": "#/$defs/Duration"
+            },
+            "expected_status": {
+              "type": "string"
+            },
+            "interrupt_exist_connections": {
+              "type": "boolean"
+            },
+            "disable_udp": {
+              "type": "boolean"
+            },
+            "use_asn": {
+              "type": "boolean"
+            },
+            "use_lightgbm": {
+              "type": "boolean"
+            },
+            "collect_data": {
+              "type": "boolean"
+            },
+            "sample_rate": {
+              "type": "number"
+            },
+            "max_host_failed_times": {
+              "type": "integer"
+            },
+            "algorithm": {
+              "type": "string"
+            },
+            "hysteresis": {
+              "$ref": "#/$defs/Duration"
+            },
+            "policy_priority": {
+              "type": "string"
+            },
+            "asn_database": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
             }
           },
           "required": [
@@ -14438,6 +14723,9 @@
                 },
                 "fallback_delay": {
                   "$ref": "#/$defs/Duration"
+                },
+                "resolve_on_detour": {
+                  "type": "boolean"
                 },
                 "server": {
                   "type": "string"
@@ -14612,6 +14900,9 @@
                 "fallback_delay": {
                   "$ref": "#/$defs/Duration"
                 },
+                "resolve_on_detour": {
+                  "type": "boolean"
+                },
                 "server": {
                   "type": "string"
                 },
@@ -14784,6 +15075,9 @@
                 },
                 "fallback_delay": {
                   "$ref": "#/$defs/Duration"
+                },
+                "resolve_on_detour": {
+                  "type": "boolean"
                 },
                 "server": {
                   "type": "string"
@@ -14958,6 +15252,9 @@
                 "fallback_delay": {
                   "$ref": "#/$defs/Duration"
                 },
+                "resolve_on_detour": {
+                  "type": "boolean"
+                },
                 "server": {
                   "type": "string"
                 },
@@ -15129,6 +15426,9 @@
                 },
                 "fallback_delay": {
                   "$ref": "#/$defs/Duration"
+                },
+                "resolve_on_detour": {
+                  "type": "boolean"
                 },
                 "server": {
                   "type": "string"
@@ -15302,6 +15602,9 @@
                 "fallback_delay": {
                   "$ref": "#/$defs/Duration"
                 },
+                "resolve_on_detour": {
+                  "type": "boolean"
+                },
                 "server": {
                   "type": "string"
                 },
@@ -15473,6 +15776,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -15664,6 +15970,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -15983,6 +16292,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -16103,6 +16415,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "executable_path": {
               "type": "string"
@@ -16241,6 +16556,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -16403,6 +16721,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -16540,6 +16861,12 @@
             "use_all_providers": {
               "type": "boolean"
             },
+            "hidden": {
+              "type": "boolean"
+            },
+            "icon": {
+              "type": "string"
+            },
             "url": {
               "type": "string"
             },
@@ -16559,6 +16886,9 @@
             },
             "fallback": {
               "$ref": "#/$defs/URLTestFallbackOptions"
+            },
+            "expected_status": {
+              "type": "string"
             }
           },
           "required": [
@@ -16679,6 +17009,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -16846,6 +17179,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             },
             "server": {
               "type": "string"
@@ -18856,6 +19192,9 @@
             },
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -19771,6 +20110,9 @@
                         "fallback_delay": {
                           "$ref": "#/$defs/Duration"
                         },
+                        "resolve_on_detour": {
+                          "type": "boolean"
+                        },
                         "idle_timeout": {
                           "$ref": "#/$defs/Duration"
                         },
@@ -19958,6 +20300,9 @@
                           },
                           "fallback_delay": {
                             "$ref": "#/$defs/Duration"
+                          },
+                          "resolve_on_detour": {
+                            "type": "boolean"
                           },
                           "idle_timeout": {
                             "$ref": "#/$defs/Duration"
@@ -20701,6 +21046,9 @@
             "fallback_delay": {
               "$ref": "#/$defs/Duration"
             },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -21023,6 +21371,9 @@
         },
         "fallback_delay": {
           "$ref": "#/$defs/Duration"
+        },
+        "resolve_on_detour": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -21067,6 +21418,54 @@
         },
         "password": {
           "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SmartCollectorOptions": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "size_limit_mb": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SmartLightGBMOptions": {
+      "type": "object",
+      "properties": {
+        "model_path": {
+          "type": "string"
+        },
+        "auto_update": {
+          "type": "boolean"
+        },
+        "url": {
+          "type": "string"
+        },
+        "update_interval": {
+          "$ref": "#/$defs/Duration"
+        },
+        "http_client": {
+          "$ref": "#/$defs/HTTPClientReference"
+        },
+        "download_detour": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "SmartOptions": {
+      "type": "object",
+      "properties": {
+        "lightgbm": {
+          "$ref": "#/$defs/SmartLightGBMOptions"
+        },
+        "collector": {
+          "$ref": "#/$defs/SmartCollectorOptions"
         }
       },
       "additionalProperties": false

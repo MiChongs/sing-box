@@ -4,10 +4,26 @@ package ebpf
 
 import (
 	"net/netip"
+	"reflect"
 	"testing"
 
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 )
+
+func TestCompileActionPolicyKeepsDestinationSemanticsInSync(t *testing.T) {
+	var local, shared commonEBPF.ActionScope
+	fakeIPv4 := netip.MustParsePrefix("198.18.0.0/15")
+	fakeIPv6 := netip.MustParsePrefix("fd00:eb0f::/48")
+	ports := []portRange{{Start: 443, End: 443}}
+	appendDestinationPolicy(&local, true, ports, dnsModeRespectPolicy, fakeIPv4, fakeIPv6, nil, true, true)
+	appendDestinationPolicy(&shared, true, ports, dnsModeRespectPolicy, fakeIPv4, fakeIPv6, nil, true, true)
+	if !reflect.DeepEqual(local.DestinationCIDR, shared.DestinationCIDR) {
+		t.Fatalf("local/shared destination CIDR semantics diverged:\nlocal=%+v\nshared=%+v", local.DestinationCIDR, shared.DestinationCIDR)
+	}
+	if !reflect.DeepEqual(local.DestinationPort, shared.DestinationPort) {
+		t.Fatalf("local/shared destination port semantics diverged:\nlocal=%+v\nshared=%+v", local.DestinationPort, shared.DestinationPort)
+	}
+}
 
 func TestCompileProcessUIDPolicySubtractsExcludedRanges(t *testing.T) {
 	inbound := &Inbound{
@@ -91,5 +107,110 @@ func TestValidateActionPolicyScope(t *testing.T) {
 				t.Fatal("unsupported action scope was accepted")
 			}
 		})
+	}
+}
+
+func TestAppendDestinationPolicyForcesBypassExclude(t *testing.T) {
+	var scope commonEBPF.ActionScope
+	appendDestinationPolicy(&scope, true, nil, dnsModeRespectPolicy,
+		netip.Prefix{}, netip.Prefix{},
+		[]netip.Prefix{netip.MustParsePrefix("100.64.0.0/10")},
+		true, true)
+	var forced bool
+	for _, decision := range scope.DestinationCIDR {
+		if decision.Prefix == netip.MustParsePrefix("100.64.0.0/10") && decision.Action == commonEBPF.DecisionIntercept {
+			forced = true
+		}
+	}
+	if !forced {
+		t.Fatalf("bypass_exclude prefix was not emitted as force-intercept: %+v", scope.DestinationCIDR)
+	}
+}
+
+func TestNormalizeBypassExclude(t *testing.T) {
+	v4 := netip.MustParsePrefix("100.64.0.0/10")
+	v6 := netip.MustParsePrefix("fd7a:115c:a1e0::/48")
+	if got, err := normalizeBypassExclude("local.bypass_exclude", []netip.Prefix{v4, v6}); err != nil || len(got) != 2 {
+		t.Fatalf("valid v4+v6 rejected: %v, %v", got, err)
+	}
+	if _, err := normalizeBypassExclude("local.bypass_exclude", []netip.Prefix{v4, netip.MustParsePrefix("10.0.0.0/8")}); err == nil {
+		t.Fatal("two IPv4 prefixes accepted")
+	}
+	if _, err := normalizeBypassExclude("local.bypass_exclude", []netip.Prefix{v6, netip.MustParsePrefix("fd00::/8")}); err == nil {
+		t.Fatal("two IPv6 prefixes accepted")
+	}
+	// IPv4-mapped IPv6 is converted to its IPv4 form, not rejected outright.
+	mapped, err := normalizeBypassExclude("local.bypass_exclude", []netip.Prefix{netip.MustParsePrefix("::ffff:100.64.0.0/104")})
+	if err != nil || len(mapped) != 1 || mapped[0].String() != "100.0.0.0/8" {
+		t.Fatalf("IPv4-mapped IPv6 not converted to IPv4: %v, %v", mapped, err)
+	}
+	if got, err := normalizeBypassExclude("local.bypass_exclude", nil); err != nil || got != nil {
+		t.Fatalf("empty input: got %v, %v", got, err)
+	}
+}
+
+func TestValidateBypassExcludeConflicts(t *testing.T) {
+	i := &Inbound{
+		localBypassExclude:  []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10")},
+		sharedBypassExclude: []netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::/48")},
+	}
+	if err := i.validateBypassExcludeConflicts(); err != nil {
+		t.Fatal(err)
+	}
+	i.fakeIPIPv4Prefix = netip.MustParsePrefix("198.18.0.0/16")
+	if err := i.validateBypassExcludeConflicts(); err == nil {
+		t.Fatal("fakeip IPv4 conflict accepted")
+	}
+	i.fakeIPIPv4Prefix = netip.Prefix{}
+	i.fakeIPIPv6Prefix = netip.MustParsePrefix("fdfe:dcba:9876::/64")
+	if err := i.validateBypassExcludeConflicts(); err == nil {
+		t.Fatal("fakeip IPv6 conflict accepted")
+	}
+}
+
+// The local data planes look a socket's UID up in a single LPM map, so the
+// UID decisions handed to sing-ebpf must already be final and non-overlapping.
+// An include range sent together with an overlapping pass decision made the
+// library drop the pass, and every exclude_* option was ignored as soon as any
+// include_* option was configured.
+func TestBuildActionPolicySubtractsExcludedUIDsFromIncludes(t *testing.T) {
+	inbound := &Inbound{localPolicy: localUIDPolicy{
+		IncludeUIDConfigured: true,
+		IncludeUID:           []uidRange{{Start: 10000, End: 19999}},
+		ExcludeUID:           []uidRange{{Start: 10123, End: 10123}},
+	}}
+	policy, err := inbound.buildActionPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Local.Default != commonEBPF.DecisionPass {
+		t.Fatalf("local default = %v, want pass", policy.Local.Default)
+	}
+	want := []commonEBPF.UIDDecision{
+		{Start: 10000, End: 10122, Action: commonEBPF.DecisionIntercept},
+		{Start: 10124, End: 19999, Action: commonEBPF.DecisionIntercept},
+	}
+	if !reflect.DeepEqual(policy.Local.UID, want) {
+		t.Fatalf("local UID decisions = %+v, want %+v", policy.Local.UID, want)
+	}
+	if _, err = commonEBPF.CompileActionPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestBuildActionPolicyPassesExcludedUIDsByDefault(t *testing.T) {
+	inbound := &Inbound{localPolicy: localUIDPolicy{
+		ExcludeUID: []uidRange{{Start: 10123, End: 10123}},
+	}}
+	policy, err := inbound.buildActionPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if policy.Local.Default != commonEBPF.DecisionIntercept {
+		t.Fatalf("local default = %v, want intercept", policy.Local.Default)
+	}
+	want := []commonEBPF.UIDDecision{{Start: 10123, End: 10123, Action: commonEBPF.DecisionPass}}
+	if !reflect.DeepEqual(policy.Local.UID, want) {
+		t.Fatalf("local UID decisions = %+v, want %+v", policy.Local.UID, want)
 	}
 }

@@ -7,8 +7,10 @@ import (
 	"net/netip"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	C "github.com/sagernet/sing-box/constant"
@@ -19,8 +21,6 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
 	"github.com/sagernet/sing/service"
-
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 )
 
 const (
@@ -81,6 +81,7 @@ type Inbound struct {
 	udpNat                    *udpNATService
 	tcDataPlane               tcRuntime
 	udpTimeout                time.Duration
+	udpFragment               bool
 	enableTCP                 bool
 	enableUDP                 bool
 	localDNSMode              string
@@ -98,6 +99,8 @@ type Inbound struct {
 	sharedBypassPrivate       bool
 	localBypassPort           []portRange
 	sharedBypassPort          []portRange
+	localBypassExclude        []netip.Prefix
+	sharedBypassExclude       []netip.Prefix
 	tcPriority                uint16
 	networkGeneration         uint64
 	fakeIPIPv4Prefix          netip.Prefix
@@ -110,8 +113,16 @@ type Inbound struct {
 	tcDataPlaneAccess         sync.RWMutex
 	cgroupBackendAccess       sync.RWMutex
 	cgroupReleaseWait         sync.WaitGroup
+	cgroupRecoveryAccess      sync.Mutex
+	cgroupRecoveryCancel      context.CancelFunc
+	cgroupRecoveryDone        chan struct{}
+	cgroupRecoveryEvents      chan commonEBPF.UDPReleaseEvent
 	lifecycleAccess           sync.Mutex
 	interfaceMonitor          tcInterfaceMonitor
+	// localTCAwaitingInterface is set while local TC interception has not been
+	// attached yet because no default interface was known at start. The
+	// interface monitor attaches it as soon as one is reported.
+	localTCAwaitingInterface atomic.Bool
 
 	bypassRuleSetAccess       sync.Mutex
 	bypassRuleSet             []adapter.RuleSet
@@ -203,15 +214,12 @@ type Inbound struct {
 func (i *Inbound) localTCEnabled() bool {
 	return i.localEnabled && i.localDataPlane == localDataPlaneTC
 }
-
 func (i *Inbound) localCgroupEnabled() bool {
 	return i.localEnabled && i.localDataPlane == localDataPlaneCgroup
 }
-
 func (i *Inbound) sharedSocketAssignEnabled() bool {
 	return i.sharedEnabled && i.sharedDataPlane == sharedDataPlaneSocketAssign
 }
-
 func (i *Inbound) sharedRewriteEnabled() bool {
 	return i.sharedEnabled && i.sharedDataPlane == sharedDataPlanePacketRewrite
 }
@@ -266,6 +274,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		return nil, err
 	}
 	sharedBypassPort, err := parsePortRanges("shared.bypass_port", options.Shared.BypassPort, options.Shared.BypassPortRange)
+	if err != nil {
+		return nil, err
+	}
+	localBypassExclude, err := normalizeBypassExclude("local.bypass_exclude", options.Local.BypassExclude)
+	if err != nil {
+		return nil, err
+	}
+	sharedBypassExclude, err := normalizeBypassExclude("shared.bypass_exclude", options.Shared.BypassExclude)
 	if err != nil {
 		return nil, err
 	}
@@ -329,6 +345,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		sharedBypassPrivate: options.Shared.BypassPrivateAddress == nil || *options.Shared.BypassPrivateAddress,
 		localBypassPort:     localBypassPort,
 		sharedBypassPort:    sharedBypassPort,
+		localBypassExclude:  localBypassExclude,
+		sharedBypassExclude: sharedBypassExclude,
 		tcPriority:          uint16(options.TCPriority),
 		sharedIncludeMAC:    sharedIncludeMAC,
 		sharedExcludeMAC:    sharedExcludeMAC,
@@ -390,7 +408,11 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	if options.UDPTimeout != 0 {
 		udpTimeout = time.Duration(options.UDPTimeout)
 	}
+	if udpTimeout < 5*time.Second {
+		return nil, E.New("eBPF UDP timeout must be at least 5s: ", udpTimeout)
+	}
 	inbound.udpTimeout = udpTimeout
+	inbound.udpFragment = options.UDPFragment != nil && *options.UDPFragment
 	inbound.udpNat = newUDPNATService(inbound, inbound.preparePacketConnection, udpTimeout)
 	return inbound, nil
 }

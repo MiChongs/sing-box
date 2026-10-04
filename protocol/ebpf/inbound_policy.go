@@ -5,14 +5,12 @@ package ebpf
 import (
 	"net/netip"
 	"reflect"
-	"slices"
 	"strings"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/x/list"
-
-	commonEBPF "github.com/CHIZI-0618/sing-ebpf"
 	"go4.org/netipx"
 )
 
@@ -286,10 +284,10 @@ func (i *Inbound) applyDestinationDecisionBackend(
 // is independent of the others', exactly like its forward update was.
 func revertBypassCIDRBackends(applied []bypassCIDRAppliedBackend, warn func(name string, err error)) []string {
 	var failed []string
-	for _, backend := range slices.Backward(applied) {
-		if err := backend.revert(); err != nil {
-			failed = append(failed, backend.name)
-			warn(backend.name, err)
+	for index := len(applied) - 1; index >= 0; index-- {
+		if err := applied[index].revert(); err != nil {
+			failed = append(failed, applied[index].name)
+			warn(applied[index].name, err)
 		}
 	}
 	return failed

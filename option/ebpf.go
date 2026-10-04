@@ -8,11 +8,14 @@ import (
 )
 
 type EBPFInboundOptions struct {
-	Network    NetworkList       `json:"network,omitempty"`
-	UDPTimeout UDPTimeoutCompat  `json:"udp_timeout,omitempty"`
-	TCPriority EBPFTCPriority    `json:"tc_priority,omitempty"`
-	Local      EBPFLocalOptions  `json:"local,omitempty"`
-	Shared     EBPFSharedOptions `json:"shared,omitempty"`
+	Network    NetworkList      `json:"network,omitempty"`
+	UDPTimeout UDPTimeoutCompat `json:"udp_timeout,omitempty"`
+	// UDPFragment controls whether transparent UDP sockets may fragment
+	// oversized datagrams. An omitted value keeps fragmentation disabled.
+	UDPFragment *bool             `json:"udp_fragment,omitempty"`
+	TCPriority  EBPFTCPriority    `json:"tc_priority,omitempty"`
+	Local       EBPFLocalOptions  `json:"local,omitempty"`
+	Shared      EBPFSharedOptions `json:"shared,omitempty"`
 	// FakeIPICMP, when "reply", answers ICMP Echo Request packets addressed to
 	// a FakeIP so a client's ping sees that address as reachable, without the
 	// request ever leaving this box. It applies to whichever of local/shared
@@ -24,22 +27,23 @@ type EBPFInboundOptions struct {
 }
 
 type EBPFLocalOptions struct {
-	Enabled              *bool                      `json:"enabled,omitempty"`
-	DNSMode              string                     `json:"dns_mode,omitempty" enum:"hijack,respect_policy,off"`
-	DataPlane            string                     `json:"data_plane,omitempty" enum:"tc,cgroup"`
-	CgroupPath           string                     `json:"cgroup_path,omitempty"`
-	IPv6                 *bool                      `json:"ipv6,omitempty"`
-	BypassPrivateAddress *bool                      `json:"bypass_private_address,omitempty"`
-	BypassRuleSet        badoption.Listable[string] `json:"bypass_rule_set,omitempty" reference:"rule_set"`
-	IncludeUID           badoption.Listable[uint32] `json:"include_uid,omitempty"`
-	IncludeUIDRange      badoption.Listable[string] `json:"include_uid_range,omitempty"`
-	ExcludeUID           badoption.Listable[uint32] `json:"exclude_uid,omitempty"`
-	ExcludeUIDRange      badoption.Listable[string] `json:"exclude_uid_range,omitempty"`
-	IncludeAndroidUser   badoption.Listable[int]    `json:"include_android_user,omitempty"`
-	IncludePackage       badoption.Listable[string] `json:"include_package,omitempty"`
-	ExcludePackage       badoption.Listable[string] `json:"exclude_package,omitempty"`
-	BypassPort           badoption.Listable[uint16] `json:"bypass_port,omitempty"`
-	BypassPortRange      badoption.Listable[string] `json:"bypass_port_range,omitempty"`
+	Enabled              *bool                            `json:"enabled,omitempty"`
+	DNSMode              string                           `json:"dns_mode,omitempty" enum:"hijack,respect_policy,off"`
+	DataPlane            string                           `json:"data_plane,omitempty" enum:"tc,cgroup"`
+	CgroupPath           string                           `json:"cgroup_path,omitempty"`
+	IPv6                 *bool                            `json:"ipv6,omitempty"`
+	BypassPrivateAddress *bool                            `json:"bypass_private_address,omitempty"`
+	BypassRuleSet        badoption.Listable[string]       `json:"bypass_rule_set,omitempty" reference:"rule_set"`
+	BypassExclude        badoption.Listable[netip.Prefix] `json:"bypass_exclude,omitempty"`
+	IncludeUID           badoption.Listable[uint32]       `json:"include_uid,omitempty"`
+	IncludeUIDRange      badoption.Listable[string]       `json:"include_uid_range,omitempty"`
+	ExcludeUID           badoption.Listable[uint32]       `json:"exclude_uid,omitempty"`
+	ExcludeUIDRange      badoption.Listable[string]       `json:"exclude_uid_range,omitempty"`
+	IncludeAndroidUser   badoption.Listable[int]          `json:"include_android_user,omitempty"`
+	IncludePackage       badoption.Listable[string]       `json:"include_package,omitempty"`
+	ExcludePackage       badoption.Listable[string]       `json:"exclude_package,omitempty"`
+	BypassPort           badoption.Listable[uint16]       `json:"bypass_port,omitempty"`
+	BypassPortRange      badoption.Listable[string]       `json:"bypass_port_range,omitempty"`
 }
 
 type EBPFSharedOptions struct {
@@ -50,6 +54,7 @@ type EBPFSharedOptions struct {
 	IPv6                 *bool                            `json:"ipv6,omitempty"`
 	BypassPrivateAddress *bool                            `json:"bypass_private_address,omitempty"`
 	BypassRuleSet        badoption.Listable[string]       `json:"bypass_rule_set,omitempty" reference:"rule_set"`
+	BypassExclude        badoption.Listable[netip.Prefix] `json:"bypass_exclude,omitempty"`
 	IncludeSourceCIDR    badoption.Listable[netip.Prefix] `json:"include_source_cidr,omitempty"`
 	ExcludeSourceCIDR    badoption.Listable[netip.Prefix] `json:"exclude_source_cidr,omitempty"`
 	IncludeMACAddress    badoption.Listable[string]       `json:"include_mac_address,omitempty"`

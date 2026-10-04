@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"testing"
 	"time"
@@ -139,6 +140,68 @@ func TestInterfaceDriftCheckOnlyTracksTCState(t *testing.T) {
 	if interval := inbound.interfaceDriftCheckInterval(); interval != time.Duration(0) {
 		t.Fatalf("cleared data-plane drift interval = %s, want disabled", interval)
 	}
+}
+
+// TestLocalTCWaitsQuietlyForFirstDefaultInterface covers a start before any
+// default network exists (boot, airplane mode): that is not a lost attachment,
+// so it must not warn, and the first attachment must be reported once.
+func TestLocalTCWaitsQuietlyForFirstDefaultInterface(t *testing.T) {
+	logger := &interfaceMonitorTestLogger{}
+	inbound := &Inbound{
+		localEnabled:   true,
+		localDataPlane: localDataPlaneTC,
+		logger:         logger,
+		networkManager: &testInterfaceNetworkManager{finder: control.NewDefaultInterfaceFinder()},
+	}
+	inbound.setTCDataPlane(&changedTestTCRuntime{})
+	inbound.localTCAwaitingInterface.Store(true)
+
+	inbound.updateTCInterfaces(context.Background())
+	if len(logger.warnMessages) != 0 || len(logger.infoMessages) != 0 {
+		t.Fatalf("waiting for the first default interface logged warn=%q info=%q", logger.warnMessages, logger.infoMessages)
+	}
+
+	inbound.interfaceMonitor.defaultInterfaceName = "lo"
+	inbound.updateTCInterfaces(context.Background())
+	want := []string{"local TC eBPF interception started on default interface lo"}
+	if !slices.Equal(logger.infoMessages, want) {
+		t.Fatalf("first attachment info = %q, want %q", logger.infoMessages, want)
+	}
+	if inbound.localTCAwaitingInterface.Load() {
+		t.Fatal("still waiting for a default interface after attaching")
+	}
+	inbound.updateTCInterfaces(context.Background())
+	if len(logger.infoMessages) != 1 {
+		t.Fatalf("attachment reported again: %q", logger.infoMessages)
+	}
+
+	inbound.interfaceMonitor.defaultInterfaceName = ""
+	inbound.updateTCInterfaces(context.Background())
+	if len(logger.warnMessages) != 1 {
+		t.Fatalf("losing the default interface after attaching warned %q, want one warning", logger.warnMessages)
+	}
+}
+
+type changedTestTCRuntime struct {
+	testTCRuntime
+}
+
+func (r *changedTestTCRuntime) AttachmentStateChanged(string, []string) (bool, error) {
+	return true, nil
+}
+
+type interfaceMonitorTestLogger struct {
+	captureLogger
+	infoMessages []string
+	warnMessages []string
+}
+
+func (l *interfaceMonitorTestLogger) Info(args ...any) {
+	l.infoMessages = append(l.infoMessages, fmt.Sprint(args...))
+}
+
+func (l *interfaceMonitorTestLogger) Warn(args ...any) {
+	l.warnMessages = append(l.warnMessages, fmt.Sprint(args...))
 }
 
 type testInterfaceNetworkManager struct {
