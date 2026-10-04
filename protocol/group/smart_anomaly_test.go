@@ -73,9 +73,8 @@ func TestResetEventTracker_ThresholdCrossing(t *testing.T) {
 func TestResetEventTracker_WindowExpiry(t *testing.T) {
 	tr := newResetEventTracker()
 	const target, node = "example.com", "node-A"
-	key := target + "|" + node
 	// Stage one ancient event manually so we don't have to wait 60 s.
-	tr.events[key] = []time.Time{time.Now().Add(-2 * resetEventWindow)}
+	tr.events.record(target, node, time.Now().Add(-2*resetEventWindow), resetEventWindow, resetEventThreshold, resetEventsMaxEntries)
 	// A fresh single event must NOT cross — the ancient one is
 	// outside the window and gets pruned by record().
 	if tr.record(target, node) {
@@ -105,10 +104,10 @@ func TestResetEventTracker_PerNodeIsolation(t *testing.T) {
 	// counter boundary.
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
-	if got := len(tr.events["T|A"]); got != 1 {
+	if got := tr.events.count("T", "A"); got != 1 {
 		t.Fatalf("A's event count = %d, want 1 (must be unaffected by B's storm)", got)
 	}
-	if _, present := tr.events["T|B"]; present {
+	if tr.events.count("T", "B") != 0 {
 		t.Fatalf("B's slot should be wiped after threshold crossing")
 	}
 }
@@ -125,13 +124,13 @@ func TestResetEventTracker_ResetForNode(t *testing.T) {
 	// A's slots gone; B's stays.
 	tr.mu.Lock()
 	defer tr.mu.Unlock()
-	if _, exists := tr.events["T1|A"]; exists {
+	if tr.events.count("T1", "A") != 0 {
 		t.Errorf("T1|A not cleared after resetForNode(A)")
 	}
-	if _, exists := tr.events["T2|A"]; exists {
+	if tr.events.count("T2", "A") != 0 {
 		t.Errorf("T2|A not cleared after resetForNode(A)")
 	}
-	if _, exists := tr.events["T1|B"]; !exists {
+	if tr.events.count("T1", "B") == 0 {
 		t.Errorf("T1|B should still be present (different node)")
 	}
 }

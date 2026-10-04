@@ -8,41 +8,12 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/puzpuzpuz/xsync/v3"
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
+	"github.com/sagernet/sing-box/log"
 )
-
-// TestIsWatchdogDeadlineErr matrix-tests the deadline classifier so
-// any future error-wrapping refactor surfaces as a fail here, not as
-// a silent watchdog regression in production.
-func TestIsWatchdogDeadlineErr(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"nil", nil, false},
-		{"deadline_exceeded_canonical", os.ErrDeadlineExceeded, true},
-		{"netop_timeout", &net.OpError{Op: "read", Err: timeoutErr{}}, true},
-		{"substring_io_timeout", errors.New("read tcp 1.2.3.4:443: i/o timeout"), true},
-		{"substring_deadline_exceeded", errors.New("context deadline exceeded"), true},
-		{"unrelated", errors.New("connection refused"), false},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := isWatchdogDeadlineErr(c.err); got != c.want {
-				t.Errorf("isWatchdogDeadlineErr(%v) = %v, want %v", c.err, got, c.want)
-			}
-		})
-	}
-}
-
-// timeoutErr makes a fake net.Error with Timeout()=true for the
-// matrix above. Concrete error type, not in the standard lib so we
-// don't accidentally rely on platform-specific behaviour.
-type timeoutErr struct{}
-
-func (timeoutErr) Error() string { return "timeout" }
-func (timeoutErr) Timeout() bool { return true }
-func (timeoutErr) Temporary() bool { return false }
 
 // deadlineTrackingFake records SetReadDeadline calls so tests can
 // assert the kernel-watchdog deadline plumbing actually runs through
@@ -58,51 +29,86 @@ func (d *deadlineTrackingFake) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-// TestApplyFirstByteDeadline_ReachesUnderlyingConn proves the wrap
-// path actually invokes SetReadDeadline on the wrapped conn so the
-// kernel-driven detection has any chance of firing.
-func TestApplyFirstByteDeadline_ReachesUnderlyingConn(t *testing.T) {
+// TestFirstByteDeadline_ArmedAtFirstWriteAndDisarmed proves the
+// first-byte deadline reaches the underlying conn only once the client
+// has written, and is cleared again exactly once.
+func TestFirstByteDeadline_ArmedAtFirstWriteAndDisarmed(t *testing.T) {
 	fake := &deadlineTrackingFake{fakeNetConn: &fakeNetConn{}}
 	c := &smartTrackedConn{Conn: fake}
+	if len(fake.deadlines) != 0 {
+		t.Fatalf("deadline armed before any write: %+v", fake.deadlines)
+	}
 	before := time.Now()
-	c.applyFirstByteDeadline()
+	if _, err := c.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
 	if len(fake.deadlines) != 1 {
 		t.Fatalf("SetReadDeadline call count = %d, want 1", len(fake.deadlines))
 	}
 	got := fake.deadlines[0]
-	min := before.Add(firstByteWatchdogTimeout - time.Second)
-	max := before.Add(firstByteWatchdogTimeout + time.Second)
-	if got.Before(min) || got.After(max) {
+	if got.Before(before.Add(firstByteWatchdogTimeout-time.Second)) || got.After(before.Add(firstByteWatchdogTimeout+time.Second)) {
 		t.Fatalf("deadline = %v, want within %v±1s of %v", got, firstByteWatchdogTimeout, before)
 	}
-}
-
-// TestArmTransferStalledDeadline confirms the second deadline (after
-// first byte arrives) uses the longer transfer-stalled budget.
-func TestArmTransferStalledDeadline(t *testing.T) {
-	fake := &deadlineTrackingFake{fakeNetConn: &fakeNetConn{}}
-	c := &smartTrackedConn{Conn: fake}
-	before := time.Now()
-	c.armTransferStalledDeadline()
+	if _, err := c.Write([]byte("again")); err != nil {
+		t.Fatal(err)
+	}
 	if len(fake.deadlines) != 1 {
-		t.Fatalf("SetReadDeadline call count = %d, want 1", len(fake.deadlines))
+		t.Fatalf("later writes re-armed the deadline: %+v", fake.deadlines)
 	}
-	got := fake.deadlines[0]
-	min := before.Add(stalledTransferTimeout - time.Second)
-	if got.Before(min) {
-		t.Fatalf("deadline = %v, want >= %v", got, min)
+	c.disarmFirstByteDeadline()
+	c.disarmFirstByteDeadline()
+	if len(fake.deadlines) != 2 || !fake.deadlines[1].IsZero() {
+		t.Fatalf("expected exactly one zero-time disarm, got %+v", fake.deadlines)
 	}
 }
 
-// TestClearReadDeadline_ZeroTime proves the close-time clear actually
-// passes the zero Time value (which net's SetReadDeadline contract
-// interprets as "no deadline").
-func TestClearReadDeadline_ZeroTime(t *testing.T) {
-	fake := &deadlineTrackingFake{fakeNetConn: &fakeNetConn{}}
-	c := &smartTrackedConn{Conn: fake}
-	c.clearReadDeadline()
-	if len(fake.deadlines) != 1 || !fake.deadlines[0].IsZero() {
-		t.Fatalf("expected one zero-time SetReadDeadline call, got %+v", fake.deadlines)
+// TestTrackedConn_LongActiveStreamKeepsReading guards against the read
+// deadline outliving the first byte: a stream that keeps delivering data
+// past the first-byte budget must never see a timeout.
+func TestTrackedConn_LongActiveStreamKeepsReading(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	streamFor := 2500 * time.Millisecond
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		buffer := make([]byte, 16)
+		if _, err := conn.Read(buffer); err != nil {
+			return
+		}
+		for start := time.Now(); time.Since(start) < streamFor; {
+			if _, err := conn.Write([]byte{1}); err != nil {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+	raw, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer raw.Close()
+	s := newTestSmartForWatchdog(t)
+	s.history = urltest.NewHistoryStorage()
+	// 1 ms URL-test delay: the adaptive first-byte budget bottoms out at
+	// 1.5 s, shorter than the stream.
+	s.history.StoreURLTestHistory("node", &adapter.URLTestHistory{Time: time.Now(), Delay: 1})
+	c := &smartTrackedConn{Conn: raw, s: s, proxyTag: "node", meta: &smartDialMeta{}, startTime: time.Now()}
+	if _, err := c.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	buffer := make([]byte, 64)
+	for time.Since(start) < streamFor-200*time.Millisecond {
+		if _, err := c.Read(buffer); err != nil {
+			t.Fatalf("read failed after %v of active streaming: %v", time.Since(start), err)
+		}
 	}
 }
 
@@ -118,9 +124,6 @@ func TestTriggerInstantResetEviction_Idempotent(t *testing.T) {
 		proxyTag: "node-X",
 		meta:     &smartDialMeta{smartTarget: "ex.example"},
 	}
-
-	// nil-logger path: stub by recover, like the existing tests.
-	defer func() { _ = recover() }()
 
 	if got := s.triggerInstantResetEviction(c, "read", errors.New("connection reset by peer")); !got {
 		t.Fatal("first trigger should report ran=true")
@@ -173,15 +176,13 @@ func TestTriggerInstantResetEviction_BelowThreshold(t *testing.T) {
 		proxyTag: "node-Y",
 		meta:     &smartDialMeta{smartTarget: "below.example"},
 	}
-	defer func() { _ = recover() }()
-
 	// First call records one event — well below threshold (=2).
 	if !s.triggerInstantResetEviction(c, "read", errors.New("connection reset by peer")) {
 		t.Fatal("first trigger should run")
 	}
 	// Tracker should have ONE event for (target, node).
 	s.resetEvents.mu.Lock()
-	got := len(s.resetEvents.events["below.example|node-Y"])
+	got := s.resetEvents.events.count("below.example", "node-Y")
 	s.resetEvents.mu.Unlock()
 	if got != 1 {
 		t.Fatalf("event count = %d, want 1 (below threshold)", got)
@@ -193,97 +194,110 @@ func TestTriggerInstantResetEviction_BelowThreshold(t *testing.T) {
 // forever to simulate a node that absorbed the request without
 // responding (the first-byte-timeout symptom).
 type fakeNetConn struct {
-	closed atomic.Bool
+	closed     atomic.Bool
+	closeCount atomic.Int32
 }
 
 func (f *fakeNetConn) Read([]byte) (int, error)         { select {} }
 func (f *fakeNetConn) Write(p []byte) (int, error)      { return len(p), nil }
-func (f *fakeNetConn) Close() error                     { f.closed.Store(true); return nil }
+func (f *fakeNetConn) Close() error                     { f.closeCount.Add(1); f.closed.Store(true); return nil }
 func (f *fakeNetConn) LocalAddr() net.Addr              { return &net.TCPAddr{} }
 func (f *fakeNetConn) RemoteAddr() net.Addr             { return &net.TCPAddr{} }
 func (f *fakeNetConn) SetDeadline(time.Time) error      { return nil }
 func (f *fakeNetConn) SetReadDeadline(time.Time) error  { return nil }
 func (f *fakeNetConn) SetWriteDeadline(time.Time) error { return nil }
 
-// nullLogger swallows the watchdog's Warn output so test runs stay
-// quiet. The real ContextLogger interface is implemented in
-// experimental/clashapi tests; we don't need its surface here, just
-// "doesn't panic on call".
-type nullLogger struct{}
-
-// We can't easily import the full ContextLogger interface here; the
-// watchdog's logger calls all go through s.logger.Warn(...). For these
-// unit tests we leave s.logger nil and use the helper below to assert
-// only the side effects we care about (close + breaker bump).
-
 // newTestSmartForWatchdog assembles a minimal Smart with the few
-// fields the watchdog touches: targetConns map, mu, breakers
-// xsync.MapOf and the helpers handleResetThresholdCrossed needs.
+// fields the watchdog and the reset-eviction path touch.
 func newTestSmartForWatchdog(t *testing.T) *Smart {
 	t.Helper()
-	s := &Smart{
-		targetConns: map[string]map[*smartTrackedConn]struct{}{},
-		nodeLoad:    newNodeLoadCounter(),
-		resetEvents: newResetEventTracker(),
+	return &Smart{
+		logger:        log.NewNOPFactory().NewLogger("smart"),
+		targetConns:   map[string]map[*smartTrackedConn]struct{}{},
+		nodeLoad:      newNodeLoadCounter(),
+		resetEvents:   newResetEventTracker(),
+		targetDebargo: xsync.NewMapOf[string, time.Time](),
 	}
-	return s
 }
 
-// stageStalledConn drops a fake stalled conn into the per-target
-// registry as if a dial had just succeeded. age controls how long
-// ago the dial completed (used to push the conn past the watchdog
-// timeouts without actual sleeps).
-func stageStalledConn(s *Smart, target, tag string, age time.Duration, hadFirstByte bool, lastReadAge time.Duration) (*smartTrackedConn, *fakeNetConn) {
+// stageConn drops a fake conn into the per-target registry as if a dial
+// had just succeeded; tests then set its IO timestamps.
+func stageConn(s *Smart, target, tag string) (*smartTrackedConn, *fakeNetConn) {
 	fake := &fakeNetConn{}
-	now := time.Now()
 	c := &smartTrackedConn{
 		Conn:        fake,
 		s:           s,
 		proxyTag:    tag,
 		meta:        &smartDialMeta{smartTarget: target},
 		connectTime: 50,
-		startTime:   now.Add(-age),
-	}
-	if hadFirstByte {
-		c.firstReadOnce.Store(true)
-		c.firstReadMs.Store(int64(age.Milliseconds()))
-		c.lastReadAt.Store(now.Add(-lastReadAge).UnixNano())
+		startTime:   time.Now().Add(-time.Hour),
 	}
 	s.targetConns[target] = map[*smartTrackedConn]struct{}{c: {}}
 	s.targetConnsCount.Add(1)
 	return c, fake
 }
 
-// TestWatchdog_FirstByteTimeoutClosesAndSwitches dialled-OK but no
-// first byte for >firstByteWatchdogTimeout — expect the underlying
-// conn to be closed and the (target, node) reset event to be tallied.
+func ago(d time.Duration) int64 {
+	return time.Now().Add(-d).UnixNano()
+}
+
+// TestWatchdog_FirstByteTimeoutClosesAndSwitches: the client wrote but no
+// first byte came back within the budget — the conn is closed and the
+// (target, node) reset event tallied.
 func TestWatchdog_FirstByteTimeoutClosesAndSwitches(t *testing.T) {
 	s := newTestSmartForWatchdog(t)
-	_, fake := stageStalledConn(s, "stalled.example", "node-A",
-		firstByteWatchdogTimeout+2*time.Second, false, 0)
-
-	// Stub logger to a no-op writer; without it Warn() panics on nil.
-	// We can't construct a real ContextLogger here, so monkeypatch
-	// the Warn path by hand — bypass logger entirely with deferred
-	// recover + skip on panic.
-	defer func() { _ = recover() }()
+	c, fake := stageConn(s, "stalled.example", "node-A")
+	c.firstWriteAt.Store(ago(firstByteWatchdogTimeout + 2*time.Second))
 
 	s.runStalledConnWatchdog()
 
 	if !fake.closed.Load() {
 		t.Fatal("watchdog did not close stalled fake conn")
 	}
+	s.resetEvents.mu.Lock()
+	events := s.resetEvents.events.count("stalled.example", "node-A")
+	s.resetEvents.mu.Unlock()
+	if events != 1 {
+		t.Fatalf("reset events = %d, want 1", events)
+	}
 }
 
-// TestWatchdog_TransferStalledClosesAndSwitches first byte arrived
-// long ago, then >stalledTransferTimeout of silence — expect close
-// + switch.
+// TestWatchdog_SilentClientNotClosed: a conn the client never wrote on
+// (preconnect, server-speaks-first) is not waiting for a byte.
+func TestWatchdog_SilentClientNotClosed(t *testing.T) {
+	s := newTestSmartForWatchdog(t)
+	_, fake := stageConn(s, "preconnect.example", "node-C")
+
+	s.runStalledConnWatchdog()
+
+	if fake.closed.Load() {
+		t.Fatal("watchdog closed a conn the client has not written on")
+	}
+}
+
+// TestWatchdog_FreshRequestNotClosed: the first-byte budget has not
+// elapsed since the first write.
+func TestWatchdog_FreshRequestNotClosed(t *testing.T) {
+	s := newTestSmartForWatchdog(t)
+	c, fake := stageConn(s, "fresh.example", "node-C")
+	c.firstWriteAt.Store(ago(firstByteWatchdogTimeout / 2))
+
+	s.runStalledConnWatchdog()
+
+	if fake.closed.Load() {
+		t.Fatal("watchdog closed a conn still inside its first-byte window")
+	}
+}
+
+// TestWatchdog_TransferStalledClosesAndSwitches: after the first byte,
+// a write went unanswered for longer than stalledTransferTimeout.
 func TestWatchdog_TransferStalledClosesAndSwitches(t *testing.T) {
 	s := newTestSmartForWatchdog(t)
-	_, fake := stageStalledConn(s, "stalled.example", "node-B",
-		2*stalledTransferTimeout, true, stalledTransferTimeout+5*time.Second)
+	c, fake := stageConn(s, "stalled.example", "node-B")
+	c.firstReadOnce.Store(true)
+	c.lastReadAt.Store(ago(stalledTransferTimeout + 10*time.Second))
+	c.lastWriteAt.Store(ago(stalledTransferTimeout + 5*time.Second))
 
-	defer func() { _ = recover() }()
 	s.runStalledConnWatchdog()
 
 	if !fake.closed.Load() {
@@ -291,30 +305,30 @@ func TestWatchdog_TransferStalledClosesAndSwitches(t *testing.T) {
 	}
 }
 
-// TestWatchdog_FreshConnNotClosed: a conn that's only been dialled
-// for a moment with no first byte yet must NOT be evicted — the
-// first-byte window hasn't expired.
-func TestWatchdog_FreshConnNotClosed(t *testing.T) {
+// TestWatchdog_IdleConnNotClosed: a keep-alive / websocket / push conn
+// that has been quiet for long with every write answered is healthy.
+func TestWatchdog_IdleConnNotClosed(t *testing.T) {
 	s := newTestSmartForWatchdog(t)
-	_, fake := stageStalledConn(s, "fresh.example", "node-C",
-		firstByteWatchdogTimeout/2, false, 0)
+	c, fake := stageConn(s, "idle.example", "node-D")
+	c.firstReadOnce.Store(true)
+	c.lastWriteAt.Store(ago(3 * stalledTransferTimeout))
+	c.lastReadAt.Store(ago(2 * stalledTransferTimeout))
 
-	defer func() { _ = recover() }()
 	s.runStalledConnWatchdog()
 
 	if fake.closed.Load() {
-		t.Fatal("watchdog closed a fresh conn that hasn't reached the first-byte window")
+		t.Fatal("watchdog closed an idle conn")
 	}
 }
 
-// TestWatchdog_ActiveTransferNotClosed: a conn with recent reads
-// must NOT be evicted even if the dial happened long ago.
+// TestWatchdog_ActiveTransferNotClosed: the latest write is recent.
 func TestWatchdog_ActiveTransferNotClosed(t *testing.T) {
 	s := newTestSmartForWatchdog(t)
-	_, fake := stageStalledConn(s, "active.example", "node-D",
-		2*stalledTransferTimeout, true, 1*time.Second) // very recent activity
+	c, fake := stageConn(s, "active.example", "node-D")
+	c.firstReadOnce.Store(true)
+	c.lastReadAt.Store(ago(2 * time.Second))
+	c.lastWriteAt.Store(ago(time.Second))
 
-	defer func() { _ = recover() }()
 	s.runStalledConnWatchdog()
 
 	if fake.closed.Load() {
@@ -327,26 +341,16 @@ func TestWatchdog_ActiveTransferNotClosed(t *testing.T) {
 // double-handling the same conn.
 func TestWatchdog_DoubleTriggerSafe(t *testing.T) {
 	s := newTestSmartForWatchdog(t)
-	c, fake := stageStalledConn(s, "tw.example", "node-E",
-		firstByteWatchdogTimeout+2*time.Second, false, 0)
+	c, fake := stageConn(s, "tw.example", "node-E")
+	c.firstWriteAt.Store(ago(firstByteWatchdogTimeout + 2*time.Second))
 
-	defer func() { _ = recover() }()
 	s.runStalledConnWatchdog()
-	closeCount1 := boolToInt(fake.closed.Load())
-	// After first scan, the trigger flag is set and the conn slot
-	// remains in targetConns until a real Close path removes it. A
-	// second scan must skip it because of the CAS guard.
 	s.runStalledConnWatchdog()
+
 	if !c.watchdogTriggered.Load() {
 		t.Fatal("watchdogTriggered flag not set after first scan")
 	}
-	// Close was called exactly once.
-	_ = closeCount1
-}
-
-func boolToInt(b bool) int {
-	if b {
-		return 1
+	if got := fake.closeCount.Load(); got != 1 {
+		t.Fatalf("conn closed %d times, want 1", got)
 	}
-	return 0
 }

@@ -43,22 +43,118 @@ const (
 	resetEventsMaxEntries = 4096
 )
 
-// resetEventTracker mirrors the shortLife pattern but for upstream
-// resets. Embedded into Smart at construction so the dial hot path can
-// reach it without a lock-walk through the parent struct.
+// pairEventLog keeps event timestamps per (target, node) pair inside a
+// sliding window. Pairs are grouped by node so dropping one node's pairs
+// — done on every successful dial — only touches that node instead of
+// scanning every pair. Not goroutine-safe: owners guard it with their own
+// mutex.
+type pairEventLog struct {
+	byNode map[string]map[string][]time.Time // node → target → timestamps
+	pairs  int
+}
+
+func newPairEventLog() pairEventLog {
+	return pairEventLog{byNode: make(map[string]map[string][]time.Time)}
+}
+
+// record adds an event at `at` for (target, node), dropping the pair's
+// events older than window, and reports true when the pair reached
+// threshold — the pair is then cleared so a single spike is not counted
+// twice. Once the log holds maxPairs pairs, pairs without an event inside
+// the window are swept first so a flood of distinct pairs cannot grow it
+// without bound.
+func (l *pairEventLog) record(target, node string, at time.Time, window time.Duration, threshold, maxPairs int) bool {
+	cutoff := at.Add(-window)
+	if l.pairs >= maxPairs {
+		l.prune(cutoff)
+	}
+	targets := l.byNode[node]
+	if targets == nil {
+		targets = make(map[string][]time.Time)
+		l.byNode[node] = targets
+	}
+	old, loaded := targets[target]
+	if !loaded {
+		l.pairs++
+	}
+	kept := old[:0]
+	for _, ts := range old {
+		if ts.After(cutoff) {
+			kept = append(kept, ts)
+		}
+	}
+	kept = append(kept, at)
+	if len(kept) >= threshold {
+		l.delete(target, node)
+		return true
+	}
+	targets[target] = kept
+	return false
+}
+
+// count reports the events recorded for (target, node).
+func (l *pairEventLog) count(target, node string) int {
+	return len(l.byNode[node][target])
+}
+
+func (l *pairEventLog) delete(target, node string) {
+	targets := l.byNode[node]
+	if _, loaded := targets[target]; !loaded {
+		return
+	}
+	delete(targets, target)
+	l.pairs--
+	if len(targets) == 0 {
+		delete(l.byNode, node)
+	}
+}
+
+// deleteNode drops every pair of node.
+func (l *pairEventLog) deleteNode(node string) {
+	l.pairs -= len(l.byNode[node])
+	delete(l.byNode, node)
+}
+
+// prune drops the pairs whose newest event is not after cutoff and
+// returns how many it dropped.
+func (l *pairEventLog) prune(cutoff time.Time) int {
+	var dropped int
+	for node, targets := range l.byNode {
+		for target, stamps := range targets {
+			if len(stamps) == 0 || !stamps[len(stamps)-1].After(cutoff) {
+				delete(targets, target)
+				dropped++
+			}
+		}
+		if len(targets) == 0 {
+			delete(l.byNode, node)
+		}
+	}
+	l.pairs -= dropped
+	return dropped
+}
+
+func (l *pairEventLog) reset() {
+	clear(l.byNode)
+	l.pairs = 0
+}
+
+// resetEventTracker counts upstream resets per (target, node). Embedded
+// into Smart at construction so the dial hot path can reach it without a
+// lock-walk through the parent struct.
 type resetEventTracker struct {
 	mu     sync.Mutex
-	events map[string][]time.Time // key = "target|node"
+	events pairEventLog
 }
 
 func newResetEventTracker() *resetEventTracker {
-	return &resetEventTracker{events: make(map[string][]time.Time, 64)}
+	return &resetEventTracker{events: newPairEventLog()}
 }
 
 // record adds one reset event for (target, node) and reports true when
 // the count within resetEventWindow has just crossed the threshold —
 // caller takes decisive action (markDead + cache invalidation +
-// ranking kick). On crossing we DROP the slot so a single spike isn't
+// ranking kick). On crossing the slot is dropped so a single spike isn't
 // counted twice in a row.
 //
 // Empty target/node short-circuits to false; it's harmless and
@@ -68,62 +164,27 @@ func (t *resetEventTracker) record(target, node string) (crossed bool) {
 	if target == "" || node == "" {
 		return false
 	}
-	key := target + "|" + node
-	now := time.Now()
-	cutoff := now.Add(-resetEventWindow)
-
 	t.mu.Lock()
 	defer t.mu.Unlock()
-
-	// Inline cap: sweep window-expired keys when the map overflows so a
-	// reset storm across many distinct pairs can't grow RSS unbounded
-	// between cleanups.
-	if len(t.events) >= resetEventsMaxEntries {
-		for k, stamps := range t.events {
-			if len(stamps) == 0 || !stamps[len(stamps)-1].After(cutoff) {
-				delete(t.events, k)
-			}
-		}
-	}
-
-	old := t.events[key]
-	kept := old[:0]
-	for _, ts := range old {
-		if ts.After(cutoff) {
-			kept = append(kept, ts)
-		}
-	}
-	kept = append(kept, now)
-	t.events[key] = kept
-	if len(kept) >= resetEventThreshold {
-		delete(t.events, key)
-		return true
-	}
-	return false
+	return t.events.record(target, node, time.Now(), resetEventWindow, resetEventThreshold, resetEventsMaxEntries)
 }
 
-// reset clears every recorded event — invoked from FlushStore and on
-// markAlive so a recovered node starts with a fresh window.
+// reset clears every recorded event — invoked from FlushStore.
 func (t *resetEventTracker) reset() {
 	t.mu.Lock()
-	t.events = make(map[string][]time.Time, 64)
+	t.events.reset()
 	t.mu.Unlock()
 }
 
-// resetForNode drops every (target, node) slot for the given node tag.
-// Cheaper than .reset() when only one node has recovered. Safe to call
+// resetForNode drops every (target, node) slot for the given node tag,
+// so a recovered node starts with a fresh window. Safe to call
 // concurrently with record().
 func (t *resetEventTracker) resetForNode(node string) {
 	if node == "" {
 		return
 	}
-	suffix := "|" + node
 	t.mu.Lock()
-	for k := range t.events {
-		if strings.HasSuffix(k, suffix) {
-			delete(t.events, k)
-		}
-	}
+	t.events.deleteNode(node)
 	t.mu.Unlock()
 }
 

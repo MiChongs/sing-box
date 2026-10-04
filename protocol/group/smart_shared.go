@@ -2,6 +2,8 @@ package group
 
 import (
 	"context"
+	"errors"
+	"math"
 	"math/bits"
 	"runtime"
 	"strconv"
@@ -12,52 +14,11 @@ import (
 	"github.com/RussellLuo/timingwheel"
 	"github.com/cespare/xxhash/v2"
 	"github.com/josharian/intern"
-	"github.com/panjf2000/ants/v2"
 	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
-	"golang.org/x/sync/singleflight"
+	"github.com/sagernet/sing-box/log"
 )
-
-// probeSem caps the number of concurrently in-flight URLTest
-// probes process-wide. Sized at NumCPU*2 with a conservative
-// [8, 32] clamp so low-end Android handsets (2-4 cores) stay around
-// 8, while a 16-core desktop lets 32 probes race.
-//
-// Why we need this on TOP of ants.Pool(64) + singleflight:
-//
-//   ants.Pool limits total goroutines but doesn't know a probe
-//   does a TLS handshake under the hood. A network-switch event
-//   where 15 Smart groups each fire runHealthCheck + preWarm at
-//   once used to spawn HUNDREDS of TLS handshakes in a few hundred
-//   ms, which on Android cellular hand-off would peg CPU at 100%
-//   and grow heap by tens of MBs before the dust settled.
-//
-//   singleflight collapses by TAG, not by concurrency count —
-//   different tags still fan out unrestricted. The semaphore
-//   gates the actual handshake regardless of tag identity.
-//
-// Initialised lazily so test builds that don't touch Smart never
-// pay the channel alloc cost.
-var (
-	probeSem     chan struct{}
-	probeSemOnce sync.Once
-)
-
-// ensureProbeSem lazy-initialises the global probe semaphore.
-// Cheap to call on every probe (one atomic load via sync.Once).
-func ensureProbeSem() {
-	probeSemOnce.Do(func() {
-		n := runtime.NumCPU() * 2
-		if n < 8 {
-			n = 8
-		}
-		if n > 32 {
-			n = 32
-		}
-		probeSem = make(chan struct{}, n)
-	})
-}
 
 // internTag dedupes a node-tag string against a process-wide pool so
 // N Smart groups referencing the same outbound hold pointers to ONE
@@ -77,36 +38,29 @@ func internTag(s string) string {
 	return intern.String(s)
 }
 
-// smartSharedWorker deduplicates cross-group work that targets the SAME
-// physical outbound node, and bounds process-wide concurrency so N Smart
-// groups don't stampede the CPU / network when all their health checks
-// fire at once.
+// smartSharedWorker owns the process-wide execution resources every Smart
+// group shares, so N groups referencing the same nodes neither duplicate
+// work nor stampede the CPU / network when their timers fire together:
 //
-// Scenario that drove this: user has 15 Smart groups of 20-30 nodes each
-// plus a 600-node global group. Many nodes overlap across groups. Per-group
-// runHealthCheck previously probed the SAME node once per group it belonged
-// to — a node shared by 16 groups got 16 concurrent probes every interval,
-// 16× the real work.
+//  1. Network probes (URL tests, SNI handshakes) run on a fixed set of
+//     probe workers. A request for a probe that is already queued or in
+//     flight joins it instead of probing again, and a probe's timeout
+//     only starts when a worker picks it up — time spent queued is never
+//     mistaken for a slow or dead node.
 //
-// This worker fixes it at the process level:
+//  2. Connection bookkeeping (stats on close, failed-dial records) runs on
+//     a few bookkeeping workers behind a bounded queue. Enqueueing never
+//     blocks the IO path; a full queue drops the sample.
 //
-//  1. singleflight.Group collapses in-flight probes of the same tag into
-//     one HTTP request — all callers wait for the same result.
+//  3. freshnessCache remembers very recent probe results by tag so
+//     back-to-back requests from different groups (within freshWindow)
+//     skip the probe entirely.
 //
-//  2. ants.Pool caps concurrent probe / prefetch / ranking goroutines so
-//     the spike of "all 16 groups' health-check ticker fires simultaneously"
-//     is flattened into a steady stream of work through a bounded worker set.
-//
-//  3. freshnessCache remembers very-recent probe results keyed by tag so
-//     back-to-back calls from different groups (within a 1s burst window)
-//     skip the URLTest entirely — singleflight only dedupes CONCURRENT
-//     flight, not sequential.
+// Periodic tasks run on the shared timing wheel, see scheduleTask.
 type smartSharedWorker struct {
-	// probeGroup dedupes concurrent URLTest probes by node tag.
-	probeGroup singleflight.Group
-	// pool is the bounded goroutine pool; nil = unlimited (fallback when
-	// ants failed to initialize, which shouldn't happen).
-	pool *ants.Pool
+	probes      probeQueue
+	bookkeeping chan func()
+
 	// freshnessCache short-TTL result cache to absorb probe bursts.
 	//   key = node tag; value = probeResult captured at that moment.
 	freshnessCache *xsync.MapOf[string, probeResult]
@@ -117,8 +71,7 @@ type smartSharedWorker struct {
 	// background tasks. Collapsing 16 groups × 9 tasks = 144 parked
 	// ticker goroutines (each costing 2-8 KB stack and a runtime.timer
 	// slot) into a single bucket-processor goroutine saves ~500 KB - 2 MB
-	// of RSS on a 15-group config. Task fn()s are still dispatched through
-	// the ants pool so concurrent execution remains bounded.
+	// of RSS on a 15-group config.
 	wheel     *timingwheel.TimingWheel
 	wheelOnce sync.Once
 }
@@ -170,103 +123,90 @@ func nextGroupOrdinal() int64 {
 	return smartGroupCounter.Add(1)
 }
 
-// staggeredInitialDelay spreads the N-th group's initial delay across a
-// 3-second window. Combined with singleflight de-duplication, this
-// smooths the "all groups fire their health check at startup" spike
-// into a steady stream of probe work.
-func staggeredInitialDelay(base time.Duration, ordinal int64) time.Duration {
-	const staggerRange = 3 * time.Second
-	offset := time.Duration((ordinal % 30)) * (staggerRange / 30)
-	return base + offset
+// staggeredInitialDelay offsets the N-th group's first firing of a task
+// so groups run it at different points of its period rather than in
+// lockstep every cycle. Offsets follow the golden-ratio sequence, which
+// keeps any number of groups evenly spread, within min(period/4, 30s) so
+// a long period never delays the first run by much.
+func staggeredInitialDelay(base, period time.Duration, ordinal int64) time.Duration {
+	spread := min(period/4, 30*time.Second)
+	if spread <= 0 {
+		return base
+	}
+	const goldenRatioConjugate = 0.6180339887498949
+	_, phase := math.Modf(float64(ordinal) * goldenRatioConjugate)
+	return base + time.Duration(phase*float64(spread))
+}
+
+const (
+	// probeQueueCapacity bounds probes waiting for a worker; requests
+	// beyond it are skipped (no verdict) instead of piling up.
+	probeQueueCapacity = 1024
+	// bookkeepingQueueCapacity bounds connection bookkeeping waiting for
+	// a worker. Absorbs the close burst of a network handoff.
+	bookkeepingQueueCapacity = 2048
+	// bookkeepingWorkers drain the bookkeeping queue. recordStats may
+	// wait up to 200 ms on a DNS lookup, so a single worker would fall
+	// behind under load.
+	bookkeepingWorkers = 4
+)
+
+// smartProbeWorkers is the number of probe workers: NumCPU*2 clamped to
+// [8, 32], so low-end handsets stay around 8 concurrent TLS handshakes
+// while a desktop lets 32 race.
+func smartProbeWorkers() int {
+	return min(max(runtime.NumCPU()*2, 8), 32)
 }
 
 // getSmartWorker lazily initialises the process-wide smartSharedWorker.
 // Safe to call from any Smart group; all groups share a single instance.
 func getSmartWorker() *smartSharedWorker {
 	smartWorkerOnce.Do(func() {
-		// Pool size: capped at 64 workers. With 16 groups running bursty
-		// probe + prefetch work, 64 workers process the burst in parallel
-		// without letting the goroutine count explode. Unused workers
-		// expire after the idle timeout so idle resources are reclaimed.
-		//
-		// MaxBlockingTasks=256 bounds the parked-caller pile-up when the
-		// pool saturates. Without this, ants' blocking semantics park
-		// submit callers in cond.Wait() UNBOUNDED — during a Wi-Fi ↔
-		// cellular handoff or a full network outage, 15 Smart groups
-		// firing mass recordFailedDial + runHealthCheck + stats flush
-		// submits concurrently can stack up thousands of parked goroutines
-		// (~8 KB stack each) in seconds, which is the RSS explosion users
-		// observe on network switch. Beyond 256 queued callers Submit
-		// returns ErrPoolOverload and our wrapper silently drops the task
-		// — acceptable because every dropped task is either telemetry
-		// (stats / data collector) or a retry-on-schedule probe.
-		pool, err := ants.NewPool(64,
-			ants.WithExpiryDuration(30*time.Second),
-			ants.WithNonblocking(false),
-			ants.WithMaxBlockingTasks(smartPoolMaxBlockingTasks),
-			ants.WithPreAlloc(false),
-		)
-		if err != nil {
-			// Extremely unlikely — ants.NewPool only fails on invalid
-			// config. Fall back to unbounded (go func{}) via pool==nil.
-			smartWorker = &smartSharedWorker{
-				freshnessCache: xsync.NewMapOf[string, probeResult](),
-				freshWindow:    1 * time.Second,
-			}
-			return
-		}
-		smartWorker = &smartSharedWorker{
-			pool:           pool,
+		w := &smartSharedWorker{
+			probes: probeQueue{
+				jobs:  make(map[string]*probeJob),
+				queue: make(chan *probeJob, probeQueueCapacity),
+			},
+			bookkeeping:    make(chan func(), bookkeepingQueueCapacity),
 			freshnessCache: xsync.NewMapOf[string, probeResult](),
 			freshWindow:    1 * time.Second,
 		}
+		for range smartProbeWorkers() {
+			go w.probes.work()
+		}
+		for range bookkeepingWorkers {
+			go func() {
+				for fn := range w.bookkeeping {
+					runRecovered(fn)
+				}
+			}()
+		}
+		smartWorker = w
 	})
 	return smartWorker
 }
 
-// smartPoolMaxBlockingTasks caps parked Submit callers when every worker
-// is busy. Chosen to absorb a normal multi-group burst (16 groups × ~8
-// concurrent tasks = 128 peak) with headroom, but stay far below the
-// "thousands of parked goroutines" regime observed during network
-// handoffs. Each parked caller holds ~8 KB stack plus the mutex
-// bookkeeping, so 256 ≈ 2 MB worst case — predictable and bounded.
-const smartPoolMaxBlockingTasks = 256
-
-// submit schedules fn to run on the shared worker pool. When the pool is
-// saturated AND the backlog is at MaxBlockingTasks, pool.Submit returns
-// ErrPoolOverload and we silently drop the task. Callers must assume
-// submit is best-effort — critical side-effects MUST run inline BEFORE
-// the submit call, not inside the submitted closure.
-//
-// During network outages / handoffs this drop-on-overload behaviour is
-// what prevents the parked-goroutine pile-up that otherwise grows RSS
-// unboundedly. Dropped tasks are either telemetry (acceptable to lose)
-// or periodic probes (next tick re-submits).
-func (w *smartSharedWorker) submit(fn func()) {
-	if w.pool != nil {
-		_ = w.pool.Submit(fn)
-		return
-	}
-	go fn()
-}
-
-// trySubmit is the explicit-shedding variant of submit. Returns true when
-// the task was accepted, false when the pool is overloaded and the task
-// was NOT enqueued. Callers on hot paths (stats recording, data
-// collector) use this so they can skip preparatory work (map allocations,
-// struct copies) when the backlog is shedding — reduces allocation
-// pressure during storms beyond just dropping the scheduled fn.
-func (w *smartSharedWorker) trySubmit(fn func()) bool {
-	if w == nil {
+// bookkeep queues fn for the bookkeeping workers. It never blocks: when
+// the backlog is full fn is dropped and false is returned, which only
+// loses one observation.
+func (w *smartSharedWorker) bookkeep(fn func()) bool {
+	select {
+	case w.bookkeeping <- fn:
+		return true
+	default:
 		return false
 	}
-	if w.pool == nil {
-		// No pool: fall back to unbounded go, same as submit. Callers
-		// still observe a true-return so they skip no work.
-		go fn()
-		return true
-	}
-	return w.pool.Submit(fn) == nil
+}
+
+// runRecovered runs a background task, logging instead of crashing the
+// process when it panics.
+func runRecovered(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Error("smart: background task panic: ", r)
+		}
+	}()
+	fn()
 }
 
 // getWheel lazily starts the shared timing wheel on first use. 100ms tick
@@ -284,34 +224,47 @@ func (w *smartSharedWorker) getWheel() *timingwheel.TimingWheel {
 // Returning zero time ends the schedule (used when the owning Smart group
 // has been closed and we want the wheel to drop this entry).
 type periodSched struct {
-	period   time.Duration
-	firstAt  time.Time
+	period    time.Duration
+	firstAt   time.Time
 	firedOnce atomic.Bool
-	stopped  atomic.Bool
+	stopped   atomic.Bool
 }
 
 // Next is called by timingwheel to decide when the task should next fire.
 // Returning zero Time tells the wheel to stop firing.
+//
+// The wheel calls Next before running the task, and re-adds the timer
+// whenever the result is non-zero: a one-shot (period <= 0) must return
+// zero after its first firing, or the wheel runs it again immediately.
 func (p *periodSched) Next(prev time.Time) time.Time {
 	if p.stopped.Load() {
 		return time.Time{}
 	}
-	if !p.firedOnce.Load() {
-		p.firedOnce.Store(true)
-		if !p.firstAt.IsZero() {
-			return p.firstAt
-		}
+	if p.firedOnce.CompareAndSwap(false, true) && !p.firstAt.IsZero() {
+		return p.firstAt
 	}
-	return prev.Add(p.period)
+	if p.period <= 0 {
+		return time.Time{}
+	}
+	next := prev.Add(p.period)
+	// After a device suspend or a wall-clock step, prev lags far behind
+	// and the wheel would replay every missed period back to back.
+	// Resume the cadence from now instead.
+	if now := time.Now(); next.Before(now) {
+		next = now.Add(p.period)
+	}
+	return next
 }
 
 // stop signals the scheduler to end — the next Next() call returns zero.
 func (p *periodSched) stop() { p.stopped.Store(true) }
 
 // scheduleTask registers fn to fire once at `initial` (from now) and then
-// every `period`. Actual execution happens on the ants pool so task work
-// doesn't block the wheel's internal processor goroutine. Returns a handle
-// the caller stores so Close() can cancel pending firings.
+// every `period`. The wheel already runs each firing on its own goroutine,
+// so fn runs there directly. A firing that finds the previous run of the
+// same task still going is skipped, so a slow task never stacks copies of
+// itself. Returns a handle the caller stores so Close() can cancel pending
+// firings.
 func (w *smartSharedWorker) scheduleTask(initial, period time.Duration, fn func(), once bool, taskCtx context.Context) *scheduledTask {
 	wh := w.getWheel()
 	sched := &periodSched{
@@ -323,19 +276,18 @@ func (w *smartSharedWorker) scheduleTask(initial, period time.Duration, fn func(
 	task.timer = wh.ScheduleFunc(sched, func() {
 		// Respect the owning group's context so a stopped group doesn't
 		// keep firing even before the wheel drops the entry.
-		if taskCtx != nil {
-			select {
-			case <-taskCtx.Done():
-				task.sched.stop()
-				return
-			default:
-			}
+		if taskCtx != nil && taskCtx.Err() != nil {
+			task.sched.stop()
+			return
 		}
-		// Dispatch the actual work to the shared pool.
-		w.submit(fn)
 		if once {
 			task.sched.stop()
 		}
+		if !task.running.CompareAndSwap(false, true) {
+			return
+		}
+		defer task.running.Store(false)
+		runRecovered(fn)
 	})
 	return task
 }
@@ -343,9 +295,10 @@ func (w *smartSharedWorker) scheduleTask(initial, period time.Duration, fn func(
 // scheduledTask bundles a timing-wheel timer with its scheduler so callers
 // can stop both at once when the owning Smart group is closed.
 type scheduledTask struct {
-	timer *timingwheel.Timer
-	sched *periodSched
-	once  bool
+	timer   *timingwheel.Timer
+	sched   *periodSched
+	once    bool
+	running atomic.Bool
 }
 
 // stop cancels the timer AND tells the scheduler to return zero on the
@@ -360,30 +313,101 @@ func (t *scheduledTask) stop() {
 	}
 }
 
-// probeOnce runs a URLTest probe for ob, deduplicating concurrent calls
-// with the same tag via singleflight + short-TTL cache. Returns the delay
-// in ms and an error (same contract as urltest.URLTest).
-//
-// Three-stage resolution:
-//  1. freshnessCache hit within freshWindow → return cached result instantly.
-//  2. singleflight collapse → one in-flight probe serves all callers.
-//  3. actual URLTest → cache result + resolve singleflight waiters.
-func (w *smartSharedWorker) probeOnce(
-	ctx context.Context,
-	testURL string,
-	ob adapter.Outbound,
-	matcher *urltest.StatusMatcher,
-) (uint16, error) {
-	tag := ob.Tag()
-	if hit, ok := w.freshnessCache.Load(tag); ok {
-		if time.Since(hit.at) < w.freshWindow {
-			return hit.delay, hit.err
+// errProbeSkipped is reported to a probe's callbacks when it could not
+// start before its deadline or the probe queue was full. It carries no
+// verdict about the node: callers must not count it as a failure.
+var errProbeSkipped = errors.New("smart: probe skipped before it started")
+
+type probeJob struct {
+	key     string
+	run     func(ctx context.Context) (uint16, error)
+	timeout time.Duration
+	// startBy is the unix-nano deadline for a worker to pick the job up;
+	// later requests joining the job may extend it.
+	startBy int64
+	waiters []func(delay uint16, err error)
+}
+
+type probeQueue struct {
+	access sync.Mutex
+	jobs   map[string]*probeJob // queued or running, by key
+	queue  chan *probeJob
+}
+
+// enqueueProbe schedules run under key, or joins the queued / running job
+// with the same key. done is called exactly once, from a probe worker, with
+// the result or errProbeSkipped. A zero startBy never expires.
+func (w *smartSharedWorker) enqueueProbe(key string, timeout time.Duration, startBy time.Time, run func(ctx context.Context) (uint16, error), done func(delay uint16, err error)) {
+	startByNS := int64(math.MaxInt64)
+	if !startBy.IsZero() {
+		startByNS = startBy.UnixNano()
+	}
+	q := &w.probes
+	q.access.Lock()
+	if job, loaded := q.jobs[key]; loaded {
+		job.waiters = append(job.waiters, done)
+		job.startBy = max(job.startBy, startByNS)
+		q.access.Unlock()
+		return
+	}
+	job := &probeJob{
+		key:     key,
+		run:     run,
+		timeout: timeout,
+		startBy: startByNS,
+		waiters: []func(uint16, error){done},
+	}
+	select {
+	case q.queue <- job:
+		q.jobs[key] = job
+		q.access.Unlock()
+	default:
+		q.access.Unlock()
+		done(0, errProbeSkipped)
+	}
+}
+
+func (q *probeQueue) work() {
+	for job := range q.queue {
+		q.access.Lock()
+		startBy := job.startBy
+		q.access.Unlock()
+		var (
+			delay uint16
+			err   error
+		)
+		if time.Now().UnixNano() > startBy {
+			err = errProbeSkipped
+		} else {
+			runRecovered(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), job.timeout)
+				defer cancel()
+				delay, err = job.run(ctx)
+			})
 		}
+		q.access.Lock()
+		delete(q.jobs, job.key)
+		waiters := job.waiters
+		q.access.Unlock()
+		for _, done := range waiters {
+			runRecovered(func() { done(delay, err) })
+		}
+	}
+}
+
+// probeURL queues a URL test of ob through the probe workers, deduplicated
+// across groups by (testURL, tag, matcher). done receives the delay, the
+// probe error, or errProbeSkipped when the probe did not start by startBy.
+func (w *smartSharedWorker) probeURL(testURL string, ob adapter.Outbound, matcher *urltest.StatusMatcher, timeout time.Duration, startBy time.Time, done func(delay uint16, err error)) {
+	tag := ob.Tag()
+	if hit, ok := w.freshnessCache.Load(tag); ok && time.Since(hit.at) < w.freshWindow {
+		done(hit.delay, hit.err)
+		return
 	}
 	// Key 里除了 (testURL, tag) 还要混入 matcher.String() —— 不同 Smart 组
 	// 可能对同一节点、同一 URL 用不同 expected-status。若 key 里不区分，
-	// singleflight 会把探测结果互相覆盖，一个组的 200-299 结果被另一个
-	// 组的 204-only 结果污染。matcher.String() 是规范化后的字符串（见
+	// 探测结果会互相覆盖，一个组的 200-299 结果被另一个组的 204-only
+	// 结果污染。matcher.String() 是规范化后的字符串（见
 	// expected_status.go），MatchAny 的 matcher 输出 "*"，相同配置
 	// 的组共享一个 key 保持性能优势。
 	matcherKey := ""
@@ -396,33 +420,32 @@ func (w *smartSharedWorker) probeOnce(
 			bits.RotateLeft64(xxhash.Sum64String(matcherKey), 17),
 		36,
 	)
-	v, err, _ := w.probeGroup.Do(key, func() (interface{}, error) {
-		// Gate the actual handshake on the global probe semaphore.
-		// Only the singleflight LEADER reaches this — followers
-		// for the same tag wait at w.probeGroup.Do and share the
-		// result, so the sem cap counts distinct in-flight probes
-		// regardless of how many Smart groups asked for them.
-		ensureProbeSem()
-		select {
-		case probeSem <- struct{}{}:
-			defer func() { <-probeSem }()
-		case <-ctx.Done():
-			return uint16(0), ctx.Err()
-		}
-		var detail urltest.URLTestDetail
-		d, perr := urltest.URLTestWithDetailAndStatus(ctx, testURL, ob, &detail, matcher)
-		w.freshnessCache.Store(tag, probeResult{
-			at:     time.Now(),
-			delay:  d,
-			err:    perr,
-			detail: detail,
+	w.enqueueProbe(key, timeout, startBy, func(ctx context.Context) (uint16, error) {
+		result := probeBounded(ctx, func() probeResult {
+			var detail urltest.URLTestDetail
+			delay, err := urltest.URLTestWithDetailAndStatus(ctx, testURL, ob, &detail, matcher)
+			return probeResult{delay: delay, err: err, detail: detail}
 		})
-		return d, perr
-	})
-	if v == nil {
-		return 0, err
+		result.at = time.Now()
+		w.freshnessCache.Store(tag, result)
+		return result.delay, result.err
+	}, done)
+}
+
+// probeBounded returns once ctx is done even if the outbound ignores
+// cancellation, so a stuck probe never holds a probe worker past its
+// timeout.
+func probeBounded(ctx context.Context, probe func() probeResult) probeResult {
+	resultChan := make(chan probeResult, 1)
+	go func() {
+		resultChan <- probe()
+	}()
+	select {
+	case result := <-resultChan:
+		return result
+	case <-ctx.Done():
+		return probeResult{err: ctx.Err()}
 	}
-	return v.(uint16), err
 }
 
 // freshnessPruneTTL is how long a probeResult lingers after its last

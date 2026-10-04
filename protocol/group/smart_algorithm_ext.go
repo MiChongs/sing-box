@@ -85,34 +85,6 @@ type hysteresisEntry struct {
 	at  int64 // unix-nano
 }
 
-// algoRandSource is a per-CPU rand source. math/rand/v2 NewPCG is
-// lock-free per instance; we shard so concurrent reorderForAlgorithm
-// callers across goroutines don't serialise on the global default
-// source. Allocated once at init and indexed by a goroutine-stable
-// counter.
-//
-// 16 shards is plenty: contention on math/rand at 1k QPS is already
-// negligible after sharding even four-way. The extra shards leave
-// headroom for the parallel-dial expansion.
-const algoRandShards = 16
-
-var algoRandShardsArr [algoRandShards]*mathrand.Rand
-var algoRandIdx atomic.Uint32
-
-func init() {
-	for i := range algoRandShardsArr {
-		algoRandShardsArr[i] = mathrand.New(mathrand.NewPCG(uint64(i)+1, 0xC4F5_2A1B_DEF0_1234))
-	}
-}
-
-// pickRand returns a per-call rand source. The cursor is incremented
-// atomically so concurrent callers fan out across the shards. Callers
-// must NOT cache the returned pointer across goroutines.
-func pickRand() *mathrand.Rand {
-	idx := int(algoRandIdx.Add(1)) & (algoRandShards - 1)
-	return algoRandShardsArr[idx]
-}
-
 // shortRTTCache is a global short-TTL memoiser for AtomicStatsRecord
 // ShortRTT lookups. The recordCache itself already deduplicates the
 // underlying bbolt fetch, but ShortRTT() takes the per-record mutex on
@@ -202,9 +174,10 @@ func (s *Smart) reorderP2C(candidates []adapter.Outbound) []adapter.Outbound {
 	if k > len(candidates) {
 		k = len(candidates)
 	}
-	r := pickRand()
-	a := r.IntN(k)
-	b := r.IntN(k - 1)
+	// The package-level math/rand/v2 functions are safe for concurrent
+	// use and lock-free; a shared *Rand is not.
+	a := mathrand.IntN(k)
+	b := mathrand.IntN(k - 1)
 	if b >= a {
 		b++ // ensures a != b without rejection sampling
 	}
@@ -282,15 +255,14 @@ func (s *Smart) reorderLatencyBanded(candidates []adapter.Outbound) []adapter.Ou
 			nSlow++
 		}
 	}
-	r := pickRand()
 	var pick int
 	switch {
 	case nFast > 0:
-		pick = fast[r.IntN(nFast)]
+		pick = fast[mathrand.IntN(nFast)]
 	case nMedium > 0:
-		pick = medium[r.IntN(nMedium)]
+		pick = medium[mathrand.IntN(nMedium)]
 	case nSlow > 0:
-		pick = slow[r.IntN(nSlow)]
+		pick = slow[mathrand.IntN(nSlow)]
 	default:
 		return candidates
 	}

@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -361,6 +362,12 @@ type Smart struct {
 	// rankingMinInterval) and gate on this stamp. 0 = never computed.
 	lastRankingComputeAt atomic.Int64
 
+	// rankingRefresh / weightsRefresh run event-driven ranking and
+	// prefetch+ranking recomputes in the background, coalescing requests
+	// that arrive while one is running into a single follow-up run.
+	rankingRefresh providerUpdateCheckScheduler
+	weightsRefresh providerUpdateCheckScheduler
+
 	// healthCheckCursor is a monotonically-incrementing rotation offset
 	// for the NON-priority tail of nodes in runHealthCheck. When the node
 	// count exceeds the per-round probe budget, each tick probes a
@@ -390,7 +397,7 @@ type Smart struct {
 	// user's observable dissatisfaction (three Ctrl+W's in a row on a
 	// slow page) instead of silently re-picking the same bad node.
 	shortLifeMu sync.Mutex
-	shortLife   map[string][]time.Time
+	shortLife   pairEventLog
 
 	// resetEvents tracks upstream TCP RST / broken-pipe / forcibly-
 	// closed events per (target, node) pair. Distinct from shortLife
@@ -508,6 +515,9 @@ type Smart struct {
 	// computed yet this process lifetime" — fall through to the
 	// existing live/delay paths in that case.
 	rankingSnapshot atomic.Pointer[smartRankingSnapshot]
+	// rankingHydrated marks the one-time warm-up of rankingSnapshot from
+	// the persisted ranking, see loadRankingSnapshot.
+	rankingHydrated atomic.Bool
 
 	// rankingKickOnce gates the post-first-dial kick of updateNodeRanking.
 	// The 45 s scheduled initial delay made every fresh process
@@ -577,7 +587,25 @@ type Smart struct {
 type smartRankingSnapshot struct {
 	ranking    []smart.NodeRank
 	computedAt time.Time
+	// order lists the ranked node names by weight (descending, ties by
+	// name) and ranked holds the same names as a set: the order
+	// fillProxies draws supplemental candidates in, precomputed once per
+	// publish instead of re-sorted on every dial.
+	order  []string
+	ranked map[string]struct{}
+	// finalized caches the count-enriched copy WeightRanking serves, so
+	// a dashboard polling every few seconds does not re-enrich each time.
+	finalized atomic.Pointer[finalizedRanking]
 }
+
+type finalizedRanking struct {
+	ranking []smart.NodeRank
+	at      time.Time
+}
+
+// rankingFinalizeTTL bounds how stale the enriched counts WeightRanking
+// serves from a snapshot may be.
+const rankingFinalizeTTL = 30 * time.Second
 
 func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
 	networks := []string{N.NetworkTCP}
@@ -617,7 +645,7 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		icon:               options.Icon,
 		nodeLoad:           newNodeLoadCounter(),
 		targetConns:        make(map[string]map[*smartTrackedConn]struct{}),
-		shortLife:          make(map[string][]time.Time),
+		shortLife:          newPairEventLog(),
 		resetEvents:        newResetEventTracker(),
 		knownDead:          xsync.NewMapOf[string, time.Time](),
 		targetDebargo:      xsync.NewMapOf[string, time.Time](),
@@ -966,7 +994,7 @@ func (s *Smart) postStart() error {
 		// all thrash the CPU / testURL host at the exact same tick.
 		// singleflight de-dup kicks in even without staggering, but
 		// staggering also spreads the freshness-cache fill across time.
-		initial := staggeredInitialDelay(t.initial, s.groupOrdinal)
+		initial := staggeredInitialDelay(t.initial, t.period, s.groupOrdinal)
 		fn := t.fn
 		if t.idleSkip {
 			tname := t.name
@@ -1044,13 +1072,11 @@ func (s *Smart) postStart() error {
 // time.NewTicker — for 15 Smart groups × 9 tasks = 135 parked goroutines
 // each costing 2-8 KB stack + a runtime timer slot. Now a single bucket
 // processor goroutine in timingwheel.TimingWheel drives every group's
-// tasks, and the actual work routes through the shared ants pool (which
-// already caps global concurrency at 64 workers).
+// tasks.
 //
 // Semantic preservation:
-//   - "task completes before next tick considers firing" — enforced by
-//     running fn() synchronously inside the ants worker before the
-//     scheduler's Next() computes the next firing time.
+//   - A run never overlaps the previous run of the same task: a firing
+//     that finds it still running is skipped (see scheduleTask).
 //   - Cancellation via s.taskCtx.Done() — checked inside the fire
 //     callback AND via scheduledTask.stop() on Close().
 //   - Per-group startup staggering via groupOrdinal to avoid
@@ -1342,7 +1368,12 @@ func (s *Smart) WeightRanking(forceRefresh bool) ([]smart.NodeRank, error) {
 	if !forceRefresh {
 		if mem := s.rankingSnapshot.Load(); mem != nil &&
 			len(mem.ranking) > 0 && time.Since(mem.computedAt) < snapshotMaxAge {
-			return s.finalizeRanking(mem.ranking, true), nil
+			if cached := mem.finalized.Load(); cached != nil && time.Since(cached.at) < rankingFinalizeTTL {
+				return slices.Clone(cached.ranking), nil
+			}
+			ranking := s.finalizeRanking(mem.ranking, true)
+			mem.finalized.Store(&finalizedRanking{ranking: slices.Clone(ranking), at: time.Now()})
+			return ranking, nil
 		}
 	}
 	if forceRefresh {
@@ -1391,10 +1422,42 @@ func (s *Smart) publishRankingSnapshot(ranking []smart.NodeRank) {
 	// snapshot mid-read on another goroutine.
 	clone := make([]smart.NodeRank, len(ranking))
 	copy(clone, ranking)
+	byWeight := make([]smart.NodeRank, len(ranking))
+	copy(byWeight, ranking)
+	sort.Slice(byWeight, func(i, j int) bool {
+		if byWeight[i].Weight != byWeight[j].Weight {
+			return byWeight[i].Weight > byWeight[j].Weight
+		}
+		return byWeight[i].Name < byWeight[j].Name
+	})
+	order := make([]string, len(byWeight))
+	ranked := make(map[string]struct{}, len(byWeight))
+	for i, r := range byWeight {
+		order[i] = r.Name
+		ranked[r.Name] = struct{}{}
+	}
 	s.rankingSnapshot.Store(&smartRankingSnapshot{
 		ranking:    clone,
 		computedAt: time.Now(),
+		order:      order,
+		ranked:     ranked,
 	})
+}
+
+// loadRankingSnapshot returns the in-process ranking, warming it once
+// from the persisted ranking after a restart so the dial path never has
+// to decode the bbolt copy itself.
+func (s *Smart) loadRankingSnapshot() *smartRankingSnapshot {
+	if mem := s.rankingSnapshot.Load(); mem != nil {
+		return mem
+	}
+	if s.store == nil || !s.rankingHydrated.CompareAndSwap(false, true) {
+		return nil
+	}
+	if cached, err := s.store.GetNodeWeightRankingCache(s.Tag(), smartConfigName); err == nil && len(cached) > 0 {
+		s.publishRankingSnapshot(cached)
+	}
+	return s.rankingSnapshot.Load()
 }
 
 // DiagnosticSnapshot returns the deep internal state of this Smart
@@ -1691,7 +1754,7 @@ func (s *Smart) FlushStore() (smart.FlushStats, error) {
 	}
 
 	s.shortLifeMu.Lock()
-	s.shortLife = make(map[string][]time.Time)
+	s.shortLife.reset()
 	s.shortLifeMu.Unlock()
 	if s.resetEvents != nil {
 		s.resetEvents.reset()
@@ -1767,12 +1830,8 @@ func (s *Smart) ClearSelection() ClearSelectionResult {
 		"]); unwrap cache dropped, active connections interrupted")
 
 	// Kick the ranking pipeline asynchronously so the next /weights or
-	// DialContext sees fresh data. Cheap: goroutines are work-stealing and
-	// the functions are idempotent.
-	getSmartWorker().submit(func() {
-		s.runPrefetch()
-		s.updateNodeRanking()
-	})
+	// DialContext sees fresh data.
+	s.weightsRefresh.Schedule(s.recomputeWeights)
 
 	res.Now = s.Now()
 	return res
@@ -1788,10 +1847,12 @@ func (s *Smart) RecomputeWeights() {
 	if s.store == nil {
 		return
 	}
-	getSmartWorker().submit(func() {
-		s.runPrefetch()
-		s.updateNodeRanking()
-	})
+	s.weightsRefresh.Schedule(s.recomputeWeights)
+}
+
+func (s *Smart) recomputeWeights() {
+	s.runPrefetch()
+	s.updateNodeRanking()
 }
 
 // DefaultBlockDuration applied by MarkBlocked when caller doesn't specify one.
@@ -2310,7 +2371,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	// the pin is healthy again — clear the suspended flag so the
 	// Clash API stops showing "pin unavailable".
 	s.maybeResumePin(proxyTag)
-	s.logger.InfoContext(ctx, "smart[", s.Tag(), "] ", network, " → ", destination,
+	s.logger.DebugContext(ctx, "smart[", s.Tag(), "] ", network, " → ", destination,
 		" via [", proxyTag, "] in ", connectTime, "ms (target=",
 		displayTarget(meta, destination), " asn=", displayASN(meta), " source=", source, ")")
 
@@ -2444,7 +2505,7 @@ func (s *Smart) racePacketCandidates(
 			// instead of waiting for an eventual recordStats on conn close.
 			s.onDialOutcome(true)
 			s.maybeResumePin(ob.Tag())
-			s.logger.InfoContext(ctx, "smart[", s.Tag(), "] UDP → ", destination,
+			s.logger.DebugContext(ctx, "smart[", s.Tag(), "] UDP → ", destination,
 				" via [", ob.Tag(), "] in ", connectTime, "ms (target=",
 				displayTarget(meta, destination), " asn=", displayASN(meta),
 				" source=", source, ")")
@@ -2455,13 +2516,11 @@ func (s *Smart) racePacketCandidates(
 		s.logger.DebugContext(ctx, "smart[", s.Tag(), "] UDP probe [", ob.Tag(),
 			"] failed in ", connectTime, "ms: ", err)
 		// Sync storm-counter bump for the UDP race too — same reason as
-		// the TCP paths: don't let trySubmit's drop shield storm detection.
+		// the TCP paths: a dropped bookkeeping task must not shield storm
+		// detection.
 		s.onDialOutcome(false)
 		tag, ct, m := ob.Tag(), connectTime, meta
-		// trySubmit: the UDP race loops through every candidate so a
-		// network-down burst spams N submits per ListenPacket call.
-		// Drop-on-overload keeps the pool backlog bounded.
-		getSmartWorker().trySubmit(func() {
+		getSmartWorker().bookkeep(func() {
 			s.recordStats("failed", m, tag, ct, 0, 0, 0, 0, 0, 0)
 		})
 	}
@@ -2724,106 +2783,25 @@ func (s *Smart) fillProxies(target string, names []string, weights []float64, al
 		return selected[:minCount]
 	}
 
-	// Build supplemental pool from nodes not already in named list
+	// Supplemental candidates: nodes outside the named list, best first.
 	inNamedPtr := getStringBoolMap()
 	defer putStringBoolMap(inNamedPtr)
 	inNamed := *inNamedPtr
 	for _, name := range names {
 		inNamed[name] = true
 	}
-
-	filteredAll := make([]adapter.Outbound, 0, len(all))
-	for _, ob := range all {
-		if !inNamed[ob.Tag()] {
-			filteredAll = append(filteredAll, ob)
-		}
+	eligible := func(ob adapter.Outbound) bool {
+		tag := ob.Tag()
+		return !inNamed[tag] && !blockedNodes[tag] && s.isAlive(tag) &&
+			(!isUDP || s.supportsUDP(ob)) && !s.isTargetDebargoed(target, tag)
 	}
-
-	// Sort supplemental: policyPriority > ranking > random
-	if len(s.policyPriority) > 0 {
-		sort.Slice(filteredAll, func(i, j int) bool {
-			fi := s.getPriorityFactor(filteredAll[i].Tag())
-			fj := s.getPriorityFactor(filteredAll[j].Tag())
-			if fi != fj {
-				return fi > fj
-			}
-			return filteredAll[i].Tag() < filteredAll[j].Tag()
-		})
-	} else if s.store != nil {
-		sorted := false
-		if ranking, err := s.store.GetNodeWeightRankingCache(s.Tag(), smartConfigName); err == nil && len(ranking) > 0 {
-			rankMapPtr := getStringFloatMap()
-			rankMap := *rankMapPtr
-			for _, r := range ranking {
-				rankMap[r.Name] = r.Weight
-			}
-			sort.Slice(filteredAll, func(i, j int) bool {
-				wi, oki := rankMap[filteredAll[i].Tag()]
-				wj, okj := rankMap[filteredAll[j].Tag()]
-				if oki && okj {
-					if wi != wj {
-						return wi > wj
-					}
-					return filteredAll[i].Tag() < filteredAll[j].Tag()
-				}
-				return oki
-			})
-			putStringFloatMap(rankMapPtr)
-			sorted = true
-		}
-		if !sorted && s.history != nil {
-			// Ranking cache not warmed yet — bias supplemental ordering by
-			// URLTest delay so cold-start dials still prefer fast nodes over
-			// a purely random shuffle (mihomo parity).
-			delayMapPtr := getStringUint16Map()
-			delayMap := *delayMapPtr
-			anyDelay := false
-			for _, ob := range filteredAll {
-				if h := s.history.LoadURLTestHistory(ob.Tag()); h != nil && h.Delay > 0 {
-					delayMap[ob.Tag()] = h.Delay
-					anyDelay = true
-				}
-			}
-			if anyDelay {
-				sort.Slice(filteredAll, func(i, j int) bool {
-					di, oki := delayMap[filteredAll[i].Tag()]
-					dj, okj := delayMap[filteredAll[j].Tag()]
-					if oki && okj {
-						if di != dj {
-							return di < dj
-						}
-						return filteredAll[i].Tag() < filteredAll[j].Tag()
-					}
-					return oki // nodes with a measured delay outrank unmeasured ones
-				})
-				sorted = true
-			}
-			putStringUint16Map(delayMapPtr)
-		}
-		if !sorted {
-			rand.Shuffle(len(filteredAll), func(i, j int) {
-				filteredAll[i], filteredAll[j] = filteredAll[j], filteredAll[i]
-			})
-		}
-	} else {
-		rand.Shuffle(len(filteredAll), func(i, j int) {
-			filteredAll[i], filteredAll[j] = filteredAll[j], filteredAll[i]
-		})
-	}
-
 	firstAppended := false
-	for _, ob := range filteredAll {
-		if blockedNodes[ob.Tag()] || !s.isAlive(ob.Tag()) || (isUDP && !s.supportsUDP(ob)) || s.isTargetDebargoed(target, ob.Tag()) {
-			continue
-		}
+	for _, ob := range s.supplementalCandidates(all, proxyByName, eligible, minCount-len(selected)) {
 		if !firstAppended && len(names) < minCount {
 			selected = append([]adapter.Outbound{ob}, selected...)
 			firstAppended = true
 		} else {
 			selected = append(selected, ob)
-		}
-		if len(selected) >= minCount {
-			break
 		}
 	}
 
@@ -2848,6 +2826,124 @@ func (s *Smart) fillProxies(target string, names []string, weights []float64, al
 	}
 
 	return selected
+}
+
+// supplementalCandidates returns up to need eligible members in the order
+// fillProxies tops up its candidate list with: policy priority when
+// configured; otherwise the published weight ranking, then nodes with a
+// measured URL-test delay (fastest first), then a random sample of the
+// rest. It stops as soon as it has enough instead of sorting the whole
+// group on every dial.
+func (s *Smart) supplementalCandidates(all []adapter.Outbound, proxyByName map[string]adapter.Outbound, eligible func(adapter.Outbound) bool, need int) []adapter.Outbound {
+	if need <= 0 || len(all) == 0 {
+		return nil
+	}
+	if len(s.policyPriority) > 0 {
+		return topKOutbounds(all, need, eligible, func(a, b adapter.Outbound) bool {
+			fa, fb := s.getPriorityFactor(a.Tag()), s.getPriorityFactor(b.Tag())
+			if fa != fb {
+				return fa > fb
+			}
+			return a.Tag() < b.Tag()
+		})
+	}
+	result := make([]adapter.Outbound, 0, need)
+	chosen := make(map[string]struct{}, need)
+	take := func(ob adapter.Outbound) {
+		result = append(result, ob)
+		chosen[ob.Tag()] = struct{}{}
+	}
+	fresh := func(ob adapter.Outbound) bool {
+		_, taken := chosen[ob.Tag()]
+		return !taken && eligible(ob)
+	}
+	if s.store != nil {
+		if mem := s.loadRankingSnapshot(); mem != nil {
+			for _, name := range mem.order {
+				if ob := proxyByName[name]; ob != nil && fresh(ob) {
+					take(ob)
+					if len(result) == need {
+						return result
+					}
+				}
+			}
+		}
+		// The ranking may cover only the nodes that already carried
+		// traffic: prefer the rest by URL-test delay so dials don't pick
+		// at random (mihomo parity); measured nodes outrank unmeasured ones.
+		if s.history != nil {
+			delayOf := func(ob adapter.Outbound) uint16 {
+				if h := s.history.LoadURLTestHistory(ob.Tag()); h != nil {
+					return h.Delay
+				}
+				return 0
+			}
+			for _, ob := range topKOutbounds(all, need-len(result), func(ob adapter.Outbound) bool {
+				return delayOf(ob) > 0 && fresh(ob)
+			}, func(a, b adapter.Outbound) bool {
+				da, db := delayOf(a), delayOf(b)
+				if da != db {
+					return da < db
+				}
+				return a.Tag() < b.Tag()
+			}) {
+				take(ob)
+			}
+			if len(result) == need {
+				return result
+			}
+		}
+	}
+	// Uniform random sample of the remaining eligible nodes: random probes
+	// first, which is enough when most nodes are eligible, then a shuffled
+	// sweep of whatever was not probed.
+	probed := make(map[int]struct{}, 4*need)
+	for range 4 * need {
+		i := rand.Intn(len(all))
+		if _, seen := probed[i]; seen {
+			continue
+		}
+		probed[i] = struct{}{}
+		if fresh(all[i]) {
+			take(all[i])
+			if len(result) == need {
+				return result
+			}
+		}
+	}
+	for _, i := range rand.Perm(len(all)) {
+		if _, seen := probed[i]; seen {
+			continue
+		}
+		if fresh(all[i]) {
+			take(all[i])
+			if len(result) == need {
+				break
+			}
+		}
+	}
+	return result
+}
+
+// topKOutbounds returns, in order, up to k eligible outbounds that sort
+// first under less, without sorting the whole slice.
+func topKOutbounds(all []adapter.Outbound, k int, eligible func(adapter.Outbound) bool, less func(a, b adapter.Outbound) bool) []adapter.Outbound {
+	top := make([]adapter.Outbound, 0, k)
+	for _, ob := range all {
+		if len(top) == k && !less(ob, top[k-1]) {
+			continue
+		}
+		if !eligible(ob) {
+			continue
+		}
+		index := sort.Search(len(top), func(i int) bool { return less(ob, top[i]) })
+		if len(top) < k {
+			top = append(top, nil)
+		}
+		copy(top[index+1:], top[index:len(top)-1])
+		top[index] = ob
+	}
+	return top
 }
 
 // dialWithRetry runs up to maxRetries rounds with exponential jitter backoff.
@@ -3189,14 +3285,9 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 			// exactly the case where storm detection matters most.
 			s.onDialOutcome(false)
 			ct2, tag2, meta2 := ct, tag, meta
-			// trySubmit (not submit): during a network storm, the failure-
-			// recording telemetry is the #1 producer of pool-backlog growth.
-			// Each of these submits runs recordStats → 200 ms DNS lookup →
-			// bbolt queue append; 100 concurrent failing dials × 12 submits
-			// each would park 1200 callers in the pool's cond.Wait() under
-			// the old blocking-unbounded policy. Shedding the oldest-first
-			// here keeps backlog bounded AND the per-storm RSS flat.
-			getSmartWorker().trySubmit(func() { s.recordFailedDial(tag2, meta2, ct2) })
+			// Off the dial path; during a network storm a full bookkeeping
+			// queue drops the record instead of growing a backlog.
+			getSmartWorker().bookkeep(func() { s.recordFailedDial(tag2, meta2, ct2) })
 		}
 		return conn, outbounds[0].Tag(), ct, err
 	}
@@ -3267,10 +3358,7 @@ func (s *Smart) parallelDial(ctx context.Context, network string, dest M.Socksad
 			// Sync storm-counter bump — see single-node branch rationale.
 			s.onDialOutcome(false)
 			rtag, rct, rmeta := r.tag, r.connectTime, meta
-			// See parallelDial-single-node branch: trySubmit instead of
-			// submit so a storm-of-failures doesn't grow the pool backlog
-			// without bound.
-			getSmartWorker().trySubmit(func() { s.recordFailedDial(rtag, rmeta, rct) })
+			getSmartWorker().bookkeep(func() { s.recordFailedDial(rtag, rmeta, rct) })
 		}
 	}
 
@@ -3380,11 +3468,7 @@ func (s *Smart) hedgedDial(ctx context.Context, network string, dest M.Socksaddr
 				// Sync storm-counter bump — see parallelDial rationale.
 				s.onDialOutcome(false)
 				rtag, rct, rmeta := r.tag, r.connectTime, meta
-				// Shed-on-overload: mirror parallelDial — during a
-				// mass-failure storm a hedged-dial loop generates up
-				// to 2×failures worth of recordFailedDial submits, so
-				// trySubmit keeps the pool backlog bounded.
-				getSmartWorker().trySubmit(func() { s.recordFailedDial(rtag, rmeta, rct) })
+				getSmartWorker().bookkeep(func() { s.recordFailedDial(rtag, rmeta, rct) })
 			}
 			// primary 快速失败 → 不等 hedge timer 直接启动 hedges (加速
 			// 失败切换；本来就要追加 hedge，提前一点点避免再浪费 250ms)。
@@ -3435,13 +3519,17 @@ type smartTrackedConn struct {
 	upload   atomic.Int64
 	download atomic.Int64
 
-	// first-byte tracking
-	currentFirstByteTimeout time.Duration
-	firstReadOnce           atomic.Bool
-	firstReadMs             atomic.Int64 // latency in ms from dial-success
-	firstReadErr            atomic.Pointer[error]
-	firstWriteOnce          atomic.Bool
-	firstWriteErr           atomic.Pointer[error]
+	// first-byte tracking. The first-byte watchdog starts at the first
+	// Write: a conn the client has not spoken on yet (preconnect,
+	// server-speaks-first) is not waiting for anything.
+	firstByteTimeout atomic.Int64 // nanoseconds, set when the watchdog is armed
+	firstReadOnce    atomic.Bool
+	firstReadMs      atomic.Int64 // latency in ms from dial-success
+	firstReadErr     atomic.Pointer[error]
+	firstWriteOnce   atomic.Bool
+	firstWriteErr    atomic.Pointer[error]
+	firstWriteAt     atomic.Int64 // unix-nano of the first Write
+	deadlineArmed    atomic.Bool  // a first-byte read deadline is set on Conn
 
 	// lastIOErr is the most recent non-nil error observed on Read or
 	// Write, regardless of whether the conn had already produced bytes.
@@ -3458,12 +3546,13 @@ type smartTrackedConn struct {
 	// when no error has ever been observed.
 	lastIOErr atomic.Pointer[error]
 
-	// lastReadAt is the unix-nano timestamp of the most recent successful
-	// Read (n > 0). Drives the stalled-transfer watchdog: when a conn
-	// has data but stops moving for stalledTransferTimeout the watchdog
-	// force-closes it and triggers an algorithm-aware node switch.
-	// 0 means no successful read yet — first-byte watchdog handles that.
-	lastReadAt atomic.Int64
+	// lastReadAt / lastWriteAt are the unix-nano timestamps of the most
+	// recent successful Read / Write (n > 0). They drive the
+	// stalled-transfer watchdog: a conn whose last write has gone
+	// unanswered for stalledTransferTimeout is force-closed. A conn that
+	// is merely idle (keep-alive, websocket, push) is left alone.
+	lastReadAt  atomic.Int64
+	lastWriteAt atomic.Int64
 
 	// watchdogTriggered guards against double-handling when the
 	// watchdog and a natural close race. Set the moment the watchdog
@@ -3503,15 +3592,15 @@ func (c *smartTrackedConn) Read(b []byte) (int, error) {
 		// at most once per scan tick.
 		c.lastReadAt.Store(time.Now().UnixNano())
 	}
-	firstByteJustNow := false
-	if c.firstReadOnce.CompareAndSwap(false, true) {
+	if wasPreFirstByte && c.firstReadOnce.CompareAndSwap(false, true) {
 		c.firstReadMs.Store(time.Since(c.startTime).Milliseconds())
 		if err != nil {
 			e := err // copy to heap before pointer-atomic Store
 			c.firstReadErr.Store(&e)
-		} else if n > 0 {
-			firstByteJustNow = true
 		}
+		// The first-byte watchdog has done its job; never let its
+		// deadline surface as an error on a healthy conn later.
+		c.disarmFirstByteDeadline()
 	}
 	// Always surface the latest error to lastIOErr — firstReadErr only
 	// captures the first-byte instant; mid-transfer errors land here so
@@ -3520,13 +3609,11 @@ func (c *smartTrackedConn) Read(b []byte) (int, error) {
 		e := err
 		c.lastIOErr.Store(&e)
 	}
-	// Real-time RST detection. Three layered triggers:
+	// Real-time RST detection. Two layered triggers:
 	//
 	//   - isPreFirstByteFatal: the conn NEVER produced a payload byte
-	//     and Read returned a non-EOF error. Pre-first-byte semantics
-	//     let us be aggressive — we already waited firstByteWatchdog
-	//     for a byte, anything other than clean EOF means the node
-	//     didn't deliver.
+	//     and Read returned a non-EOF error — including the first-byte
+	//     deadline armed at the first Write. The node didn't deliver.
 	//
 	//   - isTransferFatalErr: after first-byte, the conn got a wider
 	//     set of "dirty RST" errors — TLS record-layer damage, h2
@@ -3537,9 +3624,9 @@ func (c *smartTrackedConn) Read(b []byte) (int, error) {
 	//     includes isResetErr so the classic kernel-level RST path
 	//     is still covered when it reaches mid-transfer.
 	//
-	// All triggers funnel through the CAS-guarded
-	// triggerInstantResetEviction so a follow-up Write(EPIPE) or
-	// Close(reset) can't double-handle the same conn.
+	// Both funnel through the CAS-guarded triggerInstantResetEviction
+	// so a follow-up Write(EPIPE) or Close(reset) can't double-handle
+	// the same conn.
 	if err != nil {
 		switch {
 		case wasPreFirstByte && isPreFirstByteFatal(err):
@@ -3547,41 +3634,6 @@ func (c *smartTrackedConn) Read(b []byte) (int, error) {
 		case isTransferFatalErr(err):
 			c.s.triggerInstantResetEviction(c, "read", err)
 		}
-	}
-	// Kernel-driven watchdog: Read returned a deadline-style timeout.
-	// Decide between (a) a genuine stall (no recent activity) → trigger
-	// the same eviction sequence as a TCP RST so the algorithm picks
-	// a different node on the very next dial; or (b) a benign deadline
-	// fire (we just had real bytes a moment ago — the deadline simply
-	// hasn't been re-armed yet) → push the deadline forward and let
-	// the caller decide whether to retry. This is the "极速响应"
-	// path: the trigger fires the instant the kernel observes the
-	// stall, no goroutine sleep / wakeup involved.
-	if err != nil && isWatchdogDeadlineErr(err) && !c.watchdogTriggered.Load() {
-		lastNS := c.lastReadAt.Load()
-		idle := time.Since(c.startTime)
-		if lastNS != 0 {
-			idle = time.Since(time.Unix(0, lastNS))
-		}
-		genuineStall := !c.firstReadOnce.Load() ||
-			idle >= stalledTransferTimeout-stalledTransferGrace
-		if genuineStall && c.watchdogTriggered.CompareAndSwap(false, true) {
-			c.s.logger.Warn("smart[", c.s.Tag(), "] kernel watchdog evicting [",
-				c.proxyTag, "] target=[", c.meta.smartTarget,
-				"] reason=", classifyWatchdogStall(c), " idle=", idle.Truncate(time.Millisecond))
-			// Don't close the conn here — the caller will hit our
-			// Close() through their normal flow once Read returns,
-			// and that path runs recordStats. We DO need to fire
-			// the eviction so the breaker / unwrap-cache / ranking
-			// catch up before the user's next dial.
-			c.s.handleResetThresholdCrossed(c.meta, c.proxyTag)
-		} else if !genuineStall {
-			// Push the deadline forward and let the read loop retry.
-			c.rearmTransferStalledDeadline()
-		}
-	}
-	if firstByteJustNow {
-		c.armTransferStalledDeadline()
 	}
 	c.sampleRate()
 	return n, err
@@ -3591,11 +3643,14 @@ func (c *smartTrackedConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
 	if n > 0 {
 		c.upload.Add(int64(n))
+		c.lastWriteAt.Store(time.Now().UnixNano())
 	}
 	if c.firstWriteOnce.CompareAndSwap(false, true) {
 		if err != nil {
 			e := err
 			c.firstWriteErr.Store(&e)
+		} else {
+			c.armFirstByteDeadline()
 		}
 	}
 	// Mirror Read: every Write error (not only the first) must surface
@@ -3715,7 +3770,7 @@ func (c *smartTrackedConn) Close() error {
 		// Clear the kernel watchdog deadline before any post-close
 		// cleanup so a stale deadline doesn't surface as a spurious
 		// timeout during downstream EOF propagation.
-		c.clearReadDeadline()
+		c.disarmFirstByteDeadline()
 		// Remove from per-target registry so a subsequent mass-close doesn't
 		// try to close this already-closed connection.
 		if c.meta != nil {
@@ -3788,11 +3843,10 @@ func (c *smartTrackedConn) Close() error {
 		cs, meta, tag, ctime := c.s, c.meta, c.proxyTag, c.connectTime
 		statusCopy := status
 		latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy := latency, up, down, maxUpBps, maxDownBps, durMS
-		// trySubmit: during a network-switch burst every in-flight conn
-		// closes roughly together, producing a herd of stats submits.
-		// Drop-on-overload is acceptable (one close sample) and keeps
-		// the pool backlog bounded.
-		getSmartWorker().trySubmit(func() {
+		// Never blocks Close: during a network-switch burst every in-flight
+		// conn closes roughly together, and a full bookkeeping queue drops
+		// the sample instead of stalling the caller.
+		getSmartWorker().bookkeep(func() {
 			cs.recordStats(statusCopy, meta, tag, ctime,
 				latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy)
 		})
@@ -3903,9 +3957,8 @@ func (c *smartTrackedPacketConn) Close() error {
 		}
 		cs, meta, tag, ctime := c.s, c.meta, c.proxyTag, c.connectTime
 		latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy := latency, up, down, maxUpBps, maxDownBps, durMS
-		// trySubmit: see smartTrackedConn.Close — UDP close-herds during
-		// network handoff generate the same submit burst as TCP.
-		getSmartWorker().trySubmit(func() {
+		// See smartTrackedConn.Close.
+		getSmartWorker().bookkeep(func() {
 			cs.recordStats("closed", meta, tag, ctime,
 				latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy)
 		})
@@ -3922,12 +3975,8 @@ func (s *Smart) wrapConn(conn net.Conn, tag string, meta *smartDialMeta, connect
 		connectTime: connectTime,
 		startTime:   time.Now(),
 	}
-	// Arm the kernel-level read deadline so a silent node returns
-	// from the very next Read instead of hanging until the kernel /
-	// TLS timeout. This is the "real-time" detection path — the
-	// periodic watchdog is just a backstop for transports that
-	// silently ignore SetReadDeadline.
-	tracked.applyFirstByteDeadline()
+	// The first-byte read deadline is armed by the first Write, see
+	// armFirstByteDeadline.
 	s.registerTargetConn(meta.smartTarget, tracked)
 	if s.interruptExternalConnections {
 		return s.interruptGroup.NewConn(tracked,
@@ -4051,12 +4100,12 @@ func (s *Smart) onDialOutcome(success bool) {
 	cnt := s.dialFailCount.Add(1)
 	if cnt >= 5 && s.recheckOnce.CompareAndSwap(false, true) {
 		cntCopy := cnt
-		getSmartWorker().submit(func() {
+		go func() {
 			defer s.recheckOnce.Store(false)
 			s.logger.Info("smart[", s.Tag(), "] accumulated ", cntCopy,
 				" dial failures in short window; triggering emergency prefetch refresh")
 			s.runPrefetch()
-		})
+		}()
 	}
 }
 
@@ -4145,8 +4194,8 @@ func (s *Smart) recordStats(
 	// every dial (failure: parallelDial / hedgedDial / UDP race; success:
 	// DialContext / ListenPacket). That guarantees the storm counter and
 	// emergency-refresh signal advance regardless of whether this
-	// recordStats call was dispatched via trySubmit (and potentially
-	// dropped under pool overload). Keeping the call here too would
+	// recordStats call was queued for bookkeeping (and potentially
+	// dropped when the queue was full). Keeping the call here too would
 	// produce double-counting on every dial whose submit actually runs,
 	// which we deliberately avoid.
 
@@ -4424,19 +4473,9 @@ func (s *Smart) recordStats(
 				break
 			}
 		}
-		// Route sample collection through the shared ants pool so a high-
-		// throughput config doesn't spawn thousands of goroutines.
-		// Must COPY the ModelInput by value — `input` gets released back
-		// to the pool when recordStats returns (via defer), and the
-		// async goroutine can't hold a reference to pooled memory.
-		// trySubmit: training-sample loss is acceptable under pool
-		// overload — we'd rather drop a few samples than let a network
-		// outage grow RSS through pool-backlog accumulation.
-		inputSnap := *input
-		cmetaCopy, w, srcCopy := cmeta, baseWeight, source
-		getSmartWorker().trySubmit(func() {
-			s.dataCollector.AddSample(&inputSnap, cmetaCopy, w, srcCopy)
-		})
+		// recordStats already runs on a bookkeeping worker, so the sample
+		// is added inline.
+		s.dataCollector.AddSample(input, cmeta, baseWeight, source)
 	}
 
 	if isDegraded {
@@ -4484,14 +4523,7 @@ func (s *Smart) recordStats(
 			Node:   proxyTag,
 			Data:   data,
 		}
-		// trySubmit: dropping a single stats record during an overload
-		// storm is far better than parking thousands of submit callers.
-		// The per-record loss is captured by flushQueue running on its
-		// own periodic tick; if the backlog clears before that tick, no
-		// visible effect.
-		getSmartWorker().trySubmit(func() {
-			s.store.AppendToGlobalQueue(op)
-		})
+		s.store.AppendToGlobalQueue(op)
 	}
 
 	// Verbose per-event log — includes enough context to reconstruct node
@@ -4676,17 +4708,18 @@ func (s *Smart) updatePrefetchCache(meta *smartDialMeta, target, nodeName string
 // Concurrency + de-duplication is delegated to the process-wide
 // smartSharedWorker:
 //
-//   - singleflight collapses concurrent probes of the SAME node tag
-//     across all Smart groups into a single HTTP request. A node shared
-//     by 16 groups used to be probed 16 times per interval — now once.
+//   - A probe of a node already queued or in flight for any Smart group
+//     is joined instead of repeated. A node shared by 16 groups used to
+//     be probed 16 times per interval — now once.
 //
-//   - ants.Pool caps total concurrent probe goroutines to 64 across the
-//     whole process so a "all-groups tick at once" burst doesn't thrash
-//     the CPU / test-URL host.
+//   - A fixed set of probe workers bounds concurrent probes across the
+//     whole process, so an "all-groups tick at once" burst doesn't
+//     thrash the CPU / test-URL host. A probe's timeout starts when a
+//     worker picks it up, and probes still queued by the next tick are
+//     dropped without a verdict.
 //
 //   - 1-second freshness cache short-circuits back-to-back identical
-//     probes even across sequential calls (singleflight only dedupes
-//     concurrent in-flight requests).
+//     probes even across sequential calls.
 // Health-check probe-scheduler tunables. These bound the per-tick probe
 // dispatch so a large subscription stays cool: instead of O(N) TLS probes
 // every interval, we always probe the few nodes that matter (priority) and
@@ -4710,6 +4743,10 @@ const (
 	// clamped to Max. A single success clears the state entirely.
 	probeBackoffBase = 3 * time.Minute
 	probeBackoffMax  = 1 * time.Hour
+
+	// smartProbeTimeout bounds one health-check probe, counted from the
+	// moment a probe worker starts it.
+	smartProbeTimeout = 5 * time.Second
 
 	// lightgbmPredCacheTTL is how long a memoised LightGBM inference stays
 	// valid. Short enough that feature drift is immaterial, long enough to
@@ -4810,20 +4847,9 @@ func (s *Smart) runHealthCheck() {
 	}
 
 	worker := getSmartWorker()
-	// NOTE: ctx lifetime is no longer bounded by this function's
-	// scope (we've dropped wg.Wait below to avoid an ants.Pool
-	// deadlock — see large comment further down). Instead, derive
-	// the probe ctx from s.taskCtx with a 30s hard cap which is
-	// longer than any single probe but short enough that stale
-	// contexts don't accumulate across repeated health checks.
-	// The old `defer cancel()` would fire BEFORE any probe finished
-	// once we go fire-and-forget, invalidating probes in-flight.
-	ctx, cancel := context.WithTimeout(s.taskCtx, 30*time.Second)
-	_ = cancel // released by time-based expiry; explicit cancel not tied to this frame
-
 	start := time.Now()
 
-	var alive, dead, skipped atomic.Int32
+	var alive, skipped atomic.Int32
 	var dispatched atomic.Int32
 	// Freshness window = max(configured interval, 5 min). A node is
 	// considered fresh if EITHER:
@@ -4906,19 +4932,20 @@ func (s *Smart) runHealthCheck() {
 		tail = rotated
 	}
 
+	// Probes not started by the next tick are dropped without a verdict;
+	// that tick plans afresh.
+	startBy := start.Add(s.interval)
 	dispatch := func(ob adapter.Outbound) {
 		tag := ob.Tag()
 		dispatched.Add(1)
-		worker.submit(func() {
-			probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
-			delay, err := worker.probeOnce(probeCtx, s.testURL, ob, s.expectedStatus)
-			probeCancel()
-
+		worker.probeURL(s.testURL, ob, s.expectedStatus, smartProbeTimeout, startBy, func(delay uint16, err error) {
+			if errors.Is(err, errProbeSkipped) || s.taskCtx.Err() != nil {
+				return
+			}
 			if err != nil || delay == 0 {
 				s.history.DeleteURLTestHistory(tag)
 				s.markDead(tag)
 				s.probeBackoffFail(tag) // stretch this node's next probe gap
-				dead.Add(1)
 				return
 			}
 			s.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
@@ -4927,7 +4954,6 @@ func (s *Smart) runHealthCheck() {
 			})
 			s.markAlive(tag)
 			s.probeBackoffReset(tag) // success → back to base cadence
-			alive.Add(1)
 		})
 	}
 	for _, ob := range priority {
@@ -4936,26 +4962,11 @@ func (s *Smart) runHealthCheck() {
 	for _, ob := range tail {
 		dispatch(ob)
 	}
-	// Fire-and-forget: NO wg.Wait here. The previous wg.Wait caused
-	// a fatal ants.Pool deadlock during Wi-Fi ↔ cellular handoff
-	// when 15+ Smart groups fired runHealthCheck simultaneously:
-	// each parent runHealthCheck goroutine held one pool worker
-	// slot while waiting on its children; the children needed pool
-	// slots to run; the pool caps at 64 workers. Once ≥64 parents
-	// were suspended, no child could progress and wg.Wait hung
-	// forever, piling up goroutines (CPU 100%) and heap (memory
-	// growth) for every subsequent warmup attempt.
-	//
-	// Removing wg.Wait lets the parent slot release immediately
-	// after dispatching all probe submissions. The probes still
-	// run, their results still land in URLTestHistory / aliveAt via
-	// markAlive/markDead, but the statistics log loses its synchronous
-	// alive/dead breakdown — we log the dispatched count instead.
-	// Accurate per-probe success is still observable through the
-	// Clash API / Smart weights endpoint moments later.
-	s.logger.Info("smart[", s.Tag(), "] health-check dispatched ",
+	// Results land in URLTestHistory / aliveAt as probes complete; the
+	// probe workers are shared by every group, so nothing waits here.
+	s.logger.Debug("smart[", s.Tag(), "] health-check dispatched ",
 		dispatched.Load(), " probes (skipped ", skipped.Load(),
-		" via fresh cache) in ", time.Since(start).Round(time.Millisecond))
+		" via fresh cache, ", alive.Load(), " known alive) in ", time.Since(start).Round(time.Millisecond))
 }
 
 // cleanupOrphanedGroups removes Smart store data for group tags that no
@@ -5199,108 +5210,82 @@ func (s *Smart) checkAndRecoverDegradedNodes() {
 		return
 	}
 
-	// 原实现在单 goroutine 里串行 json.Unmarshal → 修改 → json.Marshal。
-	// 大订阅 (>500 节点) 每 5 分钟跑一次，单次走到 300-800ms，全部占用
-	// 主调度 goroutine — Android 上这段时间调度器延迟可见 jitter。
-	//
-	// 并行化：每个节点的状态修正彼此独立 (不同 nodeName 不共享 state
-	// 结构、不共享 ops 切片 — 最后 append 走 mutex 即可)；用 shared
-	// worker pool 把 CPU 工作打散到所有 P 上。Android GOMAXPROCS 通常
-	// 4-8，submit 仍然经过 ants 池 (64 worker 上限)，不会对系统产生
-	// 额外压力。
-	//
-	// 仍然保留 "更新后 append 进 global queue"：bbolt 写由 flush-queue
-	// 任务统一合并，不会因为并行 recovery 而产生写放大。
+	// Each state is a few microseconds of JSON work, so the pass runs
+	// inline: a goroutine per node cost more than the work itself. bbolt
+	// writes still go through the global queue and are merged there.
 	now := time.Now().Unix()
 	var (
-		opsMu                               sync.Mutex
 		ops                                 []smart.StoreOperation
-		unblocked, recovered, stillDegraded atomic.Int32
+		unblocked, recovered, stillDegraded int
 		// anyActive counts node states that remain degraded or blocked
 		// after this pass. When it ends at zero, the recovery gate closes
 		// and future ticks skip the scan until the next degrade/block.
-		anyActive atomic.Int32
+		anyActive int
 	)
+	for name, raw := range stateData {
+		var state smart.NodeState
+		if json.Unmarshal(raw, &state) != nil {
+			continue
+		}
 
-	const recoveryParallel = 8 // 够 Android 4-8 核 + 有轻量等待窗口
-	sem := make(chan struct{}, recoveryParallel)
-	var wg sync.WaitGroup
-	for nodeName, data := range stateData {
-		wg.Add(1)
-		sem <- struct{}{}
-		name, raw := nodeName, data
-		go func() {
-			defer wg.Done()
-			defer func() { <-sem }()
+		updated := false
+		if state.BlockedUntil > 0 && state.BlockedUntil <= now {
+			state.BlockedUntil = 0
+			updated = true
+			unblocked++
+			s.logger.Info("smart[", s.Tag(), "] unblocked node [", name,
+				"] (cooldown ended)")
+		}
 
-			var state smart.NodeState
-			if json.Unmarshal(raw, &state) != nil {
-				return
+		if state.Degraded && state.BlockedUntil == 0 {
+			recoveryFactor := math.Min(1.0, state.DegradedFactor+0.01)
+			state.FailureCount = int(float64(state.FailureCount) * 0.95)
+			if recoveryFactor >= 0.99 {
+				state.Degraded = false
+				state.DegradedFactor = 1.0
+				recovered++
+				s.logger.Info("smart[", s.Tag(), "] node [", name, "] fully recovered")
+			} else {
+				state.DegradedFactor = recoveryFactor
+				stillDegraded++
 			}
+			updated = true
+		}
 
-			updated := false
-			if state.BlockedUntil > 0 && state.BlockedUntil <= now {
-				state.BlockedUntil = 0
-				updated = true
-				unblocked.Add(1)
-				s.logger.Info("smart[", s.Tag(), "] unblocked node [", name,
-					"] (cooldown ended)")
-			}
+		// Still-active = remains degraded, or blocked with a future
+		// cooldown that a later tick must clear. Keeps the gate open.
+		if state.Degraded || state.BlockedUntil > now {
+			anyActive++
+		}
 
-			if state.Degraded && state.BlockedUntil == 0 {
-				recoveryFactor := math.Min(1.0, state.DegradedFactor+0.01)
-				state.FailureCount = int(float64(state.FailureCount) * 0.95)
-				if recoveryFactor >= 0.99 {
-					state.Degraded = false
-					state.DegradedFactor = 1.0
-					recovered.Add(1)
-					s.logger.Info("smart[", s.Tag(), "] node [", name, "] fully recovered")
-				} else {
-					state.DegradedFactor = recoveryFactor
-					stillDegraded.Add(1)
-				}
-				updated = true
-			}
-
-			// Still-active = remains degraded, or blocked with a future
-			// cooldown that a later tick must clear. Keeps the gate open.
-			if state.Degraded || state.BlockedUntil > now {
-				anyActive.Add(1)
-			}
-
-			if !updated {
-				return
-			}
-			stateBytes, err := json.Marshal(&state)
-			if err != nil {
-				return
-			}
-			op := smart.StoreOperation{
-				Type:   smart.OpSaveNodeState,
-				Group:  s.Tag(),
-				Config: smartConfigName,
-				Node:   name,
-				Data:   stateBytes,
-			}
-			opsMu.Lock()
-			ops = append(ops, op)
-			opsMu.Unlock()
-		}()
+		if !updated {
+			continue
+		}
+		stateBytes, err := json.Marshal(&state)
+		if err != nil {
+			continue
+		}
+		ops = append(ops, smart.StoreOperation{
+			Type:   smart.OpSaveNodeState,
+			Group:  s.Tag(),
+			Config: smartConfigName,
+			Node:   name,
+			Data:   stateBytes,
+		})
 	}
-	wg.Wait()
 
 	// Close the gate when nothing remains degraded or blocked — the next
 	// degrade/block write reopens it. This makes the steady state (all
 	// healthy) a true O(1) no-op for every subsequent tick.
-	if anyActive.Load() == 0 {
+	if anyActive == 0 {
 		s.hasDegraded.Store(false)
 	}
 
 	if len(ops) > 0 {
 		s.store.AppendToGlobalQueue(ops...)
 		s.logger.Debug("smart[", s.Tag(), "] recovery check: unblocked=",
-			unblocked.Load(), " recovered=", recovered.Load(),
-			" still_degraded=", stillDegraded.Load())
+			unblocked, " recovered=", recovered,
+			" still_degraded=", stillDegraded)
 	}
 }
 
@@ -5544,6 +5529,12 @@ func (c *circuitBreakerState) recordFailure(now int64, windowNS, baseOpenForNS i
 // reset clears the failure streak after a successful dial. Drops
 // tripCount too — markAlive uses this to signal the node has fully
 // recovered, so the next failure cycle starts from the base cooldown.
+// active reports whether the breaker holds any failure state.
+func (c *circuitBreakerState) active() bool {
+	return c.consecFails.Load() != 0 || c.firstFailAt.Load() != 0 ||
+		c.openUntil.Load() != 0 || c.tripCount.Load() != 0
+}
+
 func (c *circuitBreakerState) reset() {
 	c.consecFails.Store(0)
 	c.firstFailAt.Store(0)
@@ -5728,18 +5719,7 @@ func (s *Smart) pruneStaleMemoryMaps() {
 	// entries whose newest timestamp is already outside the shortLife
 	// window — they cannot contribute to a future threshold crossing.
 	s.shortLifeMu.Lock()
-	slCutoff := now.Add(-shortLifeWindow)
-	for k, stamps := range s.shortLife {
-		if len(stamps) == 0 {
-			delete(s.shortLife, k)
-			sl++
-			continue
-		}
-		if stamps[len(stamps)-1].Before(slCutoff) {
-			delete(s.shortLife, k)
-			sl++
-		}
-	}
+	sl += s.shortLife.prune(now.Add(-shortLifeWindow))
 	s.shortLifeMu.Unlock()
 
 	// hysteresisMemo: entries outlive their window. Prune anything
@@ -5823,8 +5803,11 @@ func (s *Smart) markAlive(tag string) {
 		return
 	}
 	_, wasDead := s.knownDead.LoadAndDelete(tag)
+	// Breaker entries are kept after a reset, so only a breaker that
+	// actually holds failure state needs resetting and a persisted
+	// delete; otherwise every successful dial would queue a write.
 	var hadBreaker bool
-	if cb, ok := s.breakers.Load(tag); ok {
+	if cb, ok := s.breakers.Load(tag); ok && cb.active() {
 		cb.reset()
 		hadBreaker = true
 	}
@@ -5844,11 +5827,7 @@ func (s *Smart) markAlive(tag string) {
 	// for this node so a previously-problematic node that's recovered
 	// doesn't keep counting toward a future threshold.
 	s.shortLifeMu.Lock()
-	for k := range s.shortLife {
-		if strings.HasSuffix(k, "|"+tag) {
-			delete(s.shortLife, k)
-		}
-	}
+	s.shortLife.deleteNode(tag)
 	s.shortLifeMu.Unlock()
 	if s.resetEvents != nil {
 		s.resetEvents.resetForNode(tag)
@@ -6182,13 +6161,10 @@ func (s *Smart) handleResetThresholdCrossed(meta *smartDialMeta, proxyTag string
 		"] within ", resetEventWindow,
 		" (breaker tripped=", tripped, ")")
 
-	// Kick the ranking refresh on the shared worker so the next
-	// /weights call and the next selectProxies pass both see the
-	// post-eviction state. Bounded by the worker pool — never
-	// spawns an unbounded goroutine even under reset storms.
-	if w := getSmartWorker(); w != nil {
-		w.submit(s.updateNodeRanking)
-	}
+	// Refresh the ranking so the next /weights call and the next
+	// selectProxies pass both see the post-eviction state. Coalesced, so
+	// a reset storm runs it at most once at a time.
+	s.rankingRefresh.Schedule(s.updateNodeRanking)
 }
 
 // recordShortLife registers one short-life close for (target, node).
@@ -6203,44 +6179,9 @@ func (s *Smart) recordShortLife(target, node string) (crossed bool) {
 	if target == "" || node == "" {
 		return false
 	}
-	key := target + "|" + node
-	now := time.Now()
-	cutoff := now.Add(-shortLifeWindow)
-
 	s.shortLifeMu.Lock()
 	defer s.shortLifeMu.Unlock()
-
-	// Inline cap: if the map has grown past the bound since the last
-	// janitor pass, sweep out keys whose newest timestamp already fell
-	// out of the window (they can no longer contribute to a crossing).
-	// O(map) but only triggers in the rare flood case, and bounds RSS
-	// independently of the 5-min prune task.
-	if len(s.shortLife) >= shortLifeMaxEntries {
-		for k, stamps := range s.shortLife {
-			if len(stamps) == 0 || stamps[len(stamps)-1].Before(cutoff) {
-				delete(s.shortLife, k)
-			}
-		}
-	}
-
-	// Compact existing slice: drop entries outside the 60s window
-	old := s.shortLife[key]
-	kept := old[:0]
-	for _, t := range old {
-		if t.After(cutoff) {
-			kept = append(kept, t)
-		}
-	}
-	kept = append(kept, now)
-	s.shortLife[key] = kept
-
-	if len(kept) >= shortLifeThreshold {
-		// Clear so a single spike doesn't ban the node twice in a row;
-		// next short-life cycle starts fresh.
-		delete(s.shortLife, key)
-		return true
-	}
-	return false
+	return s.shortLife.record(target, node, time.Now(), shortLifeWindow, shortLifeThreshold, shortLifeMaxEntries)
 }
 
 // classifyShortLife returns true when a close event has "user gave up on
@@ -6296,8 +6237,15 @@ func (s *Smart) getHistoryConnectTime(meta *smartDialMeta, proxyTag string) int6
 	if s.store == nil || meta.smartTarget == "" {
 		return 0
 	}
+	// Dial path: peek at the in-memory record only. Hydrating from bbolt
+	// here would add a read transaction per candidate and cache a record
+	// for every (target, node) pair merely considered; on a miss the
+	// caller falls back to its default timeout.
 	cacheKey := smart.FormatDBKey(smart.KeyTypeStats, smartConfigName, s.Tag(), meta.smartTarget, proxyTag)
-	record := s.store.GetOrCreateAtomicRecord(cacheKey, s.Tag(), smartConfigName, meta.smartTarget, proxyTag)
+	record := s.store.LookupAtomicRecord(cacheKey)
+	if record == nil {
+		return 0
+	}
 	return record.GetInt64("connectTime")
 }
 
@@ -6335,6 +6283,11 @@ func (s *Smart) lookupASN(ips []netip.Addr) string {
 // at most once per 60s. This handles the common case where Smart started
 // before GeoX finished downloading country.mmdb.
 func (s *Smart) lookupCountry(ips []netip.Addr) []string {
+	// Only LightGBM features and the training collector read the
+	// country; skip the per-connection mmdb read otherwise.
+	if !s.useLightGBM && !s.collectData {
+		return nil
+	}
 	if s.countryDB == nil {
 		s.maybeOpenCountryDB()
 		if s.countryDB == nil {

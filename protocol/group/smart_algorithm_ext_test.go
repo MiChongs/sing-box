@@ -202,31 +202,6 @@ func TestRoundRobinCounter_Wrap(t *testing.T) {
 	}
 }
 
-// TestPickRand_DistinctShards ensures the per-call rand source
-// rotates rather than always returning the same shard. Asserting
-// exact distribution is flaky; we just check at least 2 distinct
-// pointers come back across many calls.
-func TestPickRand_DistinctShards(t *testing.T) {
-	seen := map[*[1]byte]bool{} // identity-only
-	const trials = 64
-	for i := 0; i < trials; i++ {
-		// Touch the source so the compiler doesn't optimise the call away.
-		r := pickRand()
-		_ = r.IntN(8)
-		// xor-shift the address into the map; we can't take address
-		// of the rand value type but we can compare pointers.
-		// Skip identity check; just assert >0 distinct sums.
-		_ = r
-	}
-	// Looser smoke: confirm consecutive calls don't deadlock and
-	// produce different output.
-	a, b := pickRand().Uint64(), pickRand().Uint64()
-	if a == b && a == 0 {
-		t.Fatal("pickRand produced two zeros — initialisation broken")
-	}
-	_ = seen
-}
-
 // TestFactorsPool_Recycle confirms acquireFactorsSlice → release
 // returns the same backing array when capacity is sufficient.
 func TestFactorsPool_Recycle(t *testing.T) {

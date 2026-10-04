@@ -58,9 +58,9 @@ type dialHandle struct{ _ byte }
 //
 // Note on correctness: triggering an extra runHealthCheck is
 // FUNCTIONALLY equivalent to waiting until the scheduled tick —
-// singleflight in smartSharedWorker.probeOnce ensures a concurrent
-// scheduled fire coalesces with the forced fire, and the freshness
-// window in runHealthCheck keeps it idempotent across debounce races.
+// the shared probe queue joins a concurrent scheduled probe of the same
+// node with the forced one, and the freshness window in runHealthCheck
+// keeps it idempotent across debounce races.
 
 const (
 	// netChangeDebounce collapses multiple InterfaceUpdated callbacks
@@ -90,6 +90,14 @@ const (
 	// aliveAt.Clear, freshnessCache.Delete) since those are O(1) or
 	// O(small-N) and semantically required per group.
 	globalWarmupDebounce = 5 * time.Second
+
+	// preWarmProbeTimeout bounds one priority warm-up probe, counted from
+	// the moment a probe worker starts it.
+	preWarmProbeTimeout = 3 * time.Second
+
+	// preWarmStartWindow drops warm-up probes still queued after this
+	// long; by then the user's dials have measured the nodes anyway.
+	preWarmStartWindow = 10 * time.Second
 )
 
 // globalWarmupLastNS is the shared timestamp used by every Smart
@@ -259,17 +267,16 @@ func (s *Smart) InterfaceUpdated(context.Context) {
 	// (preWarmPriorityNodes + runHealthCheck) is what used to
 	// stampede: 15 groups each dispatching probes for 30 nodes
 	// during a single Wi-Fi↔cellular handoff turned into hundreds
-	// of parallel TLS handshakes plus an ants.Pool deadlock
-	// (see the comment in runHealthCheck for the deadlock mechanics).
+	// of parallel TLS handshakes.
 	//
 	// We now serialise warmup across ALL Smart groups with a
 	// process-global atomic CAS. The first group to observe a
 	// network change within globalWarmupDebounce schedules the
 	// heavy work; every subsequent group within that window logs
-	// a skip and returns. The single warmup still uses singleflight
-	// in probeOnce to fan out across all groups' node tags, so no
-	// group is actually "missed" — it just doesn't pay the per-
-	// group scheduling cost on top.
+	// a skip and returns. Probes of a node shared by several groups
+	// are joined in the shared probe queue, so no group is actually
+	// "missed" — it just doesn't pay the per-group scheduling cost on
+	// top.
 	globalLast := globalWarmupLastNS.Load()
 	if globalLast != 0 && nowNS-globalLast < int64(globalWarmupDebounce) {
 		s.logger.Debug("smart[", s.Tag(),
@@ -368,20 +375,16 @@ func (s *Smart) preWarmPriorityNodes() {
 	}
 
 	worker := getSmartWorker()
-	// 3s per-probe budget on a standalone timer — was previously
-	// scoped with `defer cancel()` tied to this function, but since
-	// we've switched to fire-and-forget (no wg.Wait) the cancel
-	// would fire BEFORE any probe starts. ctx.WithTimeout + drop
-	// the cancel handle: the internal timer will release resources
-	// at deadline expiry regardless.
-	probeCtx, cancel := context.WithTimeout(s.taskCtx, 3*time.Second)
-	_ = cancel // timer-driven expiry; explicit cancel not required
-
+	// Warm-up results are only worth having before the user's next dials;
+	// probes still queued after that are dropped without a verdict.
+	startBy := time.Now().Add(preWarmStartWindow)
 	for _, ob := range targets {
 		ob := ob
 		tag := ob.Tag()
-		worker.submit(func() {
-			delay, err := worker.probeOnce(probeCtx, s.testURL, ob, s.expectedStatus)
+		worker.probeURL(s.testURL, ob, s.expectedStatus, preWarmProbeTimeout, startBy, func(delay uint16, err error) {
+			if errors.Is(err, errProbeSkipped) || s.taskCtx.Err() != nil {
+				return
+			}
 			if err != nil || delay == 0 {
 				s.history.DeleteURLTestHistory(tag)
 				s.markDead(tag)
@@ -399,8 +402,4 @@ func (s *Smart) preWarmPriorityNodes() {
 				tag, "] ready in ", delay, "ms")
 		})
 	}
-	// Fire-and-forget: dropping the wg.Wait that used to block here
-	// is what unblocks the ants.Pool during a network-switch storm.
-	// See the equivalent note in runHealthCheck for the full
-	// deadlock explanation.
 }

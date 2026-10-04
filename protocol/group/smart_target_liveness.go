@@ -3,6 +3,8 @@ package group
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"math"
 	"net"
 	"sync/atomic"
 	"time"
@@ -90,6 +92,9 @@ const sniProbeTTL = 15 * time.Minute
 // long enough that a typical 200-600ms handshake finishes cleanly.
 const sniProbeBudget = 2 * time.Second
 
+// sniProbeStartWindow drops SNI probes still queued after this long.
+const sniProbeStartWindow = time.Minute
+
 // targetHitTracker counts recent dials per target within this group.
 // The periodic probe task samples the top-K entries to decide which
 // (target, SNI) pairs to actively verify.
@@ -165,6 +170,26 @@ func (t *targetHitTracker) topK(k int) []string {
 	return result
 }
 
+// decay halves every counter and drops targets that reach zero, so the
+// tracker only holds recently dialled targets and topK favours recent
+// traffic over all-time totals.
+func (t *targetHitTracker) decay() {
+	if t == nil {
+		return
+	}
+	t.counts.Range(func(target string, c *atomic.Int64) bool {
+		for {
+			old := c.Load()
+			if c.CompareAndSwap(old, old/2) {
+				if old/2 == 0 {
+					t.counts.Delete(target)
+				}
+				return true
+			}
+		}
+	})
+}
+
 // ── B: probe + filter hook API ──────────────────────────────────────────────
 
 // targetLivenessState holds the per-group runtime data added for
@@ -182,6 +207,21 @@ type targetLivenessState struct {
 func (s *Smart) initTargetLiveness() {
 	s.targetLiveness.hits = newTargetHitTracker()
 	s.targetLiveness.probeHistory = xsync.NewMapOf[string, *sniProbeResult]()
+}
+
+// pruneSNIProbeHistory drops probe results that no longer influence
+// isTargetSuspicious (older than sniProbeTTL).
+func (s *Smart) pruneSNIProbeHistory() {
+	if s.targetLiveness.probeHistory == nil {
+		return
+	}
+	cutoff := time.Now().Add(-sniProbeTTL).UnixNano()
+	s.targetLiveness.probeHistory.Range(func(key string, result *sniProbeResult) bool {
+		if result.tsNS < cutoff {
+			s.targetLiveness.probeHistory.Delete(key)
+		}
+		return true
+	})
 }
 
 // recordTargetHit is the DialContext hook that the caller fires once
@@ -398,10 +438,8 @@ const (
 // results into probeHistory for the filter to read.
 //
 // Single pass, fully non-blocking from the wheel's viewpoint — the
-// probes themselves dispatch through the shared ants pool. The
-// function returns as soon as it has FIRED probes, not waited for
-// them, so the wheel stays unblocked even when individual probes
-// hit their 2s budget.
+// probes themselves run on the shared probe workers. The function
+// returns as soon as it has queued probes, not waited for them.
 func (s *Smart) runTargetLivenessProbes() {
 	if s == nil || !s.started.Load() || s.targetLiveness.hits == nil {
 		return
@@ -421,6 +459,8 @@ func (s *Smart) runTargetLivenessProbes() {
 		return
 	}
 	targets := s.targetLiveness.hits.topK(sniProbeTopK)
+	s.targetLiveness.hits.decay()
+	s.pruneSNIProbeHistory()
 	if len(targets) == 0 {
 		return
 	}
@@ -450,16 +490,23 @@ func (s *Smart) runTargetLivenessProbes() {
 		return
 	}
 
+	// Probes run on the shared probe workers. Groups probing the same
+	// (target, node) pair share one handshake; probes still queued after
+	// sniProbeStartWindow are dropped without a verdict.
 	worker := getSmartWorker()
+	startBy := time.Now().Add(sniProbeStartWindow)
 	for _, target := range targets {
 		for _, ob := range aliveNodes {
 			target, ob := target, ob
-			worker.submit(func() {
-				if !s.started.Load() {
+			key := "sni|" + target + "|" + ob.Tag()
+			worker.enqueueProbe(key, sniProbeBudget, startBy, func(ctx context.Context) (uint16, error) {
+				rtt, err := s.probeSNIOnce(ctx, target, ob)
+				return uint16(min(max(rtt, 0), math.MaxUint16)), err
+			}, func(rtt uint16, err error) {
+				if errors.Is(err, errProbeSkipped) || !s.started.Load() {
 					return
 				}
-				rtt, err := s.probeSNIOnce(s.taskCtx, target, ob)
-				s.recordSNIProbe(target, ob.Tag(), err == nil, rtt)
+				s.recordSNIProbe(target, ob.Tag(), err == nil, int32(rtt))
 				if err != nil {
 					s.logger.Debug("smart[", s.Tag(),
 						"] SNI-probe miss [", ob.Tag(),

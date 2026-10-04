@@ -3,9 +3,6 @@ package group
 import (
 	"errors"
 	"io"
-	"net"
-	"os"
-	"strings"
 	"time"
 )
 
@@ -47,45 +44,42 @@ const (
 	// doesn't sit on a blank page when the upstream is filtered.
 	firstByteWatchdogTimeout = 5 * time.Second
 
-	// stalledTransferTimeout: had bytes flowing, then dead silence
-	// for this long. 30 s is well past any normal HTTP/2 idle period
-	// (the spec keep-alive is shorter) but well before the user
-	// would tolerate a frozen page.
-	stalledTransferTimeout = 30 * time.Second
+	// stalledTransferTimeout: the conn already produced bytes, then the
+	// client wrote and nothing came back for this long. Only unanswered
+	// writes count — an idle keep-alive, websocket or push conn is not
+	// stalled. Long enough to ride out long-poll requests the server
+	// legitimately holds open.
+	stalledTransferTimeout = 60 * time.Second
 
 	// watchdogScanInterval: backstop scan period. The PRIMARY
-	// detection path is kernel-driven via SetReadDeadline (instant
-	// response, zero extra goroutines / memory). This periodic scan
-	// only catches conns whose underlying outbound silently ignores
-	// SetReadDeadline (rare — net.Conn implementations should always
-	// honour it, but mux'd transports occasionally don't).
-	// Reduced to 2.5s for highly responsive timeout tracking, as the scan
-	// takes virtually no CPU time but eliminates "blind wait" UX drops.
+	// first-byte detection path is kernel-driven via SetReadDeadline
+	// (instant response, zero extra goroutines / memory). This periodic
+	// scan catches conns whose underlying outbound silently ignores
+	// SetReadDeadline (mux'd transports occasionally do) and stalled
+	// transfers. The scan takes virtually no CPU time.
 	watchdogScanInterval = 2500 * time.Millisecond
-
-	// stalledTransferGrace: wiggle room before the periodic backstop
-	// declares a deadline-driven re-arm cycle a "false positive". The
-	// kernel deadline can fire moments AFTER a successful read on
-	// some transports; this grace prevents us from killing a conn
-	// that just had real activity within the last second.
-	stalledTransferGrace = 1 * time.Second
 )
 
-// applyFirstByteDeadline wires the kernel-level read deadline so a
-// silent node returns an error from Read instead of hanging until
-// the kernel/TLS timeout. Must be called immediately after wrapConn
-// before any Read happens. Best-effort: a transport that returns an
-// error from SetReadDeadline still gets caught by the periodic
-// backstop scan.
-func (c *smartTrackedConn) applyFirstByteDeadline() {
-	if c.Conn == nil {
+// errWatchdogStall is reported to the reset-event tracker when the
+// periodic scan evicts a stalled conn.
+var errWatchdogStall = errors.New("smart: connection stalled")
+
+// armFirstByteDeadline wires the kernel-level read deadline at the
+// client's first Write, so a silent node returns an error from Read
+// instead of hanging until the kernel/TLS timeout. Best-effort: a
+// transport that ignores SetReadDeadline still gets caught by the
+// periodic backstop scan.
+func (c *smartTrackedConn) armFirstByteDeadline() {
+	now := time.Now()
+	c.firstWriteAt.Store(now.UnixNano())
+	if c.Conn == nil || c.firstReadOnce.Load() {
 		return
 	}
 	timeout := firstByteWatchdogTimeout
 	if c.s != nil && c.s.history != nil {
 		h := c.s.history.LoadURLTestHistory(c.proxyTag)
 		if h != nil && h.Delay > 0 {
-			adaptive := time.Duration(float64(h.Delay) * 4.0) * time.Millisecond
+			adaptive := time.Duration(float64(h.Delay)*4.0) * time.Millisecond
 			if adaptive < 1500*time.Millisecond {
 				adaptive = 1500 * time.Millisecond
 			}
@@ -94,61 +88,25 @@ func (c *smartTrackedConn) applyFirstByteDeadline() {
 			}
 		}
 	}
-	c.currentFirstByteTimeout = timeout
-	_ = c.Conn.SetReadDeadline(time.Now().Add(timeout))
-}
-
-// armTransferStalledDeadline switches the kernel deadline from the
-// (short) first-byte budget to the (longer) transfer-stalled budget
-// once the conn has produced at least one payload byte. Called
-// exactly once on the first successful Read.
-func (c *smartTrackedConn) armTransferStalledDeadline() {
-	if c.Conn == nil {
-		return
+	c.firstByteTimeout.Store(int64(timeout))
+	c.deadlineArmed.Store(true)
+	_ = c.Conn.SetReadDeadline(now.Add(timeout))
+	// Server-speaks-first protocols can deliver the first byte before
+	// the client's first write; Read may have disarmed just before we
+	// armed, so re-check.
+	if c.firstReadOnce.Load() {
+		c.disarmFirstByteDeadline()
 	}
-	_ = c.Conn.SetReadDeadline(time.Now().Add(stalledTransferTimeout))
 }
 
-// rearmTransferStalledDeadline pushes the deadline forward whenever
-// recent activity proves the conn is healthy. Skipped when the
-// existing deadline still has plenty of headroom — saves the syscall
-// on every Read in steady-state high-throughput streams.
-func (c *smartTrackedConn) rearmTransferStalledDeadline() {
-	if c.Conn == nil {
-		return
-	}
-	_ = c.Conn.SetReadDeadline(time.Now().Add(stalledTransferTimeout))
-}
-
-// clearReadDeadline removes the watchdog's deadline before the conn
-// is handed to anything that might block on its own (read until EOF
-// patterns, http library copy loops). Called from Close so a
-// stale deadline doesn't leak into reused buffers.
-func (c *smartTrackedConn) clearReadDeadline() {
-	if c.Conn == nil {
+// disarmFirstByteDeadline removes the first-byte deadline once the first
+// byte arrived or the conn closes, so it never surfaces as a timeout on a
+// healthy conn. Skips the syscall when no deadline was armed.
+func (c *smartTrackedConn) disarmFirstByteDeadline() {
+	if c.Conn == nil || !c.deadlineArmed.CompareAndSwap(true, false) {
 		return
 	}
 	_ = c.Conn.SetReadDeadline(time.Time{})
-}
-
-// isWatchdogDeadlineErr reports whether err is the timeout signal
-// our deadline produced (vs an unrelated network error). Matches
-// every common shape: os.ErrDeadlineExceeded (Go 1.15+ canonical),
-// net.OpError-wrapped timeout, and substring "i/o timeout" for
-// transports that wrap errors loosely.
-func isWatchdogDeadlineErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, os.ErrDeadlineExceeded) {
-		return true
-	}
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return true
-	}
-	return strings.Contains(err.Error(), "i/o timeout") ||
-		strings.Contains(err.Error(), "deadline exceeded")
 }
 
 // isPreFirstByteFatal reports whether a Read error received BEFORE
@@ -232,17 +190,6 @@ func (s *Smart) triggerInstantResetEviction(c *smartTrackedConn, op string, err 
 	return true
 }
 
-// classifyWatchdogStall returns a short label describing which pattern
-// caused the watchdog to evict the conn. Surfaced via logs so
-// operators can tell first-byte-timeout (often "node ate the request")
-// from transfer-stalled (often "egress filtered mid-stream").
-func classifyWatchdogStall(c *smartTrackedConn) string {
-	if !c.firstReadOnce.Load() {
-		return "first-byte-timeout"
-	}
-	return "transfer-stalled"
-}
-
 // runStalledConnWatchdog is the periodic body invoked by the shared
 // timing wheel. Idle groups (no active conns at all) are an O(1)
 // check that returns immediately.
@@ -252,72 +199,61 @@ func (s *Smart) runStalledConnWatchdog() {
 	}
 	// Lock-free fast-path: when the per-group atomic counter reports
 	// zero active conns, skip the mutex acquire + map iteration
-	// entirely. Watchdog runs every watchdogScanInterval for every
-	// Smart group; on an idle phone this used to burn 24 mutex
-	// acquires/minute * N groups for no work.
+	// entirely.
 	if s.targetConnsCount.Load() == 0 {
 		return
 	}
 	type victim struct {
-		c        *smartTrackedConn
-		target   string
-		kind     string
-		ageMS    int64
+		c     *smartTrackedConn
+		kind  string
+		ageMS int64
 	}
-	now := time.Now()
+	nowNS := time.Now().UnixNano()
 	var victims []victim
 
 	s.targetConnsMu.Lock()
-	for tgt, set := range s.targetConns {
+	for _, set := range s.targetConns {
 		for c := range set {
 			if c == nil || c.watchdogTriggered.Load() {
 				continue
 			}
-			age := now.Sub(c.startTime)
 			if !c.firstReadOnce.Load() {
-				timeout := c.currentFirstByteTimeout
+				firstWrite := c.firstWriteAt.Load()
+				if firstWrite == 0 {
+					continue // the client has not asked for anything yet
+				}
+				timeout := time.Duration(c.firstByteTimeout.Load())
 				if timeout == 0 {
 					timeout = firstByteWatchdogTimeout
 				}
-				if age > timeout {
-					victims = append(victims, victim{c, tgt, "first-byte-timeout", age.Milliseconds()})
+				if waited := time.Duration(nowNS - firstWrite); waited > timeout {
+					victims = append(victims, victim{c, "first-byte-timeout", waited.Milliseconds()})
 				}
 				continue
 			}
-			lastNS := c.lastReadAt.Load()
-			if lastNS == 0 {
-				continue // first read seen but byte-tracking not started — defer judgement
+			lastWrite := c.lastWriteAt.Load()
+			if lastWrite <= c.lastReadAt.Load() {
+				continue // every write so far has been answered
 			}
-			idle := now.Sub(time.Unix(0, lastNS))
-			if idle > stalledTransferTimeout {
-				victims = append(victims, victim{c, tgt, "transfer-stalled", idle.Milliseconds()})
+			if waited := time.Duration(nowNS - lastWrite); waited > stalledTransferTimeout {
+				victims = append(victims, victim{c, "transfer-stalled", waited.Milliseconds()})
 			}
 		}
 	}
 	s.targetConnsMu.Unlock()
 
 	for _, v := range victims {
-		// CAS the trigger flag so concurrent scans (or a parallel
-		// reset event) don't double-handle the same conn.
-		if !v.c.watchdogTriggered.CompareAndSwap(false, true) {
+		// Same handling as an upstream reset: the (target, node) pair is
+		// debargoed right away and the node is evicted once resets on it
+		// cross the threshold. The CAS inside makes concurrent scans and
+		// a racing Read/Write error handle the conn once.
+		if !s.triggerInstantResetEviction(v.c, "watchdog "+v.kind, errWatchdogStall) {
 			continue
 		}
 		s.logger.Warn("smart[", s.Tag(), "] watchdog evicting conn (", v.kind,
-			") via [", v.c.proxyTag, "] target=[", v.target,
-			"] elapsed=", v.ageMS, "ms")
-
-		// Force the underlying conn closed. The Close() pipeline will
-		// eventually run and recordStats sees firstReadOnce==false (or
-		// stale lastRead) — classifyShortLife already covers the
-		// "no first byte" pattern, so the persistent stats stay
-		// consistent.
+			") via [", v.c.proxyTag, "] waited=", v.ageMS, "ms")
+		// Force the underlying conn closed so the caller stops waiting;
+		// its Close() then runs recordStats as usual.
 		_ = v.c.Conn.Close()
-
-		// Trigger the same eviction sequence as a TCP RST: bumps the
-		// circuit breaker, marks dead, drops unwrap cache, kicks the
-		// ranking refresh — algorithm-aware node switch happens on
-		// the very next dial without waiting for the natural close
-		// timeout.
-		s.handleResetThresholdCrossed(v.c.meta, v.c.proxyTag)
 	}
 }
