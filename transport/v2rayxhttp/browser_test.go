@@ -6,7 +6,7 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/option"
-	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/common/json/badoption"
 )
 
 // 浏览器伪装测试 — 对齐 XTLS/Xray-core PR#5802。
@@ -142,105 +142,53 @@ func TestMasquerade_WsVariant(t *testing.T) {
 	}
 }
 
-func TestConfig_UserAgent_ValidValues(t *testing.T) {
-	for _, ua := range []string{"", "chrome", "firefox", "edge", "golang"} {
-		t.Run("ua="+ua, func(t *testing.T) {
-			opts := &option.V2RayXHTTPOptions{Path: "/p", UserAgent: ua}
-			c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-			if err != nil {
-				t.Fatalf("newConfig %q: %v", ua, err)
+func TestMasquerade_SafariAndCurl(t *testing.T) {
+	h := http.Header{}
+	h.Set("User-Agent", "safari")
+	tryDefaultHeadersWith(h, "fetch")
+	if !strings.Contains(h.Get("User-Agent"), "Safari/605.1.15") || h.Get("Priority") != "u=3, i" || h["Sec-CH-UA"] != nil {
+		t.Errorf("safari headers: %v", h)
+	}
+	h = http.Header{}
+	h.Set("User-Agent", "curl")
+	tryDefaultHeadersWith(h, "fetch")
+	if !strings.HasPrefix(h.Get("User-Agent"), "curl/8.") || h.Get("Sec-Fetch-Mode") != "" {
+		t.Errorf("curl headers: %v", h)
+	}
+}
+
+func TestMasquerade_VersionsAreCurrent(t *testing.T) {
+	// Chrome 144 发布于 2026-01-13；外推出来的版本不能比它旧。
+	if anchoredChromeVersion < 144 {
+		t.Errorf("chrome version %d is outdated", anchoredChromeVersion)
+	}
+	if !strings.Contains(msEdgeUA, "Safari/537.36 Edg/") {
+		t.Errorf("edge UA %q", msEdgeUA)
+	}
+}
+
+func TestConfig_UserAgent(t *testing.T) {
+	for _, userAgent := range []string{"chrome", "firefox", "safari", "edge", "curl", "golang", "MyAgent/1.0"} {
+		c := mustNewConfig(t, &option.V2RayXHTTPOptions{UserAgent: userAgent})
+		header := c.requestHeader()
+		switch userAgent {
+		case "golang":
+			if header.Get("User-Agent") != "" {
+				t.Errorf("golang: UA=%q", header.Get("User-Agent"))
 			}
-			if c.userAgent != ua {
-				t.Errorf("c.userAgent=%q want %q", c.userAgent, ua)
+		case "MyAgent/1.0":
+			if header.Get("User-Agent") != userAgent || header["Sec-CH-UA"] != nil {
+				t.Errorf("literal UA: %v", header)
 			}
-		})
-	}
-}
-
-func TestConfig_UserAgent_InvalidValue(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{Path: "/p", UserAgent: "safari"}
-	_, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err == nil {
-		t.Fatal("expected error for unsupported user_agent")
-	}
-	if !strings.Contains(err.Error(), "user_agent") {
-		t.Errorf("err=%v want user_agent msg", err)
-	}
-}
-
-func TestConfig_FillRequest_Firefox(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{Path: "/p", UserAgent: "firefox"}
-	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, _ := http.NewRequest("POST", "https://example.com/p/", nil)
-	c.fillRequest(req, "example.com", "", "")
-	if !strings.Contains(req.Header.Get("User-Agent"), "Firefox/") {
-		t.Errorf("Firefox UA not propagated to req: %q", req.Header.Get("User-Agent"))
-	}
-	if req.Header["Sec-CH-UA"] != nil {
-		t.Error("Firefox shouldn't have Sec-CH-UA")
-	}
-}
-
-// PR#5720 — UplinkDataPlacement="auto" 在客户端等同 body（applyUplinkData 返回 false）。
-func TestConfig_UplinkData_AutoBehavesAsBody(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{
-		Path:                "/p",
-		Mode:                "packet-up",
-		UplinkDataPlacement: PlacementAuto,
-	}
-	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.uplinkDataPlacement != PlacementAuto {
-		t.Errorf("placement=%q want auto", c.uplinkDataPlacement)
-	}
-	req, _ := http.NewRequest("POST", "https://example.com/", nil)
-	if c.applyUplinkData(req, []byte("hello world")) {
-		t.Error("applyUplinkData on auto must return false (data stays in body)")
-	}
-}
-
-// PR#5720 — UplinkChunkSize 是 range，每次切片大小在区间里抽。
-func TestConfig_UplinkChunkSize_Range(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{
-		Path:                "/p",
-		Mode:                "packet-up",
-		UplinkDataPlacement: PlacementHeader,
-		UplinkChunkSize:     "100-500",
-	}
-	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.uplinkChunkSize.Min != 100 || c.uplinkChunkSize.Max != 500 {
-		t.Errorf("uplinkChunkSize=%+v want {100,500}", c.uplinkChunkSize)
-	}
-	// rand 多次落在 [100,500]
-	for i := 0; i < 20; i++ {
-		r := c.uplinkChunkSize.rand()
-		if r < 100 || r > 500 {
-			t.Errorf("rand=%d out of [100,500]", r)
+		default:
+			if header.Get("User-Agent") == userAgent || header.Get("User-Agent") == "" {
+				t.Errorf("%s: UA not expanded: %q", userAgent, header.Get("User-Agent"))
+			}
 		}
 	}
-}
-
-// PR#5720 — From < 64 时强制提到 64。
-func TestConfig_UplinkChunkSize_BumpsBelow64(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{
-		Path:                "/p",
-		Mode:                "packet-up",
-		UplinkDataPlacement: PlacementHeader,
-		UplinkChunkSize:     "10-32",
-	}
-	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if c.uplinkChunkSize.Min < 64 {
-		t.Errorf("Min=%d should be bumped to ≥64", c.uplinkChunkSize.Min)
+	// headers 里显式写的 User-Agent 优先于 user_agent
+	c := mustNewConfig(t, &option.V2RayXHTTPOptions{UserAgent: "chrome", Headers: badoption.HTTPHeader{"User-Agent": {"firefox"}}})
+	if !strings.Contains(c.requestHeader().Get("User-Agent"), "Firefox/") {
+		t.Errorf("headers User-Agent should win: %q", c.requestHeader().Get("User-Agent"))
 	}
 }

@@ -1,56 +1,78 @@
 package v2rayxhttp
 
 import (
-	"math/rand/v2"
+	"hash/fnv"
+	"math"
+	"math/rand"
 	"net/http"
+	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// 浏览器伪装实现 — 对齐 XTLS/Xray-core PR#5802。
+// 浏览器伪装 header，对齐 Xray-core v26.9.30 common/utils/browser.go
+// (utils.TryDefaultHeadersWith)。
 //
-// 三件套:
-//  1. Chrome major version 用日期外推（避免编译期常量留指纹）
-//  2. Sec-CH-UA 走 GREASE：随机 "Not?A?Brand" + Chromium + Google Chrome|Microsoft Edge，
-//     三项顺序按 majorVersion 索引 shuffle 表打散
-//  3. variant ("fetch" / "ws" / "nav") 决定 Sec-Fetch-* / Accept / Priority / Cache-Control
-//     XHTTP 都用 "fetch"
+// 版本号按发布节奏从日期外推，并叠加一个按机器稳定的随机偏移 (Xray 用 CPU
+// 信息做种子)，同一台机器上 UA 保持稳定、不同机器之间自然分散。
 
-// ── Chrome major version 外推 ──
-
-// chromeMajorVersion 基准 Chrome 120 (2023-12-06)，每 ~4 周一个大版本。
-func chromeMajorVersion() int {
-	const baseline = 120
-	const baselineTs = int64(1701820800) // 2023-12-06 UTC
-	elapsed := time.Now().Unix() - baselineTs
-	if elapsed <= 0 {
-		return baseline
-	}
-	weeks := elapsed / (7 * 86400)
-	return baseline + int(weeks/4)
+func getRandomizer() *rand.Rand {
+	hostname, _ := os.Hostname()
+	fnvHash := fnv.New64()
+	fnvHash.Write([]byte(hostname + runtime.GOOS + runtime.GOARCH + strconv.Itoa(runtime.NumCPU())))
+	return rand.New(rand.NewSource(int64(fnvHash.Sum64())))
 }
 
-// 浏览器 UA 字符串（CPU-seeded 通过 chromeMajorVersion 外推，全局共享）。
+var globalRng = getRandomizer()
+
+func daysSince(year int, month time.Month, day int) int64 {
+	return time.Now().Unix()/86400 - time.Date(year, month, day, 0, 0, 0, 0, time.UTC).Unix()/86400
+}
+
+// chromeVersion: Chrome 144 发布于 2026-01-13，约 35 天一个大版本。
+func chromeVersion() int {
+	timeDiff := int(daysSince(2026, 1, 13)-35) - int(math.Floor(math.Pow(globalRng.Float64(), 2)*105))
+	return 144 + timeDiff/35
+}
+
+// curlVersion: curl 8.0.0 发布于 2023-03-20，约 57 天一个小版本。
+func curlVersion() string {
+	timeDiff := int(daysSince(2023, 3, 20)-60) - int(math.Floor(math.Pow(globalRng.Float64(), 2)*165))
+	return "8." + strconv.Itoa(timeDiff/57) + ".0"
+}
+
+func firefoxVersion() int {
+	timeDiff := daysSince(2024, 7, 29) - 25 - int64(math.Floor(math.Pow(globalRng.Float64(), 2)*50))
+	return int(timeDiff/30) + 128
+}
+
+var safariMinorMap = [25]int{
+	0, 0, 0, 1, 1,
+	1, 2, 2, 2, 2, 3, 3, 3, 4, 4,
+	4, 5, 5, 5, 5, 5, 6, 6, 6, 6,
+}
+
+func safariVersion() string {
+	anchoredTime := time.Now()
+	releaseYear := anchoredTime.Year()
+	delayedDays := int(math.Floor(math.Pow(globalRng.Float64(), 3) * 75))
+	splitPoint := time.Date(releaseYear, 9, 23, 0, 0, 0, 0, time.UTC).AddDate(0, 0, delayedDays)
+	if anchoredTime.Compare(splitPoint) < 0 {
+		releaseYear--
+		splitPoint = time.Date(releaseYear, 9, 23, 0, 0, 0, 0, time.UTC).AddDate(0, 0, delayedDays)
+	}
+	index := min(int((anchoredTime.Unix()-splitPoint.Unix())/1296000), len(safariMinorMap)-1)
+	return strconv.Itoa(releaseYear-1999) + "." + strconv.Itoa(safariMinorMap[index])
+}
+
+// Chromium Sec-CH-UA GREASE
 var (
-	anchoredChromeVersion = chromeMajorVersion()
-	chromeUA              = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" +
-		strconv.Itoa(anchoredChromeVersion) + ".0.0.0 Safari/537.36"
-	msEdgeUA = chromeUA + " Edg/" + strconv.Itoa(anchoredChromeVersion) + ".0.0.0"
-	// 钉死在 ESR；uTLS 的 Firefox 指纹和这里要匹配，每个新 ESR 出来要手工更新。
-	firefoxUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:140.0) Gecko/20100101 Firefox/140.0"
-
-	chromeUACH = getGreasedChUa(anchoredChromeVersion, "chrome")
-	msEdgeUACH = getGreasedChUa(anchoredChromeVersion, "edge")
-)
-
-// ── GREASE：Sec-CH-UA 内的 "Not A Brand" + 顺序随机化 ──
-
-var (
-	greaseNA      = []string{" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"}
-	greaseVerNA   = []string{"8", "99", "24"}
-	greaseShuf3   = [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
-	greaseShuf4 = [][4]int{
+	clientHintGreaseNA  = []string{" ", "(", ":", "-", ".", "/", ")", ";", "=", "?", "_"}
+	clientHintVersionNA = []string{"8", "99", "24"}
+	clientHintShuffle3  = [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	clientHintShuffle4  = [][4]int{
 		{0, 1, 2, 3}, {0, 1, 3, 2}, {0, 2, 1, 3}, {0, 2, 3, 1}, {0, 3, 1, 2}, {0, 3, 2, 1},
 		{1, 0, 2, 3}, {1, 0, 3, 2}, {1, 2, 0, 3}, {1, 2, 3, 0}, {1, 3, 0, 2}, {1, 3, 2, 0},
 		{2, 0, 1, 3}, {2, 0, 3, 1}, {2, 1, 0, 3}, {2, 1, 3, 0}, {2, 3, 0, 1}, {2, 3, 1, 0},
@@ -59,9 +81,9 @@ var (
 )
 
 func getGreasedChInvalidBrand(seed int) string {
-	return `"Not` + greaseNA[seed%len(greaseNA)] + "A" +
-		greaseNA[(seed+1)%len(greaseNA)] + `Brand";v="` +
-		greaseVerNA[seed%len(greaseVerNA)] + `"`
+	return `"Not` + clientHintGreaseNA[seed%len(clientHintGreaseNA)] + "A" +
+		clientHintGreaseNA[(seed+1)%len(clientHintGreaseNA)] + `Brand";v="` +
+		clientHintVersionNA[seed%len(clientHintVersionNA)] + `"`
 }
 
 func getGreasedChOrder(brandLength, seed int) []int {
@@ -69,48 +91,52 @@ func getGreasedChOrder(brandLength, seed int) []int {
 	case 1:
 		return []int{0}
 	case 2:
-		return []int{seed % 2, (seed + 1) % 2}
+		return []int{seed % brandLength, (seed + 1) % brandLength}
 	case 3:
-		s := greaseShuf3[seed%len(greaseShuf3)]
-		return []int{s[0], s[1], s[2]}
+		return clientHintShuffle3[seed%len(clientHintShuffle3)][:]
 	default:
-		s := greaseShuf4[seed%len(greaseShuf4)]
-		return []int{s[0], s[1], s[2], s[3]}
+		return clientHintShuffle4[seed%len(clientHintShuffle4)][:]
 	}
 }
 
-// getUngreasedChUa 出 Sec-CH-UA 的原始品牌串（按 chrome / edge / chromium-only）。
-func getUngreasedChUa(majorVersion int, fork string) []string {
-	base := make([]string, 0, 4)
-	base = append(base,
-		getGreasedChInvalidBrand(majorVersion),
+func getUngreasedChUa(majorVersion int, forkName string) []string {
+	baseChUa := make([]string, 0, 4)
+	baseChUa = append(baseChUa, getGreasedChInvalidBrand(majorVersion),
 		`"Chromium";v="`+strconv.Itoa(majorVersion)+`"`)
-	switch fork {
+	switch forkName {
 	case "chrome":
-		base = append(base, `"Google Chrome";v="`+strconv.Itoa(majorVersion)+`"`)
+		baseChUa = append(baseChUa, `"Google Chrome";v="`+strconv.Itoa(majorVersion)+`"`)
 	case "edge":
-		base = append(base, `"Microsoft Edge";v="`+strconv.Itoa(majorVersion)+`"`)
+		baseChUa = append(baseChUa, `"Microsoft Edge";v="`+strconv.Itoa(majorVersion)+`"`)
 	}
-	return base
+	return baseChUa
 }
 
-func getGreasedChUa(majorVersion int, fork string) string {
-	un := getUngreasedChUa(majorVersion, fork)
-	order := getGreasedChOrder(len(un), majorVersion)
-	out := make([]string, len(un))
-	for i, dst := range order {
-		out[dst] = un[i]
+func getGreasedChUa(majorVersion int, forkName string) string {
+	ungreasedCh := getUngreasedChUa(majorVersion, forkName)
+	shuffleMap := getGreasedChOrder(len(ungreasedCh), majorVersion)
+	shuffledCh := make([]string, len(ungreasedCh))
+	for i, e := range shuffleMap {
+		shuffledCh[e] = ungreasedCh[i]
 	}
-	return strings.Join(out, ", ")
+	return strings.Join(shuffledCh, ", ")
 }
 
-// ── variant 适用：把浏览器 + 上下文专属的 header 套一遍 ──
+var (
+	curlUA                 = "curl/" + curlVersion()
+	anchoredFirefoxVersion = strconv.Itoa(firefoxVersion())
+	firefoxUA              = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:" + anchoredFirefoxVersion + ".0) Gecko/20100101 Firefox/" + anchoredFirefoxVersion + ".0"
+	safariUA               = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/" + safariVersion() + " Safari/605.1.15"
+	anchoredChromeVersion  = chromeVersion()
+	chromeUA               = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/" + strconv.Itoa(anchoredChromeVersion) + ".0.0.0 Safari/537.36"
+	chromeUACH             = getGreasedChUa(anchoredChromeVersion, "chrome")
+	// 真实 Edge UA 在 "Safari/537.36" 与 "Edg/" 之间有空格 (Xray 漏了这个空格)。
+	msEdgeUA   = chromeUA + " Edg/" + strconv.Itoa(anchoredChromeVersion) + ".0.0.0"
+	msEdgeUACH = getGreasedChUa(anchoredChromeVersion, "edge")
+)
 
-// applyMasqueradedHeaders 按 browser 和 variant 把伪装 header 覆盖进去。
-// browser 取值: "chrome" / "firefox" / "edge" / "golang"
-// variant 取值: "nav" / "ws" / "fetch"
-func applyMasqueradedHeaders(header http.Header, browser, variant string) {
-	// 浏览器维度
+func applyMasqueradedHeaders(header http.Header, browser string, variant string) {
+	// Browser-specific.
 	switch browser {
 	case "chrome":
 		header["Sec-CH-UA"] = []string{chromeUACH}
@@ -130,13 +156,18 @@ func applyMasqueradedHeaders(header http.Header, browser, variant string) {
 		header.Set("User-Agent", firefoxUA)
 		header["DNT"] = []string{"1"}
 		header.Set("Accept-Language", "en-US,en;q=0.5")
+	case "safari":
+		header.Set("User-Agent", safariUA)
+		header.Set("Accept-Language", "en-US,en;q=0.9")
 	case "golang":
-		// 暴露 net/http 默认 UA — 完全不伪装。
+		// Expose the default net/http header.
 		header.Del("User-Agent")
 		return
+	case "curl":
+		header.Set("User-Agent", curlUA)
+		return
 	}
-
-	// variant 维度
+	// Context-specific.
 	switch variant {
 	case "nav":
 		if header.Get("Cache-Control") == "" {
@@ -150,18 +181,25 @@ func applyMasqueradedHeaders(header http.Header, browser, variant string) {
 			switch browser {
 			case "chrome", "edge":
 				header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/jxl,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-			case "firefox":
+			case "firefox", "safari":
 				header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 			}
 		}
 		header.Set("Sec-Fetch-Site", "none")
 		header.Set("Sec-Fetch-Mode", "navigate")
-		header.Set("Sec-Fetch-User", "?1")
+		if browser != "safari" {
+			header.Set("Sec-Fetch-User", "?1")
+		}
 		header.Set("Sec-Fetch-Dest", "document")
 		header.Set("Priority", "u=0, i")
 	case "ws":
 		header.Set("Sec-Fetch-Mode", "websocket")
-		header.Set("Sec-Fetch-Dest", "empty")
+		if browser == "safari" {
+			// Safari is NOT web-compliant here!
+			header.Set("Sec-Fetch-Dest", "websocket")
+		} else {
+			header.Set("Sec-Fetch-Dest", "empty")
+		}
 		header.Set("Sec-Fetch-Site", "same-origin")
 		if header.Get("Cache-Control") == "" {
 			header.Set("Cache-Control", "no-cache")
@@ -182,6 +220,8 @@ func applyMasqueradedHeaders(header http.Header, browser, variant string) {
 				header.Set("Priority", "u=1, i")
 			case "firefox":
 				header.Set("Priority", "u=4")
+			case "safari":
+				header.Set("Priority", "u=3, i")
 			}
 		}
 		if header.Get("Cache-Control") == "" {
@@ -196,31 +236,16 @@ func applyMasqueradedHeaders(header http.Header, browser, variant string) {
 	}
 }
 
-// tryDefaultHeadersWith — 与 Xray 的 utils.TryDefaultHeadersWith 等价。
-//
-// 调用语义:
-//   - header.Get("User-Agent") == "" → 默认走 chrome
-//   - header.Get("User-Agent") ∈ {chrome,firefox,edge,golang} → 用该浏览器集合
-//   - 其他（已被用户设置的真 UA 字符串）→ 不动 UA，也不补 Sec-CH-UA / Sec-Fetch-*
-//
-// XHTTP 全部调用都传 variant="fetch"。
+// tryDefaultHeadersWith 对应 Xray utils.TryDefaultHeadersWith:
+// 没有 User-Agent 时按 chrome 伪装；User-Agent 为 chrome / firefox / safari /
+// edge / curl / golang 时套用对应集合；其他值视为字面 UA，不做改动。
 func tryDefaultHeadersWith(header http.Header, variant string) {
 	if len(header.Values("User-Agent")) < 1 {
 		applyMasqueradedHeaders(header, "chrome", variant)
 		return
 	}
-	switch header.Get("User-Agent") {
-	case "chrome":
-		applyMasqueradedHeaders(header, "chrome", variant)
-	case "firefox":
-		applyMasqueradedHeaders(header, "firefox", variant)
-	case "edge":
-		applyMasqueradedHeaders(header, "edge", variant)
-	case "golang":
-		applyMasqueradedHeaders(header, "golang", variant)
+	switch userAgent := header.Get("User-Agent"); userAgent {
+	case "chrome", "firefox", "safari", "edge", "curl", "golang":
+		applyMasqueradedHeaders(header, userAgent, variant)
 	}
 }
-
-// 注意: 这里不直接用 math/rand 全局；只在 V2 包内的非 padding 路径用，避免和
-// crypto/rand 出来的 padding 字节产生指纹关联。
-var _ = rand.Uint32

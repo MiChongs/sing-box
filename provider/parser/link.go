@@ -410,6 +410,8 @@ func parseVMessLink(link string) (option.Outbound, error) {
 				if host, exists := proxy["host"]; exists && host != "" {
 					Transport.GRPCOptions.ServiceName = host
 				}
+			case "xhttp", "splithttp":
+				Transport = v2rayTransportXHTTP(proxy)
 			default:
 				continue
 			}
@@ -497,6 +499,8 @@ func parseVLESSLink(link string) (option.Outbound, error) {
 				if serviceName, exists := proxy["serviceName"]; exists && serviceName != "" {
 					Transport.GRPCOptions.ServiceName = serviceName
 				}
+			case "xhttp", "splithttp":
+				Transport = v2rayTransportXHTTP(proxy)
 			default:
 				continue
 			}
@@ -614,6 +618,8 @@ func parseTrojanLink(link string) (option.Outbound, error) {
 				if serviceName, exists := proxy["grpc-service-name"]; exists && serviceName != "" {
 					Transport.GRPCOptions.ServiceName = serviceName
 				}
+			case "xhttp", "splithttp":
+				Transport = v2rayTransportXHTTP(proxy)
 			default:
 				continue
 			}

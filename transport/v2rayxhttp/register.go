@@ -19,8 +19,9 @@ import (
 // "type": "xhttp" 的 JSON 配置。
 //
 // 分两步是因为 option/ 和 transport/v2ray/ 各自有独立 registry：
-//   option registry  → 负责 JSON 解码到具体结构体
-//   v2ray registry   → 负责从结构体实例化出 Server/Client
+//
+//	option registry  → 负责 JSON 解码到具体结构体
+//	v2ray registry   → 负责从结构体实例化出 Server/Client
 //
 // 都在这里一次性注册，调用方只需在 include/ 用 build tag 控制导入即可。
 func RegisterPlugin() {

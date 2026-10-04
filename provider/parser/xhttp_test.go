@@ -1,173 +1,405 @@
-package parser_test
+package parser
 
 import (
+	"context"
 	"encoding/base64"
-	"strings"
+	"net/url"
 	"testing"
 
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/provider/parser"
-	"github.com/sagernet/sing-box/transport/v2rayxhttp"
 
-	"gopkg.in/yaml.v3"
+	"github.com/stretchr/testify/require"
 )
 
-func stdB64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
-
-// 链接格式 XHTTP 解析 —— VLESS / VMess / Trojan 三种协议
-
-func TestVLESSLinkXHTTP(t *testing.T) {
-	// vless://uuid@host:443?security=tls&type=xhttp&path=/xyz&host=a.com&mode=packet-up#tag
-	link := "vless://11111111-1111-1111-1111-111111111111@example.com:443?" +
-		"encryption=none&security=tls&type=xhttp&path=%2Fxyz&host=a.com&mode=packet-up#mytag"
-	out, err := parser.ParseSubscriptionLink(link)
-	if err != nil {
-		t.Fatalf("parse vless: %v", err)
-	}
-	if out.Type != "vless" {
-		t.Fatalf("type=%q want vless", out.Type)
-	}
-	opts, ok := out.Options.(*option.VLESSOutboundOptions)
-	if !ok {
-		t.Fatalf("options=%T", out.Options)
-	}
-	if opts.Transport == nil || opts.Transport.Type != "xhttp" {
-		t.Fatalf("transport=%+v, want xhttp", opts.Transport)
-	}
-	x, ok := opts.Transport.Extra.(*option.V2RayXHTTPOptions)
-	if !ok {
-		t.Fatalf("extra=%T", opts.Transport.Extra)
-	}
-	if x.Path != "/xyz" {
-		t.Errorf("path=%q", x.Path)
-	}
-	if len(x.Host) != 1 || x.Host[0] != "a.com" {
-		t.Errorf("host=%v", x.Host)
-	}
-	if x.Mode != "packet-up" {
-		t.Errorf("mode=%q", x.Mode)
-	}
+func xhttpTransport(t *testing.T, transport *option.V2RayTransportOptions) *option.V2RayXHTTPOptions {
+	t.Helper()
+	require.NotNil(t, transport)
+	require.Equal(t, C.V2RayTransportTypeXHTTP, transport.Type)
+	xhttpOptions, ok := transport.Extra.(*option.V2RayXHTTPOptions)
+	require.True(t, ok, "extra=%T", transport.Extra)
+	return xhttpOptions
 }
 
-func TestVMessLinkXHTTP(t *testing.T) {
-	// vmess:// 顶层 net=xhttp + path/host/mode。不测试 extra=<json> 嵌套
-	// （VMess 链接的 JSON 解析链里有个正则 re-quote 数字值的阶段，对嵌套
-	// 转义 JSON 容错不佳，用户端极少这么写 —— 主流用法是 VLESS 链接带 extra）。
+func xhttpRangeOf(from, to int32) option.XHTTPRange {
+	return option.XHTTPRange{From: from, To: to}
+}
+
+// Share links: VLESS / VMess / Trojan
+
+func TestParseVLESSLinkXHTTP(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("vless://11111111-1111-1111-1111-111111111111@example.com:443?" +
+		"encryption=none&security=tls&type=xhttp&path=%2Fxyz&host=a.com&mode=packet-up#mytag")
+	require.NoError(t, err)
+	require.Equal(t, C.TypeVLESS, outbound.Type)
+	xhttpOptions := xhttpTransport(t, outbound.Options.(*option.VLESSOutboundOptions).Transport)
+	require.Equal(t, "/xyz", xhttpOptions.Path)
+	require.Equal(t, []string{"a.com"}, []string(xhttpOptions.Host))
+	require.Equal(t, "packet-up", xhttpOptions.Mode)
+}
+
+func TestParseVMessLinkXHTTP(t *testing.T) {
 	vmessJSON := `{"v":"2","ps":"xhttp-test","add":"cdn.example.com","port":"443",` +
 		`"id":"11111111-1111-1111-1111-111111111111","aid":"0","scy":"auto",` +
 		`"net":"xhttp","path":"/top","host":"top.com","mode":"stream-up","tls":"tls"}`
-	link := "vmess://" + stdB64(vmessJSON)
-	out, err := parser.ParseSubscriptionLink(link)
-	if err != nil {
-		t.Fatalf("parse vmess: %v", err)
-	}
-	opts := out.Options.(*option.VMessOutboundOptions)
-	if opts.Transport == nil || opts.Transport.Type != "xhttp" {
-		t.Fatalf("transport=%+v", opts.Transport)
-	}
-	x := opts.Transport.Extra.(*option.V2RayXHTTPOptions)
-	if x.Path != "/top" {
-		t.Errorf("path=%q", x.Path)
-	}
-	if x.Mode != "stream-up" {
-		t.Errorf("mode=%q", x.Mode)
-	}
-	if len(x.Host) != 1 || x.Host[0] != "top.com" {
-		t.Errorf("host=%v", x.Host)
-	}
+	outbound, err := ParseSubscriptionLink("vmess://" + base64.StdEncoding.EncodeToString([]byte(vmessJSON)))
+	require.NoError(t, err)
+	vmessOptions := outbound.Options.(*option.VMessOutboundOptions)
+	xhttpOptions := xhttpTransport(t, vmessOptions.Transport)
+	require.Equal(t, "/top", xhttpOptions.Path)
+	require.Equal(t, "stream-up", xhttpOptions.Mode)
+	require.Equal(t, []string{"top.com"}, []string(xhttpOptions.Host))
+	require.Equal(t, expectedVMessAutoSecurity(), vmessOptions.Security)
 }
 
-// VLESS 链接支持 extra=<url-encoded json>，测试 extra 覆盖字段
-func TestVLESSLinkXHTTPWithExtra(t *testing.T) {
-	// extra 里 urlencode 一个 xhttp JSON
-	// {"xPaddingBytes":"200-800","scMaxEachPostBytes":4096,"noSSEHeader":true}
-	extra := `%7B%22xPaddingBytes%22%3A%22200-800%22%2C%22scMaxEachPostBytes%22%3A4096%2C%22noSSEHeader%22%3Atrue%7D`
-	link := "vless://11111111-1111-1111-1111-111111111111@example.com:443?" +
-		"encryption=none&security=tls&type=xhttp&path=%2Fxyz&host=a.com&mode=packet-up&extra=" + extra + "#tag"
-	out, err := parser.ParseSubscriptionLink(link)
-	if err != nil {
-		t.Fatalf("parse vless: %v", err)
-	}
-	opts := out.Options.(*option.VLESSOutboundOptions)
-	x := opts.Transport.Extra.(*option.V2RayXHTTPOptions)
-	if x.XPaddingBytes != "200-800" {
-		t.Errorf("x_padding_bytes=%q", x.XPaddingBytes)
-	}
-	if x.ScMaxEachPostBytes != 4096 {
-		t.Errorf("sc_max_each_post_bytes=%d", x.ScMaxEachPostBytes)
-	}
-	if !x.NoSSEHeader {
-		t.Errorf("no_sse_header not parsed from extra")
-	}
+func TestParseTrojanLinkXHTTP(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("trojan://password@example.com:443?security=tls&type=xhttp&path=%2Ft&mode=auto#tag")
+	require.NoError(t, err)
+	xhttpOptions := xhttpTransport(t, outbound.Options.(*option.TrojanOutboundOptions).Transport)
+	require.Equal(t, "/t", xhttpOptions.Path)
+	require.Equal(t, "auto", xhttpOptions.Mode)
 }
 
+// Xray share links put every xhttpSettings field except host/path/mode into a
+// URL-encoded "extra" JSON; host/path/mode inside extra are ignored.
+func TestParseVLESSLinkXHTTPExtra(t *testing.T) {
+	extra := `{
+		"host": "ignored.com", "path": "/ignored", "mode": "stream-one",
+		"headers": {"User-Agent": "ua", "Host": "header-host.com"},
+		"xPaddingBytes": "200-800",
+		"xPaddingObfsMode": true,
+		"xPaddingPlacement": "header",
+		"uplinkHTTPMethod": "PUT",
+		"sessionIDPlacement": "query",
+		"sessionIDKey": "sid",
+		"sessionIDLength": "8-16",
+		"seqPlacement": "header",
+		"uplinkChunkSize": 4096,
+		"noGRPCHeader": true,
+		"noSSEHeader": true,
+		"scMaxEachPostBytes": 4096,
+		"scMinPostsIntervalMs": "10-50",
+		"scMaxBufferedPosts": 64,
+		"xmux": {"maxConnections": "2-4", "hMaxRequestTimes": 500, "hKeepAlivePeriod": 30},
+		"downloadSettings": {
+			"address": "down.example.com",
+			"port": 8443,
+			"network": "xhttp",
+			"security": "reality",
+			"realitySettings": {"serverName": "www.example.com", "publicKey": "pbk", "shortId": "abcd", "fingerprint": "firefox"},
+			"xhttpSettings": {"path": "/down", "host": "down-host.com", "xmux": {"maxConcurrency": "16-32"}}
+		}
+	}`
+	outbound, err := ParseSubscriptionLink("vless://11111111-1111-1111-1111-111111111111@example.com:443?" +
+		"encryption=none&security=tls&type=xhttp&path=%2Fxyz&mode=packet-up&extra=" + url.QueryEscape(extra) + "#tag")
+	require.NoError(t, err)
+	xhttpOptions := xhttpTransport(t, outbound.Options.(*option.VLESSOutboundOptions).Transport)
 
-// Clash yaml 格式 XHTTP 解析
+	require.Equal(t, "/xyz", xhttpOptions.Path)
+	require.Equal(t, "packet-up", xhttpOptions.Mode)
+	require.Equal(t, []string{"header-host.com"}, []string(xhttpOptions.Host))
+	require.Equal(t, []string{"ua"}, []string(xhttpOptions.Headers["User-Agent"]))
+	require.NotContains(t, xhttpOptions.Headers, "Host")
+	require.Equal(t, xhttpRangeOf(200, 800), xhttpOptions.XPaddingBytes)
+	require.True(t, xhttpOptions.XPaddingObfsMode)
+	require.Equal(t, "header", xhttpOptions.XPaddingPlacement)
+	require.Equal(t, "PUT", xhttpOptions.UplinkHTTPMethod)
+	require.Equal(t, "query", xhttpOptions.SessionPlacement)
+	require.Equal(t, "sid", xhttpOptions.SessionKey)
+	require.Equal(t, xhttpRangeOf(8, 16), xhttpOptions.SessionIDLength)
+	require.Equal(t, "header", xhttpOptions.SeqPlacement)
+	require.Equal(t, xhttpRangeOf(4096, 4096), xhttpOptions.UplinkChunkSize)
+	require.True(t, xhttpOptions.NoGRPCHeader)
+	require.True(t, xhttpOptions.NoSSEHeader)
+	require.Equal(t, xhttpRangeOf(4096, 4096), xhttpOptions.ScMaxEachPostBytes)
+	require.Equal(t, xhttpRangeOf(10, 50), xhttpOptions.ScMinPostsIntervalMs)
+	require.EqualValues(t, 64, xhttpOptions.ScMaxBufferedPosts)
 
-func TestClashVLESSXHTTP(t *testing.T) {
-	// 模拟 mihomo subscription yaml 里一个 vless+xhttp 节点
-	yamlStr := `
-name: xh
-type: vless
-server: s.com
-port: 443
-uuid: 11111111-1111-1111-1111-111111111111
-tls: true
-network: xhttp
-xhttp-opts:
-  path: /abc
-  host: s.com
-  mode: packet-up
-  x-padding-bytes: "100-1000"
-  no-sse-header: true
-  sc-max-each-post-bytes: 8192
-  sc-min-posts-interval-ms: 20
-  headers:
-    User-Agent: test-agent
-`
-	var v parser.VlessOption
-	if err := yaml.Unmarshal([]byte(yamlStr), &v); err != nil {
-		t.Fatalf("yaml: %v", err)
-	}
-	built := v.Build()
-	opts := built.(*option.VLESSOutboundOptions)
-	if opts.Transport == nil || opts.Transport.Type != "xhttp" {
-		t.Fatalf("transport=%+v", opts.Transport)
-	}
-	x := opts.Transport.Extra.(*option.V2RayXHTTPOptions)
-	if x.Path != "/abc" || x.Mode != "packet-up" {
-		t.Errorf("parsed wrong: path=%q mode=%q", x.Path, x.Mode)
-	}
-	if x.ScMaxEachPostBytes != 8192 {
-		t.Errorf("sc_max_each_post_bytes=%d", x.ScMaxEachPostBytes)
-	}
-	if !x.NoSSEHeader {
-		t.Errorf("no_sse_header not parsed")
-	}
-	if len(x.Headers) == 0 || len(x.Headers["User-Agent"]) == 0 || x.Headers["User-Agent"][0] != "test-agent" {
-		t.Errorf("headers=%+v", x.Headers)
-	}
+	require.NotNil(t, xhttpOptions.Xmux)
+	require.Equal(t, xhttpRangeOf(2, 4), xhttpOptions.Xmux.MaxConnections)
+	require.Equal(t, xhttpRangeOf(500, 500), xhttpOptions.Xmux.HMaxRequestTimes)
+	require.EqualValues(t, 30, xhttpOptions.Xmux.HKeepAlivePeriod)
+
+	download := xhttpOptions.DownloadSettings
+	require.NotNil(t, download)
+	require.Equal(t, "down.example.com", download.Server)
+	require.EqualValues(t, 8443, download.ServerPort)
+	require.Equal(t, "/down", download.Path)
+	require.Equal(t, []string{"down-host.com"}, []string(download.Host))
+	require.NotNil(t, download.Xmux)
+	require.Equal(t, xhttpRangeOf(16, 32), download.Xmux.MaxConcurrency)
+	require.Nil(t, download.DownloadSettings)
+	require.NotNil(t, download.TLS)
+	require.True(t, download.TLS.Enabled)
+	require.Equal(t, "www.example.com", download.TLS.ServerName)
+	require.True(t, download.TLS.Reality.Enabled)
+	require.Equal(t, "pbk", download.TLS.Reality.PublicKey)
+	require.Equal(t, "abcd", download.TLS.Reality.ShortID)
+	require.Equal(t, "firefox", download.TLS.UTLS.Fingerprint)
 }
 
-// 验证 xhttp 节点经由 sing-box 配置 JSON 往返能 roundtrip
-// (需要先让 plugin registry 注册 xhttp 类型)
-func TestXHTTPOptionRoundtrip(t *testing.T) {
-	v2rayxhttp.RegisterPlugin()
-	input := `{"type":"xhttp","path":"/r","mode":"stream-one","x_padding_bytes":"50-500"}`
-	var o option.V2RayTransportOptions
-	if err := o.UnmarshalJSON([]byte(input)); err != nil {
-		t.Fatal(err)
-	}
-	out, err := o.MarshalJSON()
-	if err != nil {
-		t.Fatal(err)
-	}
-	// badjson 输出带空格分隔符，检查语义包含即可
-	s := string(out)
-	if !strings.Contains(s, `"path"`) || !strings.Contains(s, `"/r"`) {
-		t.Errorf("path missing in %s", s)
-	}
-	if !strings.Contains(s, `"mode"`) || !strings.Contains(s, `"stream-one"`) {
-		t.Errorf("mode missing in %s", s)
-	}
+func TestParseVLESSLinkXHTTPInvalidExtraIgnored(t *testing.T) {
+	outbound, err := ParseSubscriptionLink("vless://11111111-1111-1111-1111-111111111111@example.com:443?" +
+		"security=tls&type=xhttp&path=%2Fxyz&extra=%7Bnot-json#tag")
+	require.NoError(t, err)
+	xhttpOptions := xhttpTransport(t, outbound.Options.(*option.VLESSOutboundOptions).Transport)
+	require.Equal(t, "/xyz", xhttpOptions.Path)
+}
+
+// Clash / mihomo YAML
+
+func parseSingleClashProxy(t *testing.T, content string) option.Outbound {
+	t.Helper()
+	outbounds, _, err := ParseClashSubscription(context.Background(), content)
+	require.NoError(t, err)
+	require.Len(t, outbounds, 1)
+	return outbounds[0]
+}
+
+func TestParseClashVLESSXHTTP(t *testing.T) {
+	outbound := parseSingleClashProxy(t, `
+proxies:
+  - name: xh
+    type: vless
+    server: s.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    tls: true
+    network: xhttp
+    xhttp-opts:
+      path: /abc
+      host: s.com
+      mode: packet-up
+      headers:
+        User-Agent: test-agent
+      no-grpc-header: true
+      no-sse-header: true
+      x-padding-bytes: "100-1000"
+      x-padding-obfs-mode: true
+      x-padding-key: pad
+      x-padding-header: X-Pad
+      x-padding-placement: cookie
+      x-padding-method: tokenish
+      uplink-http-method: PATCH
+      session-placement: header
+      session-key: X-Session
+      session-table: abcdef
+      session-length: "10-20"
+      seq-placement: query
+      seq-key: seq
+      uplink-data-placement: body
+      uplink-data-key: data
+      uplink-chunk-size: "2048-4096"
+      sc-max-each-post-bytes: 8192
+      sc-min-posts-interval-ms: "20"
+      sc-max-buffered-posts: 40
+      reuse-settings:
+        max-connections: "3"
+        c-max-reuse-times: "8-16"
+        h-max-request-times: "600-900"
+        h-max-reusable-secs: "1800-3000"
+        h-keep-alive-period: 15
+`)
+	xhttpOptions := xhttpTransport(t, outbound.Options.(*option.VLESSOutboundOptions).Transport)
+	require.Equal(t, "/abc", xhttpOptions.Path)
+	require.Equal(t, []string{"s.com"}, []string(xhttpOptions.Host))
+	require.Equal(t, "packet-up", xhttpOptions.Mode)
+	require.Equal(t, []string{"test-agent"}, []string(xhttpOptions.Headers["User-Agent"]))
+	require.True(t, xhttpOptions.NoGRPCHeader)
+	require.True(t, xhttpOptions.NoSSEHeader)
+	require.Equal(t, xhttpRangeOf(100, 1000), xhttpOptions.XPaddingBytes)
+	require.True(t, xhttpOptions.XPaddingObfsMode)
+	require.Equal(t, "pad", xhttpOptions.XPaddingKey)
+	require.Equal(t, "X-Pad", xhttpOptions.XPaddingHeader)
+	require.Equal(t, "cookie", xhttpOptions.XPaddingPlacement)
+	require.Equal(t, "tokenish", xhttpOptions.XPaddingMethod)
+	require.Equal(t, "PATCH", xhttpOptions.UplinkHTTPMethod)
+	require.Equal(t, "header", xhttpOptions.SessionPlacement)
+	require.Equal(t, "X-Session", xhttpOptions.SessionKey)
+	require.Equal(t, "abcdef", xhttpOptions.SessionIDTable)
+	require.Equal(t, xhttpRangeOf(10, 20), xhttpOptions.SessionIDLength)
+	require.Equal(t, "query", xhttpOptions.SeqPlacement)
+	require.Equal(t, "seq", xhttpOptions.SeqKey)
+	require.Equal(t, "body", xhttpOptions.UplinkDataPlacement)
+	require.Equal(t, "data", xhttpOptions.UplinkDataKey)
+	require.Equal(t, xhttpRangeOf(2048, 4096), xhttpOptions.UplinkChunkSize)
+	require.Equal(t, xhttpRangeOf(8192, 8192), xhttpOptions.ScMaxEachPostBytes)
+	require.Equal(t, xhttpRangeOf(20, 20), xhttpOptions.ScMinPostsIntervalMs)
+	require.EqualValues(t, 40, xhttpOptions.ScMaxBufferedPosts)
+	require.NotNil(t, xhttpOptions.Xmux)
+	require.Equal(t, xhttpRangeOf(3, 3), xhttpOptions.Xmux.MaxConnections)
+	require.Equal(t, xhttpRangeOf(8, 16), xhttpOptions.Xmux.CMaxReuseTimes)
+	require.Equal(t, xhttpRangeOf(600, 900), xhttpOptions.Xmux.HMaxRequestTimes)
+	require.Equal(t, xhttpRangeOf(1800, 3000), xhttpOptions.Xmux.HMaxReusableSecs)
+	require.EqualValues(t, 15, xhttpOptions.Xmux.HKeepAlivePeriod)
+	require.Nil(t, xhttpOptions.DownloadSettings)
+}
+
+// mihomo download-settings inherit every unset field from the upload side;
+// the converted download_settings must spell that inheritance out.
+func TestParseClashXHTTPDownloadSettingsInheritance(t *testing.T) {
+	outbound := parseSingleClashProxy(t, `
+proxies:
+  - name: xh
+    type: vless
+    server: up.example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    tls: true
+    servername: sni.example.com
+    skip-cert-verify: true
+    client-fingerprint: chrome
+    alpn: [h2]
+    network: xhttp
+    xhttp-opts:
+      path: /up
+      host: up-host.com
+      mode: stream-up
+      x-padding-bytes: "300-600"
+      headers:
+        User-Agent: up-agent
+      reuse-settings:
+        max-connections: "2"
+      download-settings:
+        server: down.example.com
+        reuse-settings:
+          max-concurrency: "8"
+`)
+	xhttpOptions := xhttpTransport(t, outbound.Options.(*option.VLESSOutboundOptions).Transport)
+	download := xhttpOptions.DownloadSettings
+	require.NotNil(t, download)
+	require.Equal(t, "down.example.com", download.Server)
+	require.EqualValues(t, 443, download.ServerPort)
+	require.Equal(t, "/up", download.Path)
+	require.Equal(t, []string{"up-host.com"}, []string(download.Host))
+	require.Equal(t, []string{"up-agent"}, []string(download.Headers["User-Agent"]))
+	require.Equal(t, "stream-up", download.Mode)
+	require.Equal(t, xhttpRangeOf(300, 600), download.XPaddingBytes)
+	require.NotNil(t, download.Xmux)
+	require.Equal(t, xhttpRangeOf(8, 8), download.Xmux.MaxConcurrency)
+	require.True(t, download.Xmux.MaxConnections.IsZero())
+	require.Nil(t, download.DownloadSettings)
+
+	require.NotNil(t, download.TLS)
+	require.True(t, download.TLS.Enabled)
+	require.Equal(t, "sni.example.com", download.TLS.ServerName)
+	require.True(t, download.TLS.Insecure)
+	require.Equal(t, []string{"h2"}, []string(download.TLS.ALPN))
+	require.NotNil(t, download.TLS.UTLS)
+	require.Equal(t, "chrome", download.TLS.UTLS.Fingerprint)
+}
+
+func TestParseClashXHTTPDownloadSettingsOverride(t *testing.T) {
+	outbound := parseSingleClashProxy(t, `
+proxies:
+  - name: xh
+    type: vless
+    server: up.example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    tls: true
+    network: xhttp
+    xhttp-opts:
+      path: /up
+      host: up-host.com
+      download-settings:
+        server: down.example.com
+        port: 8443
+        path: /down
+        host: down-host.com
+        headers:
+          X-Down: "1"
+        tls: true
+        servername: down-sni.example.com
+        skip-cert-verify: true
+`)
+	vlessOptions := outbound.Options.(*option.VLESSOutboundOptions)
+	require.Equal(t, "up.example.com", vlessOptions.TLS.ServerName)
+	download := xhttpTransport(t, vlessOptions.Transport).DownloadSettings
+	require.NotNil(t, download)
+	require.EqualValues(t, 8443, download.ServerPort)
+	require.Equal(t, "/down", download.Path)
+	require.Equal(t, []string{"down-host.com"}, []string(download.Host))
+	require.Equal(t, []string{"1"}, []string(download.Headers["X-Down"]))
+	require.Equal(t, "down-sni.example.com", download.TLS.ServerName)
+	require.True(t, download.TLS.Insecure)
+}
+
+func TestParseClashXHTTPDownloadSNIFallsBackToDownloadServer(t *testing.T) {
+	outbound := parseSingleClashProxy(t, `
+proxies:
+  - name: xh
+    type: vless
+    server: up.example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    tls: true
+    network: xhttp
+    xhttp-opts:
+      download-settings:
+        server: down.example.com
+`)
+	vlessOptions := outbound.Options.(*option.VLESSOutboundOptions)
+	require.Equal(t, "up.example.com", vlessOptions.TLS.ServerName)
+	download := xhttpTransport(t, vlessOptions.Transport).DownloadSettings
+	require.NotNil(t, download)
+	require.Equal(t, "down.example.com", download.TLS.ServerName)
+}
+
+func TestParseClashTrojanAndVMessXHTTP(t *testing.T) {
+	trojan := parseSingleClashProxy(t, `
+proxies:
+  - name: trojan-xh
+    type: trojan
+    server: t.example.com
+    port: 443
+    password: password
+    network: xhttp
+    xhttp-opts:
+      path: /trojan
+`)
+	require.Equal(t, "/trojan", xhttpTransport(t, trojan.Options.(*option.TrojanOutboundOptions).Transport).Path)
+
+	vmess := parseSingleClashProxy(t, `
+proxies:
+  - name: vmess-xh
+    type: vmess
+    server: v.example.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    alterId: 0
+    cipher: auto
+    tls: true
+    network: xhttp
+    xhttp-opts:
+      path: /vmess
+      mode: stream-one
+`)
+	vmessOptions := vmess.Options.(*option.VMessOutboundOptions)
+	xhttpOptions := xhttpTransport(t, vmessOptions.Transport)
+	require.Equal(t, "/vmess", xhttpOptions.Path)
+	require.Equal(t, "stream-one", xhttpOptions.Mode)
+	require.Equal(t, expectedVMessAutoSecurity(), vmessOptions.Security)
+}
+
+// A Host header is rejected by XHTTP; it is moved into host when host is unset.
+func TestParseClashXHTTPHostHeader(t *testing.T) {
+	outbound := parseSingleClashProxy(t, `
+proxies:
+  - name: xh
+    type: vless
+    server: s.com
+    port: 443
+    uuid: 11111111-1111-1111-1111-111111111111
+    tls: true
+    network: xhttp
+    xhttp-opts:
+      headers:
+        Host: header-host.com
+        User-Agent: ua
+`)
+	xhttpOptions := xhttpTransport(t, outbound.Options.(*option.VLESSOutboundOptions).Transport)
+	require.Equal(t, []string{"header-host.com"}, []string(xhttpOptions.Host))
+	require.NotContains(t, xhttpOptions.Headers, "Host")
+	require.Equal(t, []string{"ua"}, []string(xhttpOptions.Headers["User-Agent"]))
 }

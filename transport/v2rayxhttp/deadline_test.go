@@ -3,7 +3,6 @@ package v2rayxhttp
 import (
 	"errors"
 	"io"
-	"net"
 	"testing"
 	"time"
 )
@@ -27,7 +26,7 @@ func newBlockingPipe() *blockingPipe {
 // 修复后：deadline 到时 timer 会 Close conn，Write 立刻以 timeout 返回。
 func TestSetDeadlineUnblocksWrite(t *testing.T) {
 	pipe := newBlockingPipe()
-	c := newLateXHTTPConn(pipe.w, nil)
+	c := newXHTTPConn(pipe.r, pipe.w, nil, nil, nil)
 
 	// 把 deadline 设到 80ms 后。这个值要足够大来观察 timer 生效但又足够
 	// 小让测试总时长可控——80ms 远小于默认 probe 预算，又远大于调度抖动。
@@ -60,41 +59,31 @@ func TestSetDeadlineUnblocksWrite(t *testing.T) {
 	_ = pipe.r.Close()
 }
 
-// TestSetupReaderErrClosesWriter 验证 tunnel 建立失败时 writer 会被关掉，
-// pending Write 立即返回而不是永久挂起。修复前：setupReader 只记错误到
-// setupErr，writer 仍 open，任何 Write 都会阻塞到对端 pipe 消费为止。
-func TestSetupReaderErrClosesWriter(t *testing.T) {
+// TestPastDeadlineDoesNotDeadlock: 已过期的 deadline 曾在持锁状态下同步 Close，
+// 而 Close 需要同一把锁，导致死锁。
+func TestPastDeadlineDoesNotDeadlock(t *testing.T) {
 	pipe := newBlockingPipe()
-	c := newLateXHTTPConn(pipe.w, nil)
-
-	errCh := make(chan error, 1)
+	c := newXHTTPConn(pipe.r, pipe.w, nil, nil, nil)
+	done := make(chan struct{})
 	go func() {
-		_, err := c.Write([]byte("hello"))
-		errCh <- err
+		_ = c.SetDeadline(time.Now().Add(-time.Second))
+		close(done)
 	}()
-
-	// 模拟 xhttp RoundTrip goroutine 拿到非 2xx 响应：setupReader(nil, err)
-	time.Sleep(20 * time.Millisecond) // 让 Write 先阻塞起来
-	tunnelErr := errors.New("xhttp stream-one: status 502 Bad Gateway")
-	c.setupReader(nil, tunnelErr)
-
 	select {
-	case err := <-errCh:
-		if err == nil {
-			t.Fatal("Write should have failed after setupReader(err)")
-		}
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Write still blocked after setupReader failure — writer not closed")
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("SetDeadline with a past time deadlocked")
 	}
-
-	_ = pipe.r.Close()
+	if _, err := c.Read(make([]byte, 1)); err == nil {
+		t.Fatal("Read after past deadline should fail")
+	}
 }
 
 // TestSetDeadlineZeroClears 验证 zero time.Time 能取消已设的 deadline
 // （标准 net.Conn 语义），后续 Read/Write 不会被之前的 timer 意外打断。
 func TestSetDeadlineZeroClears(t *testing.T) {
 	pipe := newBlockingPipe()
-	c := newLateXHTTPConn(pipe.w, nil)
+	c := newXHTTPConn(pipe.r, pipe.w, nil, nil, nil)
 
 	// 先设一个 50ms deadline
 	_ = c.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
@@ -109,6 +98,3 @@ func TestSetDeadlineZeroClears(t *testing.T) {
 	}
 	_ = pipe.r.Close()
 }
-
-// ensure net import not unused
-var _ = net.IPv4zero

@@ -8,20 +8,14 @@ import (
 	"time"
 )
 
-// httpServerConn 包住一对 request.Body (上行) + http.ResponseWriter (下行)，
-// 给 stream-one / stream-up / packet-up 的下行长流共用。
-//
-// done 通道：服务端 ServeHTTP 处理完毕（连接被上层 Close 或 request.Context 取消）
-// 后 Close()，让外层 select { <-request.Context().Done(): <-httpSC.Wait() } 解阻塞。
-//
-// 移植自 Xray-core hub.go 的 httpServerConn。
+// httpServerConn 包住一对 request.Body (读) + http.ResponseWriter (写)。
+// 移植自 Xray-core hub.go httpServerConn。
 type httpServerConn struct {
-	mu       sync.Mutex
-	done     chan struct{}
-	doneOnce sync.Once
-
-	reader io.Reader      // request.Body — caller 不需要 Close 它（http.Server 管）
-	writer http.ResponseWriter
+	access    sync.Mutex
+	done      chan struct{}
+	closeOnce sync.Once
+	reader    io.Reader // request.Body，由 http.Server 负责关闭
+	writer    http.ResponseWriter
 }
 
 func newHTTPServerConn(reader io.Reader, writer http.ResponseWriter) *httpServerConn {
@@ -37,75 +31,71 @@ func (c *httpServerConn) Read(b []byte) (int, error) {
 }
 
 func (c *httpServerConn) Write(b []byte) (int, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	select {
-	case <-c.done:
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.isDone() {
 		return 0, io.ErrClosedPipe
-	default:
 	}
 	n, err := c.writer.Write(b)
-	// 立即 flush 让 SSE / chunked 帧及时下发
 	if err == nil {
-		if flusher, ok := c.writer.(http.Flusher); ok {
+		if flusher, loaded := c.writer.(http.Flusher); loaded {
 			flusher.Flush()
 		}
 	}
 	return n, err
 }
 
+func (c *httpServerConn) isDone() bool {
+	select {
+	case <-c.done:
+		return true
+	default:
+		return false
+	}
+}
+
+// Close 只标记结束: "A ResponseWriter may not be used after Handler.ServeHTTP
+// has returned"，因此持锁关闭，保证 Write 不会与 ServeHTTP 返回并发。
 func (c *httpServerConn) Close() error {
-	c.doneOnce.Do(func() { close(c.done) })
+	c.access.Lock()
+	defer c.access.Unlock()
+	c.closeOnce.Do(func() { close(c.done) })
 	return nil
 }
 
 func (c *httpServerConn) Wait() <-chan struct{} { return c.done }
 
-// ────────────────────────────────────────────────────────────────────────
-// splitConn — net.Conn 包装，server 端给上层（vless / trojan / 等）的实体
-// ────────────────────────────────────────────────────────────────────────
-
-// splitConn 把 reader + writer 拼成 net.Conn。reader 端可能是:
-//   - stream-one: 同一个 httpServerConn (reader/writer 都是它)
-//   - stream-up / packet-up: uploadQueue (按 seq 重排或继承 reader)
+// splitConn 把读写两端拼成交给上层协议 (vless / vmess / trojan ...) 的 net.Conn。
+//   - stream-one: reader = writer = 同一个 httpServerConn
+//   - stream-up / packet-up: reader = uploadQueue，writer = GET 下行的 httpServerConn
 //
-// deadline 在 v2ray transport 体系下不容易精确实现（底层是 HTTP body 而非
-// socket），与上游 Xray 一样 stub 掉，只满足 net.Conn 接口要求。
+// 底层是 HTTP body，没有原生 deadline 语义，与 Xray 一样不实现 deadline；
+// NeedAdditionalReadDeadline 让 sing 在需要时包一层读超时。
 type splitConn struct {
 	writer     io.WriteCloser
 	reader     io.ReadCloser
 	remoteAddr net.Addr
 	localAddr  net.Addr
-	onClose    func()
-
-	closeOnce sync.Once
-}
-
-func newSplitConn(writer io.WriteCloser, reader io.ReadCloser, localAddr, remoteAddr net.Addr) *splitConn {
-	return &splitConn{
-		writer:     writer,
-		reader:     reader,
-		localAddr:  localAddr,
-		remoteAddr: remoteAddr,
-	}
+	closeOnce  sync.Once
 }
 
 func (c *splitConn) Read(b []byte) (int, error)  { return c.reader.Read(b) }
 func (c *splitConn) Write(b []byte) (int, error) { return c.writer.Write(b) }
 
 func (c *splitConn) Close() error {
+	var err error
 	c.closeOnce.Do(func() {
-		if c.onClose != nil {
-			c.onClose()
+		err = c.writer.Close()
+		if readerErr := c.reader.Close(); err == nil {
+			err = readerErr
 		}
-		_ = c.writer.Close()
-		_ = c.reader.Close()
 	})
-	return nil
+	return err
 }
 
-func (c *splitConn) LocalAddr() net.Addr            { return c.localAddr }
-func (c *splitConn) RemoteAddr() net.Addr           { return c.remoteAddr }
-func (c *splitConn) SetDeadline(time.Time) error    { return nil }
+func (c *splitConn) LocalAddr() net.Addr              { return c.localAddr }
+func (c *splitConn) RemoteAddr() net.Addr             { return c.remoteAddr }
+func (c *splitConn) SetDeadline(time.Time) error      { return nil }
 func (c *splitConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *splitConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *splitConn) NeedAdditionalReadDeadline() bool { return true }

@@ -2,48 +2,54 @@ package v2rayxhttp
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/sagernet/sing-box/option"
-	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/common/json/badoption"
+
+	"golang.org/x/net/http2/hpack"
 )
 
-// TestPaddingMethodRepeatX 验证 repeat-x 模式产生 N 个 X 字符。
+func mustNewConfig(t *testing.T, options *option.V2RayXHTTPOptions) *config {
+	t.Helper()
+	c, err := newConfig(options)
+	if err != nil {
+		t.Fatalf("newConfig: %v", err)
+	}
+	return c
+}
+
 func TestPaddingMethodRepeatX(t *testing.T) {
 	v := generatePaddingValue(PaddingMethodRepeatX, 128)
-	if len(v) != 128 {
-		t.Fatalf("repeat-x: len=%d want 128", len(v))
-	}
-	if strings.Trim(v, "X") != "" {
-		t.Fatalf("repeat-x: non-X char in %q", v)
+	if len(v) != 128 || strings.Trim(v, "X") != "" {
+		t.Fatalf("repeat-x: got %q", v)
 	}
 }
 
-// TestPaddingMethodTokenish 验证 tokenish 后 huffman 长度近似 target ±2 字节。
 func TestPaddingMethodTokenish(t *testing.T) {
-	// 多次采样，看 tolerance 区间被遵守
 	for _, target := range []int{50, 100, 500, 1000} {
 		for i := 0; i < 20; i++ {
 			v := generatePaddingValue(PaddingMethodTokenish, target)
-			if v == "" {
-				t.Fatalf("tokenish: empty padding for target=%d", target)
-			}
-			// 字符集校验
 			for _, c := range v {
-				if !strings.ContainsRune(charsetBase62+"XZ", c) {
-					t.Fatalf("tokenish: invalid char %q in padding", c)
+				if !strings.ContainsRune(charsetBase62, c) {
+					t.Fatalf("tokenish: invalid char %q", c)
 				}
+			}
+			n := int(hpack.HuffmanEncodeLength(v))
+			if n < target-paddingValidationTolerance || n > target+paddingValidationTolerance {
+				t.Fatalf("tokenish: huffman length %d not within %d±%d", n, target, paddingValidationTolerance)
 			}
 		}
 	}
 }
 
-// TestApplyPaddingToRequest_QueryInHeader 验证默认 placement (queryInHeader → Referer)。
-func TestApplyPaddingToRequest_QueryInHeader(t *testing.T) {
-	req, _ := http.NewRequest("POST", "https://example.com/path/", nil)
-	cfg := XPaddingConfig{
+func TestApplyXPaddingToRequest_QueryInHeader(t *testing.T) {
+	req, _ := http.NewRequest("POST", "https://example.com/path/?a=b", nil)
+	applyXPaddingToRequest(req, XPaddingConfig{
 		Length: 50,
 		Placement: XPaddingPlacement{
 			Placement: PlacementQueryInHeader,
@@ -51,304 +57,251 @@ func TestApplyPaddingToRequest_QueryInHeader(t *testing.T) {
 			Header:    "Referer",
 			RawURL:    req.URL.String(),
 		},
-		Method: PaddingMethodRepeatX,
-	}
-	applyPaddingToRequest(req, cfg)
-	ref := req.Header.Get("Referer")
-	if ref == "" {
-		t.Fatal("Referer not set")
-	}
-	u, err := url.Parse(ref)
+	})
+	u, err := url.Parse(req.Header.Get("Referer"))
 	if err != nil {
-		t.Fatalf("Referer not URL: %v", err)
+		t.Fatal(err)
 	}
-	pad := u.Query().Get("x_padding")
-	if len(pad) != 50 {
-		t.Fatalf("x_padding len=%d want 50", len(pad))
-	}
-}
-
-// TestApplyPaddingToRequest_CustomHeader 验证 obfsMode 下走自定义 header。
-func TestApplyPaddingToRequest_CustomHeader(t *testing.T) {
-	req, _ := http.NewRequest("POST", "https://example.com/", nil)
-	cfg := XPaddingConfig{
-		Length: 30,
-		Placement: XPaddingPlacement{
-			Placement: PlacementHeader,
-			Header:    "X-Cache",
-		},
-		Method: PaddingMethodRepeatX,
-	}
-	applyPaddingToRequest(req, cfg)
-	v := req.Header.Get("X-Cache")
-	if len(v) != 30 {
-		t.Fatalf("X-Cache len=%d want 30", len(v))
+	if u.Path != "/path/" || len(u.Query().Get("x_padding")) != 50 || u.Query().Get("a") != "" {
+		t.Fatalf("Referer=%q", req.Header.Get("Referer"))
 	}
 }
 
-// TestApplyPaddingToRequest_Cookie 验证 cookie placement。
-func TestApplyPaddingToRequest_Cookie(t *testing.T) {
-	req, _ := http.NewRequest("POST", "https://example.com/", nil)
-	cfg := XPaddingConfig{
-		Length: 40,
-		Placement: XPaddingPlacement{
-			Placement: PlacementCookie,
-			Key:       "_dc",
-		},
-		Method: PaddingMethodRepeatX,
-	}
-	applyPaddingToRequest(req, cfg)
-	c, err := req.Cookie("_dc")
-	if err != nil {
-		t.Fatalf("cookie _dc not set: %v", err)
-	}
-	if len(c.Value) != 40 {
-		t.Fatalf("_dc len=%d want 40", len(c.Value))
-	}
-}
-
-// TestApplyPaddingToRequest_Query 验证 query placement。
-func TestApplyPaddingToRequest_Query(t *testing.T) {
+func TestApplyXPaddingToRequest_Placements(t *testing.T) {
 	req, _ := http.NewRequest("POST", "https://example.com/path?a=b", nil)
-	cfg := XPaddingConfig{
-		Length: 25,
-		Placement: XPaddingPlacement{
-			Placement: PlacementQuery,
-			Key:       "_t",
-		},
-		Method: PaddingMethodRepeatX,
+	applyXPaddingToRequest(req, XPaddingConfig{Length: 30, Placement: XPaddingPlacement{Placement: PlacementHeader, Header: "X-Cache"}})
+	if len(req.Header.Get("X-Cache")) != 30 {
+		t.Errorf("header: %q", req.Header.Get("X-Cache"))
 	}
-	applyPaddingToRequest(req, cfg)
-	if v := req.URL.Query().Get("_t"); len(v) != 25 {
-		t.Fatalf("query _t len=%d want 25", len(v))
+	applyXPaddingToRequest(req, XPaddingConfig{Length: 40, Placement: XPaddingPlacement{Placement: PlacementCookie, Key: "_dc"}})
+	if cookie, err := req.Cookie("_dc"); err != nil || len(cookie.Value) != 40 {
+		t.Errorf("cookie: %v %v", cookie, err)
 	}
-	if v := req.URL.Query().Get("a"); v != "b" {
-		t.Fatal("existing query a=b lost")
+	applyXPaddingToRequest(req, XPaddingConfig{Length: 25, Placement: XPaddingPlacement{Placement: PlacementQuery, Key: "_t"}})
+	if len(req.URL.Query().Get("_t")) != 25 || req.URL.Query().Get("a") != "b" {
+		t.Errorf("query: %q", req.URL.RawQuery)
 	}
 }
 
-// TestConfig_NormalizeDefaults 默认 (obfsMode=false) 不应触发新校验，行为同旧版。
-func TestConfig_NormalizeDefaults(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{Path: "/p"}
-	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err != nil {
-		t.Fatalf("newConfig: %v", err)
+func TestApplyXPaddingToResponse(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	applyXPaddingToResponse(recorder, XPaddingConfig{Length: 20, Placement: XPaddingPlacement{Placement: PlacementHeader, Header: "X-Padding"}})
+	if len(recorder.Header().Get("X-Padding")) != 20 {
+		t.Errorf("header: %q", recorder.Header().Get("X-Padding"))
 	}
-	if c.xPaddingObfsMode {
-		t.Error("xPaddingObfsMode should default to false")
+	recorder = httptest.NewRecorder()
+	applyXPaddingToResponse(recorder, XPaddingConfig{Length: 20, Placement: XPaddingPlacement{Placement: PlacementCookie, Key: "_p"}})
+	if !strings.HasPrefix(recorder.Header().Get("Set-Cookie"), "_p=XXXXXXXXXXXXXXXXXXXX") {
+		t.Errorf("cookie: %q", recorder.Header().Get("Set-Cookie"))
 	}
-	if c.xPaddingKey != paddingQueryKey {
-		t.Errorf("xPaddingKey=%q want %q", c.xPaddingKey, paddingQueryKey)
-	}
-	if c.xPaddingHeader != "X-Padding" {
-		t.Errorf("xPaddingHeader=%q want X-Padding", c.xPaddingHeader)
-	}
-	if c.xPaddingPlacement != PlacementQueryInHeader {
-		t.Errorf("xPaddingPlacement=%q want queryInHeader", c.xPaddingPlacement)
-	}
-	if c.xPaddingMethod != PaddingMethodRepeatX {
-		t.Errorf("xPaddingMethod=%q want repeat-x", c.xPaddingMethod)
-	}
-	if c.uplinkHTTPMethod != "POST" {
-		t.Errorf("uplinkHTTPMethod=%q want POST", c.uplinkHTTPMethod)
-	}
-	if c.sessionPlacement != PlacementPath {
-		t.Errorf("sessionPlacement=%q want path", c.sessionPlacement)
-	}
-	if c.uplinkDataPlacement != PlacementAuto {
-		t.Errorf("uplinkDataPlacement=%q want auto (PR#5720 default)", c.uplinkDataPlacement)
+	recorder = httptest.NewRecorder()
+	applyXPaddingToResponse(recorder, XPaddingConfig{Length: 20, Placement: XPaddingPlacement{Placement: PlacementQueryInHeader, Key: "k", Header: "X-Ref"}})
+	if recorder.Header().Get("X-Ref") != "?k="+strings.Repeat("X", 20) {
+		t.Errorf("queryInHeader: %q", recorder.Header().Get("X-Ref"))
 	}
 }
 
-// TestConfig_AllPR5414 全套 PR#5414 字段正确读取 + 默认 fallback key。
-func TestConfig_AllPR5414(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{
-		Path:              "/p",
-		Mode:              "packet-up",
-		XPaddingObfsMode:  true,
-		XPaddingPlacement: PlacementCookie,
-		XPaddingKey:       "_t",
-		XPaddingMethod:    string(PaddingMethodTokenish),
-		UplinkHTTPMethod:  "put",
-		SessionPlacement:  PlacementCookie,
-		// SessionKey omitted to trigger default
+func TestConfig_Defaults(t *testing.T) {
+	c := mustNewConfig(t, &option.V2RayXHTTPOptions{Path: "/p"})
+	if c.mode != ModeAuto ||
+		c.path != "/p/" ||
+		c.xPaddingObfsMode ||
+		c.xPaddingKey != "x_padding" ||
+		c.xPaddingHeader != "X-Padding" ||
+		c.xPaddingPlacement != PlacementQueryInHeader ||
+		c.xPaddingMethod != PaddingMethodRepeatX ||
+		c.uplinkHTTPMethod != "POST" ||
+		c.sessionPlacement != PlacementPath ||
+		c.seqPlacement != PlacementPath ||
+		c.uplinkDataPlacement != PlacementAuto ||
+		c.uplinkDataKey != "X-Data" ||
+		c.xPaddingBytes != (rangeConfig{100, 1000}) ||
+		c.scMaxEachPostBytes != (rangeConfig{1000000, 1000000}) ||
+		c.scMinPostsIntervalMs != (rangeConfig{30, 30}) ||
+		c.scMaxBufferedPosts != 30 ||
+		c.scStreamUpServerSecs != (rangeConfig{20, 80}) ||
+		c.uplinkChunkSize != c.scMaxEachPostBytes ||
+		c.serverMaxHeaderBytes != 8192 {
+		t.Fatalf("unexpected defaults: %+v", c)
+	}
+	if c.xmux.maxConnections != (rangeConfig{3, 3}) ||
+		c.xmux.hMaxRequestTimes != (rangeConfig{600, 900}) ||
+		c.xmux.hMaxReusableSecs != (rangeConfig{1800, 3000}) {
+		t.Fatalf("unexpected xmux defaults: %+v", c.xmux)
+	}
+}
+
+func TestConfig_PathAndQuery(t *testing.T) {
+	c := mustNewConfig(t, &option.V2RayXHTTPOptions{Path: "xhttp?ed=2048&a=b"})
+	if c.path != "/xhttp/" || c.query != "ed=2048&a=b" {
+		t.Fatalf("path=%q query=%q", c.path, c.query)
+	}
+	// session 与 seq 都不在 path 时不补尾斜杠 (Xray GetNormalizedPath)
+	c = mustNewConfig(t, &option.V2RayXHTTPOptions{Path: "/xhttp", SessionPlacement: "header", SeqPlacement: "query"})
+	if c.path != "/xhttp" {
+		t.Fatalf("path=%q", c.path)
+	}
+}
+
+func TestConfig_AllObfsFields(t *testing.T) {
+	c := mustNewConfig(t, &option.V2RayXHTTPOptions{
+		Mode:                "packet-up",
+		XPaddingObfsMode:    true,
+		XPaddingPlacement:   PlacementCookie,
+		XPaddingKey:         "_t",
+		XPaddingMethod:      string(PaddingMethodTokenish),
+		UplinkHTTPMethod:    "put",
+		SessionPlacement:    PlacementCookie,
 		SeqPlacement:        PlacementHeader,
-		UplinkDataPlacement: PlacementHeader,
-		UplinkChunkSize:     "2048-2048",
-	}
-	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err != nil {
-		t.Fatalf("newConfig: %v", err)
-	}
-	if !c.xPaddingObfsMode {
-		t.Error("xPaddingObfsMode lost")
-	}
-	if c.xPaddingMethod != PaddingMethodTokenish {
-		t.Errorf("method=%q", c.xPaddingMethod)
-	}
-	if c.uplinkHTTPMethod != "PUT" { // forced upper
-		t.Errorf("method=%q want PUT", c.uplinkHTTPMethod)
-	}
-	if c.sessionKey != "x_session" {
-		t.Errorf("default sessionKey=%q want x_session", c.sessionKey)
-	}
-	if c.seqKey != "X-Seq" {
-		t.Errorf("default seqKey=%q want X-Seq", c.seqKey)
-	}
-	if c.uplinkDataKey != "X-Data" {
-		t.Errorf("default uplinkDataKey=%q want X-Data", c.uplinkDataKey)
-	}
-	if r := c.uplinkChunkSize.rand(); r != 2048 {
-		t.Errorf("uplinkChunkSize range mid=%d want 2048", r)
+		UplinkDataPlacement: PlacementCookie,
+		UplinkChunkSize:     option.XHTTPRange{From: 2048, To: 2048},
+	})
+	if !c.xPaddingObfsMode || c.xPaddingMethod != PaddingMethodTokenish || c.uplinkHTTPMethod != "PUT" ||
+		c.sessionKey != "x_session" || c.seqKey != "X-Seq" || c.uplinkDataKey != "x_data" ||
+		c.uplinkChunkSize != (rangeConfig{2048, 2048}) {
+		t.Fatalf("unexpected config: %+v", c)
 	}
 }
 
-// TestConfig_PathSessionAllowsNonPathSeq verifies that PR#5720 removed the
-// "SessionPlacement=path forces SeqPlacement=path" constraint. Path+header
-// combo must now build cleanly.
-func TestConfig_PathSessionAllowsNonPathSeq(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{
-		Path:             "/p",
-		Mode:             "packet-up",
-		SessionPlacement: PlacementPath,
-		SeqPlacement:     PlacementHeader,
-	}
-	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err != nil {
-		t.Fatalf("PR#5720 dropped this constraint: %v", err)
-	}
-	if c.sessionPlacement != PlacementPath || c.seqPlacement != PlacementHeader {
-		t.Errorf("placements lost: session=%q seq=%q", c.sessionPlacement, c.seqPlacement)
-	}
-}
-
-// TestConfig_ValidateConstraint_GET_RequiresPacketUp verifies GET method requires packet-up mode.
-func TestConfig_ValidateConstraint_GET_RequiresPacketUp(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{
-		Path:             "/p",
-		Mode:             "stream-up",
-		UplinkHTTPMethod: "GET",
-	}
-	_, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err == nil {
-		t.Fatal("expected error when GET + stream-up")
-	}
-	if !strings.Contains(err.Error(), "GET") {
-		t.Errorf("err=%v want GET msg", err)
+func TestConfig_Validation(t *testing.T) {
+	for name, options := range map[string]option.V2RayXHTTPOptions{
+		"bad mode":                    {Mode: "stream-down"},
+		"GET needs packet-up":         {Mode: "stream-up", UplinkHTTPMethod: "GET"},
+		"GET needs explicit mode":     {UplinkHTTPMethod: "GET"},
+		"header data needs packet-up": {Mode: "auto", UplinkDataPlacement: "header"},
+		"padding cannot be disabled":  {XPaddingBytes: option.XHTTPRange{From: 0, To: 100}},
+		"host in headers":             {Headers: badoption.HTTPHeader{"Host": {"a.com"}}},
+		"bad padding placement":       {XPaddingPlacement: "body"},
+		"bad session placement":       {SessionPlacement: "body"},
+		"xmux conflict":               {Xmux: &option.V2RayXHTTPXmuxOptions{MaxConnections: option.XHTTPRange{From: 1, To: 1}, MaxConcurrency: option.XHTTPRange{From: 1, To: 1}}},
+		"session table too small":     {SessionIDTable: "hex", SessionIDLength: option.XHTTPRange{From: 4, To: 4}},
+		"brutal without quic_up":      {QuicCongestion: "force-brutal"},
+	} {
+		options := options
+		if _, err := newConfig(&options); err == nil {
+			t.Errorf("%s: expected error", name)
+		}
 	}
 }
 
-// TestConfig_ValidateConstraint_UplinkData_RequiresPacketUp verifies uplinkData != body requires packet-up.
-func TestConfig_ValidateConstraint_UplinkData_RequiresPacketUp(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{
-		Path:                "/p",
-		Mode:                "stream-up",
-		UplinkDataPlacement: PlacementHeader,
+func TestConfig_UplinkChunkSize(t *testing.T) {
+	c := mustNewConfig(t, &option.V2RayXHTTPOptions{Mode: "packet-up", UplinkDataPlacement: PlacementHeader})
+	if c.uplinkChunkSize != (rangeConfig{3000, 4000}) {
+		t.Errorf("header default=%+v", c.uplinkChunkSize)
 	}
-	_, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err == nil {
-		t.Fatal("expected error when uplinkData=header + stream-up")
+	c = mustNewConfig(t, &option.V2RayXHTTPOptions{Mode: "packet-up", UplinkDataPlacement: PlacementCookie})
+	if c.uplinkChunkSize != (rangeConfig{2048, 3072}) {
+		t.Errorf("cookie default=%+v", c.uplinkChunkSize)
 	}
-	if !strings.Contains(err.Error(), "uplink_data_placement") {
-		t.Errorf("err=%v want uplink_data_placement msg", err)
+	c = mustNewConfig(t, &option.V2RayXHTTPOptions{Mode: "packet-up", UplinkDataPlacement: PlacementHeader, UplinkChunkSize: option.XHTTPRange{From: 10, To: 32}})
+	if c.uplinkChunkSize != (rangeConfig{64, 64}) {
+		t.Errorf("bumped=%+v", c.uplinkChunkSize)
+	}
+	for i := 0; i < 20; i++ {
+		if r := (rangeConfig{100, 500}).rand(); r < 100 || r > 500 {
+			t.Fatalf("rand=%d", r)
+		}
 	}
 }
 
-// TestApplyMetaToRequest_Path 默认 placement=path 应拼到 URL path。
-func TestApplyMetaToRequest_Path(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{Path: "/base/", Mode: "packet-up"}
-	c, _ := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
+func TestConfig_GenerateSessionID(t *testing.T) {
+	c := mustNewConfig(t, &option.V2RayXHTTPOptions{})
+	if id := c.generateSessionID(); len(id) != 36 || strings.Count(id, "-") != 4 {
+		t.Errorf("default session id should be a UUID, got %q", id)
+	}
+	c = mustNewConfig(t, &option.V2RayXHTTPOptions{SessionIDTable: "number", SessionIDLength: option.XHTTPRange{From: 12, To: 16}})
+	for i := 0; i < 20; i++ {
+		id := c.generateSessionID()
+		if len(id) < 12 || len(id) > 16 || strings.Trim(id, "0123456789") != "" {
+			t.Fatalf("session id %q", id)
+		}
+	}
+}
+
+func TestFillStreamRequest(t *testing.T) {
+	c := mustNewConfig(t, &option.V2RayXHTTPOptions{Path: "/base?ed=1"})
+	req, _ := http.NewRequest("POST", "https://example.com/base/?ed=1", strings.NewReader("x"))
+	c.fillStreamRequest(req, "sess")
+	if req.URL.Path != "/base/sess" || req.URL.RawQuery != "ed=1" {
+		t.Errorf("url=%s", req.URL)
+	}
+	if req.Header.Get("Content-Type") != "application/grpc" {
+		t.Errorf("Content-Type=%q", req.Header.Get("Content-Type"))
+	}
+	// Referer 取 session 写入之前的 URL，query 被替换为 x_padding
+	referer, _ := url.Parse(req.Header.Get("Referer"))
+	if referer.Path != "/base/" || len(referer.Query().Get("x_padding")) < 100 || referer.Query().Get("ed") != "" {
+		t.Errorf("Referer=%q", req.Header.Get("Referer"))
+	}
+
+	c = mustNewConfig(t, &option.V2RayXHTTPOptions{NoGRPCHeader: true})
+	req, _ = http.NewRequest("POST", "https://example.com/", strings.NewReader("x"))
+	c.fillStreamRequest(req, "")
+	if req.Header.Get("Content-Type") != "" {
+		t.Errorf("no_grpc_header: Content-Type=%q", req.Header.Get("Content-Type"))
+	}
+}
+
+func TestFillPacketRequest_Placements(t *testing.T) {
+	payload := []byte(strings.Repeat("Hello, World! ", 14))
+	for _, placement := range []string{PlacementHeader, PlacementCookie} {
+		c := mustNewConfig(t, &option.V2RayXHTTPOptions{
+			Mode:                "packet-up",
+			UplinkDataPlacement: placement,
+			UplinkChunkSize:     option.XHTTPRange{From: 64, To: 64},
+			SessionPlacement:    PlacementHeader,
+			SeqPlacement:        PlacementQuery,
+		})
+		req, _ := http.NewRequest("POST", "https://example.com/", nil)
+		c.fillPacketRequest(req, "sess", "7", payload)
+		if req.Body != nil {
+			t.Errorf("%s: body should be empty", placement)
+		}
+		if req.Header.Get("X-Session") != "sess" || req.URL.Query().Get("x_seq") != "7" {
+			t.Errorf("%s: meta lost: %v %s", placement, req.Header, req.URL)
+		}
+		// Xray 不发送 -Length / -Upstream 之类的额外字段
+		if req.Header.Get("X-Data-Length") != "" || req.Header.Get("X-Data-Upstream") != "" {
+			t.Errorf("%s: unexpected extra uplink fields", placement)
+		}
+		// 交给服务端解析，验证往返一致
+		server := mustNewConfig(t, &option.V2RayXHTTPOptions{Mode: "packet-up", UplinkDataPlacement: placement})
+		var decoded []byte
+		var err error
+		if placement == PlacementHeader {
+			decoded, err = decodeChunkedPayload(func(i int) (string, bool) {
+				chunk := req.Header.Get(server.uplinkDataKey + "-" + strconv.Itoa(i))
+				if len(chunk) > 64 {
+					t.Errorf("chunk %d too large: %d", i, len(chunk))
+				}
+				return chunk, chunk != ""
+			})
+		} else {
+			decoded, err = decodeChunkedPayload(func(i int) (string, bool) {
+				cookie, _ := req.Cookie(server.uplinkDataKey + "_" + strconv.Itoa(i))
+				if cookie == nil {
+					return "", false
+				}
+				return cookie.Value, true
+			})
+		}
+		if err != nil || string(decoded) != string(payload) {
+			t.Errorf("%s: decoded=%q err=%v", placement, decoded, err)
+		}
+	}
+}
+
+func TestApplyMetaToRequest(t *testing.T) {
+	c := mustNewConfig(t, &option.V2RayXHTTPOptions{Path: "/base/"})
 	req, _ := http.NewRequest("POST", "https://example.com/base/", nil)
 	c.applyMetaToRequest(req, "sess123", "5")
 	if req.URL.Path != "/base/sess123/5" {
-		t.Fatalf("path=%q want /base/sess123/5", req.URL.Path)
+		t.Fatalf("path=%q", req.URL.Path)
 	}
-}
-
-// TestApplyMetaToRequest_Headers session→header, seq→header。
-func TestApplyMetaToRequest_Headers(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{
-		Path:             "/base/",
-		Mode:             "packet-up",
-		SessionPlacement: PlacementHeader,
-		SeqPlacement:     PlacementHeader,
-	}
-	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, _ := http.NewRequest("POST", "https://example.com/base/", nil)
+	c = mustNewConfig(t, &option.V2RayXHTTPOptions{Path: "/base/", SessionPlacement: PlacementPath, SeqPlacement: PlacementHeader, SeqKey: "X-Page"})
+	req, _ = http.NewRequest("POST", "https://example.com/base/", nil)
 	c.applyMetaToRequest(req, "sess123", "5")
-	if req.URL.Path != "/base/" {
-		t.Errorf("path=%q expect unchanged", req.URL.Path)
+	if req.URL.Path != "/base/sess123" || req.Header.Get("X-Page") != "5" {
+		t.Fatalf("path=%q header=%v", req.URL.Path, req.Header)
 	}
-	if req.Header.Get("X-Session") != "sess123" {
-		t.Errorf("X-Session=%q", req.Header.Get("X-Session"))
-	}
-	if req.Header.Get("X-Seq") != "5" {
-		t.Errorf("X-Seq=%q", req.Header.Get("X-Seq"))
-	}
-}
-
-// TestApplyUplinkData_Header data → chunked headers + length + upstream marker。
-func TestApplyUplinkData_Header(t *testing.T) {
-	opts := &option.V2RayXHTTPOptions{
-		Path:                "/base/",
-		Mode:                "packet-up",
-		UplinkDataPlacement: PlacementHeader,
-		UplinkChunkSize:     "64-64", // 最小允许值；测试会喂 > 64 的数据强制切多片
-	}
-	c, err := newConfig(opts, M.ParseSocksaddrHostPortStr("example.com", "443"), false, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	req, _ := http.NewRequest("POST", "https://example.com/", nil)
-	// 196 字节 → base64 编码 ~262 chars → 在 chunk_size=64 下会切 ≥4 片
-	data := []byte(strings.Repeat("Hello, World! ", 14))
-	if !c.applyUplinkData(req, data) {
-		t.Fatal("applyUplinkData returned false")
-	}
-	if req.Header.Get("X-Data-Upstream") != "1" {
-		t.Error("X-Data-Upstream missing")
-	}
-	if req.Header.Get("X-Data-Length") == "" {
-		t.Error("X-Data-Length missing")
-	}
-	if req.Header.Get("X-Data-0") == "" {
-		t.Error("X-Data-0 missing")
-	}
-	if req.Header.Get("X-Data-1") == "" {
-		t.Error("X-Data-1 missing; data did not split")
-	}
-	// 切片之间长度恒 <= chunk
-	chunkCount := 0
-	for i := 0; ; i++ {
-		v := req.Header.Get(formatChunkKey("X-Data", "-", i))
-		if v == "" {
-			break
-		}
-		if len(v) > 64 {
-			t.Errorf("chunk %d len=%d > 64", i, len(v))
-		}
-		chunkCount++
-	}
-	if chunkCount < 2 {
-		t.Errorf("got %d chunks, expected ≥ 2", chunkCount)
-	}
-}
-
-func formatChunkKey(base, sep string, i int) string {
-	return base + sep + intToStr(i)
-}
-
-func intToStr(i int) string {
-	if i == 0 {
-		return "0"
-	}
-	s := ""
-	for i > 0 {
-		s = string(rune('0'+(i%10))) + s
-		i /= 10
-	}
-	return s
 }

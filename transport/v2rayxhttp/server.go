@@ -1,6 +1,7 @@
 package v2rayxhttp
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -8,32 +9,37 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
-	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
 	sHttp "github.com/sagernet/sing/protocol/http"
+
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c" //nolint:staticcheck
 )
 
-// Server 完整实现 XHTTP inbound (server 端)，对齐 XTLS/Xray-core v26.3.27
-// transport/internet/splithttp/hub.go。
+// Server 是 XHTTP 入站，对齐 XTLS/Xray-core v26.9.30 splithttp/hub.go。
 //
-// 支持三种 mode:
-//   - stream-one: 单条 H2 duplex POST，reader/writer 同一 httpServerConn
-//   - stream-up:  POST 上行长流 + GET 下行长流 (SSE)；upload queue 继承 POST body 当 reader
-//   - packet-up:  每个 POST 一片 + GET SSE 下行；upload queue 按 seq 重排
+//   - alpn = ["h3"]: 仅监听 UDP，走 HTTP/3 (需要 with_quic)
+//   - 其他: TCP 上同时支持 HTTP/1.1、HTTP/2 (TLS ALPN) 与 h2c (明文 prior knowledge)
 //
-// padding / session / seq / uplink_data 的 placement 全部支持服务端反解。
+// 服务端 mode=auto 时同时接受 stream-one / stream-up / packet-up；
+// 上下行分离 (客户端 download_settings) 不需要服务端额外配置，只要上行与下行
+// 请求最终到达同一个入站即可按 session 关联。
 var _ adapter.V2RayServerTransport = (*Server)(nil)
 
 type Server struct {
@@ -43,23 +49,28 @@ type Server struct {
 	tlsConfig  tls.ServerConfig
 	handler    adapter.V2RayServerTransportHandler
 	httpServer *http.Server
+	h2Server   *http2.Server
+	h2cHandler http.Handler
+	h3Access   sync.Mutex
+	h3Server   io.Closer
+	isH3       bool
 
-	host            string
-	path            string
-	sessionMu       sync.Mutex
-	sessions        sync.Map // sessionId → *httpSession
-	localAddr       net.Addr
+	hosts         []string
+	path          string
+	sessionAccess sync.Mutex
+	sessions      sync.Map // sessionId → *httpSession
+	localAddr     atomic.Pointer[net.Addr]
 }
 
 type httpSession struct {
 	uploadQueue *uploadQueue
-	// isFullyConnected: GET 下行建立后 Close，让 upsertSession 里的 30s reap goroutine 停掉
+	// GET 下行到达之前 session 可能被超时回收；下行到达之后 session 与 GET 同生命周期。
 	isFullyConnected chan struct{}
-	once             sync.Once
+	connectOnce      sync.Once
 }
 
-func (s *httpSession) markConnected() {
-	s.once.Do(func() { close(s.isFullyConnected) })
+func (s *httpSession) markFullyConnected() {
+	s.connectOnce.Do(func() { close(s.isFullyConnected) })
 }
 
 func NewServer(
@@ -69,435 +80,423 @@ func NewServer(
 	tlsConfig tls.ServerConfig,
 	handler adapter.V2RayServerTransportHandler,
 ) (adapter.V2RayServerTransport, error) {
-	cfg, err := newConfig(options, M.Socksaddr{}, false, tlsConfig != nil)
+	cfg, err := newConfig(options)
 	if err != nil {
 		return nil, err
 	}
-	s := &Server{
+	if options.DownloadSettings != nil {
+		return nil, E.New("xhttp: download_settings is a client-only option")
+	}
+	server := &Server{
 		ctx:       ctx,
 		logger:    logger,
 		cfg:       cfg,
 		tlsConfig: tlsConfig,
 		handler:   handler,
-		host:      pickHost(options),
+		hosts:     cfg.hosts,
 		path:      cfg.path,
+		h2Server:  &http2.Server{},
 	}
-	s.httpServer = &http.Server{
-		Handler:           s,
-		ReadHeaderTimeout: C.TCPTimeout,
+	if tlsConfig != nil {
+		nextProtos := tlsConfig.NextProtos()
+		server.isH3 = len(nextProtos) == 1 && nextProtos[0] == "h3"
+	}
+	server.httpServer = &http.Server{
+		Handler:           server,
+		ReadHeaderTimeout: serverReadHeaderTimeout,
 		MaxHeaderBytes:    cfg.serverMaxHeaderBytes,
 		BaseContext: func(net.Listener) context.Context {
 			return ctx
 		},
-		TLSNextProto: make(map[string]func(*http.Server, *tls.STDConn, http.Handler)),
+		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			return log.ContextWithNewID(ctx)
+		},
 	}
-	return s, nil
+	//nolint:staticcheck
+	server.h2cHandler = h2c.NewHandler(server, server.h2Server)
+	return server, nil
 }
-
-func pickHost(opts *option.V2RayXHTTPOptions) string {
-	if len(opts.Host) > 0 {
-		return opts.Host[0]
-	}
-	return ""
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// ServeHTTP — 每个入站 HTTP 请求的分发入口
-// ──────────────────────────────────────────────────────────────────────
 
 func (s *Server) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	// 1) host 校验
-	if len(s.host) > 0 && !isValidHTTPHost(request.Host, s.host) {
-		s.logger.DebugContext(request.Context(), "xhttp inbound: bad host ", request.Host)
+	// h2c prior knowledge，以及非 *tls.Conn 的 TLS 实现 (REALITY 等) 上协商出的 h2，
+	// 都会以 "PRI * HTTP/2.0" 的形式落到 HTTP/1 路径，交给 h2c handler 接管。
+	if request.Method == "PRI" && len(request.Header) == 0 && request.URL.Path == "*" && request.Proto == "HTTP/2.0" {
+		s.h2cHandler.ServeHTTP(writer, request)
+		return
+	}
+	ctx := request.Context()
+	if len(s.hosts) > 0 && !isValidHTTPHost(request.Host, s.hosts) {
+		s.logger.DebugContext(ctx, "xhttp: failed to validate host, request: ", request.Host, ", config: ", strings.Join(s.hosts, ","))
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
-	// 2) path 前缀校验 (path 是已 normalize 带尾斜杠的 base)
 	if !strings.HasPrefix(request.URL.Path, s.path) {
-		s.logger.DebugContext(request.Context(), "xhttp inbound: bad path ", request.URL.Path)
+		s.logger.DebugContext(ctx, "xhttp: failed to validate path, request: ", request.URL.Path, ", config: ", s.path)
 		writer.WriteHeader(http.StatusNotFound)
 		return
 	}
 
-	// 3) CORS + padding 写回 response header
-	s.writeResponseHeader(writer, request)
+	s.cfg.writeResponseHeader(writer, request.Method, request.Header)
+	applyXPaddingToResponse(writer, s.cfg.responsePaddingConfig())
 
 	if request.Method == http.MethodOptions {
 		writer.WriteHeader(http.StatusOK)
 		return
 	}
 
-	// 4) padding 校验
-	validRange := s.cfg.padding
-	paddingValue, _ := extractXPaddingFromRequest(request, s.cfg.xPaddingObfsMode,
-		s.cfg.xPaddingKey, s.cfg.xPaddingHeader, s.cfg.xPaddingPlacement)
-	if !isPaddingValid(paddingValue, int32(validRange.Min), int32(validRange.Max), s.cfg.xPaddingMethod) {
-		s.logger.DebugContext(request.Context(), "xhttp inbound: invalid padding length ", len(paddingValue))
+	paddingValue, paddingPlacement := s.cfg.extractXPaddingFromRequest(request)
+	if !s.cfg.isPaddingValid(paddingValue) {
+		s.logger.DebugContext(ctx, "xhttp: invalid padding (", paddingPlacement, ") length: ", len(paddingValue))
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	obfsPaddingAccepted := s.cfg.xPaddingObfsMode && paddingValue != ""
+
+	sessionId, seqStr := s.cfg.extractMetaFromRequest(request, s.path)
+	if sessionId == "" && s.cfg.mode != ModeAuto && s.cfg.mode != ModeStreamOne && s.cfg.mode != ModeStreamUp {
+		s.logger.DebugContext(ctx, "xhttp: stream-one mode is not allowed")
 		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
 
-	// 5) session / seq 提取
-	sessionId, seqStr := extractMetaFromRequest(request, s.path,
-		s.cfg.sessionPlacement, s.cfg.sessionKey,
-		s.cfg.seqPlacement, s.cfg.seqKey)
-
-	// 6) 路由: GET (下行) vs POST/其他 (上行)
-	uplinkMethod := s.cfg.uplinkHTTPMethod
-	isUplinkRequest := false
-	switch request.Method {
-	case http.MethodGet:
-		// GET 带 seq → packet-up 单包上行 (走 GET-only CDN)
-		isUplinkRequest = seqStr != ""
-	default:
-		isUplinkRequest = request.Method == uplinkMethod || (uplinkMethod == "GET" && request.Method == http.MethodGet)
+	var session *httpSession
+	if sessionId != "" {
+		session = s.upsertSession(sessionId)
 	}
 
-	if isUplinkRequest && sessionId != "" {
-		s.handleUplink(writer, request, sessionId, seqStr)
-	} else if request.Method == http.MethodGet || sessionId == "" {
-		s.handleDownlink(writer, request, sessionId)
-	} else {
+	isUplinkRequest := request.Method != http.MethodGet || seqStr != ""
+	switch {
+	case isUplinkRequest && sessionId != "": // stream-up, packet-up
+		if seqStr == "" {
+			s.handleStreamUp(writer, request, session, obfsPaddingAccepted)
+		} else {
+			s.handlePacketUp(writer, request, session, seqStr)
+		}
+	case request.Method == http.MethodGet || sessionId == "": // stream-down, stream-one
+		s.handleDownlink(writer, request, sessionId, session)
+	default:
+		s.logger.DebugContext(ctx, "xhttp: unsupported method: ", request.Method)
 		writer.WriteHeader(http.StatusMethodNotAllowed)
 	}
 }
 
-// writeResponseHeader 写 CORS + padding 到 response header。
-func (s *Server) writeResponseHeader(writer http.ResponseWriter, request *http.Request) {
-	if origin := request.Header.Get("Origin"); origin == "" {
-		writer.Header().Set("Access-Control-Allow-Origin", "*")
-	} else {
-		// Chrome: credentials mode 'include' 时不允许 '*'，必须回显 origin
-		writer.Header().Set("Access-Control-Allow-Origin", origin)
-	}
-	// 当任何 placement = cookie 时需要 credentials: include
-	if s.cfg.sessionPlacement == PlacementCookie ||
-		s.cfg.seqPlacement == PlacementCookie ||
-		s.cfg.xPaddingPlacement == PlacementCookie ||
-		s.cfg.uplinkDataPlacement == PlacementCookie {
-		writer.Header().Set("Access-Control-Allow-Credentials", "true")
-	}
-	if request.Method == http.MethodOptions {
-		reqMethod := request.Header.Get("Access-Control-Request-Method")
-		if reqMethod != "" {
-			writer.Header().Set("Access-Control-Allow-Methods", reqMethod)
-		} else {
-			writer.Header().Set("Access-Control-Allow-Methods", "*")
-		}
-		reqHeaders := request.Header.Get("Access-Control-Request-Headers")
-		if reqHeaders == "" {
-			writer.Header().Set("Access-Control-Allow-Headers", "*")
-		} else {
-			writer.Header().Set("Access-Control-Allow-Headers", reqHeaders)
-		}
-	}
-
-	// padding 写回
-	length := s.cfg.padding.rand()
-	if length > 0 {
-		pc := XPaddingConfig{Length: length}
-		if s.cfg.xPaddingObfsMode {
-			pc.Placement = XPaddingPlacement{
-				Placement: s.cfg.xPaddingPlacement,
-				Header:    s.cfg.xPaddingHeader,
-				Key:       s.cfg.xPaddingKey,
-			}
-			pc.Method = s.cfg.xPaddingMethod
-		} else {
-			pc.Placement = XPaddingPlacement{
-				Placement: PlacementHeader,
-				Header:    "X-Padding",
-			}
-		}
-		applyXPaddingToResponse(writer.Header(), pc)
-	}
-}
-
-// ──────────────────────────────────────────────────────────────────────
-// handleUplink — POST / PUT / PATCH / GET(seq) 上行
-// ──────────────────────────────────────────────────────────────────────
-
-func (s *Server) handleUplink(writer http.ResponseWriter, request *http.Request, sessionId, seqStr string) {
-	session := s.upsertSession(sessionId)
-	scMaxEachPostBytes := s.cfg.scMaxEachPostBytes
-
-	if seqStr == "" {
-		// stream-up: 整条 POST body 当长 reader 塞进 queue
-		if s.cfg.mode != "" && s.cfg.mode != ModeAuto && s.cfg.mode != ModeStreamUp {
-			writer.WriteHeader(http.StatusBadRequest)
-			return
-		}
-		httpSC := newHTTPServerConn(request.Body, writer)
-		err := session.uploadQueue.push(packet{reader: httpSC})
-		if err != nil {
-			s.logger.DebugContext(request.Context(), "xhttp inbound: push stream-up reader: ", err)
-			writer.WriteHeader(http.StatusConflict)
-			return
-		}
-		writer.Header().Set("X-Accel-Buffering", "no")
-		writer.Header().Set("Cache-Control", "no-store")
-		writer.WriteHeader(http.StatusOK)
-		// 等 POST body 结束或 request 取消
-		select {
-		case <-request.Context().Done():
-		case <-httpSC.Wait():
-		}
-		httpSC.Close()
-		return
-	}
-
-	// packet-up: 单片 payload + seq
-	if s.cfg.mode != "" && s.cfg.mode != ModeAuto && s.cfg.mode != ModePacketUp {
+func (s *Server) handleStreamUp(writer http.ResponseWriter, request *http.Request, session *httpSession, obfsPaddingAccepted bool) {
+	ctx := request.Context()
+	if s.cfg.mode != ModeAuto && s.cfg.mode != ModeStreamUp {
+		s.logger.DebugContext(ctx, "xhttp: stream-up mode is not allowed")
 		writer.WriteHeader(http.StatusBadRequest)
 		return
 	}
-
-	payload, err := s.readUplinkPayload(writer, request, scMaxEachPostBytes)
+	enableFullDuplex(writer, request)
+	httpSC := newHTTPServerConn(request.Body, writer)
+	err := session.uploadQueue.push(packet{reader: httpSC})
 	if err != nil {
-		return // readUplinkPayload 已经写了 status code
-	}
-
-	seq, err := strconv.ParseUint(seqStr, 10, 64)
-	if err != nil {
-		s.logger.DebugContext(request.Context(), "xhttp inbound: parse seq: ", err)
-		writer.WriteHeader(http.StatusInternalServerError)
+		s.logger.DebugContext(ctx, E.Cause(err, "xhttp: failed to upload (push reader)"))
+		writer.WriteHeader(http.StatusConflict)
+		httpSC.Close()
 		return
 	}
-
-	err = session.uploadQueue.push(packet{payload: payload, seq: seq})
-	if err != nil {
-		s.logger.DebugContext(request.Context(), "xhttp inbound: push packet: ", err)
-		writer.WriteHeader(http.StatusInternalServerError)
-		return
-	}
-
-	if len(payload) == 0 {
-		writer.Header().Set("Cache-Control", "no-store")
-	}
+	writer.Header().Set("X-Accel-Buffering", "no")
+	writer.Header().Set("Cache-Control", "no-store")
 	writer.WriteHeader(http.StatusOK)
+	// 部分 CDN 会掐掉长时间没有下行数据的上传请求，服务端在 POST 响应里周期性写 padding 保活。
+	// 只对新版客户端 (带 Referer 兼容标记或通过了 obfs padding 校验) 开启。
+	hasLegacyRefererCompatMarker := request.Header.Get("Referer") != ""
+	if (hasLegacyRefererCompatMarker || obfsPaddingAccepted) && s.cfg.scStreamUpServerSecs.To > 0 {
+		go func() {
+			for {
+				_, err := httpSC.Write(bytes.Repeat([]byte{'X'}, int(s.cfg.xPaddingBytes.rand())))
+				if err != nil {
+					return
+				}
+				select {
+				case <-time.After(time.Duration(s.cfg.scStreamUpServerSecs.rand()) * time.Second):
+				case <-httpSC.Wait():
+					return
+				}
+			}
+		}()
+	} else if flusher, loaded := writer.(http.Flusher); loaded {
+		flusher.Flush()
+	}
+	select {
+	case <-ctx.Done():
+	case <-httpSC.Wait():
+	}
+	httpSC.Close()
 }
 
-// readUplinkPayload 按 uplinkDataPlacement 从 body / header / cookie 读 payload。
-func (s *Server) readUplinkPayload(writer http.ResponseWriter, request *http.Request, maxBytes int) ([]byte, error) {
-	placement := s.cfg.uplinkDataPlacement
-	key := s.cfg.uplinkDataKey
+func (s *Server) handlePacketUp(writer http.ResponseWriter, request *http.Request, session *httpSession, seqStr string) {
+	ctx := request.Context()
+	if s.cfg.mode != ModeAuto && s.cfg.mode != ModePacketUp {
+		s.logger.DebugContext(ctx, "xhttp: packet-up mode is not allowed")
+		writer.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	scMaxEachPostBytes := int(s.cfg.scMaxEachPostBytes.To)
+	dataPlacement := s.cfg.uplinkDataPlacement
+	uplinkDataKey := s.cfg.uplinkDataKey
 
-	var bodyPayload, headerPayload, cookiePayload []byte
+	var headerPayload, cookiePayload, bodyPayload []byte
 	var err error
-
-	if placement == PlacementAuto || placement == PlacementBody {
-		if request.ContentLength > int64(maxBytes) {
+	if dataPlacement == PlacementAuto || dataPlacement == PlacementHeader {
+		headerPayload, err = decodeChunkedPayload(func(i int) (string, bool) {
+			chunk := request.Header.Get(fmt.Sprintf("%s-%d", uplinkDataKey, i))
+			return chunk, chunk != ""
+		})
+		if err != nil {
+			s.logger.DebugContext(ctx, "xhttp: invalid base64 in header's payload: ", err)
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+	if dataPlacement == PlacementAuto || dataPlacement == PlacementCookie {
+		cookiePayload, err = decodeChunkedPayload(func(i int) (string, bool) {
+			cookie, _ := request.Cookie(fmt.Sprintf("%s_%d", uplinkDataKey, i))
+			if cookie == nil {
+				return "", false
+			}
+			return cookie.Value, true
+		})
+		if err != nil {
+			s.logger.DebugContext(ctx, "xhttp: invalid base64 in cookies' payload: ", err)
+			writer.WriteHeader(http.StatusBadRequest)
+			return
+		}
+	}
+	if dataPlacement == PlacementAuto || dataPlacement == PlacementBody {
+		if request.ContentLength > int64(scMaxEachPostBytes) {
+			s.logger.DebugContext(ctx, "xhttp: too large upload. sc_max_each_post_bytes is set to ", scMaxEachPostBytes,
+				" but request size exceed it. Adjust sc_max_each_post_bytes on the server to be at least as large as client.")
 			writer.WriteHeader(http.StatusRequestEntityTooLarge)
-			return nil, E.New("payload too large")
+			return
 		}
 		if request.ContentLength > 0 {
 			bodyPayload = make([]byte, request.ContentLength)
 			_, err = io.ReadFull(request.Body, bodyPayload)
 		} else {
-			bodyPayload, err = io.ReadAll(io.LimitReader(request.Body, int64(maxBytes)+1))
+			bodyPayload, err = io.ReadAll(io.LimitReader(request.Body, int64(scMaxEachPostBytes)+1))
 		}
 		if err != nil {
+			s.logger.DebugContext(ctx, E.Cause(err, "xhttp: failed to read body payload"))
 			writer.WriteHeader(http.StatusBadRequest)
-			return nil, E.Cause(err, "read body")
+			return
 		}
 	}
 
-	if placement == PlacementAuto || placement == PlacementHeader {
-		headerPayload, err = decodeChunkedPayload(func(i int) string {
-			return request.Header.Get(fmt.Sprintf("%s-%d", key, i))
-		})
-		if err != nil {
-			writer.WriteHeader(http.StatusBadRequest)
-			return nil, err
-		}
-	}
-
-	if placement == PlacementAuto || placement == PlacementCookie {
-		cookiePayload, err = decodeChunkedPayload(func(i int) string {
-			c, e := request.Cookie(fmt.Sprintf("%s_%d", key, i))
-			if e != nil || c == nil {
-				return ""
-			}
-			return c.Value
-		})
-		if err != nil {
-			writer.WriteHeader(http.StatusBadRequest)
-			return nil, err
-		}
-	}
-
-	switch placement {
+	var payload []byte
+	switch dataPlacement {
 	case PlacementHeader:
-		return headerPayload, nil
+		payload = headerPayload
 	case PlacementCookie:
-		return cookiePayload, nil
+		payload = cookiePayload
 	case PlacementBody:
-		return bodyPayload, nil
+		payload = bodyPayload
 	case PlacementAuto:
-		// 拼接三路 payload
-		var result []byte
-		result = append(result, headerPayload...)
-		result = append(result, cookiePayload...)
-		result = append(result, bodyPayload...)
-		return result, nil
+		payload = slices.Concat(headerPayload, cookiePayload, bodyPayload)
 	}
-	return bodyPayload, nil
+	if len(payload) > scMaxEachPostBytes {
+		s.logger.DebugContext(ctx, "xhttp: too large upload. sc_max_each_post_bytes is set to ", scMaxEachPostBytes,
+			" but request size exceed it. Adjust sc_max_each_post_bytes on the server to be at least as large as client.")
+		writer.WriteHeader(http.StatusRequestEntityTooLarge)
+		return
+	}
+
+	seq, err := strconv.ParseUint(seqStr, 10, 64)
+	if err != nil {
+		s.logger.DebugContext(ctx, E.Cause(err, "xhttp: failed to upload (parse seq)"))
+		writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	err = session.uploadQueue.push(packet{payload: payload, seq: seq})
+	if err != nil {
+		s.logger.DebugContext(ctx, E.Cause(err, "xhttp: failed to upload (push payload)"))
+		writer.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if len(bodyPayload) == 0 {
+		// Methods without a body are usually cached by default.
+		writer.Header().Set("Cache-Control", "no-store")
+	}
+	writer.WriteHeader(http.StatusOK)
 }
 
-// decodeChunkedPayload 把客户端切片的 base64 段重新拼起来 decode。
-// getChunk(i) 返回第 i 段的字符串，空串表示没有更多段。
-func decodeChunkedPayload(getChunk func(int) string) ([]byte, error) {
-	var encodedParts []string
+// decodeChunkedPayload 按序号收集 base64 分片并解码。
+func decodeChunkedPayload(getChunk func(int) (string, bool)) ([]byte, error) {
+	var chunks []string
 	for i := 0; ; i++ {
-		chunk := getChunk(i)
-		if chunk == "" {
+		chunk, loaded := getChunk(i)
+		if !loaded {
 			break
 		}
-		encodedParts = append(encodedParts, chunk)
+		chunks = append(chunks, chunk)
 	}
-	if len(encodedParts) == 0 {
-		return nil, nil
-	}
-	encoded := strings.Join(encodedParts, "")
-	return base64.RawURLEncoding.DecodeString(encoded)
+	return base64.RawURLEncoding.DecodeString(strings.Join(chunks, ""))
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// handleDownlink — GET 长流 (stream-down / stream-one)
-// ──────────────────────────────────────────────────────────────────────
-
-func (s *Server) handleDownlink(writer http.ResponseWriter, request *http.Request, sessionId string) {
-	var session *httpSession
-	if sessionId != "" {
-		session = s.upsertSession(sessionId)
-		session.markConnected()
+func (s *Server) handleDownlink(writer http.ResponseWriter, request *http.Request, sessionId string, session *httpSession) {
+	if session != nil {
+		// GET 到达后 session 与该请求同生命周期，关闭超时回收，结束时在 defer 里删除。
+		session.markFullyConnected()
 		defer s.sessions.Delete(sessionId)
 	}
+	if session == nil {
+		// stream-one 在 HTTP/1.1 上需要边读请求体边写响应。
+		enableFullDuplex(writer, request)
+	}
 
-	// 告诉 nginx / CDN 不要缓冲 response body
+	// magic header instructs nginx + apache to not buffer response body
 	writer.Header().Set("X-Accel-Buffering", "no")
+	// A web-compliant header telling all middleboxes to disable caching.
 	writer.Header().Set("Cache-Control", "no-store")
-	if !s.useNoSSEHeader() {
+	if !s.cfg.noSSEHeader {
+		// magic header to make the HTTP middle box consider this as SSE to disable buffer
 		writer.Header().Set("Content-Type", contentTypeSSE)
 	}
 	writer.WriteHeader(http.StatusOK)
-	if flusher, ok := writer.(http.Flusher); ok {
+	if flusher, loaded := writer.(http.Flusher); loaded {
 		flusher.Flush()
 	}
 
 	httpSC := newHTTPServerConn(request.Body, writer)
-	var reader io.ReadCloser = httpSC
-	if sessionId != "" {
-		// stream-up / packet-up: reader 从 upload queue 取
-		reader = session.uploadQueue
+	source := sHttp.SourceAddress(request)
+	conn := &splitConn{
+		writer:     httpSC,
+		reader:     httpSC,
+		remoteAddr: s.remoteAddr(request, source),
+	}
+	if localAddr := s.localAddr.Load(); localAddr != nil {
+		conn.localAddr = *localAddr
+	}
+	if localAddr, loaded := request.Context().Value(http.LocalAddrContextKey).(net.Addr); loaded && localAddr != nil {
+		conn.localAddr = localAddr
+	}
+	if session != nil { // stream-up / packet-up
+		conn.reader = session.uploadQueue
 	}
 
-	conn := newSplitConn(httpSC, reader, s.localAddr, parseRemoteAddr(request))
-
-	// 把连接交给上层 (vless / trojan / etc.) 处理
-	source := sHttp.SourceAddress(request)
-	s.handler.NewConnectionEx(request.Context(), conn, source, M.Socksaddr{}, nil)
-
-	// 阻塞到 request.Context 取消或 httpSC.Close
+	done := make(chan struct{})
+	s.handler.NewConnectionEx(request.Context(), conn, source, M.Socksaddr{}, N.OnceClose(func(it error) {
+		close(done)
+	}))
+	// "A ResponseWriter may not be used after Handler.ServeHTTP has returned."
 	select {
 	case <-request.Context().Done():
 	case <-httpSC.Wait():
+	case <-done:
 	}
 	conn.Close()
 }
 
-func (s *Server) useNoSSEHeader() bool {
-	// NoSSEHeader 来自 option.NoSSEHeader，已在 config 里没有独立字段；
-	// 这里通过 headers 检测是否有显式 Content-Type 覆盖。
-	return false
+func (s *Server) remoteAddr(request *http.Request, source M.Socksaddr) net.Addr {
+	if request.ProtoMajor == 3 {
+		return source.UDPAddr()
+	}
+	return source.TCPAddr()
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// session 管理
-// ──────────────────────────────────────────────────────────────────────
+// enableFullDuplex 让 HTTP/1.1 handler 能在写响应后继续读请求体
+// (stream-one / stream-up)。HTTP/2、HTTP/3 本身就是全双工，返回的错误忽略即可。
+func enableFullDuplex(writer http.ResponseWriter, request *http.Request) {
+	if request.ProtoMajor == 1 {
+		_ = http.NewResponseController(writer).EnableFullDuplex()
+	}
+}
 
 func (s *Server) upsertSession(sessionId string) *httpSession {
-	if v, ok := s.sessions.Load(sessionId); ok {
-		return v.(*httpSession)
+	// fast path
+	if currentSession, loaded := s.sessions.Load(sessionId); loaded {
+		return currentSession.(*httpSession)
 	}
-	s.sessionMu.Lock()
-	defer s.sessionMu.Unlock()
-	if v, ok := s.sessions.Load(sessionId); ok {
-		return v.(*httpSession)
+	// slow path
+	s.sessionAccess.Lock()
+	defer s.sessionAccess.Unlock()
+	if currentSession, loaded := s.sessions.Load(sessionId); loaded {
+		return currentSession.(*httpSession)
 	}
 	session := &httpSession{
-		uploadQueue:     newUploadQueue(s.cfg.scMaxBufferedPosts),
+		uploadQueue:      newUploadQueue(s.cfg.scMaxBufferedPosts),
 		isFullyConnected: make(chan struct{}),
 	}
 	s.sessions.Store(sessionId, session)
-
-	// 30s 后如果 GET 下行还没来就回收，避免 POST-only 的孤儿 session 堆积
 	go func() {
-		timer := time.NewTimer(30 * time.Second)
+		timer := time.NewTimer(sessionReapTimeout)
 		defer timer.Stop()
 		select {
 		case <-timer.C:
 			s.sessions.Delete(sessionId)
 			session.uploadQueue.Close()
 		case <-session.isFullyConnected:
-			// GET 到了，session 由 handleDownlink 管理
 		}
 	}()
 	return session
 }
 
-func parseRemoteAddr(request *http.Request) net.Addr {
-	host, portStr, err := net.SplitHostPort(request.RemoteAddr)
-	if err != nil {
-		return &net.TCPAddr{IP: net.IPv4zero}
+// isValidHTTPHost 对应 Xray internet.IsValidHTTPHost (忽略请求里的端口)，支持多个 host。
+func isValidHTTPHost(requestHost string, hosts []string) bool {
+	requestHost = strings.ToLower(requestHost)
+	if strings.Contains(requestHost, ":") {
+		host, _, err := net.SplitHostPort(requestHost)
+		if err == nil {
+			requestHost = host
+		}
 	}
-	port, _ := strconv.Atoi(portStr)
-	ip := net.ParseIP(host)
-	if ip == nil {
-		ip = net.IPv4zero
-	}
-	return &net.TCPAddr{IP: ip, Port: port}
-}
-
-func isValidHTTPHost(reqHost, configHost string) bool {
-	// 支持多 host (逗号分隔) 的场景
-	for _, h := range strings.Split(configHost, ",") {
-		if strings.EqualFold(strings.TrimSpace(h), reqHost) {
+	for _, host := range hosts {
+		if requestHost == strings.ToLower(host) {
 			return true
 		}
 	}
 	return false
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// adapter.V2RayServerTransport 接口实现
-// ──────────────────────────────────────────────────────────────────────
-
-func (s *Server) Network() []string { return []string{N.NetworkTCP} }
+func (s *Server) Network() []string {
+	if s.isH3 {
+		return []string{N.NetworkUDP}
+	}
+	return []string{N.NetworkTCP}
+}
 
 func (s *Server) Serve(listener net.Listener) error {
+	if s.isH3 {
+		return os.ErrInvalid
+	}
 	if s.tlsConfig != nil {
 		if len(s.tlsConfig.NextProtos()) == 0 {
-			s.tlsConfig.SetNextProtos([]string{"h2", "http/1.1"})
+			s.tlsConfig.SetNextProtos([]string{http2.NextProtoTLS, "http/1.1"})
 		}
 		listener = aTLS.NewListener(listener, s.tlsConfig)
 	}
-	s.localAddr = listener.Addr()
-	return s.httpServer.Serve(listener)
+	localAddr := listener.Addr()
+	s.localAddr.Store(&localAddr)
+	err := s.httpServer.Serve(listener)
+	if err == http.ErrServerClosed {
+		return nil
+	}
+	return err
 }
 
-func (s *Server) ServePacket(listener net.PacketConn) error { return os.ErrInvalid }
+func (s *Server) ServePacket(listener net.PacketConn) error {
+	if !s.isH3 {
+		return os.ErrInvalid
+	}
+	localAddr := listener.LocalAddr()
+	s.localAddr.Store(&localAddr)
+	return s.serveH3(listener)
+}
+
+func (s *Server) setH3Server(h3Server io.Closer) {
+	s.h3Access.Lock()
+	defer s.h3Access.Unlock()
+	s.h3Server = h3Server
+}
 
 func (s *Server) Close() error {
-	var err error
-	if s.httpServer != nil {
-		err = s.httpServer.Close()
-	}
-	// 关掉所有残留 session
+	s.h3Access.Lock()
+	h3Server := s.h3Server
+	s.h3Access.Unlock()
+	err := common.Close(common.PtrOrNil(s.httpServer), h3Server)
 	s.sessions.Range(func(key, value any) bool {
-		if session, ok := value.(*httpSession); ok {
-			session.uploadQueue.Close()
-		}
+		value.(*httpSession).uploadQueue.Close()
 		s.sessions.Delete(key)
 		return true
 	})
