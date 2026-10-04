@@ -18,9 +18,11 @@ import (
 )
 
 var (
-	debugEnabled bool
-	target       string
-	platform     string
+	debugEnabled    bool
+	target          string
+	platform        string
+	extraTags       string
+	versionOverride string
 	// withTailscale bool
 )
 
@@ -28,6 +30,8 @@ func init() {
 	flag.BoolVar(&debugEnabled, "debug", false, "enable debug")
 	flag.StringVar(&target, "target", "android", "target platform")
 	flag.StringVar(&platform, "platform", "", "specify platform")
+	flag.StringVar(&extraTags, "tags", "", "additional comma separated build tags for android-bin")
+	flag.StringVar(&versionOverride, "version", "", "version of the android-bin binary instead of git describe")
 	// flag.BoolVar(&withTailscale, "with-tailscale", false, "build tailscale for iOS and tvOS")
 }
 
@@ -323,7 +327,10 @@ func buildAndroidBinary() {
 	} else {
 		tags = append([]string{}, sharedTags...)
 	}
-	tags = append(tags, "with_naive_outbound", "with_xhttp", "with_ebpf", "netgo")
+	tags = append(tags, "with_naive_outbound", "with_xhttp", "netgo")
+	if extraTags != "" {
+		tags = append(tags, strings.Split(extraTags, ",")...)
+	}
 	// deduplicate
 	seen := make(map[string]bool)
 	deduped := tags[:0]
@@ -358,7 +365,7 @@ func buildAndroidBinary() {
 
 	for _, arch := range archList {
 		outputName := "sing-box-android-" + arch.abi
-		log.Info("building ", outputName, " (GOARCH=", arch.goArch, ")")
+		log.Info("building ", outputName, " (GOARCH=", arch.goArch, ", tags=", strings.Join(tags, ","), ")")
 
 		cc := filepath.Join(ndkBin, arch.clang+androidAPI+"-clang")
 		cxx := filepath.Join(ndkBin, arch.clang+androidAPI+"-clang++")
@@ -375,7 +382,11 @@ func buildAndroidBinary() {
 			"-buildvcs=false",
 		}
 		// Use debugFlags (no -s -w strip) for full binary; sharedFlags strips symbols
-		args = append(args, debugFlags...)
+		if versionOverride != "" {
+			args = append(args, "-ldflags", build_shared.LinkerFlags(versionOverride, true))
+		} else {
+			args = append(args, debugFlags...)
+		}
 		args = append(args, "-tags", strings.Join(tags, ","))
 		args = append(args, "-o", outputName)
 		args = append(args, "./cmd/sing-box")

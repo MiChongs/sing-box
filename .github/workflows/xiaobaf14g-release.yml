@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号 (不含 v 前缀, 例如 1.14.0-alpha.14-xiaobaf14g.1)'
+        description: '版本号 (不含 v 前缀, 例如 1.15.0-alpha.10-xiaobaf14g.1)'
         required: true
         type: string
       prerelease:
@@ -35,40 +35,57 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: '1.25'
-  # `-s -w` strip 符号表，`-buildid=` 固定 build id 便于复现构建；
-  # `-checklinkname=0` 允许 sing-box 依赖的 badlinkname 跨包符号链接；
-  # `-X internal/godebug.defaultGODEBUG=multipathtcp=0` 关闭 Go 1.22+ 默认
-  # MPTCP 尝试（某些内核/NAT 兼容性差）。
-  COMMON_LDFLAGS: "-s -w -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -buildid="
+  GO_VERSION: '1.27.1'
+  # 预装 NDK 没有 r28+ 时才下载这个版本。
+  NDK_VERSION: r28c
+
+# 缓存布局（全部由 actions/cache 显式管理，setup-go 自带缓存关闭）:
+# - Go 模块 (~/go/pkg/mod): prepare 按每个 target 的 tag 组合 `go list -deps`
+#   预热，只下载真正用到的模块（cronet 全平台预编译库合计 3GB+，不能整体
+#   go mod download），key 绑定 go.sum + 构建 tag 文件，其余 job 只恢复不保存。
+# - Go 构建缓存 (~/.cache/go-build): 每个 target 一份，key 带 commit sha，
+#   restore-keys 前缀回退到上一次发布的缓存，每次发布都增量编译并写回。
+#   同一 target 的普通版与 -ebpf 版在同一 job 里先后编译，-ebpf 版复用
+#   普通版编译出的几乎全部包。
+# - Go toolchain / Zig: setup-go、setup-zig 自带 runner tool cache。
+# - NDK: 优先用 runner 预装的 r28+，没有才下载。
 
 jobs:
   # ───────────────────────────────────────────────────────────────────
-  # 1) 解析触发源 + 决定版本 / prerelease / 是否跳过 Android
-  #    轻量 job（~15s 启动 + 解析），输出供下游 matrix 和 publish 共用
+  # 1) 解析触发源 + 决定版本 / prerelease / 是否跳过 Android，
+  #    并预热 Go 模块缓存供后续所有 job 恢复
   # ───────────────────────────────────────────────────────────────────
   prepare:
-    name: prepare metadata
+    name: prepare metadata + modules
     runs-on: ubuntu-latest
     outputs:
       version:      ${{ steps.meta.outputs.version }}
       tag:          ${{ steps.meta.outputs.tag }}
       prerelease:   ${{ steps.meta.outputs.prerelease }}
       skip_android: ${{ steps.meta.outputs.skip_android }}
+      gomod_key:    ${{ steps.gomod_key.outputs.key }}
     steps:
       - name: Parse trigger
         id: meta
+        env:
+          EVENT:         ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_PRE:     ${{ inputs.prerelease }}
+          INPUT_SKIP:    ${{ inputs.skip_android }}
+          REF_NAME:      ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            VERSION='${{ inputs.version }}'
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            VERSION="${INPUT_VERSION#v}"
             TAG="v${VERSION}"
-            PRE='${{ inputs.prerelease }}'
-            SKIP_ANDROID='${{ inputs.skip_android }}'
+            PRE="$INPUT_PRE"
+            SKIP_ANDROID="$INPUT_SKIP"
           else
-            TAG='${{ github.ref_name }}'
+            TAG="$REF_NAME"
             VERSION="${TAG#v}"
-            if [[ "$VERSION" == *"-"* ]]; then
+            # 版本号本身带 -xiaobaf14g.N 后缀，不能按 "含 -" 判断；
+            # 只有 alpha / beta / rc 才是 prerelease。
+            if [[ "$VERSION" =~ -(alpha|beta|rc) ]]; then
               PRE=true
             else
               PRE=false
@@ -82,21 +99,81 @@ jobs:
             echo "skip_android=$SKIP_ANDROID"
           } | tee -a "$GITHUB_OUTPUT"
 
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Compute module cache key
+        id: gomod_key
+        run: echo "key=gomod-${{ hashFiles('go.sum', 'release/DEFAULT_BUILD_TAGS*') }}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Look up Go module cache
+        id: gomod
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ steps.gomod_key.outputs.key }}
+          lookup-only: true
+
+      - name: Setup Go
+        if: steps.gomod.outputs.cache-hit != 'true'
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      # 对每个 target 的 GOOS/GOARCH/CGO/tag 组合跑一次 go list -deps，
+      # 下载的模块集合正好是所有 job 编译时需要的。
+      - name: Download modules for every target
+        if: steps.gomod.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          drop() { tr ',' '\n' | grep -vx -e "$1" | paste -sd, -; }
+          OTHERS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS)
+          WINDOWS=$(drop with_naive_outbound < release/DEFAULT_BUILD_TAGS_WINDOWS)
+          list() {
+            echo "go list $*"
+            env "$@" go list -deps -tags "$TAGS" ./cmd/sing-box > /dev/null
+          }
+          TAGS="${OTHERS},with_ebpf"
+          for target in linux/amd64 linux/arm64 linux/386 linux/arm linux/mipsle linux/mips64le linux/riscv64 linux/loong64; do
+            list GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0
+          done
+          list GOOS=linux GOARCH=amd64 CGO_ENABLED=1
+          list GOOS=linux GOARCH=arm64 CGO_ENABLED=1
+          TAGS="$OTHERS"
+          for target in darwin/amd64 darwin/arm64 freebsd/amd64 freebsd/arm64; do
+            list GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0
+          done
+          TAGS="$WINDOWS"
+          for target in windows/amd64 windows/arm64 windows/386; do
+            list GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0
+          done
+          TAGS="${OTHERS},with_naive_outbound,with_xhttp,netgo,with_ebpf"
+          list GOOS=android GOARCH=arm64 CGO_ENABLED=1
+          go list -deps ./cmd/internal/build_libbox > /dev/null
+          du -sh ~/go/pkg/mod
+
+      - name: Save Go module cache
+        if: steps.gomod.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ steps.gomod_key.outputs.key }}
+
   # ───────────────────────────────────────────────────────────────────
-  # 2) Desktop 多平台并行编译 (16 个 target)
-  #    默认 CGO_ENABLED=0; linux-amd64-v3-glibc 例外: CGO=1 + GOAMD64=v3
-  #    走宿主 glibc 动态链接, 提供给现代 CPU + 较新 Linux 发行版用户的
-  #    优化版 (AVX/AVX2/BMI/FMA 加速 wireguard / quic-go / utls 加密路径)。
-  #    tag 集合与 build-all.bat 完全一致。
-  #
-  #    缓存策略（预期 2nd run 总时间从 ~12min 降到 ~4min）:
-  #    - Go toolchain: setup-go 自带 per-OS 缓存
-  #    - Go module cache (~/go/pkg/mod): key by go.sum, 所有 target 共享
-  #    - Go build cache (~/.cache/go-build): key by go.sum + target 三元组
-  #      (GOOS+GOARCH+后缀)，确保交叉编译产物不互相污染
+  # 2) Desktop 多平台并行编译
+  #    tag 集合取自 release/DEFAULT_BUILD_TAGS_*（随上游同步）；这里的
+  #    target 不链接 cronet，去掉 with_naive_outbound。
+  #    ebpf: true 的 target 额外编译带 with_ebpf 的 -ebpf 版本，与普通版
+  #    并列发布。
+  #    默认 CGO_ENABLED=0；linux-amd64-v3-glibc 走 CGO=1 动态链接宿主
+  #    glibc（ubuntu-latest 的 glibc 版本即最低要求）；linux-arm64-musl
+  #    用 zig cc 交叉到 aarch64-linux-musl 并完全静态链接。
   # ───────────────────────────────────────────────────────────────────
   desktop:
-    name: ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.suffix }}
+    name: ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.suffix }}${{ matrix.ebpf && ' (+ebpf)' || '' }}
     runs-on: ubuntu-latest
     needs: prepare
     strategy:
@@ -105,209 +182,155 @@ jobs:
         include:
           # Windows
           - { goos: windows, goarch: amd64,    ext: .exe, tags_src: windows, suffix: '' }
-          # AMD64 v3 — Haswell+ (Intel 2013+) / Excavator+ (AMD 2015+). 启用 AVX/AVX2/BMI1/BMI2/F16C/FMA/LZCNT/MOVBE。
-          # 纯 Go CGO=0，没有 glibc 依赖，单文件运行。
+          # AMD64 v3 — Haswell+ (Intel 2013+) / Excavator+ (AMD 2015+)。启用 AVX/AVX2/BMI1/BMI2/F16C/FMA/LZCNT/MOVBE。
           - { goos: windows, goarch: amd64,    ext: .exe, tags_src: windows, suffix: -v3,  goamd64: v3 }
-          # AMD64 v4 — Skylake-X+ (Intel 2017+) / Zen 4+ (AMD 2022+). 在 v3 之上启用 AVX-512。
-          # 适合现代 Xeon / EPYC / 高端桌面 CPU；老 CPU 跑会 SIGILL。
+          # AMD64 v4 — Skylake-X+ (Intel 2017+) / Zen 4+ (AMD 2022+)。在 v3 之上启用 AVX-512，老 CPU 会 SIGILL。
           - { goos: windows, goarch: amd64,    ext: .exe, tags_src: windows, suffix: -v4,  goamd64: v4 }
           - { goos: windows, goarch: arm64,    ext: .exe, tags_src: windows, suffix: '' }
           - { goos: windows, goarch: '386',    ext: .exe, tags_src: windows, suffix: '' }
-          # Linux
-          - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: '' }
-          # AMD64 v3 + glibc — CGO=1 動態鏈接宿主 glibc, GOAMD64=v3 啟用
-          # AVX / AVX2 / BMI1 / BMI2 / FMA / F16C 指令。產物只能跑在 Haswell
-          # (Intel 2013+) / Excavator (AMD 2015+) 之後的 CPU。對應的 glibc
-          # 最低版本 = ubuntu-latest 上的 glibc (當前 2.39, 即 ≥ Ubuntu 24.04
-          # / Debian 13 / RHEL 10 / 同代 musl 不可用)。
-          - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: -v3-glibc, goamd64: v3, cgo: '1' }
-          - { goos: linux,   goarch: arm64,    ext: '',   tags_src: others,  suffix: '' }
-          # ARM64 + musl — CGO=1 交叉到 aarch64-linux-musl，-extldflags=-static
-          # 链出完全静态产物（无 glibc/musl 动态依赖）。适合 Alpine /
-          # OpenWrt / 容器 / 嵌入式这种"宿主 libc 不可用"或小体积场景。
-          # 使用 zig 作为 CC —— zig cc -target aarch64-linux-musl 自带
-          # musl headers + libc.a，不需要维护 musl-cross 工具链。
-          - { goos: linux,   goarch: arm64,    ext: '',   tags_src: others,  suffix: -musl, cgo: '1', cc_target: aarch64-linux-musl }
-          - { goos: linux,   goarch: '386',    ext: '',   tags_src: others,  suffix: '' }
-          - { goos: linux,   goarch: arm,      ext: '',   tags_src: others,  suffix: -v7,  goarm: '7' }
-          - { goos: linux,   goarch: mipsle,   ext: '',   tags_src: others,  suffix: -softfloat, gomips: softfloat }
-          - { goos: linux,   goarch: mips64le, ext: '',   tags_src: others,  suffix: -softfloat, gomips: softfloat }
-          - { goos: linux,   goarch: riscv64,  ext: '',   tags_src: others,  suffix: '' }
-          - { goos: linux,   goarch: loong64,  ext: '',   tags_src: others,  suffix: '' }
+          # Linux（每个 target 同时出普通版与 -ebpf 版）
+          - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: '',          ebpf: true }
+          - { goos: linux,   goarch: amd64,    ext: '',   tags_src: others,  suffix: -v3-glibc,   ebpf: true, goamd64: v3, cgo: '1' }
+          - { goos: linux,   goarch: arm64,    ext: '',   tags_src: others,  suffix: '',          ebpf: true }
+          - { goos: linux,   goarch: arm64,    ext: '',   tags_src: others,  suffix: -musl,       ebpf: true, cgo: '1', cc_target: aarch64-linux-musl }
+          - { goos: linux,   goarch: '386',    ext: '',   tags_src: others,  suffix: '',          ebpf: true }
+          - { goos: linux,   goarch: arm,      ext: '',   tags_src: others,  suffix: -v7,         ebpf: true, goarm: '7' }
+          - { goos: linux,   goarch: mipsle,   ext: '',   tags_src: others,  suffix: -softfloat,  ebpf: true, gomips: softfloat }
+          - { goos: linux,   goarch: mips64le, ext: '',   tags_src: others,  suffix: -softfloat,  ebpf: true, gomips: softfloat }
+          - { goos: linux,   goarch: riscv64,  ext: '',   tags_src: others,  suffix: '',          ebpf: true }
+          - { goos: linux,   goarch: loong64,  ext: '',   tags_src: others,  suffix: '',          ebpf: true }
           # macOS
           - { goos: darwin,  goarch: amd64,    ext: '',   tags_src: others,  suffix: '' }
           - { goos: darwin,  goarch: arm64,    ext: '',   tags_src: others,  suffix: '' }
-          # FreeBSD (drop with_tailscale — sing-box/tailscale fork 在 freebsd 有构建问题)
-          - { goos: freebsd, goarch: amd64,    ext: '',   tags_src: freebsd, suffix: '' }
-          - { goos: freebsd, goarch: arm64,    ext: '',   tags_src: freebsd, suffix: '' }
+          # FreeBSD
+          - { goos: freebsd, goarch: amd64,    ext: '',   tags_src: others,  suffix: '' }
+          - { goos: freebsd, goarch: arm64,    ext: '',   tags_src: others,  suffix: '' }
     steps:
       - name: Checkout
         uses: actions/checkout@v5
         with:
           fetch-depth: 1
 
-      # setup-go@v6 的 `cache: true` 默认开，会自动缓存 ~/go/pkg/mod，
-      # key 基于 go.sum，所有 job 共享命中。go toolchain 本身也在
-      # per-OS runner 上有内置缓存。
       - name: Setup Go
         uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-          cache: true
-          cache-dependency-path: go.sum
+          cache: false
 
-      # 独立的 build cache（~/.cache/go-build）。key 精确到 target 三元组
-      # 以免 linux/amd64 的 .a 污染 windows/arm64 的链接。
-      # restore-keys 前缀匹配：同一 target 不同 go.sum 版本能拿上次增量。
+      - name: Restore Go modules
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ needs.prepare.outputs.gomod_key }}
+
       - name: Cache Go build
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cache/go-build
-          key: go-build-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}-${{ env.GO_VERSION }}-${{ hashFiles('go.sum') }}
+          path: ~/.cache/go-build
+          key: gobuild-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}-${{ env.GO_VERSION }}-${{ github.sha }}
           restore-keys: |
-            go-build-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}-${{ env.GO_VERSION }}-
-            go-build-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}-
+            gobuild-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}-${{ env.GO_VERSION }}-
 
-      # Zig is installed ONLY for targets that need a musl cross CC
-      # (currently: linux/arm64-musl). Zig ships musl headers + libc.a
-      # for every arch, which lets us do `zig cc -target ...` without
-      # maintaining a separate musl-cross toolchain. Other targets
-      # skip this step, keeping the matrix runtime unchanged.
-      # mlugg/setup-zig@v2 自带 cache，重复 run 从 ~70MB 下载降到 ~1s。
+      # Zig 只给需要 musl 交叉 CC 的 target 装，setup-zig 自带缓存。
       - name: Setup Zig (musl cross CC)
         if: matrix.cc_target
         uses: mlugg/setup-zig@v2
-        with:
-          version: 0.14.0
 
-      - name: Resolve build tags
-        id: tags
-        run: |
-          set -euo pipefail
-          case "${{ matrix.tags_src }}" in
-            windows)
-              # NOTE: with_naive_outbound 被有意省略——它依赖 cronet-go 预编译的 C 库，
-              # 只在 CGO_ENABLED=1 + 目标平台交叉工具链齐备时才能链接成功。
-              # 这里走纯 Go 跨编译路径（CGO=0），因此和 build-all.bat 保持一致：不带 naive。
-              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_purego,with_xhttp,badlinkname,tfogo_checklinkname0'
-              ;;
-            freebsd)
-              # drop with_tailscale: sing-box/tailscale fork 有 wgengine/router/osrouter 编译错误
-              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_ccm,with_ocm,with_cloudflared,with_xhttp,badlinkname,tfogo_checklinkname0'
-              ;;
-            others)
-              # with_ebpf only compiles on linux/android; darwin builds get the stub.
-              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_xhttp,with_ebpf,badlinkname,tfogo_checklinkname0'
-              ;;
-          esac
-          echo "tags=$TAGS" | tee -a "$GITHUB_OUTPUT"
-
-      - name: Build binary
+      - name: Build binaries
         env:
-          # Defaults to CGO=0 static; matrix.cgo override flips to dynamic
-          # for the linux-amd64-v3-glibc target.
           CGO_ENABLED: ${{ matrix.cgo || '0' }}
           GOOS:        ${{ matrix.goos }}
           GOARCH:      ${{ matrix.goarch }}
           GOARM:       ${{ matrix.goarm }}
           GOMIPS:      ${{ matrix.gomips }}
+          GOMIPS64:    ${{ matrix.gomips }}
           GOAMD64:     ${{ matrix.goamd64 }}
-          # cc_target, when set, drives cross-CGO via `zig cc -target`.
-          # Currently: linux/arm64-musl. Empty for every other row.
           CC_TARGET:   ${{ matrix.cc_target }}
+          TAGS_SRC:    ${{ matrix.tags_src }}
+          EBPF:        ${{ matrix.ebpf }}
+          SUFFIX:      ${{ matrix.suffix }}
+          EXT:         ${{ matrix.ext }}
+          VERSION:     ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION='${{ needs.prepare.outputs.version }}'
-          NAME="sing-box-${VERSION}-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}"
-          BIN="${NAME}${{ matrix.ext }}"
-          # Cross-CGO via zig. Musl static builds need THREE things:
-          #   1. CC/CXX pointing at zig cc -target <triple> so C
-          #      headers + libc.a come from zig's musl bundle
-          #   2. -linkmode=external — Go's internal linker doesn't
-          #      know how to emit musl-compatible dynsym entries;
-          #      leaving it on produces errors like
-          #      "runtime.gcdata: missing Go type information for
-          #       global symbol .dynsym" and floods of unresolved
-          #      getgrgid_r / getaddrinfo / malloc relocations
-          #      because the internal linker tries to do static
-          #      static merging itself instead of deferring to $CC
-          #   3. -extldflags=-static — tells the now-external zig
-          #      linker to emit a fully-static ELF (no dynamic
-          #      dependencies). Only effective when linkmode=external.
-          EXTRA_LDFLAGS=""
+          case "$TAGS_SRC" in
+            windows) BASE_TAGS=$(cat release/DEFAULT_BUILD_TAGS_WINDOWS) ;;
+            *)       BASE_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS) ;;
+          esac
+          BASE_TAGS=$(echo "$BASE_TAGS" | tr ',' '\n' | grep -vx 'with_naive_outbound' | paste -sd, -)
+          # release/LDFLAGS 随上游同步（godebug 默认值、checklinkname 等）。
+          LDFLAGS="-s -w -buildid= $(cat release/LDFLAGS) -X github.com/sagernet/sing-box/constant.Version=${VERSION}"
+          # Musl 静态构建：zig cc 提供 musl headers + libc.a；Go 内部链接器
+          # 不支持 musl 静态合并，需 -linkmode=external -extldflags=-static。
           if [ -n "${CC_TARGET}" ]; then
             export CC="zig cc -target ${CC_TARGET}"
             export CXX="zig c++ -target ${CC_TARGET}"
-            EXTRA_LDFLAGS=" -linkmode=external -extldflags=-static"
-            echo "Cross CGO via zig: CC='${CC}' (external linkmode, static)"
+            LDFLAGS="${LDFLAGS} -linkmode=external -extldflags=-static"
           fi
-          echo "::group::Build $BIN"
-          echo "tags=${{ steps.tags.outputs.tags }}"
-          echo "CGO=${CGO_ENABLED} GOAMD64=${GOAMD64:-default} CC_TARGET=${CC_TARGET:-none}"
-          # -trimpath: 消除构建机本地路径，可复现构建
-          # -buildvcs=false: 不嵌入 git commit（我们用 -X Version 显式注入）
-          # -p 0: Go 默认 GOMAXPROCS；runner 2-core 时为 2
-          go build -trimpath -buildvcs=false \
-            -tags "${{ steps.tags.outputs.tags }}" \
-            -ldflags "${COMMON_LDFLAGS} -X github.com/sagernet/sing-box/constant.Version=${VERSION}${EXTRA_LDFLAGS}" \
-            -o "$BIN" ./cmd/sing-box
-          echo "::endgroup::"
-          ls -lh "$BIN"
-          # For glibc dynamic builds, surface the runtime ELF requirements
-          # so the release notes can list the minimum supported distro.
-          # For musl static builds, verify NO dynamic dependencies — if
-          # something slipped in, fail the build loudly.
-          if [ "${CGO_ENABLED}" = "1" ]; then
-            echo "--- ELF dynamic dependencies ---"
-            DEPS=$(objdump -p "$BIN" | grep -E '(NEEDED|GLIBC_)' | sort -u || true)
-            echo "${DEPS}"
-            if [ -n "${CC_TARGET}" ]; then
-              if echo "${DEPS}" | grep -q "NEEDED"; then
-                echo "ERROR: musl build has dynamic NEEDED deps — expected fully static"
+          VARIANTS=("")
+          if [ "$EBPF" = "true" ]; then
+            VARIANTS+=("-ebpf")
+          fi
+          mkdir -p dist
+          for VARIANT in "${VARIANTS[@]}"; do
+            TAGS="$BASE_TAGS"
+            if [ "$VARIANT" = "-ebpf" ]; then
+              TAGS="${TAGS},with_ebpf"
+            fi
+            NAME="sing-box-${VERSION}-${GOOS}-${GOARCH}${SUFFIX}${VARIANT}"
+            BIN="${NAME}${EXT}"
+            echo "::group::Build $BIN"
+            echo "tags=${TAGS}"
+            echo "ldflags=${LDFLAGS}"
+            echo "CGO=${CGO_ENABLED} GOAMD64=${GOAMD64:-default} CC_TARGET=${CC_TARGET:-none}"
+            go build -trimpath -buildvcs=false -tags "$TAGS" -ldflags "$LDFLAGS" -o "dist/$BIN" ./cmd/sing-box
+            echo "::endgroup::"
+            ls -lh "dist/$BIN"
+            # glibc 动态构建列出运行时 ELF 依赖；musl 静态构建确认无动态依赖。
+            if [ "${CGO_ENABLED}" = "1" ]; then
+              DEPS=$(objdump -p "dist/$BIN" | grep -E '(NEEDED|GLIBC_)' | sort -u || true)
+              echo "--- ELF dynamic dependencies ---"
+              echo "${DEPS}"
+              if [ -n "${CC_TARGET}" ] && echo "${DEPS}" | grep -q "NEEDED"; then
+                echo "::error::musl build has dynamic NEEDED deps — expected fully static"
                 exit 1
               fi
-              echo "musl static build OK — no dynamic deps"
             fi
-          fi
-          echo "BIN=$BIN"   >> "$GITHUB_ENV"
-          echo "NAME=$NAME" >> "$GITHUB_ENV"
+          done
 
-      # pigz 替代 gzip：并行压缩，ubuntu-latest runner 2-core 上比单核
-      # gzip 快 ~1.7x。同时保留 -9 最高压缩率。
-      - name: Pack with tar.gz (pigz parallel)
+      # pigz 并行压缩，保留 -9 最高压缩率；归档内文件名与产物同名。
+      - name: Pack with tar.gz
         run: |
           set -euo pipefail
-          sudo apt-get install -y --no-install-recommends pigz >/dev/null 2>&1 || \
-            { command -v pigz || (echo "pigz not available, falling back to gzip" && sudo ln -sf /bin/gzip /usr/local/bin/pigz); }
-          tar cf - "${BIN}" | pigz -9 > "${NAME}.tar.gz"
-          ls -lh "${NAME}.tar.gz"
+          command -v pigz >/dev/null || sudo apt-get install -y --no-install-recommends pigz >/dev/null
+          cd dist
+          for BIN in sing-box-*; do
+            tar cf - "$BIN" | pigz -9 > "${BIN%.exe}.tar.gz"
+            rm -f "$BIN"
+          done
+          ls -lh
 
       # compression-level: 0 禁用 upload-artifact 内置二次压缩（tar.gz 已压）。
-      # 跳过 sha256sum 生成：publish job 统一做 manifest。
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: desktop-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.suffix }}
-          path: sing-box-*.tar.gz
+          path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
 
   # ───────────────────────────────────────────────────────────────────
-  # 3) Android arm64-v8a (CGO + NDK，走 cmd/internal/build_libbox 入口)
+  # 3) Android arm64-v8a (CGO + NDK + naive，走 cmd/internal/build_libbox
+  #    android-bin 入口)，普通版与 -ebpf 版在同一 job 先后编译共享构建缓存。
   #    continue-on-error 让 Android 失败不阻塞 desktop 的发布。
-  #    NDK 缓存：setup-ndk 默认不缓存 ~1GB 的 NDK，手工加 cache。
   # ───────────────────────────────────────────────────────────────────
   android:
-    name: android/arm64-v8a
+    name: android/arm64-v8a (+ebpf)
     runs-on: ubuntu-latest
     needs: prepare
     if: needs.prepare.outputs.skip_android != 'true'
     continue-on-error: true
-    env:
-      NDK_VERSION: r28c
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -318,95 +341,98 @@ jobs:
         uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
-          check-latest: true
-          cache: true
-          cache-dependency-path: go.sum
+          cache: false
+
+      - name: Restore Go modules
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ needs.prepare.outputs.gomod_key }}
 
       - name: Cache Go build
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cache/go-build
-          key: go-build-android-arm64-${{ env.GO_VERSION }}-${{ hashFiles('go.sum') }}
+          path: ~/.cache/go-build
+          key: gobuild-android-arm64-${{ env.GO_VERSION }}-${{ github.sha }}
           restore-keys: |
-            go-build-android-arm64-${{ env.GO_VERSION }}-
-            go-build-android-arm64-
+            gobuild-android-arm64-${{ env.GO_VERSION }}-
 
-      # NDK ~1GB 每次下载需 3min。之前尝试 actions/cache + cp -a 副本的方案
-      # 失败：NDK 的 aarch64-linux-android24-clang 是 shell wrapper，内部用
-      # `dirname $0`/clang 引用邻近的 clang binary；clang 本身又是指向
-      # `/opt/hostedtoolcache/ndk/r28c/.../clang-19` 的软链。cp -a 或
-      # actions/cache 保存时会把软链的 target 固化成绝对路径，恢复到新 runner
-      # 后 /opt/hostedtoolcache 是空的，wrapper 找不到 clang → 构建失败:
-      #   /home/runner/ndk-r28c/.../aarch64-linux-android24-clang: line 4:
-      #   /home/runner/ndk-r28c/.../clang: No such file or directory
-      #
-      # 结论：NDK 不缓存，接受每次 3min 下载开销换取稳定。setup-ndk@v1 的
-      # local-cache:true 仍然开着，单个 runner 连续跑同一 workflow 时它可能
-      # 自行复用（但跨 runner 不共享）。
-      - name: Setup NDK
-        id: ndk
-        uses: nttld/setup-ndk@v1
-        with:
-          # r28+ (LLVM 19+) 必需 —— 旧版 libcronet.a 用 R_AARCH64_AUTH_ABS64
-          # (relocation type 315, arm64e PAC pointer-authentication 扩展)，
-          # NDK r27 及更早的 lld 17 不认识这个 reloc 会报:
-          #   "unknown relocation (315) against symbol typeinfo for ..."
-          # 影响所有 cronet 依赖的符号：__cxxabiv1 / std::bad_* / libunwind.
-          # r28c (2025-10, LLVM 19) 原生支持；后续 NDK (r29+) 保持向后兼容。
-          #
-          # 不开 local-cache / add-to-path —— local-cache: true 会把 NDK
-          # 拷到 ~/.setup-ndk/<ver>/，复制过程会把 toolchain 里 clang →
-          # clang-19 的软链 target 固化成绝对路径，二次 run 时 wrapper
-          # 脚本找不到 clang binary 构建失败。upstream build.yml 原始配置
-          # 也只用默认路径 /opt/hostedtoolcache/ndk/... 不走 local-cache，
-          # 与此保持一致，NDK 解压在 runner tool cache 区而不是 home。
-          ndk-version: ${{ env.NDK_VERSION }}
-
-      - name: Verify NDK toolchain (sanity check)
+      # r28+ (LLVM 19+) 必需 —— libcronet.a 使用 R_AARCH64_AUTH_ABS64
+      # (relocation 315)，NDK r27 及更早的 lld 不认识。runner 预装了多个
+      # NDK（默认 ANDROID_NDK_HOME 指向较旧版本），优先挑预装的 r28+，
+      # 省掉 ~1GB 下载。NDK 不能用 actions/cache：clang wrapper 依赖的软链
+      # 在保存/恢复后会被固化成绝对路径，新 runner 上找不到 clang。
+      - name: Locate preinstalled NDK (r28+)
+        id: ndk_local
         run: |
           set -euo pipefail
-          NDK_BIN="${{ steps.ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          echo "ndk-path=${{ steps.ndk.outputs.ndk-path }}"
-          echo "--- NDK bin layout (clang 链路) ---"
-          ls -la "$NDK_BIN/aarch64-linux-android24-clang" "$NDK_BIN/clang"* 2>&1 | head -15
-          # wrapper 脚本应该能找到真实的 clang binary
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          NDK=""
+          for dir in $(ls -d "$SDK"/ndk/*/ 2>/dev/null | sort -V -r); do
+            dir="${dir%/}"
+            major=$(basename "$dir" | cut -d. -f1)
+            if [[ "$major" =~ ^[0-9]+$ ]] && [ "$major" -ge 28 ] && \
+               [ -x "$dir/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" ]; then
+              NDK="$dir"
+              break
+            fi
+          done
+          echo "path=$NDK" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Setup NDK (download fallback)
+        id: ndk_download
+        if: steps.ndk_local.outputs.path == ''
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+
+      - name: Verify NDK toolchain
+        env:
+          NDK_PATH: ${{ steps.ndk_local.outputs.path || steps.ndk_download.outputs.ndk-path }}
+        run: |
+          set -euo pipefail
+          NDK_BIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "ndk-path=$NDK_PATH"
           "$NDK_BIN/aarch64-linux-android24-clang" --version || {
             echo "::error::NDK clang wrapper cannot resolve its target clang binary"
-            echo "--- wrapper content ---"
             cat "$NDK_BIN/aarch64-linux-android24-clang"
-            echo "--- clang symlink target ---"
             readlink -f "$NDK_BIN/clang" || echo "clang missing"
             exit 1
           }
-          echo "ANDROID_NDK_HOME=${{ steps.ndk.outputs.ndk-path }}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK_PATH" >> "$GITHUB_ENV"
 
       - name: Build via build_libbox
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
         run: |
           set -euo pipefail
-          VERSION='${{ needs.prepare.outputs.version }}'
-          echo "::group::build_libbox android/arm64"
-          go run ./cmd/internal/build_libbox -target android-bin -platform android/arm64
-          echo "::endgroup::"
-          ls -lh sing-box-android-arm64-v8a
-          # NDK strip 减体积（约 -30%）
+          command -v pigz >/dev/null || sudo apt-get install -y --no-install-recommends pigz >/dev/null
           STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          if [ -x "$STRIP" ]; then
-            "$STRIP" --strip-all sing-box-android-arm64-v8a || true
+          mkdir -p dist
+          for VARIANT in "" "-ebpf"; do
+            EXTRA_TAGS=""
+            if [ "$VARIANT" = "-ebpf" ]; then
+              EXTRA_TAGS="with_ebpf"
+            fi
+            echo "::group::build_libbox android/arm64${VARIANT}"
+            go run ./cmd/internal/build_libbox -target android-bin -platform android/arm64 \
+              -version "${VERSION}" -tags "${EXTRA_TAGS}"
+            echo "::endgroup::"
+            # NDK strip 减体积（约 -30%）
+            "$STRIP" --strip-all sing-box-android-arm64-v8a
             ls -lh sing-box-android-arm64-v8a
-          fi
-          NAME="sing-box-${VERSION}-android-arm64-v8a"
-          # 归档内用无后缀名字（build-all.bat 同行为）
-          cp sing-box-android-arm64-v8a sing-box
-          tar cf - sing-box | pigz -9 > "${NAME}.tar.gz"
-          ls -lh "${NAME}.tar.gz"
-          rm -f sing-box sing-box-android-arm64-v8a
+            # 归档内用无后缀名字
+            mv sing-box-android-arm64-v8a sing-box
+            tar cf - sing-box | pigz -9 > "dist/sing-box-${VERSION}-android-arm64-v8a${VARIANT}.tar.gz"
+            rm -f sing-box
+          done
+          ls -lh dist
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
           name: android-arm64-v8a
-          path: sing-box-*.tar.gz
+          path: dist/*.tar.gz
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
