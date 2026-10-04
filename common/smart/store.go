@@ -2,7 +2,6 @@ package smart
 
 import (
 	"bytes"
-	"container/heap"
 	"errors"
 	"fmt"
 	"math"
@@ -13,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/bbolt"
@@ -37,34 +35,47 @@ var (
 	globalStoreOnce sync.Once
 	globalStore     *Store
 
-	// Global write queue for bbolt batch flushing. The queue is a (slice,
-	// index map) tandem protected by globalQueueMu:
+	// Global write queue for bbolt batch flushing, guarded by globalQueueMu:
 	//
-	//   globalQueueOps    — ordered list of pending StoreOperations
-	//   globalQueueIdx    — map[key] → position in globalQueueOps
-	//   globalQueueDirty  — set when the publicly-visible snapshot is stale
+	//   globalQueueOps — pending operations in arrival order, one per key
+	//   globalQueueIdx — key → position in globalQueueOps (O(1) dedup and
+	//                    exact-key reads)
+	//   inflightOps / inflightIdx — the batch the flusher is committing.
+	//                    Readers keep consulting it until the commit lands,
+	//                    so a write is never invisible between leaving the
+	//                    queue and reaching bbolt.
 	//
-	// The index keeps AppendToGlobalQueue at O(1) amortised per insert.
-	// The dirty flag keeps snapshot publishing O(1) on reads too — we
-	// only refresh the atomic.Value snapshot when a reader actually needs
-	// it (in getGlobalQueueSnapshot), not on every write. Writes just
-	// flip the dirty bit.
-	globalQueue      atomic.Value // holds []StoreOperation (read-only)
-	globalQueueOps   []StoreOperation
-	globalQueueIdx   map[string]int
-	globalQueueDirty atomic.Bool
-	globalQueueMu    sync.Mutex
+	// Readers hold the read lock and look keys up in place — exact keys via
+	// the indexes, prefixes by walking the two slices — instead of copying
+	// the queue.
+	globalQueueMu  sync.RWMutex
+	globalQueueOps []queuedOp
+	globalQueueIdx map[string]int
+	inflightOps    []queuedOp
+	inflightIdx    map[string]int
 
-	// inflightBatches counts asynchronous BatchSave goroutines that have
-	// not yet returned. AppendToGlobalQueue spawns one whenever the queue
-	// crosses BatchSaveThreshold; StoreFlushNow must Wait on this before
-	// it can claim "everything is on disk", otherwise a concurrent async
-	// flush mid-commit would leak past shutdown.
-	inflightBatches sync.WaitGroup
+	// Write generations for dbResultCache validity, guarded by
+	// globalQueueMu. Every bbolt write bumps scanAnyGen and the generation
+	// of the group scope it touches ("smart/<type>/<cfg>/<grp>"); writes
+	// wider than one group bump scanEpoch. A cached scan is served only
+	// while the stamp it was read under is still current.
+	scanEpoch     uint64
+	scanAnyGen    uint64
+	scanGroupGens map[string]uint64
+
+	// flushMu serialises queue drains, so at most one batch is in flight
+	// and callers that must not race a commit (StoreFlushNow, FlushByLevel,
+	// RemoveNodesData) can wait for it.
+	flushMu sync.Mutex
+	// flushSignal wakes the store's single background flusher once the
+	// queue crosses BatchSaveThreshold; the one-slot buffer coalesces
+	// signals that arrive while a drain is running.
+	flushSignal chan struct{}
 
 	globalCacheParams struct {
 		BatchSaveThreshold int
 		MaxTargets         int
+		IndexBudget        int64 // byte budget shared by all decoded stats indexes
 		LastMemoryUsage    float64
 		mu                 sync.RWMutex
 	}
@@ -72,9 +83,26 @@ var (
 	targetCache       *lruCache[string, string]
 	unwrapCache       *lruCache[string, UnwrapMap]
 	recordCache       *lruCache[string, *AtomicStatsRecord]
-	dbResultCache     *lruCache[string, map[string][]byte]
+	dbResultCache     *lruCache[string, dbScan]
 	blockedNodesCache *lruCache[string, map[string]bool]
 )
+
+// queuedOp is a pending write together with its bbolt key.
+type queuedOp struct {
+	key string
+	op  StoreOperation
+}
+
+// scanStamp identifies the write generation a scan was read at.
+type scanStamp struct {
+	epoch, gen uint64
+}
+
+// dbScan is a cached bbolt prefix scan and the stamp it was read under.
+type dbScan struct {
+	stamp scanStamp
+	rows  map[string][]byte
+}
 
 // Store is a singleton that wraps bbolt + in-memory caches.
 type Store struct{}
@@ -86,6 +114,7 @@ func GetOrInitStore(db *bbolt.DB) *Store {
 		initCaches()
 		initQueue()
 		globalStore = &Store{}
+		go globalStore.runFlusher()
 	})
 	return globalStore
 }
@@ -96,6 +125,7 @@ func initCaches() {
 	globalCacheParams.mu.Lock()
 	globalCacheParams.BatchSaveThreshold = batch
 	globalCacheParams.MaxTargets = sz * 4
+	globalCacheParams.IndexBudget = bytesPer
 	globalCacheParams.mu.Unlock()
 
 	// Byte-budgeted caches: MaxCost is real memory, cost fns return each
@@ -104,8 +134,9 @@ func initCaches() {
 	// guess that the actual values rarely match.
 	targetCache = newLRUBytes[string, string](bytesPer, costString)
 	unwrapCache = newLRUBytes[string, UnwrapMap](bytesPer, costUnwrapMap)
-	recordCache = newLRUBytes[string, *AtomicStatsRecord](bytesPer, costRecord)
-	dbResultCache = newLRUBytesWithTTL[string, map[string][]byte](bytesPer, 300*time.Second, costDBResult)
+	// recordCache reports every departing record to the record index.
+	recordCache = newCacheCost[string, *AtomicStatsRecord](bytesPer, 0, byteBudgetCounters(bytesPer), costRecord, unindexRecord)
+	dbResultCache = newLRUBytesWithTTL[string, dbScan](bytesPer, 300*time.Second, costDBScan)
 	blockedNodesCache = newLRUBytesWithTTL[string, map[string]bool](bytesPer, 300*time.Second, costBlocked)
 }
 
@@ -116,13 +147,15 @@ func initCaches() {
 const cacheEntryOverhead = 96
 
 // atomicRecordCost is the representative footprint charged for one
-// *AtomicStatsRecord at insert time. The struct's atomic/mutex/float
-// fields are ~320 B; on top of that each record lazily grows a weights
-// map and an eventual ~1.2 KiB t-digest that ristretto cannot re-cost
-// after insertion (records are mutated in place). We charge the upper
-// bound so a busy group's record cache honours the byte budget rather
-// than overshooting it once every record has accreted its digest.
-const atomicRecordCost = 1280
+// *AtomicStatsRecord at insert time: the struct (~330 B), its four EWMA
+// trackers and the weights map once it holds a few entries. ristretto
+// cannot re-cost a record after insertion (records are mutated in place),
+// so this is the steady-state size rather than the size at creation.
+const atomicRecordCost = 768
+
+// cacheBudgetShares splits SMART_CACHE_BUDGET_MB between the five caches
+// and the decoded stats indexes.
+const cacheBudgetShares = 6
 
 func costString(v string) int64 { return int64(len(v)) + cacheEntryOverhead }
 
@@ -147,6 +180,8 @@ func costDBResult(v map[string][]byte) int64 {
 	return n + cacheEntryOverhead
 }
 
+func costDBScan(v dbScan) int64 { return costDBResult(v.rows) }
+
 func costBlocked(v map[string]bool) int64 {
 	n := int64(0)
 	for k := range v {
@@ -159,17 +194,17 @@ func costBlocked(v map[string]bool) int64 {
 // limits, per-cache BYTE budget for the ristretto MaxCost, batch-save
 // threshold). It honours one env-var override:
 //
-//   - SMART_CACHE_BUDGET_MB: total memory budget across all five caches.
-//     This is now a REAL byte ceiling: each cache gets mb/5 MiB of
-//     MaxCost and evicts by measured value footprint (see the cost fns in
-//     initCaches), so the configured number tracks actual RSS instead of
-//     an entry count derived from a 2 KiB/entry assumption that the live
-//     values rarely match.
+//   - SMART_CACHE_BUDGET_MB: total memory budget across the five caches
+//     and the decoded stats indexes. This is a REAL byte ceiling: each
+//     gets mb/6 MiB and evicts by measured value footprint (see the cost
+//     fns in initCaches), so the configured number tracks actual RSS
+//     instead of an entry count derived from a 2 KiB/entry assumption
+//     that the live values rarely match.
 //
 // perCacheEntries is retained ONLY to size MaxTargets (the prefetch /
 // bbolt-scan target cap), which is a count, not a memory figure.
 //
-// Defaults: desktop 32 MB, Android/iOS 8 MB, split five ways.
+// Defaults: desktop 32 MB, Android/iOS 8 MB, split six ways.
 func resolveCacheBudget() (perCacheEntries int, perCacheBytes int64, batchThreshold int) {
 	mb := defaultCacheBudgetMB()
 	if raw := os.Getenv("SMART_CACHE_BUDGET_MB"); raw != "" {
@@ -179,7 +214,7 @@ func resolveCacheBudget() (perCacheEntries int, perCacheBytes int64, batchThresh
 	}
 
 	// Real byte budget per cache.
-	perCacheBytes = int64(mb) * 1024 * 1024 / 5
+	perCacheBytes = int64(mb) * 1024 * 1024 / cacheBudgetShares
 
 	// Entry budget (for MaxTargets only): ~2 KiB per entry, 5 caches share.
 	entriesTotal := (mb * 1024) / 2
@@ -220,9 +255,11 @@ func defaultCacheBudgetMB() int {
 }
 
 func initQueue() {
-	globalQueueOps = make([]StoreOperation, 0, 128)
+	globalQueueOps = make([]queuedOp, 0, 128)
 	globalQueueIdx = make(map[string]int, 128)
-	globalQueue.Store([]StoreOperation{})
+	inflightIdx = make(map[string]int, 128)
+	scanGroupGens = make(map[string]uint64)
+	flushSignal = make(chan struct{}, 1)
 }
 
 func getBatchSaveThreshold() int {
@@ -234,20 +271,17 @@ func getBatchSaveThreshold() int {
 	return globalCacheParams.BatchSaveThreshold
 }
 
-// AppendToGlobalQueue deduplicates by operation key and auto-flushes when
-// over threshold. O(1) amortised per insert — we maintain a persistent
-// `key → index` map alongside the queue slice, so dedup doesn't require
-// rebuilding the map from the whole queue on every call.
-//
-// The exported snapshot (via globalQueue atomic.Value) is republished
-// lazily only when callers need it — see getGlobalQueueSnapshot.
+// AppendToGlobalQueue deduplicates by operation key and wakes the
+// background flusher once the queue crosses BatchSaveThreshold. O(1)
+// amortised per insert — a persistent `key → index` map sits alongside
+// the queue slice, so dedup never rebuilds anything. Stats writes are
+// also handed to their group's stats index (when one is tracked) so it
+// stays current without re-reading the group.
 func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 	if len(operations) == 0 {
 		return
 	}
-
-	var shouldFlush bool
-	var snapshot []StoreOperation
+	threshold := getBatchSaveThreshold()
 
 	globalQueueMu.Lock()
 	if globalQueueIdx == nil {
@@ -260,96 +294,53 @@ func (s *Store) AppendToGlobalQueue(operations ...StoreOperation) {
 		}
 		if pos, ok := globalQueueIdx[key]; ok {
 			// Overwrite in place — preserves slot, no slice growth.
-			globalQueueOps[pos] = operations[i]
-			continue
+			globalQueueOps[pos].op = operations[i]
+		} else {
+			globalQueueIdx[key] = len(globalQueueOps)
+			globalQueueOps = append(globalQueueOps, queuedOp{key: key, op: operations[i]})
 		}
-		globalQueueIdx[key] = len(globalQueueOps)
-		globalQueueOps = append(globalQueueOps, operations[i])
-	}
-
-	threshold := getBatchSaveThreshold()
-	if len(globalQueueOps) >= threshold {
-		shouldFlush = true
-		// Hand the accumulated ops to the flusher; reset the queue. We
-		// copy into a fresh slice so the flusher can work in parallel
-		// with new inserts without holding globalQueueMu.
-		snapshot = make([]StoreOperation, len(globalQueueOps))
-		copy(snapshot, globalQueueOps)
-		globalQueueOps = globalQueueOps[:0]
-		// Clear map keys instead of reallocating — preserves capacity.
-		for k := range globalQueueIdx {
-			delete(globalQueueIdx, k)
+		if operations[i].Type == OpSaveStats {
+			feedStatsIndex(key, operations[i].Data)
 		}
 	}
-
-	// Mark the snapshot dirty — actual publish deferred until a reader
-	// calls getGlobalQueueSnapshot. Keeps the append hot path allocation-
-	// free for the steady-state (non-threshold) case.
-	globalQueueDirty.Store(true)
+	full := len(globalQueueOps) >= threshold
 	globalQueueMu.Unlock()
 
-	if shouldFlush && len(snapshot) > 0 {
-		inflightBatches.Add(1)
-		go func() {
-			defer inflightBatches.Done()
-			_ = s.BatchSave(snapshot)
-		}()
-	}
-}
-
-// publishQueueSnapshotLocked copies globalQueueOps into the atomic.Value
-// so lock-free readers (GetSubBytesByPath) see a consistent view without
-// contending on globalQueueMu. Must be called with globalQueueMu held.
-func publishQueueSnapshotLocked() {
-	snap := make([]StoreOperation, len(globalQueueOps))
-	copy(snap, globalQueueOps)
-	globalQueue.Store(snap)
-	globalQueueDirty.Store(false)
-}
-
-// getGlobalQueueSnapshot returns the most recent view of the queue.
-// Republishes the snapshot if the append path has flagged it dirty —
-// this defers the O(n) copy until a reader actually needs the data,
-// keeping AppendToGlobalQueue O(1) in the common case.
-func getGlobalQueueSnapshot() []StoreOperation {
-	if globalQueueDirty.Load() {
-		globalQueueMu.Lock()
-		if globalQueueDirty.Load() {
-			publishQueueSnapshotLocked()
+	if full {
+		select {
+		case flushSignal <- struct{}{}:
+		default:
 		}
-		globalQueueMu.Unlock()
 	}
-	v, _ := globalQueue.Load().([]StoreOperation)
-	return v
 }
 
-// removeFromQueue filters the queue in-place and rebuilds the index. Used
-// by FlushByLevel → filterQueueByGroup / filterQueueByConfig which run on
-// cache-maintenance operations (infrequent, so the O(n) cost is fine).
+// runFlusher is the store's single background writer. It drains the queue
+// whenever AppendToGlobalQueue reports it over threshold; signals arriving
+// mid-drain coalesce in the channel, so bursts never stack goroutines or
+// concurrent bbolt write transactions.
+func (s *Store) runFlusher() {
+	for range flushSignal {
+		s.FlushQueue(false)
+	}
+}
+
+// removeFromQueue filters the queue in place and rebuilds the index. Its
+// callers (FlushByLevel, RemoveNodesData) hold flushMu, so no batch is in
+// flight that the filter would miss.
 func removeFromQueue(shouldRemove func(StoreOperation) bool) {
 	globalQueueMu.Lock()
 	kept := globalQueueOps[:0]
-	for _, op := range globalQueueOps {
-		if !shouldRemove(op) {
-			kept = append(kept, op)
+	for _, q := range globalQueueOps {
+		if !shouldRemove(q.op) {
+			kept = append(kept, q)
 		}
 	}
+	clear(globalQueueOps[len(kept):])
 	globalQueueOps = kept
-	// Rebuild the index — cheaper than incremental delete because filter
-	// operations are bulk and we'd do O(n) deletes anyway.
-	if globalQueueIdx == nil {
-		globalQueueIdx = make(map[string]int, len(kept))
-	} else {
-		for k := range globalQueueIdx {
-			delete(globalQueueIdx, k)
-		}
-	}
+	clear(globalQueueIdx)
 	for i := range globalQueueOps {
-		if key := FormatOperationKey(&globalQueueOps[i]); key != "" {
-			globalQueueIdx[key] = i
-		}
+		globalQueueIdx[globalQueueOps[i].key] = i
 	}
-	publishQueueSnapshotLocked()
 	globalQueueMu.Unlock()
 }
 
@@ -375,314 +366,299 @@ func filterQueueByConfig(config string) {
 	})
 }
 
-// FlushQueue writes buffered operations to bbolt. Swaps the in-memory
-// queue atomically with globalQueueMu so concurrent Append calls don't
-// race against the flusher — the caller gets a consistent snapshot to
-// BatchSave while new inserts start on a fresh slice.
+// FlushQueue writes buffered operations to bbolt; force=false only drains
+// a queue at or above BatchSaveThreshold. The drained batch stays readable
+// as the in-flight batch until its commit lands. Drains are serialised by
+// flushMu, so a call that finds one running waits for it first.
 func (s *Store) FlushQueue(force bool) {
+	threshold := getBatchSaveThreshold()
+	flushMu.Lock()
+	defer flushMu.Unlock()
+
 	globalQueueMu.Lock()
-	if len(globalQueueOps) == 0 {
+	if n := len(globalQueueOps); n == 0 || (!force && n < threshold) {
 		globalQueueMu.Unlock()
 		return
 	}
-	if !force && len(globalQueueOps) < getBatchSaveThreshold() {
-		globalQueueMu.Unlock()
-		return
-	}
-	ops := make([]StoreOperation, len(globalQueueOps))
-	copy(ops, globalQueueOps)
-	globalQueueOps = globalQueueOps[:0]
-	for k := range globalQueueIdx {
-		delete(globalQueueIdx, k)
-	}
-	publishQueueSnapshotLocked()
+	// Swap the queue into the in-flight slot; new appends continue on the
+	// previous batch's (cleared) storage.
+	batch := globalQueueOps
+	globalQueueOps, inflightOps = inflightOps[:0], batch
+	globalQueueIdx, inflightIdx = inflightIdx, globalQueueIdx
 	globalQueueMu.Unlock()
-	_ = s.BatchSave(ops)
+
+	// A failed commit drops the batch, as before: retrying against a
+	// closed or broken database would only grow the queue.
+	err := commitBatch(batch)
+
+	var lost []string
+	globalQueueMu.Lock()
+	for i := range batch {
+		noteWriteLocked(batch[i].key)
+		if err != nil && batch[i].op.Type == OpSaveStats {
+			lost = append(lost, batch[i].key)
+		}
+	}
+	clear(batch)
+	inflightOps = batch[:0]
+	clear(inflightIdx)
+	globalQueueMu.Unlock()
+	// Stats indexes already applied the dropped writes; rebuild them.
+	noteDBMutation(lost...)
 }
 
-// BatchSave persists a list of operations to bbolt in a single Batch
-// transaction. Tombstone ops (OpDelete*) invoke bucket.Delete instead of
-// bucket.Put so deletes propagate through the same batched path.
-//
-// Save and Delete for the same key share FormatOperationKey, so when both
-// land in the batch only the LAST action wins — the writeMap below just
-// replays insertion order into a deterministic map. This is fine because
-// the queue already dedups at enqueue time; BatchSave is a best-effort
-// coalesce for any stragglers that escaped the enqueue dedup window
-// (e.g. two concurrent writers racing the append).
-type writeOp struct {
-	data []byte
-	del  bool
+// commitBatch writes a deduplicated batch in one bbolt transaction.
+// Tombstone ops (OpDelete*) delete their key. bbolt fsyncs every commit
+// unless the database was opened with NoSync, so there is no extra Sync
+// per batch; StoreFlushNow adds the explicit one shutdown paths rely on.
+func commitBatch(batch []queuedOp) error {
+	return globalDB.Update(func(tx *bbolt.Tx) error {
+		bucket, err := tx.CreateBucketIfNotExists(bucketSmartStats)
+		if err != nil {
+			return err
+		}
+		for i := range batch {
+			q := &batch[i]
+			if isDeleteOp(q.op.Type) {
+				err = bucket.Delete([]byte(q.key))
+			} else {
+				err = bucket.Put([]byte(q.key), q.op.Data)
+			}
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 }
 
+// BatchSave persists operations to bbolt in a single transaction,
+// bypassing the queue. Tombstone ops (OpDelete*) delete their key; when
+// several operations share a key the last one wins.
 func (s *Store) BatchSave(operations []StoreOperation) error {
 	if len(operations) == 0 {
 		return nil
 	}
-
-	writeMap := make(map[string]writeOp, len(operations))
+	batch := make([]queuedOp, 0, len(operations))
+	pos := make(map[string]int, len(operations))
 	for i := range operations {
 		key := FormatOperationKey(&operations[i])
 		if key == "" {
 			continue
 		}
-		writeMap[key] = writeOp{
-			data: operations[i].Data,
-			del:  isDeleteOp(operations[i].Type),
+		if p, ok := pos[key]; ok {
+			batch[p].op = operations[i]
+			continue
 		}
+		pos[key] = len(batch)
+		batch = append(batch, queuedOp{key: key, op: operations[i]})
 	}
-
-	if err := globalDB.Batch(func(tx *bbolt.Tx) error {
-		bucket, err := tx.CreateBucketIfNotExists(bucketSmartStats)
-		if err != nil {
-			return err
-		}
-		for key, op := range writeMap {
-			if op.del {
-				if err := bucket.Delete([]byte(key)); err != nil {
-					return err
-				}
-			} else {
-				if err := bucket.Put([]byte(key), op.data); err != nil {
-					return err
-				}
-			}
-		}
-		return nil
-	}); err != nil {
-		return err
+	err := commitBatch(batch)
+	keys := make([]string, len(batch))
+	for i := range batch {
+		keys[i] = batch[i].key
 	}
-	// Explicit fsync. bbolt.DB.Batch already commits synchronously and —
-	// unless NoSync has been set — issues its own fsync per transaction.
-	// We call Sync anyway so this function's contract is independent of
-	// how globalDB was opened: a successful return means the write is on
-	// stable storage. Cost: one fsync per batch, amortised over
-	// BatchSaveThreshold ops (default 50–300), which is negligible next
-	// to the per-op bbolt write path.
-	return globalDB.Sync()
+	noteDBMutation(keys...)
+	return err
 }
 
-// StoreFlushNow drains every pending queue entry AND any in-flight async
-// BatchSave goroutine, then issues a final fsync on the bbolt store.
+// StoreFlushNow drains every pending queue entry — first waiting out any
+// batch the background flusher is committing — then issues one explicit
+// fsync on the bbolt store.
 //
 // Call this from shutdown / SIGTERM / cache-reset paths where you need
 // the "everything the Smart group has observed is on disk" guarantee.
-// Unlike FlushQueue(true), which only drains the queue snapshot visible
-// at call time, StoreFlushNow also waits on goroutines spawned by
-// earlier AppendToGlobalQueue calls that may still be committing.
-//
-// Idempotent and safe to call concurrently; overlapping calls simply
-// share the same waitgroup drain + final Sync.
+// Idempotent and safe to call concurrently.
 func (s *Store) StoreFlushNow() error {
 	if s == nil || globalDB == nil {
 		return nil
 	}
 	s.FlushQueue(true)
-	inflightBatches.Wait()
 	return globalDB.Sync()
 }
 
-// GetSubBytesByPath returns all bbolt records matching a key prefix.
+// noteWriteLocked bumps the write generations covering key (a full key or
+// a prefix). Caller holds globalQueueMu for writing.
+func noteWriteLocked(key string) {
+	scanAnyGen++
+	scope, ok := groupScope(key)
+	if !ok {
+		scanEpoch++
+		return
+	}
+	if scanGroupGens == nil {
+		scanGroupGens = make(map[string]uint64)
+	}
+	if _, seen := scanGroupGens[scope]; !seen {
+		// Don't pin the whole key string behind the map entry.
+		scope = strings.Clone(scope)
+	}
+	scanGroupGens[scope]++
+}
+
+// scanStampLocked returns the generation a scan of prefix reads at.
+// Caller holds globalQueueMu.
+func scanStampLocked(prefix string) scanStamp {
+	if scope, ok := groupScope(prefix); ok {
+		return scanStamp{scanEpoch, scanGroupGens[scope]}
+	}
+	return scanStamp{scanEpoch, scanAnyGen}
+}
+
+// noteDBMutation records bbolt writes that bypassed the queue (deletes,
+// direct puts) under each key or prefix: cached scans covering them stop
+// being served and stats indexes covering them are rebuilt on next use.
+func noteDBMutation(prefixes ...string) {
+	if len(prefixes) == 0 {
+		return
+	}
+	globalQueueMu.Lock()
+	for _, p := range prefixes {
+		noteWriteLocked(p)
+	}
+	globalQueueMu.Unlock()
+	seen := make(map[string]struct{}, 1)
+	for _, p := range prefixes {
+		if scope, ok := groupScope(p); ok {
+			p = scope
+		}
+		if _, dup := seen[p]; dup {
+			continue
+		}
+		seen[p] = struct{}{}
+		invalidateStatsIndexes(p)
+	}
+}
+
+// groupScope returns the "smart/<type>/<cfg>/<grp>" head of a key or
+// prefix, or false when it is shallower than a group.
+func groupScope(key string) (string, bool) {
+	if !strings.HasPrefix(key, "smart/") {
+		return "", false
+	}
+	slashes := 0
+	for i := 0; i < len(key); i++ {
+		if key[i] == '/' {
+			slashes++
+			if slashes == 4 {
+				return key[:i], true
+			}
+		}
+	}
+	return key, slashes == 3
+}
+
+// hasScanPrefix reports whether key lies under prefix on a segment
+// boundary: equal to it, or prefix followed by '/'.
+func hasScanPrefix(key, prefix string) bool {
+	if len(key) == len(prefix) {
+		return key == prefix
+	}
+	return len(key) > len(prefix) && key[len(prefix)] == '/' && key[:len(prefix)] == prefix
+}
+
+// scanPrefixShape returns the key type and segment count of a
+// "smart/<type>/..." prefix.
+func scanPrefixShape(prefix string) (keyType string, depth int, ok bool) {
+	if !strings.HasPrefix(prefix, "smart/") {
+		return "", 0, false
+	}
+	keyType = prefix[len("smart/"):]
+	if i := strings.IndexByte(keyType, '/'); i >= 0 {
+		keyType = keyType[:i]
+	}
+	return keyType, strings.Count(prefix, "/") + 1, true
+}
+
+// isLeafKey reports whether a prefix with depth segments is a complete key
+// of its type (the depth FormatOperationKey produces).
+func isLeafKey(keyType string, depth int) bool {
+	switch keyType {
+	case KeyTypeStats:
+		return depth == 6
+	case KeyTypeRanking, KeyTypeManualPin:
+		return depth == 4
+	case KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures, KeyTypeKnownDead, KeyTypeBreaker, KeyTypePinEndorsement:
+		return depth == 5
+	}
+	return false
+}
+
+// queuedLocked returns the pending write for key, preferring the queue
+// over the in-flight batch. Caller holds globalQueueMu.
+func queuedLocked(key string) (queuedOp, bool) {
+	if pos, ok := globalQueueIdx[key]; ok {
+		return globalQueueOps[pos], true
+	}
+	if pos, ok := inflightIdx[key]; ok {
+		return inflightOps[pos], true
+	}
+	return queuedOp{}, false
+}
+
+// GetSubBytesByPath returns all records under a key prefix: queued and
+// in-flight writes overlaid on bbolt — a queued value wins over the
+// stored one and a queued tombstone hides it. Prefixes match whole
+// segments, so group "HK" never picks up "HK-Auto" rows.
 func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 	result := make(map[string][]byte)
+	keyType, depth, ok := scanPrefixShape(prefix)
+	if !ok {
+		return result, nil
+	}
+	exact := isLeafKey(keyType, depth)
 
 	globalCacheParams.mu.RLock()
 	configMaxTargets := globalCacheParams.MaxTargets / 2
 	globalCacheParams.mu.RUnlock()
 
-	pathParts := strings.Split(prefix, "/")
-	if len(pathParts) < 2 || pathParts[0] != "smart" {
-		return result, nil
-	}
-
-	keyType := pathParts[1]
-	config := ""
-	group := ""
-	if len(pathParts) >= 3 {
-		config = pathParts[2]
-	}
-	if len(pathParts) >= 4 {
-		group = pathParts[3]
-	}
-
-	strict := false
-	switch keyType {
-	case KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures:
-		if len(pathParts) == 5 {
-			strict = true
-		}
-	case KeyTypeRanking:
-		if len(pathParts) == 4 {
-			strict = true
-		}
-	case KeyTypeStats:
-		if len(pathParts) == 6 {
-			strict = true
-		}
-	case KeyTypeManualPin:
-		// smart/manual/<cfg>/<grp> — exactly 4 parts
-		if len(pathParts) == 4 {
-			strict = true
-		}
-	case KeyTypeKnownDead, KeyTypeBreaker, KeyTypePinEndorsement:
-		// smart/dead|breaker|pinendor/<cfg>/<grp>/<node> — exactly 5 parts
-		if len(pathParts) == 5 {
-			strict = true
-		}
-	}
-
-	// Tombstones from the in-flight queue MUST be visible to readers —
-	// otherwise hydrate would see a stale bbolt value that a pending
-	// Delete hasn't yet flushed. Collected here and applied at the end.
 	var tombstoned map[string]struct{}
-
-	// Pull from write-queue first (in-flight data takes precedence)
-	for _, op := range getGlobalQueueSnapshot() {
-		if op.Config != config || op.Group != group {
-			continue
+	globalQueueMu.RLock()
+	stamp := scanStampLocked(prefix)
+	if exact {
+		// A pending value or tombstone for an exact key is authoritative;
+		// bbolt is not consulted.
+		if q, found := queuedLocked(prefix); found {
+			globalQueueMu.RUnlock()
+			if !isDeleteOp(q.op.Type) {
+				result[prefix] = q.op.Data
+			}
+			return result, nil
 		}
-		var key string
-		switch keyType {
-		case KeyTypeNode:
-			if op.Type == OpSaveNodeState && op.Node != "" {
-				key = FormatDBKey(KeyTypeNode, op.Config, op.Group, op.Node)
-				result[key] = op.Data
-			}
-		case KeyTypeStats:
-			if op.Type == OpSaveStats && op.Target != "" && op.Node != "" {
-				if len(pathParts) >= 5 && pathParts[4] != op.Target {
+	} else {
+		// In-flight first, so newer queued writes override it.
+		for _, ops := range [2][]queuedOp{inflightOps, globalQueueOps} {
+			for i := range ops {
+				q := &ops[i]
+				if !hasScanPrefix(q.key, prefix) {
 					continue
 				}
-				key = FormatDBKey(KeyTypeStats, op.Config, op.Group, op.Target, op.Node)
-				result[key] = op.Data
-			}
-		case KeyTypePrefetch:
-			if op.Type == OpSavePrefetch && op.Target != "" {
-				if len(pathParts) >= 5 && pathParts[4] != op.Target {
-					continue
+				if isDeleteOp(q.op.Type) {
+					delete(result, q.key)
+					if tombstoned == nil {
+						tombstoned = make(map[string]struct{})
+					}
+					tombstoned[q.key] = struct{}{}
+				} else {
+					result[q.key] = q.op.Data
+					delete(tombstoned, q.key)
 				}
-				key = FormatDBKey(KeyTypePrefetch, op.Config, op.Group, op.Target)
-				result[key] = op.Data
-			}
-		case KeyTypeRanking:
-			if op.Type == OpSaveRanking {
-				key = FormatDBKey(KeyTypeRanking, op.Config, op.Group)
-				result[key] = op.Data
-			}
-		case KeyTypeHostFailures:
-			if op.Type == OpSaveHostFailures && op.Target != "" {
-				if len(pathParts) >= 5 && pathParts[4] != op.Target {
-					continue
-				}
-				key = FormatDBKey(KeyTypeHostFailures, op.Config, op.Group, op.Target)
-				result[key] = op.Data
-			}
-		case KeyTypeManualPin:
-			switch op.Type {
-			case OpSaveManualPin:
-				key = FormatDBKey(KeyTypeManualPin, op.Config, op.Group)
-				result[key] = op.Data
-				delete(tombstoned, key)
-			case OpDeleteManualPin:
-				key = FormatDBKey(KeyTypeManualPin, op.Config, op.Group)
-				delete(result, key)
-				if tombstoned == nil {
-					tombstoned = make(map[string]struct{})
-				}
-				tombstoned[key] = struct{}{}
-			}
-		case KeyTypeKnownDead:
-			if op.Node == "" {
-				continue
-			}
-			if len(pathParts) >= 5 && pathParts[4] != op.Node {
-				continue
-			}
-			switch op.Type {
-			case OpSaveKnownDead:
-				key = FormatDBKey(KeyTypeKnownDead, op.Config, op.Group, op.Node)
-				result[key] = op.Data
-				delete(tombstoned, key)
-			case OpDeleteKnownDead:
-				key = FormatDBKey(KeyTypeKnownDead, op.Config, op.Group, op.Node)
-				delete(result, key)
-				if tombstoned == nil {
-					tombstoned = make(map[string]struct{})
-				}
-				tombstoned[key] = struct{}{}
-			}
-		case KeyTypeBreaker:
-			if op.Node == "" {
-				continue
-			}
-			if len(pathParts) >= 5 && pathParts[4] != op.Node {
-				continue
-			}
-			switch op.Type {
-			case OpSaveBreaker:
-				key = FormatDBKey(KeyTypeBreaker, op.Config, op.Group, op.Node)
-				result[key] = op.Data
-				delete(tombstoned, key)
-			case OpDeleteBreaker:
-				key = FormatDBKey(KeyTypeBreaker, op.Config, op.Group, op.Node)
-				delete(result, key)
-				if tombstoned == nil {
-					tombstoned = make(map[string]struct{})
-				}
-				tombstoned[key] = struct{}{}
-			}
-		case KeyTypePinEndorsement:
-			if op.Node == "" {
-				continue
-			}
-			if len(pathParts) >= 5 && pathParts[4] != op.Node {
-				continue
-			}
-			switch op.Type {
-			case OpSavePinEndorsement:
-				key = FormatDBKey(KeyTypePinEndorsement, op.Config, op.Group, op.Node)
-				result[key] = op.Data
-				delete(tombstoned, key)
-			case OpDeletePinEndorsement:
-				key = FormatDBKey(KeyTypePinEndorsement, op.Config, op.Group, op.Node)
-				delete(result, key)
-				if tombstoned == nil {
-					tombstoned = make(map[string]struct{})
-				}
-				tombstoned[key] = struct{}{}
 			}
 		}
 	}
-
-	if strict && len(result) > 0 {
-		return result, nil
-	}
+	globalQueueMu.RUnlock()
 
 	maxResults := -1
 	if configMaxTargets > 1 {
 		maxResults = configMaxTargets
 	}
-
-	if cached, ok := dbResultCache.Get(prefix); ok && maxResults > 0 {
-		for k, v := range cached {
-			if _, exists := result[k]; !exists {
-				if _, gone := tombstoned[k]; gone {
-					continue
-				}
-				result[k] = v
-			}
-		}
-	} else {
-		dbResult, err := s.DBViewPrefixScan(prefix, maxResults, strict)
-		if err != nil {
-			return result, nil
-		}
-		if maxResults > 0 && !(keyType == KeyTypeStats && strict) && len(tombstoned) == 0 {
-			// Don't cache when tombstones are in flight — the cached copy
-			// would include values that are about to be deleted.
-			dbResultCache.Set(prefix, dbResult)
-		}
-		for k, v := range dbResult {
+	// Stats scans stay uncached: the decoded stats index serves every hot
+	// stats read, a raw group scan would crowd hundreds of small entries
+	// out of the budget, and exact stats reads (record hydration) are
+	// one-offs.
+	cacheable := maxResults > 0 && keyType != KeyTypeStats
+	merge := func(rows map[string][]byte) {
+		for k, v := range rows {
 			if _, gone := tombstoned[k]; gone {
 				continue
 			}
@@ -691,7 +667,20 @@ func (s *Store) GetSubBytesByPath(prefix string) (map[string][]byte, error) {
 			}
 		}
 	}
-
+	if cacheable {
+		if cached, hit := dbResultCache.Get(prefix); hit && cached.stamp == stamp {
+			merge(cached.rows)
+			return result, nil
+		}
+	}
+	dbResult, err := s.DBViewPrefixScan(prefix, maxResults, true)
+	if err != nil {
+		return result, nil
+	}
+	if cacheable {
+		dbResultCache.Set(prefix, dbScan{stamp: stamp, rows: dbResult})
+	}
+	merge(dbResult)
 	return result, nil
 }
 
@@ -748,64 +737,132 @@ func (s *Store) DBViewPrefixScan(prefix string, maxResults int, strict bool) (ma
 	return result, nil
 }
 
-// DBBatchDeletePrefix deletes all keys matching a prefix.
+// deleteChunkSize bounds the keys one delete transaction removes, so a
+// huge wipe never builds a single giant bbolt transaction.
+const deleteChunkSize = 8192
+
+// DBBatchDeletePrefix deletes all keys matching a prefix (strict: whole
+// segments only, so "node-1" never takes "node-10" with it).
 func (s *Store) DBBatchDeletePrefix(prefix string, strict bool) error {
-	var keysToDelete [][]byte
+	_, err := deletePrefix(prefix, strict)
+	return err
+}
 
-	err := globalDB.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(bucketSmartStats)
-		if bucket == nil {
-			return nil
-		}
-		cursor := bucket.Cursor()
-		prefixBytes := []byte(prefix)
-		for k, _ := cursor.Seek(prefixBytes); k != nil && bytes.HasPrefix(k, prefixBytes); k, _ = cursor.Next() {
-			if strict && len(k) > len(prefixBytes) && k[len(prefixBytes)] != '/' {
-				continue
-			}
-			keyCopy := make([]byte, len(k))
-			copy(keyCopy, k)
-			keysToDelete = append(keysToDelete, keyCopy)
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-
-	const batchSize = 200
-	for i := 0; i < len(keysToDelete); i += batchSize {
-		end := i + batchSize
-		if end > len(keysToDelete) {
-			end = len(keysToDelete)
-		}
-		batch := keysToDelete[i:end]
-		if err := globalDB.Batch(func(tx *bbolt.Tx) error {
+// deletePrefix deletes every key under prefix and returns how many it
+// removed. Keys are collected and deleted inside the same write
+// transaction (keys only — values are never copied), chunked by
+// deleteChunkSize.
+func deletePrefix(prefix string, strict bool) (int, error) {
+	head := []byte(prefix)
+	total := 0
+	var err error
+	for {
+		var keys [][]byte
+		more := false
+		err = globalDB.Update(func(tx *bbolt.Tx) error {
 			bucket := tx.Bucket(bucketSmartStats)
 			if bucket == nil {
 				return nil
 			}
-			for _, k := range batch {
-				if err := bucket.Delete(k); err != nil {
-					return err
+			c := bucket.Cursor()
+			for k, _ := c.Seek(head); k != nil && bytes.HasPrefix(k, head); k, _ = c.Next() {
+				if strict && len(k) > len(head) && k[len(head)] != '/' {
+					continue
 				}
+				if len(keys) == deleteChunkSize {
+					more = true
+					break
+				}
+				keys = append(keys, bytes.Clone(k))
 			}
-			return nil
-		}); err != nil {
+			return deleteKeysTx(bucket, keys)
+		})
+		if err != nil {
+			break
+		}
+		total += len(keys)
+		if !more {
+			break
+		}
+	}
+	if total > 0 {
+		if strict {
+			noteDBMutation(prefix)
+		} else {
+			// A non-strict prefix can cut across group scopes.
+			noteDBMutation(FormatDBKey())
+		}
+	}
+	return total, err
+}
+
+// deleteKeys deletes exact keys, deleteChunkSize per transaction.
+func deleteKeys(keys [][]byte) error {
+	for len(keys) > 0 {
+		chunk := keys[:min(len(keys), deleteChunkSize)]
+		keys = keys[len(chunk):]
+		err := globalDB.Update(func(tx *bbolt.Tx) error {
+			bucket := tx.Bucket(bucketSmartStats)
+			if bucket == nil {
+				return nil
+			}
+			return deleteKeysTx(bucket, chunk)
+		})
+		if err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func deleteKeysTx(bucket *bbolt.Bucket, keys [][]byte) error {
+	for _, k := range keys {
+		if err := bucket.Delete(k); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// walkKeys calls fn for every bbolt key under prefix + "/" (keys only).
+func walkKeys(prefix string, fn func(k []byte)) error {
+	head := []byte(prefix + "/")
+	return globalDB.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(bucketSmartStats)
+		if bucket == nil {
+			return nil
+		}
+		c := bucket.Cursor()
+		for k, _ := c.Seek(head); k != nil && bytes.HasPrefix(k, head); k, _ = c.Next() {
+			fn(k)
+		}
+		return nil
+	})
+}
+
+// queuedKeys calls fn for every queued or in-flight key under prefix + "/".
+func queuedKeys(prefix string, fn func(key string)) {
+	globalQueueMu.RLock()
+	defer globalQueueMu.RUnlock()
+	for _, ops := range [2][]queuedOp{inflightOps, globalQueueOps} {
+		for i := range ops {
+			if len(ops[i].key) > len(prefix) && hasScanPrefix(ops[i].key, prefix) {
+				fn(ops[i].key)
+			}
+		}
+	}
+}
+
 func (s *Store) DBBatchPutItem(key string, value []byte) error {
-	return globalDB.Batch(func(tx *bbolt.Tx) error {
+	err := globalDB.Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists(bucketSmartStats)
 		if err != nil {
 			return err
 		}
 		return bucket.Put([]byte(key), value)
 	})
+	noteDBMutation(key)
+	return err
 }
 
 // IterateAtomicRecords walks every cached AtomicStatsRecord under the
@@ -818,62 +875,31 @@ func (s *Store) DBBatchPutItem(key string, value []byte) error {
 // Order is unspecified. Returning false from the callback stops the
 // walk early.
 func (s *Store) IterateAtomicRecords(group, config string, cb func(target, node string, rec *AtomicStatsRecord) bool) {
-	if recordCache == nil || cb == nil {
+	if cb == nil {
 		return
 	}
-	prefix := FormatDBKey(KeyTypeStats, config, group)
-	recordCache.keysIndex.Range(func(k string, _ struct{}) bool {
-		if !strings.HasPrefix(k, prefix) {
-			return true
+	for _, rec := range groupRecords(group, config) {
+		if !cb(rec.target, rec.node, rec) {
+			return
 		}
-		// Key shape: smart/stats/<config>/<group>/<target>/<node>.
-		// User-supplied parts (target / node) are percent-escaped by
-		// FormatDBKey so a `/` inside an outbound tag doesn't add an
-		// extra segment — must unescape here to recover the real
-		// values for the callback contract.
-		parts := strings.Split(k, "/")
-		if len(parts) < 6 {
-			return true
-		}
-		target := UnescapeKeyPart(parts[len(parts)-2])
-		node := UnescapeKeyPart(parts[len(parts)-1])
-		rec, ok := recordCache.Get(k)
-		if !ok || rec == nil {
-			return true
-		}
-		return cb(target, node, rec)
-	})
+	}
 }
 
-// LookupAnyAtomicRecord returns the first cached AtomicStatsRecord for
-// (group, config, proxy) regardless of which target it belongs to.
+// LookupAnyAtomicRecord returns the most recently created or used cached
+// AtomicStatsRecord for (group, config, proxy), regardless of target.
 //
 // Used by node-level signal queries (e.g. ShortRTT for the
 // fastest-recent algorithm) where the caller wants the EWMA reading on
 // a node tag without knowing which target most recently dialled it.
-// Walks the keys index of the recordCache rather than reconstructing
-// from bbolt — saves a hit on the (already in-memory) data path.
+// O(1) through the per-group record index.
 //
 // Returns nil when no cached record exists. Callers MUST treat nil as
 // "no signal yet" rather than "node is bad".
 func (s *Store) LookupAnyAtomicRecord(group, config, proxy string) *AtomicStatsRecord {
-	if recordCache == nil || proxy == "" {
+	if proxy == "" {
 		return nil
 	}
-	prefix := FormatDBKey(KeyTypeStats, config, group)
-	suffix := "/" + proxy
-	var found *AtomicStatsRecord
-	recordCache.keysIndex.Range(func(k string, _ struct{}) bool {
-		if !strings.HasPrefix(k, prefix) || !strings.HasSuffix(k, suffix) {
-			return true // continue
-		}
-		if r, ok := recordCache.Get(k); ok {
-			found = r
-			return false // stop iteration
-		}
-		return true
-	})
-	return found
+	return latestRecord(group, config, proxy)
 }
 
 // LookupAtomicRecord returns the in-memory AtomicStatsRecord for the
@@ -897,10 +923,12 @@ func (s *Store) LookupAtomicRecord(cacheKey string) *AtomicStatsRecord {
 // seeding it from bbolt if available.
 func (s *Store) GetOrCreateAtomicRecord(cacheKey, group, config, target, proxy string) *AtomicStatsRecord {
 	if r, ok := recordCache.Get(cacheKey); ok {
+		touchRecord(r)
 		return r
 	}
 
 	record := NewAtomicStatsRecord()
+	record.config, record.group, record.target, record.node = config, group, target, proxy
 
 	existingData, err := s.GetStatsForTarget(group, config, target, proxy)
 	if err == nil {
@@ -924,13 +952,13 @@ func (s *Store) GetOrCreateAtomicRecord(cacheKey, group, config, target, proxy s
 					}
 					record.weightsMu.Unlock()
 				}
-				if len(sr.RTTDigest) > 0 {
-					record.loadRTTDigestBytes(sr.RTTDigest)
-				}
 			}
 		}
 	}
 
+	// Index before offering it to the cache: an immediate rejection or
+	// eviction then finds it in the index and removes it again.
+	indexRecord(record)
 	recordCache.Set(cacheKey, record)
 	return record
 }
@@ -956,13 +984,15 @@ func (s *Store) GetStatsForTarget(group, config, target, proxy string) (map[stri
 		}
 	} else {
 		for fullPath, data := range rawResult {
-			parts := strings.Split(fullPath, "/")
-			if len(parts) > 0 {
-				result[parts[len(parts)-1]] = data
-			}
+			result[lastKeyPart(fullPath)] = data
 		}
 	}
 	return result, nil
+}
+
+// lastKeyPart returns the unescaped final segment of a key.
+func lastKeyPart(key string) string {
+	return UnescapeKeyPart(key[strings.LastIndexByte(key, '/')+1:])
 }
 
 // GetAllStats returns map[target]map[nodeName]rawJSON for a group.
@@ -1004,10 +1034,7 @@ func (s *Store) GetNodeStates(group, config string) (map[string][]byte, error) {
 
 	result := make(map[string][]byte, len(rawResult))
 	for fullPath, data := range rawResult {
-		parts := strings.Split(fullPath, "/")
-		if len(parts) > 0 {
-			result[parts[len(parts)-1]] = data
-		}
+		result[lastKeyPart(fullPath)] = data
 	}
 	return result, nil
 }
@@ -1039,107 +1066,37 @@ func (s *Store) GetBlockedNodes(group, config string) (map[string]bool, error) {
 	return blocked, nil
 }
 
-// ClearBlockedNodesCache removes cached blocked-node entries for a group.
+// ClearBlockedNodesCache removes the cached blocked-node entry for a group.
 func ClearBlockedNodesCache(group, config string) {
 	if blockedNodesCache == nil {
 		return
 	}
-	prefix := FormatDBKey(config, group)
-	blockedNodesCache.RemoveByPrefix(prefix)
+	blockedNodesCache.Delete(FormatDBKey(config, group))
 }
 
-// GetBestProxyForTarget returns nodes sorted by weight for a target (and optional ASN).
+// GetBestProxyForTarget returns nodes sorted by weight for a target (and
+// optional ASN). Served from the group's decoded stats index, so a call
+// costs the target's rows (or the ASN's candidates), not a decode of the
+// whole group — it runs on the dial path (tier-3 selection) as well as
+// once per prefetched target.
 func (s *Store) GetBestProxyForTarget(group, config, target, asnNumber string, isUDP bool) ([]string, []float64, error) {
 	if target == "" {
 		return nil, nil, errors.New("empty target")
 	}
-
-	now := time.Now().Unix()
-	getDecay := func(lastUsed int64) float64 {
-		return GetTimeDecay(lastUsed, now, 0.4)
-	}
-
-	allStatsMap, err := s.GetAllStats(group, config)
+	var (
+		nodes   []string
+		weights []float64
+	)
+	err := withStatsIndex(group, config, func(ix *statsIndex) {
+		nodes, weights = ix.bestFor(target, asnNumber, isUDP, time.Now().Unix())
+	})
 	if err != nil {
 		return nil, nil, err
 	}
-
-	weightType := WeightTypeTCP
-	if isUDP {
-		weightType = WeightTypeUDP
-	}
-
-	nodesWithWeight := make(map[string]float64)
-
-	if asnNumber != "" && !CdnASNs[asnNumber] {
-		asnWeightType := WeightTypeTCPASN + ":" + asnNumber
-		if isUDP {
-			asnWeightType = WeightTypeUDPASN + ":" + asnNumber
-		}
-
-		nodeWeights := make(map[string][]float64)
-		for _, mapStats := range allStatsMap {
-			for nodeName, data := range mapStats {
-				var record StatsRecord
-				if UnmarshalStatsRecord(data, &record) != nil || record.Weights == nil {
-					continue
-				}
-				if weight, ok := record.Weights[asnWeightType]; ok && weight > 0 {
-					decay := getDecay(record.LastUsed)
-					nodeWeights[nodeName] = append(nodeWeights[nodeName], weight*decay)
-				}
-			}
-		}
-		for nodeName, weights := range nodeWeights {
-			sort.Float64s(weights)
-			if weights[0] < AllowedWeight {
-				nodesWithWeight[nodeName] = weights[0]
-			} else {
-				nodesWithWeight[nodeName] = weights[len(weights)-1]
-			}
-		}
-	} else {
-		var mapStats map[string][]byte
-		if stats, ok := allStatsMap[target]; ok {
-			mapStats = stats
-		} else if stats, err := s.GetStatsForTarget(group, config, target, ""); err == nil {
-			mapStats = stats
-		}
-
-		for nodeName, data := range mapStats {
-			var record StatsRecord
-			if UnmarshalStatsRecord(data, &record) != nil || record.Weights == nil {
-				continue
-			}
-			if weight := record.Weights[weightType]; weight > 0 {
-				nodesWithWeight[nodeName] = weight * getDecay(record.LastUsed)
-			}
-		}
-	}
-
-	if len(nodesWithWeight) == 0 {
+	if len(nodes) == 0 {
 		return nil, nil, errors.New("no best node with enough weight")
 	}
-
-	nodeList := make([]NodeWithWeight, 0, len(nodesWithWeight))
-	for node, weight := range nodesWithWeight {
-		nodeList = append(nodeList, NodeWithWeight{node, weight})
-	}
-
-	sort.Slice(nodeList, func(i, j int) bool {
-		if nodeList[i].Weight != nodeList[j].Weight {
-			return nodeList[i].Weight > nodeList[j].Weight
-		}
-		return nodeList[i].Node < nodeList[j].Node
-	})
-
-	bestNodes := make([]string, len(nodeList))
-	bestWeights := make([]float64, len(nodeList))
-	for i, nw := range nodeList {
-		bestNodes[i] = nw.Node
-		bestWeights[i] = nw.Weight
-	}
-	return bestNodes, bestWeights, nil
+	return nodes, weights, nil
 }
 
 // StorePrefetchResult persists a prefetch result for a target (and optionally ASN).
@@ -1383,12 +1340,13 @@ func (s *Store) GetUnwrapResult(group, config, target, asnNumber string, isUDP b
 // every target on its next dial instead of riding the stale pin-era cache.
 // The unwrap LRU is process-global (to share entries across groups that map
 // the same target), so we scope the clear by FormatDBKey's group prefix
-// rather than the nuclear Clear() that would evict other groups too.
+// rather than the nuclear Clear() that would evict other groups too. The
+// trailing separator keeps "HK" from clearing "HK-Auto".
 func (s *Store) ClearUnwrapByGroup(group, config string) {
 	if group == "" {
 		return
 	}
-	unwrapCache.RemoveByPrefix(FormatDBKey(config, group))
+	unwrapCache.RemoveByPrefix(FormatDBKey(config, group) + "/")
 }
 
 // DeleteUnwrapResult removes a cached unwrap entry.
@@ -1573,10 +1531,6 @@ func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string
 	if len(allTags) == 0 {
 		return nil
 	}
-	allStats, err := s.GetAllStats(group, config)
-	if err != nil || len(allStats) == 0 {
-		return nil
-	}
 
 	// Per-node accumulators. Switched from SUM to AVG-per-target so the
 	// output Weight matches the internal CalculateWeight scale (typically
@@ -1597,32 +1551,20 @@ func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string
 		wantSet[t] = struct{}{}
 	}
 	accs := make(map[string]*acc, len(allTags))
-	for _, nodeStats := range allStats {
-		for nodeName, data := range nodeStats {
+	err := withStatsIndex(group, config, func(ix *statsIndex) {
+		ix.forEachRow(func(_, nodeName string, r *statsRow) {
 			if _, want := wantSet[nodeName]; !want {
-				continue
-			}
-			var record StatsRecord
-			if UnmarshalStatsRecord(data, &record) != nil {
-				continue
+				return
 			}
 			// Real-data gate: count this (node, target) pair only when the
 			// node has actually been dialled to that target. Pure tombstones
 			// or weight-only rows would otherwise inflate TargetCount with
 			// fake coverage. SampleCount uses the same gate so the two
 			// confidence numbers move together.
-			samples := int(record.Success + record.Failure)
+			samples := int(r.samples)
 			if samples <= 0 {
-				continue
+				return
 			}
-			tcp := 0.0
-			udp := 0.0
-			if record.Weights != nil {
-				tcp = record.Weights[WeightTypeTCP]
-				udp = record.Weights[WeightTypeUDP]
-			}
-			w := tcp + udp
-
 			a := accs[nodeName]
 			if a == nil {
 				a = &acc{}
@@ -1635,14 +1577,13 @@ func (s *Store) GetLiveNodeRanking(group, config string, isAlive func(tag string
 			// than silently filtering out.
 			a.targetCount++
 			a.sampleCount += samples
-			a.weightSum += w
-			if record.LastUsed > a.lastUsed {
-				a.lastUsed = record.LastUsed
+			a.weightSum += r.tcp + r.udp
+			if r.lastUsed > a.lastUsed {
+				a.lastUsed = r.lastUsed
 			}
-		}
-	}
-
-	if len(accs) == 0 {
+		})
+	})
+	if err != nil || len(accs) == 0 {
 		return nil
 	}
 
@@ -1867,21 +1808,14 @@ func (s *Store) EnrichRankingCounts(group, config string, ranking []NodeRank) bo
 		return true
 	})
 
-	// Source 2: bbolt — covers entries evicted from recordCache.
-	if rawStats, err := s.GetAllStats(group, config); err == nil {
-		for target, nodeStats := range rawStats {
-			for nodeName, data := range nodeStats {
-				if _, want := wantSet[nodeName]; !want {
-					continue
-				}
-				var rec StatsRecord
-				if UnmarshalStatsRecord(data, &rec) != nil {
-					continue
-				}
-				addPair(nodeName, target, int(rec.Success+rec.Failure))
+	// Source 2: persisted stats — covers entries evicted from recordCache.
+	_ = withStatsIndex(group, config, func(ix *statsIndex) {
+		ix.forEachRow(func(target, nodeName string, r *statsRow) {
+			if _, want := wantSet[nodeName]; want {
+				addPair(nodeName, target, int(r.samples))
 			}
-		}
-	}
+		})
+	})
 
 	changed := false
 	for i := range ranking {
@@ -1990,24 +1924,15 @@ func (s *Store) GetNodeWeightRanking(group, config, testURL string, isAlive func
 	// all agree on the same real-data semantic.
 	targetCoverage := make(map[string]int, len(accs))
 	sampleCounts := make(map[string]int, len(accs))
-	if rawStats, statsErr := s.GetAllStats(group, config); statsErr == nil {
-		for _, nodeStats := range rawStats {
-			for nodeName, data := range nodeStats {
-				if _, want := accs[nodeName]; !want {
-					continue
-				}
-				var rec StatsRecord
-				if UnmarshalStatsRecord(data, &rec) != nil {
-					continue
-				}
-				if rec.Success+rec.Failure <= 0 {
-					continue
-				}
-				targetCoverage[nodeName]++
-				sampleCounts[nodeName] += int(rec.Success + rec.Failure)
+	_ = withStatsIndex(group, config, func(ix *statsIndex) {
+		ix.forEachRow(func(_, nodeName string, r *statsRow) {
+			if _, want := accs[nodeName]; !want || r.samples <= 0 {
+				return
 			}
-		}
-	}
+			targetCoverage[nodeName]++
+			sampleCounts[nodeName] += int(r.samples)
+		})
+	})
 	// Fall back to the prefetch-derived count only when stats are
 	// unavailable — better a partial number than an empty field.
 	for name, cov := range targetCounts {
@@ -2061,126 +1986,19 @@ func (s *Store) StoreNodeWeightRanking(group, config string, ranking []NodeRank)
 }
 
 // GetActiveTargets returns the most recently used target/ASN/UDP combinations.
-type targetMinHeap []ActiveTarget
-
-func (h targetMinHeap) Len() int            { return len(h) }
-func (h targetMinHeap) Less(i, j int) bool  { return h[i].LastUsed < h[j].LastUsed }
-func (h targetMinHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *targetMinHeap) Push(x interface{}) { *h = append(*h, x.(ActiveTarget)) }
-func (h *targetMinHeap) Pop() interface{} {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
-}
-
 func (s *Store) GetActiveTargets(group, config string, limit int) []ActiveTarget {
-	allStats, err := s.GetAllStats(group, config)
-	if err != nil || len(allStats) == 0 {
+	var result []ActiveTarget
+	if err := withStatsIndex(group, config, func(ix *statsIndex) {
+		result = ix.activeTargets(limit)
+	}); err != nil {
 		return nil
-	}
-
-	h := &targetMinHeap{}
-	heap.Init(h)
-	seen := make(map[string]int64)
-
-	for target, nodeStats := range allStats {
-		activeCombinations := make(map[string]int64)
-		hasASN := false
-
-		for _, data := range nodeStats {
-			var record StatsRecord
-			if UnmarshalStatsRecord(data, &record) != nil || record.Weights == nil {
-				continue
-			}
-
-			if w, ok := record.Weights[WeightTypeTCP]; ok && w > 0 {
-				key := ":false"
-				if last, exists := activeCombinations[key]; !exists || record.LastUsed > last {
-					activeCombinations[key] = record.LastUsed
-				}
-			}
-			if w, ok := record.Weights[WeightTypeUDP]; ok && w > 0 {
-				key := ":true"
-				if last, exists := activeCombinations[key]; !exists || record.LastUsed > last {
-					activeCombinations[key] = record.LastUsed
-				}
-			}
-
-			for key, weight := range record.Weights {
-				// Weight keys are "tcp_asn:13335" or "udp_asn:13335" — exactly one
-				// ':' separator between the prefix and the ASN number. Previous
-				// code used SplitN(..., 3) with len(parts) >= 3 which is
-				// unreachable (the string produces 2 parts, not 3). The ASN
-				// therefore never propagated to activeCombinations, so
-				// RunPrefetch + GetNodeWeightRanking never received any ASN
-				// data — breaking the /weights Clash API endpoints entirely
-				// for users with use_asn: true.
-				//
-				// Match mihomo exactly: strings.Split (no N cap) with parts[1].
-				if strings.HasPrefix(key, WeightTypeTCPASN) && weight > 0 {
-					parts := strings.Split(key, ":")
-					if len(parts) >= 2 {
-						asn := parts[1]
-						ck := asn + ":false"
-						if last, exists := activeCombinations[ck]; !exists || record.LastUsed > last {
-							activeCombinations[ck] = record.LastUsed
-							hasASN = true
-						}
-					}
-				} else if strings.HasPrefix(key, WeightTypeUDPASN) && weight > 0 {
-					parts := strings.Split(key, ":")
-					if len(parts) >= 2 {
-						asn := parts[1]
-						ck := asn + ":true"
-						if last, exists := activeCombinations[ck]; !exists || record.LastUsed > last {
-							activeCombinations[ck] = record.LastUsed
-							hasASN = true
-						}
-					}
-				}
-			}
-		}
-
-		for combKey, lastUsed := range activeCombinations {
-			parts := strings.SplitN(combKey, ":", 2)
-			asn := parts[0]
-			isUDP := len(parts) >= 2 && parts[1] == "true"
-
-			if asn == "" && hasASN {
-				continue
-			}
-
-			recordKey := fmt.Sprintf("%s:%s:%t", target, asn, isUDP)
-			if existingLast, exists := seen[recordKey]; !exists || lastUsed > existingLast {
-				seen[recordKey] = lastUsed
-				heap.Push(h, ActiveTarget{
-					Target:   target,
-					ASN:      asn,
-					IsUDP:    isUDP,
-					LastUsed: lastUsed,
-				})
-				if h.Len() > limit {
-					heap.Pop(h)
-				}
-			}
-		}
-	}
-
-	sorted := make([]ActiveTarget, 0, h.Len())
-	for h.Len() > 0 {
-		sorted = append(sorted, heap.Pop(h).(ActiveTarget))
-	}
-
-	result := make([]ActiveTarget, 0, len(sorted))
-	for i := len(sorted) - 1; i >= 0; i-- {
-		result = append(result, sorted[i])
 	}
 	return result
 }
 
 // RunPrefetch pre-calculates best nodes for frequently accessed targets.
+// Every target is ranked from one decoded stats index in a single pass,
+// instead of re-reading and re-decoding the whole group per target.
 func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string) int {
 	blockedNodes, _ := s.GetBlockedNodes(group, config)
 
@@ -2199,8 +2017,6 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string) in
 	prefetchLimit := globalCacheParams.MaxTargets / 2
 	globalCacheParams.mu.RUnlock()
 
-	activeTargets := s.GetActiveTargets(group, config, prefetchLimit)
-
 	type asnKey struct {
 		asn   string
 		isUDP bool
@@ -2209,7 +2025,6 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string) in
 		nodes   []string
 		weights []float64
 	}
-	asnCache := make(map[asnKey]asnVal)
 
 	type prefetchItem struct {
 		target      string
@@ -2220,49 +2035,41 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string) in
 	}
 
 	var items []prefetchItem
-	for _, active := range activeTargets {
-		var (
-			bestNodes   []string
-			bestWeights []float64
-			err         error
-		)
-
-		if active.ASN != "" && !CdnASNs[active.ASN] {
+	err := withStatsIndex(group, config, func(ix *statsIndex) {
+		now := time.Now().Unix()
+		// ASN rankings span every target, so each (ASN, UDP) pair is
+		// ranked and filtered once per pass.
+		asnCache := make(map[asnKey]asnVal)
+		for _, active := range ix.activeTargets(prefetchLimit) {
+			isASN := active.ASN != "" && !CdnASNs[active.ASN]
 			k := asnKey{active.ASN, active.IsUDP}
-			if v, ok := asnCache[k]; ok {
-				bestNodes = v.nodes
-				bestWeights = v.weights
-			} else {
-				bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
-				asnCache[k] = asnVal{bestNodes, bestWeights}
+			v, cached := asnCache[k]
+			if !isASN || !cached {
+				bestNodes, bestWeights := ix.bestFor(active.Target, active.ASN, active.IsUDP, now)
+				v = asnVal{make([]string, 0, len(bestNodes)), make([]float64, 0, len(bestWeights))}
+				for i, node := range bestNodes {
+					if _, exists := availableProxyMap[node]; exists {
+						v.nodes = append(v.nodes, node)
+						v.weights = append(v.weights, bestWeights[i])
+					}
+				}
+				if isASN {
+					asnCache[k] = v
+				}
 			}
-		} else {
-			bestNodes, bestWeights, err = s.GetBestProxyForTarget(group, config, active.Target, active.ASN, active.IsUDP)
-		}
-
-		if err != nil || len(bestNodes) == 0 {
-			continue
-		}
-
-		nodes := make([]string, 0, len(bestNodes))
-		weights := make([]float64, 0, len(bestWeights))
-		for i, node := range bestNodes {
-			if _, exists := availableProxyMap[node]; exists {
-				nodes = append(nodes, node)
-				weights = append(weights, bestWeights[i])
+			if len(v.nodes) > 0 {
+				items = append(items, prefetchItem{active.Target, active.ASN, active.IsUDP, v.nodes, v.weights})
 			}
 		}
-		if len(nodes) > 0 {
-			items = append(items, prefetchItem{active.Target, active.ASN, active.IsUDP, nodes, weights})
-		}
+	})
+	if err != nil {
+		return 0
 	}
 
-	asnCache = make(map[asnKey]asnVal)
+	asnCache := make(map[asnKey]asnVal)
 	prefetchCount := 0
 
 	for _, item := range items {
-		oldNodes, oldWeights := s.GetPrefetchResult(group, config, item.target, item.asnNumber, item.isUDP)
-
 		var sortedNodes []string
 		var sortedWeights []float64
 		var needUpdate bool
@@ -2278,6 +2085,9 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string) in
 		}
 
 		if !cacheHit {
+			// The stored result only matters when merging; an ASN cache
+			// hit reuses this pass's ranking without reading it back.
+			oldNodes, oldWeights := s.GetPrefetchResult(group, config, item.target, item.asnNumber, item.isUDP)
 			if len(oldNodes) == 0 {
 				needUpdate = true
 				sortedNodes = item.bestNodes
@@ -2336,12 +2146,18 @@ func (s *Store) RunPrefetch(group, config string, proxyMap map[string]string) in
 	return prefetchCount
 }
 
-// RemoveNodesData cleans up stats, prefetch, ranking, and node-state entries for removed nodes.
+// RemoveNodesData cleans up stats, prefetch, ranking, and node-state entries
+// for removed nodes in a single bbolt transaction. Stats rows are found by
+// key alone; only prefetch and ranking values (which list nodes) are read.
 func (s *Store) RemoveNodesData(group, config string, nodes []string) error {
 	if len(nodes) == 0 {
 		return nil
 	}
 
+	// Hold off the flusher so an in-flight batch can't re-add rows for
+	// these nodes after they are deleted.
+	flushMu.Lock()
+	defer flushMu.Unlock()
 	removeNodesFromQueue(group, config, nodes)
 
 	nodeSet := make(map[string]struct{}, len(nodes))
@@ -2349,80 +2165,86 @@ func (s *Store) RemoveNodesData(group, config string, nodes []string) error {
 		nodeSet[n] = struct{}{}
 	}
 
-	var firstErr error
+	statsScope := FormatDBKey(KeyTypeStats, config, group)
+	prefetchScope := FormatDBKey(KeyTypePrefetch, config, group)
+	rankingKey := FormatDBKey(KeyTypeRanking, config, group)
+	nodeScope := FormatDBKey(KeyTypeNode, config, group)
 
-	statsPrefix := FormatDBKey(KeyTypeStats, config, group)
-	statsResults, err := s.DBViewPrefixScan(statsPrefix, -1, false)
-	if err != nil {
-		return err
-	}
-	for path := range statsResults {
-		parts := strings.Split(path, "/")
-		if len(parts) >= 6 {
-			node := parts[len(parts)-1]
-			if _, ok := nodeSet[node]; ok {
-				if delErr := s.DBBatchDeletePrefix(path, true); delErr != nil && firstErr == nil {
-					firstErr = delErr
+	err := globalDB.Update(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(bucketSmartStats)
+		if bucket == nil {
+			return nil
+		}
+		var (
+			deletes [][]byte
+			puts    []struct{ key, value []byte }
+		)
+		c := bucket.Cursor()
+
+		statsHead := []byte(statsScope + "/")
+		for k, _ := c.Seek(statsHead); k != nil && bytes.HasPrefix(k, statsHead); k, _ = c.Next() {
+			rest := k[len(statsHead):]
+			if i := bytes.LastIndexByte(rest, '/'); i >= 0 {
+				if _, ok := nodeSet[UnescapeKeyPart(string(rest[i+1:]))]; ok {
+					deletes = append(deletes, bytes.Clone(k))
 				}
 			}
 		}
-	}
 
-	prefetchPrefix := FormatDBKey(KeyTypePrefetch, config, group)
-	prefetchResults, err := s.DBViewPrefixScan(prefetchPrefix, -1, false)
-	if err != nil {
-		if firstErr == nil {
-			firstErr = err
-		}
-		return firstErr
-	}
-	for path, data := range prefetchResults {
-		var pm PrefetchMap
-		if err := json.Unmarshal(data, &pm); err != nil {
-			continue
-		}
-		changed := false
-		pm.TCP.Nodes, pm.TCP.Weights = removeFromNodesWeights(pm.TCP.Nodes, pm.TCP.Weights, nodeSet, &changed)
-		pm.UDP.Nodes, pm.UDP.Weights = removeFromNodesWeights(pm.UDP.Nodes, pm.UDP.Weights, nodeSet, &changed)
-		if changed {
-			if len(pm.TCP.Nodes) == 0 && len(pm.UDP.Nodes) == 0 && pm.RefTCP == "" && pm.RefUDP == "" {
-				_ = s.DBBatchDeletePrefix(path, true)
-			} else if newData, merr := json.Marshal(pm); merr == nil {
-				_ = s.DBBatchPutItem(path, newData)
-			}
-		}
-	}
-
-	rankingPrefix := FormatDBKey(KeyTypeRanking, config, group)
-	rankingResults, _ := s.DBViewPrefixScan(rankingPrefix, -1, true)
-	for path, data := range rankingResults {
-		var ranking []NodeRank
-		if err := json.Unmarshal(data, &ranking); err != nil {
-			continue
-		}
-		newRanking := ranking[:0]
-		changed := false
-		for _, r := range ranking {
-			if _, toRemove := nodeSet[r.Name]; toRemove {
-				changed = true
+		prefetchHead := []byte(prefetchScope + "/")
+		for k, v := c.Seek(prefetchHead); k != nil && bytes.HasPrefix(k, prefetchHead); k, v = c.Next() {
+			var pm PrefetchMap
+			if json.Unmarshal(v, &pm) != nil {
 				continue
 			}
-			newRanking = append(newRanking, r)
-		}
-		if changed {
-			if len(newRanking) == 0 {
-				_ = s.DBBatchDeletePrefix(path, true)
-			} else if newData, merr := json.Marshal(newRanking); merr == nil {
-				_ = s.DBBatchPutItem(path, newData)
+			changed := false
+			pm.TCP.Nodes, pm.TCP.Weights = removeFromNodesWeights(pm.TCP.Nodes, pm.TCP.Weights, nodeSet, &changed)
+			pm.UDP.Nodes, pm.UDP.Weights = removeFromNodesWeights(pm.UDP.Nodes, pm.UDP.Weights, nodeSet, &changed)
+			if !changed {
+				continue
+			}
+			if len(pm.TCP.Nodes) == 0 && len(pm.UDP.Nodes) == 0 && pm.RefTCP == "" && pm.RefUDP == "" {
+				deletes = append(deletes, bytes.Clone(k))
+			} else if newData, err := json.Marshal(pm); err == nil {
+				puts = append(puts, struct{ key, value []byte }{bytes.Clone(k), newData})
 			}
 		}
-	}
 
-	for _, nodeName := range nodes {
-		_ = s.DBBatchDeletePrefix(FormatDBKey(KeyTypeNode, config, group, nodeName), true)
-	}
+		if data := bucket.Get([]byte(rankingKey)); data != nil {
+			var ranking []NodeRank
+			if json.Unmarshal(data, &ranking) == nil {
+				kept := ranking[:0]
+				for _, r := range ranking {
+					if _, toRemove := nodeSet[r.Name]; !toRemove {
+						kept = append(kept, r)
+					}
+				}
+				if len(kept) < len(ranking) {
+					if len(kept) == 0 {
+						deletes = append(deletes, []byte(rankingKey))
+					} else if newData, err := json.Marshal(kept); err == nil {
+						puts = append(puts, struct{ key, value []byte }{[]byte(rankingKey), newData})
+					}
+				}
+			}
+		}
 
-	return firstErr
+		for _, n := range nodes {
+			deletes = append(deletes, []byte(FormatDBKey(KeyTypeNode, config, group, n)))
+		}
+
+		if err := deleteKeysTx(bucket, deletes); err != nil {
+			return err
+		}
+		for _, p := range puts {
+			if err := bucket.Put(p.key, p.value); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	noteDBMutation(statsScope, prefetchScope, rankingKey, nodeScope)
+	return err
 }
 
 func removeFromNodesWeights(nodes []string, weights []float64, nodeSet map[string]struct{}, changed *bool) ([]string, []float64) {
@@ -2441,30 +2263,44 @@ func removeFromNodesWeights(nodes []string, weights []float64, nodeSet map[strin
 	return newNodes, newWeights
 }
 
-// GetAllGroupsForConfig returns all known group names for a config.
+// GetAllGroupsForConfig returns all known group names for a config, from
+// stats keys alone: one cursor seek per group, values never read.
 func (s *Store) GetAllGroupsForConfig(config string) ([]string, error) {
+	scope := FormatDBKey(KeyTypeStats, config)
 	groupsMap := make(map[string]bool)
+	queuedKeys(scope, func(key string) {
+		if g, _, _ := strings.Cut(key[len(scope)+1:], "/"); g != "" {
+			groupsMap[UnescapeKeyPart(g)] = true
+		}
+	})
 
-	statsPath := FormatDBKey(KeyTypeStats, config)
-	raw, err := s.GetSubBytesByPath(statsPath)
-	if err == nil {
-		for fullPath := range raw {
-			parts := strings.Split(fullPath, "/")
-			if len(parts) >= 4 && parts[3] != "" {
-				groupsMap[parts[3]] = true
+	head := []byte(scope + "/")
+	err := globalDB.View(func(tx *bbolt.Tx) error {
+		bucket := tx.Bucket(bucketSmartStats)
+		if bucket == nil {
+			return nil
+		}
+		c := bucket.Cursor()
+		k, _ := c.Seek(head)
+		for k != nil && bytes.HasPrefix(k, head) {
+			g, _, deeper := bytes.Cut(k[len(head):], []byte{'/'})
+			if len(g) > 0 {
+				groupsMap[UnescapeKeyPart(string(g))] = true
 			}
-		}
-	} else {
-		scanResults, err2 := s.DBViewPrefixScan(statsPath, -1, false)
-		if err2 != nil {
-			return nil, err2
-		}
-		for path := range scanResults {
-			parts := strings.Split(path, "/")
-			if len(parts) >= 4 && parts[3] != "" {
-				groupsMap[parts[3]] = true
+			if !deeper || len(g) == 0 {
+				k, _ = c.Next()
+				continue
 			}
+			// Skip the rest of this group's rows: every key under
+			// head+g+"/" sorts before head+g+"0" ('0' follows '/').
+			next := make([]byte, 0, len(head)+len(g)+1)
+			next = append(append(append(next, head...), g...), '0')
+			k, _ = c.Seek(next)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 
 	result := make([]string, 0, len(groupsMap))
@@ -2474,27 +2310,30 @@ func (s *Store) GetAllGroupsForConfig(config string) ([]string, error) {
 	return result, nil
 }
 
-// GetAllNodesForGroup returns all known node names for a group.
+// GetAllNodesForGroup returns all known node names for a group, from
+// node-state and stats keys alone (values are never read).
 func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 	nodesMap := make(map[string]bool)
-
-	nodesPath := FormatDBKey(KeyTypeNode, config, group)
-	if nodeStatesData, err := s.GetSubBytesByPath(nodesPath); err == nil {
-		for key := range nodeStatesData {
-			parts := strings.Split(key, "/")
-			if len(parts) > 0 && parts[len(parts)-1] != "" {
-				nodesMap[parts[len(parts)-1]] = true
+	for i, scope := range []string{FormatDBKey(KeyTypeNode, config, group), FormatDBKey(KeyTypeStats, config, group)} {
+		// Node-state keys end in the node; stats keys need a target too.
+		needTarget := i == 1
+		add := func(rest []byte) {
+			j := bytes.LastIndexByte(rest, '/')
+			if needTarget && j < 0 {
+				return
+			}
+			node := rest[j+1:]
+			switch {
+			case len(node) == 0:
+			case bytes.IndexByte(node, '%') >= 0:
+				nodesMap[UnescapeKeyPart(string(node))] = true
+			case !nodesMap[string(node)]:
+				nodesMap[string(node)] = true
 			}
 		}
-	}
-
-	statsPath := FormatDBKey(KeyTypeStats, config, group)
-	if statsData, err := s.GetSubBytesByPath(statsPath); err == nil {
-		for key := range statsData {
-			parts := strings.Split(key, "/")
-			if len(parts) >= 6 && parts[len(parts)-1] != "" {
-				nodesMap[parts[len(parts)-1]] = true
-			}
+		queuedKeys(scope, func(key string) { add([]byte(key[len(scope)+1:])) })
+		if err := walkKeys(scope, func(k []byte) { add(k[len(scope)+1:]) }); err != nil {
+			return nil, err
 		}
 	}
 
@@ -2505,109 +2344,147 @@ func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 	return result, nil
 }
 
-// CleanupOldRecords removes excess historical data from bbolt.
+// cleanupItem is one row considered for trimming by CleanupOldRecords.
+type cleanupItem struct {
+	key      []byte
+	lastTime int64
+	value    float64
+}
+
+// cleanupLess orders rows for eviction: least valuable first, then oldest.
+// The key breaks remaining ties so the selection is deterministic.
+func cleanupLess(a, b *cleanupItem) bool {
+	if a.value != b.value {
+		return a.value < b.value
+	}
+	if a.lastTime != b.lastTime {
+		return a.lastTime < b.lastTime
+	}
+	return bytes.Compare(a.key, b.key) < 0
+}
+
+// selectSmallest partially orders items so items[:k] holds the k smallest
+// under cleanupLess (quickselect: O(n) on average instead of a full sort).
+func selectSmallest(items []cleanupItem, k int) {
+	lo, hi := 0, len(items)-1
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		pivot := items[mid]
+		items[mid], items[hi] = items[hi], items[mid]
+		store := lo
+		for i := lo; i < hi; i++ {
+			if cleanupLess(&items[i], &pivot) {
+				items[i], items[store] = items[store], items[i]
+				store++
+			}
+		}
+		items[store], items[hi] = items[hi], items[store]
+		switch {
+		case store == k:
+			return
+		case store < k:
+			lo = store + 1
+		default:
+			hi = store - 1
+		}
+	}
+}
+
+// cleanupRecord is the part of a stats row CleanupOldRecords ranks by;
+// decoding into it skips the weights map and every other field.
+type cleanupRecord struct {
+	Success  int64 `json:"success"`
+	Failure  int64 `json:"failure"`
+	LastUsed int64 `json:"last_used"`
+}
+
+// CleanupOldRecords removes excess historical data from bbolt. Each key
+// type is first counted by key alone; values are decoded only when the
+// group is over its cap, and the surplus is deleted in one transaction
+// (chunked if huge) instead of one commit per key.
 func (s *Store) CleanupOldRecords(group, config string) error {
 	globalCacheParams.mu.RLock()
 	maxTargets := globalCacheParams.MaxTargets
 	globalCacheParams.mu.RUnlock()
 
 	for _, keyType := range []string{KeyTypeStats, KeyTypePrefetch, KeyTypeHostFailures} {
-		pathPrefix := FormatDBKey(keyType, config, group)
-		rawData, err := s.DBViewPrefixScan(pathPrefix, -1, false)
+		scope := FormatDBKey(keyType, config, group)
+		total := 0
+		if walkKeys(scope, func([]byte) { total++ }) != nil || total <= maxTargets*2 {
+			continue
+		}
+
+		var items []cleanupItem
+		head := []byte(scope + "/")
+		err := globalDB.View(func(tx *bbolt.Tx) error {
+			bucket := tx.Bucket(bucketSmartStats)
+			if bucket == nil {
+				return nil
+			}
+			c := bucket.Cursor()
+			for k, v := c.Seek(head); k != nil && bytes.HasPrefix(k, head); k, v = c.Next() {
+				item := cleanupItem{}
+				switch keyType {
+				case KeyTypeStats:
+					if bytes.IndexByte(k[len(head):], '/') < 0 {
+						continue
+					}
+					var record cleanupRecord
+					if unmarshalRecord(v, &record) != nil {
+						continue
+					}
+					item.lastTime = record.LastUsed
+					item.value = float64(record.Success + record.Failure)
+				case KeyTypePrefetch:
+					var pm PrefetchMap
+					if json.Unmarshal(v, &pm) != nil {
+						continue
+					}
+					item.lastTime = pm.UpdatedTime
+					item.value = float64(len(pm.TCP.Nodes) + len(pm.UDP.Nodes))
+				case KeyTypeHostFailures:
+					var hs HostStatus
+					if json.Unmarshal(v, &hs) != nil {
+						continue
+					}
+					item.lastTime = hs.LastFailure
+					item.value = float64(hs.FailureCount)
+				}
+				item.key = bytes.Clone(k)
+				items = append(items, item)
+			}
+			return nil
+		})
+		if err != nil || len(items) <= maxTargets*2 {
+			continue
+		}
+
+		// Rows without a timestamp go first, then the least valuable /
+		// oldest of the rest.
+		toDelete := len(items) - maxTargets
+		invalid := 0
+		for i := range items {
+			if items[i].lastTime <= 0 {
+				items[i], items[invalid] = items[invalid], items[i]
+				invalid++
+			}
+		}
+		victims := items[:min(invalid, toDelete)]
+		if remaining := toDelete - len(victims); remaining > 0 {
+			valid := items[invalid:]
+			selectSmallest(valid, remaining)
+			victims = items[:invalid+min(remaining, len(valid))]
+		}
+
+		keys := make([][]byte, len(victims))
+		for i := range victims {
+			keys[i] = victims[i].key
+		}
+		err = deleteKeys(keys)
+		noteDBMutation(scope)
 		if err != nil {
-			continue
+			return err
 		}
-
-		type targetInfo struct {
-			lastTime int64
-			value    float64
-			path     string
-		}
-		targetMap := make(map[string]*targetInfo, len(rawData))
-
-		for path, data := range rawData {
-			parts := strings.Split(path, "/")
-			if len(parts) < 5 {
-				continue
-			}
-
-			var lastTime int64
-			var value float64
-
-			switch keyType {
-			case KeyTypeStats:
-				if len(parts) < 6 {
-					continue
-				}
-				var record StatsRecord
-				if err := UnmarshalStatsRecord(data, &record); err != nil {
-					continue
-				}
-				lastTime = record.LastUsed
-				value = float64(record.Success + record.Failure)
-			case KeyTypePrefetch:
-				var pm PrefetchMap
-				if err := json.Unmarshal(data, &pm); err != nil {
-					continue
-				}
-				lastTime = pm.UpdatedTime
-				value = float64(len(pm.TCP.Nodes) + len(pm.UDP.Nodes))
-			case KeyTypeHostFailures:
-				var hs HostStatus
-				if err := json.Unmarshal(data, &hs); err != nil {
-					continue
-				}
-				lastTime = hs.LastFailure
-				value = float64(hs.FailureCount)
-			}
-
-			targetMap[path] = &targetInfo{lastTime, value, path}
-		}
-
-		totalRecords := len(targetMap)
-		if totalRecords <= maxTargets*2 {
-			continue
-		}
-
-		toDeleteCount := totalRecords - maxTargets
-		deleted := 0
-
-		var invalidPaths, validPaths []string
-		for path, info := range targetMap {
-			if info.lastTime <= 0 {
-				invalidPaths = append(invalidPaths, path)
-			} else {
-				validPaths = append(validPaths, path)
-			}
-		}
-
-		for _, path := range invalidPaths {
-			if deleted >= toDeleteCount {
-				break
-			}
-			if err := s.DBBatchDeletePrefix(path, false); err == nil {
-				deleted++
-			}
-		}
-
-		if deleted < toDeleteCount {
-			remaining := toDeleteCount - deleted
-			sort.Slice(validPaths, func(i, j int) bool {
-				ii := targetMap[validPaths[i]]
-				jj := targetMap[validPaths[j]]
-				if ii.value != jj.value {
-					return ii.value < jj.value
-				}
-				return ii.lastTime < jj.lastTime
-			})
-			for i := 0; i < remaining && i < len(validPaths); i++ {
-				if err := s.DBBatchDeletePrefix(validPaths[i], false); err == nil {
-					deleted++
-				}
-			}
-		}
-
-		dbResultCache.RemoveByPrefix(pathPrefix)
 	}
 
 	return nil
@@ -2635,6 +2512,7 @@ func (s *Store) AdjustCacheParameters() {
 	globalCacheParams.mu.Lock()
 	globalCacheParams.MaxTargets = sz * 4 // legacy consumers expect MaxTargets ≈ 4×per-cache capacity
 	globalCacheParams.BatchSaveThreshold = batch
+	globalCacheParams.IndexBudget = bytesPer
 	globalCacheParams.mu.Unlock()
 
 	// Resize the byte budget — cost fns are unchanged, so eviction keeps
@@ -2687,17 +2565,19 @@ func (f FlushStats) Total() int {
 // Group-level deletes now use strict=true so "HK" doesn't accidentally
 // purge "HK-Backup" (prefix-collision bug with non-strict matching).
 func (s *Store) FlushByLevel(level, config, group string) (FlushStats, error) {
+	// Wait out any in-flight batch so it can't re-create purged rows.
+	flushMu.Lock()
+	defer flushMu.Unlock()
+
 	var stats FlushStats
 	stats.Queue = snapshotQueueDepth(level, config, group)
 
 	switch level {
 	case "all":
 		globalQueueMu.Lock()
+		clear(globalQueueOps)
 		globalQueueOps = globalQueueOps[:0]
-		for k := range globalQueueIdx {
-			delete(globalQueueIdx, k)
-		}
-		publishQueueSnapshotLocked()
+		clear(globalQueueIdx)
 		globalQueueMu.Unlock()
 	case "config":
 		filterQueueByConfig(config)
@@ -2713,8 +2593,8 @@ func (s *Store) FlushByLevel(level, config, group string) (FlushStats, error) {
 	blockedNodesCache.Clear()
 
 	var firstErr error
-	deletePrefix := func(prefix string, strict bool) int {
-		n, err := s.dbDeletePrefixCount(prefix, strict)
+	deleteCount := func(prefix string, strict bool) int {
+		n, err := deletePrefix(prefix, strict)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -2722,35 +2602,45 @@ func (s *Store) FlushByLevel(level, config, group string) (FlushStats, error) {
 	}
 	switch level {
 	case "all":
-		stats.Stats = deletePrefix(FormatDBKey(KeyTypeStats), false)
-		stats.Nodes = deletePrefix(FormatDBKey(KeyTypeNode), false)
-		stats.Ranking = deletePrefix(FormatDBKey(KeyTypeRanking), false)
-		stats.Prefetch = deletePrefix(FormatDBKey(KeyTypePrefetch), false)
-		stats.Failures = deletePrefix(FormatDBKey(KeyTypeHostFailures), false)
-		stats.ManualPin = deletePrefix(FormatDBKey(KeyTypeManualPin), false)
-		stats.KnownDead = deletePrefix(FormatDBKey(KeyTypeKnownDead), false)
-		stats.Breakers = deletePrefix(FormatDBKey(KeyTypeBreaker), false)
-		stats.PinEndorsement = deletePrefix(FormatDBKey(KeyTypePinEndorsement), false)
+		stats.Stats = deleteCount(FormatDBKey(KeyTypeStats), false)
+		stats.Nodes = deleteCount(FormatDBKey(KeyTypeNode), false)
+		stats.Ranking = deleteCount(FormatDBKey(KeyTypeRanking), false)
+		stats.Prefetch = deleteCount(FormatDBKey(KeyTypePrefetch), false)
+		stats.Failures = deleteCount(FormatDBKey(KeyTypeHostFailures), false)
+		stats.ManualPin = deleteCount(FormatDBKey(KeyTypeManualPin), false)
+		stats.KnownDead = deleteCount(FormatDBKey(KeyTypeKnownDead), false)
+		stats.Breakers = deleteCount(FormatDBKey(KeyTypeBreaker), false)
+		stats.PinEndorsement = deleteCount(FormatDBKey(KeyTypePinEndorsement), false)
 	case "config":
-		stats.Stats = deletePrefix(FormatDBKey(KeyTypeStats, config), true)
-		stats.Nodes = deletePrefix(FormatDBKey(KeyTypeNode, config), true)
-		stats.Ranking = deletePrefix(FormatDBKey(KeyTypeRanking, config), true)
-		stats.Prefetch = deletePrefix(FormatDBKey(KeyTypePrefetch, config), true)
-		stats.Failures = deletePrefix(FormatDBKey(KeyTypeHostFailures, config), true)
-		stats.ManualPin = deletePrefix(FormatDBKey(KeyTypeManualPin, config), true)
-		stats.KnownDead = deletePrefix(FormatDBKey(KeyTypeKnownDead, config), true)
-		stats.Breakers = deletePrefix(FormatDBKey(KeyTypeBreaker, config), true)
-		stats.PinEndorsement = deletePrefix(FormatDBKey(KeyTypePinEndorsement, config), true)
+		stats.Stats = deleteCount(FormatDBKey(KeyTypeStats, config), true)
+		stats.Nodes = deleteCount(FormatDBKey(KeyTypeNode, config), true)
+		stats.Ranking = deleteCount(FormatDBKey(KeyTypeRanking, config), true)
+		stats.Prefetch = deleteCount(FormatDBKey(KeyTypePrefetch, config), true)
+		stats.Failures = deleteCount(FormatDBKey(KeyTypeHostFailures, config), true)
+		stats.ManualPin = deleteCount(FormatDBKey(KeyTypeManualPin, config), true)
+		stats.KnownDead = deleteCount(FormatDBKey(KeyTypeKnownDead, config), true)
+		stats.Breakers = deleteCount(FormatDBKey(KeyTypeBreaker, config), true)
+		stats.PinEndorsement = deleteCount(FormatDBKey(KeyTypePinEndorsement, config), true)
 	case "group":
-		stats.Stats = deletePrefix(FormatDBKey(KeyTypeStats, config, group), true)
-		stats.Nodes = deletePrefix(FormatDBKey(KeyTypeNode, config, group), true)
-		stats.Ranking = deletePrefix(FormatDBKey(KeyTypeRanking, config, group), true)
-		stats.Prefetch = deletePrefix(FormatDBKey(KeyTypePrefetch, config, group), true)
-		stats.Failures = deletePrefix(FormatDBKey(KeyTypeHostFailures, config, group), true)
-		stats.ManualPin = deletePrefix(FormatDBKey(KeyTypeManualPin, config, group), true)
-		stats.KnownDead = deletePrefix(FormatDBKey(KeyTypeKnownDead, config, group), true)
-		stats.Breakers = deletePrefix(FormatDBKey(KeyTypeBreaker, config, group), true)
-		stats.PinEndorsement = deletePrefix(FormatDBKey(KeyTypePinEndorsement, config, group), true)
+		stats.Stats = deleteCount(FormatDBKey(KeyTypeStats, config, group), true)
+		stats.Nodes = deleteCount(FormatDBKey(KeyTypeNode, config, group), true)
+		stats.Ranking = deleteCount(FormatDBKey(KeyTypeRanking, config, group), true)
+		stats.Prefetch = deleteCount(FormatDBKey(KeyTypePrefetch, config, group), true)
+		stats.Failures = deleteCount(FormatDBKey(KeyTypeHostFailures, config, group), true)
+		stats.ManualPin = deleteCount(FormatDBKey(KeyTypeManualPin, config, group), true)
+		stats.KnownDead = deleteCount(FormatDBKey(KeyTypeKnownDead, config, group), true)
+		stats.Breakers = deleteCount(FormatDBKey(KeyTypeBreaker, config, group), true)
+		stats.PinEndorsement = deleteCount(FormatDBKey(KeyTypePinEndorsement, config, group), true)
+	}
+	// Purged queue entries may have fed stats indexes that no bbolt delete
+	// covered; drop the affected indexes regardless.
+	switch level {
+	case "all":
+		invalidateStatsIndexes(FormatDBKey(KeyTypeStats))
+	case "config":
+		invalidateStatsIndexes(FormatDBKey(KeyTypeStats, config))
+	case "group":
+		invalidateStatsIndexes(FormatDBKey(KeyTypeStats, config, group))
 	}
 	return stats, firstErr
 }
@@ -2759,12 +2649,11 @@ func (s *Store) FlushByLevel(level, config, group string) (FlushStats, error) {
 // captured BEFORE the queue is filtered so the stats output reflects what
 // was actually purged (not the residual).
 func snapshotQueueDepth(level, config, group string) int {
-	ops, _ := globalQueue.Load().([]StoreOperation)
-	if len(ops) == 0 {
-		return 0
-	}
+	globalQueueMu.RLock()
+	defer globalQueueMu.RUnlock()
 	n := 0
-	for _, op := range ops {
+	for i := range globalQueueOps {
+		op := &globalQueueOps[i].op
 		switch level {
 		case "all":
 			n++
@@ -2779,60 +2668,6 @@ func snapshotQueueDepth(level, config, group string) int {
 		}
 	}
 	return n
-}
-
-// dbDeletePrefixCount deletes by prefix and returns how many keys matched.
-// Mirrors DBBatchDeletePrefix but preserves the deletion count so callers
-// (notably FlushByLevel) can surface "how much did we actually wipe" to
-// operators hitting /cache/smart/flush/*.
-func (s *Store) dbDeletePrefixCount(prefix string, strict bool) (int, error) {
-	var keysToDelete [][]byte
-	err := globalDB.View(func(tx *bbolt.Tx) error {
-		bucket := tx.Bucket(bucketSmartStats)
-		if bucket == nil {
-			return nil
-		}
-		cursor := bucket.Cursor()
-		prefixBytes := []byte(prefix)
-		for k, _ := cursor.Seek(prefixBytes); k != nil && bytes.HasPrefix(k, prefixBytes); k, _ = cursor.Next() {
-			if strict && len(k) > len(prefixBytes) && k[len(prefixBytes)] != '/' {
-				continue
-			}
-			keyCopy := make([]byte, len(k))
-			copy(keyCopy, k)
-			keysToDelete = append(keysToDelete, keyCopy)
-		}
-		return nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	if len(keysToDelete) == 0 {
-		return 0, nil
-	}
-	const batchSize = 200
-	for i := 0; i < len(keysToDelete); i += batchSize {
-		end := i + batchSize
-		if end > len(keysToDelete) {
-			end = len(keysToDelete)
-		}
-		batch := keysToDelete[i:end]
-		if err := globalDB.Batch(func(tx *bbolt.Tx) error {
-			bucket := tx.Bucket(bucketSmartStats)
-			if bucket == nil {
-				return nil
-			}
-			for _, k := range batch {
-				if err := bucket.Delete(k); err != nil {
-					return err
-				}
-			}
-			return nil
-		}); err != nil {
-			return 0, err
-		}
-	}
-	return len(keysToDelete), nil
 }
 
 func (s *Store) FlushAll() (FlushStats, error) {

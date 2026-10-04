@@ -120,8 +120,8 @@ func CalculateWeight(input *ModelInput, priorityFactor float64) (float64, bool) 
 	// node stays pessimistic even after its good samples have faded.
 	// adaptiveHalfLifeScale also stretches halfLife for records with
 	// few samples, preserving their signal until more arrive.
-	timeFactor := 1.0           // applied to success/connect/latency
-	timeFactorFailure := 1.0    // applied to failure (≥ timeFactor)
+	timeFactor := 1.0        // applied to success/connect/latency
+	timeFactorFailure := 1.0 // applied to failure (≥ timeFactor)
 	n := input.Success + input.Failure
 	if input.LastUsed > 0 {
 		now := time.Now().Unix()
@@ -389,10 +389,11 @@ func CalculateWeight(input *ModelInput, priorityFactor float64) (float64, bool) 
 // pessimism we want to avoid over-trusting small samples.
 //
 // Formula:
-//   p̂ = s / n
-//   numerator = p̂ + z²/(2n) - z·√((p̂(1-p̂) + z²/(4n))/n)
-//   denominator = 1 + z²/n
-//   lower = numerator / denominator
+//
+//	p̂ = s / n
+//	numerator = p̂ + z²/(2n) - z·√((p̂(1-p̂) + z²/(4n))/n)
+//	denominator = 1 + z²/n
+//	lower = numerator / denominator
 func wilsonLowerBound(success, n float64) float64 {
 	if n <= 0 {
 		return 0
@@ -438,11 +439,11 @@ func sampleConfidence(n int64) float64 {
 // freshly-constructed record to look artificially awful.
 func recentPenaltyMultiplier(input *ModelInput, latencyMS int64) float64 {
 	const (
-		recentPenaltyMax     = 0.30 // max total drag = 30 %
-		recentRTTBadRatio    = 1.50 // shortRTT / longTerm >= 1.5 triggers
-		recentRTTAbsFloorMS  = 80.0 // don't react when both are tiny
-		recentSuccessFloor   = 0.95 // below 0.95 starts penalising
-		shortEnoughSamples   = 10   // need ≥10 lifetime samples to judge
+		recentPenaltyMax    = 0.30 // max total drag = 30 %
+		recentRTTBadRatio   = 1.50 // shortRTT / longTerm >= 1.5 triggers
+		recentRTTAbsFloorMS = 80.0 // don't react when both are tiny
+		recentSuccessFloor  = 0.95 // below 0.95 starts penalising
+		shortEnoughSamples  = 10   // need ≥10 lifetime samples to judge
 	)
 	recentMinMul := 1.0 - recentPenaltyMax
 
@@ -592,16 +593,16 @@ func clamp(x, lo, hi float64) float64 {
 func isRealtimePort(p uint16) bool {
 	switch p {
 	case 3478, 3479, // STUN / TURN (WebRTC)
-		5349,                                // STUNS
-		27015, 27016, 27017, 27018, 27019,   // Steam
-		3074,                                // Xbox Live / Warzone
-		6112, 6113, 6114,                    // Battle.net legacy
-		5060, 5061,                          // SIP (sometimes realtime)
-		25565,                               // Minecraft
-		7777, 7778, 7779,                    // UT / ARK / KF
-		19132, 19133,                        // Minecraft Bedrock
-		8767, 8768,                          // TeamSpeak voice
-		9987:                                // TeamSpeak 3 voice
+		5349,                              // STUNS
+		27015, 27016, 27017, 27018, 27019, // Steam
+		3074,             // Xbox Live / Warzone
+		6112, 6113, 6114, // Battle.net legacy
+		5060, 5061, // SIP (sometimes realtime)
+		25565,            // Minecraft
+		7777, 7778, 7779, // UT / ARK / KF
+		19132, 19133, // Minecraft Bedrock
+		8767, 8768, // TeamSpeak voice
+		9987: // TeamSpeak 3 voice
 		return true
 	}
 	// Riot games: 5000-5500 range for League / Valorant.
@@ -615,9 +616,9 @@ func isRealtimePort(p uint16) bool {
 func isVoipPort(p uint16) bool {
 	switch p {
 	case 5060, 5061, // SIP
-		3478, 5349,                   // STUN (WebRTC)
-		10000, 10001, 10002, 10003,   // Zoom / generic media
-		3480, 3481:                   // misc voip
+		3478, 5349, // STUN (WebRTC)
+		10000, 10001, 10002, 10003, // Zoom / generic media
+		3480, 3481: // misc voip
 		return true
 	}
 	return false

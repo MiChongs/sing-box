@@ -66,6 +66,10 @@ type DataCollector struct {
 	writtenRows atomic.Int64 // total rows successfully written since process start
 	droppedRows atomic.Int64 // samples silently dropped (size limit / init error)
 	sizeLimit   int64        // bytes
+	// limitReached latches once the file exceeds sizeLimit so AddSample
+	// drops samples without two stat syscalls each; Flush re-checks the
+	// file and clears it when the file was deleted or shrunk.
+	limitReached bool
 
 	stopCh   chan struct{}
 	stopped  atomic.Bool
@@ -158,6 +162,11 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, meta *CollectorMeta, 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.limitReached {
+		c.droppedRows.Add(1)
+		return
+	}
+
 	// Detect external deletion of file between writes (e.g. user rm'd it)
 	if c.configured {
 		if _, err := os.Stat(c.dataPath); os.IsNotExist(err) {
@@ -169,6 +178,7 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, meta *CollectorMeta, 
 	// Enforce size cap
 	if c.file != nil {
 		if stat, err := c.file.Stat(); err == nil && stat.Size() > c.sizeLimit {
+			c.limitReached = true
 			if c.droppedRows.Add(1) == 1 {
 				c.logger.Warn("smart collector: reached size limit ", c.sizeLimit>>20, " MB; dropping further samples (delete or increase size_limit_mb to resume)")
 			}
@@ -390,6 +400,17 @@ func (c *DataCollector) Flush() {
 		c.writer.Flush()
 		if err := c.writer.Error(); err != nil {
 			c.logger.Warn("smart collector: periodic flush error: ", err)
+		}
+	}
+	if c.limitReached {
+		stat, err := os.Stat(c.dataPath)
+		switch {
+		case os.IsNotExist(err):
+			c.logger.Info("smart collector: data file was deleted externally, resuming collection")
+			c.resetFileLocked()
+			c.limitReached = false
+		case err == nil && stat.Size() <= c.sizeLimit:
+			c.limitReached = false
 		}
 	}
 }

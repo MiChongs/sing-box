@@ -18,6 +18,16 @@ type lruKey interface {
 	~uint64 | ~string | ~byte | ~int | ~uint | ~int32 | ~uint32 | ~int64
 }
 
+// lruEntry is what the cache actually stores: the caller's value plus the
+// original key and a per-Set id. ristretto hands only key hashes to its
+// eviction callbacks, so carrying the key in the value is what lets those
+// callbacks keep keysIndex exact.
+type lruEntry[K lruKey, V any] struct {
+	key K
+	id  uint64
+	val V
+}
+
 // lruCache wraps a dgraph-io/ristretto/v2 cache to give the Smart store a
 // lock-free, cost-aware admission cache with TinyLFU eviction.
 //
@@ -42,15 +52,14 @@ type lruKey interface {
 // source-of-truth. Tests that need determinism call (*lruCache).Wait().
 //
 // Key-iteration gap: ristretto does not expose a Keys() iterator — only
-// IterValues. RemoveByPrefix therefore requires its own key index. We
-// maintain keysIndex (xsync.MapOf) in lock-step with Set/Delete/Clear;
-// ristretto evictions that happen silently through TinyLFU admission
-// may leave "zombie" entries in keysIndex that point to already-evicted
-// cache rows — harmless, because RemoveByPrefix's Del() call is a no-op
-// when the underlying row is gone. keysIndex size is bounded by the
-// cache's configured MaxCost, so there is no unbounded growth.
+// IterValues. RemoveByPrefix therefore requires its own key index.
+// keysIndex is kept exact: Set/Delete/Clear maintain it directly, and the
+// ristretto OnExit/OnReject callbacks drop a key once the entry that last
+// claimed it is evicted, expires, loses admission or is dropped from the
+// set buffer. Without the callbacks every key ever Set stayed indexed for
+// the life of the process.
 type lruCache[K lruKey, V any] struct {
-	inner *ristretto.Cache[K, V]
+	inner *ristretto.Cache[K, lruEntry[K, V]]
 	ttl   time.Duration // 0 = no TTL
 
 	// cost computes the byte cost of a value so ristretto's MaxCost budget
@@ -64,10 +73,19 @@ type lruCache[K lruKey, V any] struct {
 	// entry size.
 	cost func(V) int64
 
-	// keysIndex tracks every key we have successfully passed to inner.Set.
-	// It is the ONLY way to implement RemoveByPrefix because ristretto has
-	// no Keys() iterator. See the "Key-iteration gap" note above.
-	keysIndex *xsync.MapOf[K, struct{}]
+	// keysIndex maps every key that is cached or awaiting admission to the
+	// id of the newest entry Set for it. Callbacks only remove a key when
+	// the departing entry still owns it, so a stale eviction never drops a
+	// key that a later Set re-claimed. See the "Key-iteration gap" note.
+	keysIndex *xsync.MapOf[K, uint64]
+	nextID    atomic.Uint64
+
+	// onRemove, when set, observes every value that leaves the cache or
+	// never makes it in: eviction, expiry, admission rejection, set-buffer
+	// drop, replacement by a newer Set, Delete and Clear. It runs on
+	// ristretto's goroutines, sometimes under internal shard locks, so it
+	// must not call back into this cache.
+	onRemove func(V)
 
 	// capacity shadows ristretto.MaxCost() for cheap Cap() reads. Stored
 	// as atomic.Int64 instead of a mutex because it is written on Resize
@@ -79,14 +97,14 @@ type lruCache[K lruKey, V any] struct {
 // newLRUBytes creates a byte-budgeted cache: maxBytes is a real memory
 // ceiling and costFn returns each value's approximate heap footprint.
 func newLRUBytes[K lruKey, V any](maxBytes int64, costFn func(V) int64) *lruCache[K, V] {
-	return newCacheCost[K, V](maxBytes, 0, byteBudgetCounters(maxBytes), costFn)
+	return newCacheCost[K, V](maxBytes, 0, byteBudgetCounters(maxBytes), costFn, nil)
 }
 
 // newLRUBytesWithTTL is newLRUBytes with per-entry expiration. A Get on an
 // expired entry returns miss (ristretto's GC tick reclaims the row in the
 // background).
 func newLRUBytesWithTTL[K lruKey, V any](maxBytes int64, ttl time.Duration, costFn func(V) int64) *lruCache[K, V] {
-	return newCacheCost[K, V](maxBytes, ttl, byteBudgetCounters(maxBytes), costFn)
+	return newCacheCost[K, V](maxBytes, ttl, byteBudgetCounters(maxBytes), costFn, nil)
 }
 
 // byteBudgetCounters picks a TinyLFU counter count for a byte budget.
@@ -101,14 +119,20 @@ func byteBudgetCounters(maxBytes int64) int64 {
 	return n
 }
 
-func newCacheCost[K lruKey, V any](maxCost int64, ttl time.Duration, numCounters int64, costFn func(V) int64) *lruCache[K, V] {
+func newCacheCost[K lruKey, V any](maxCost int64, ttl time.Duration, numCounters int64, costFn func(V) int64, onRemove func(V)) *lruCache[K, V] {
 	if maxCost <= 0 {
 		maxCost = 1
 	}
 	if numCounters < 128 {
 		numCounters = 128
 	}
-	c, err := ristretto.NewCache(&ristretto.Config[K, V]{
+	lc := &lruCache[K, V]{
+		ttl:       ttl,
+		cost:      costFn,
+		keysIndex: xsync.NewMapOf[K, uint64](),
+		onRemove:  onRemove,
+	}
+	c, err := ristretto.NewCache(&ristretto.Config[K, lruEntry[K, V]]{
 		NumCounters: numCounters,
 		MaxCost:     maxCost,
 		BufferItems: 64,
@@ -120,6 +144,8 @@ func newCacheCost[K lruKey, V any](maxCost int64, ttl time.Duration, numCounters
 		// into the returned cost, so we likewise keep it off and own the
 		// full accounting ourselves — keeps the math predictable.
 		IgnoreInternalCost: true,
+		OnReject:           lc.onReject,
+		OnExit:             lc.onExit,
 	})
 	if err != nil {
 		// ristretto.NewCache only errors on invalid config; with the
@@ -128,29 +154,71 @@ func newCacheCost[K lruKey, V any](maxCost int64, ttl time.Duration, numCounters
 		// instead of returning a nil cache.
 		panic("smart: ristretto init failed: " + err.Error())
 	}
-	lc := &lruCache[K, V]{
-		inner:     c,
-		ttl:       ttl,
-		cost:      costFn,
-		keysIndex: xsync.NewMapOf[K, struct{}](),
-	}
+	lc.inner = c
 	lc.capacity.Store(maxCost)
 	return lc
 }
 
-// Get returns (value, true) on hit, (zero, false) on miss.
-func (c *lruCache[K, V]) Get(key K) (V, bool) {
-	return c.inner.Get(key)
+// onExit runs for every value ristretto lets go of. The key leaves
+// keysIndex only when this entry was the last one Set for it — an entry
+// replaced in place exits while its newer sibling keeps the key.
+func (c *lruCache[K, V]) onExit(e lruEntry[K, V]) {
+	if e.id == 0 {
+		// Zero value: delete markers and misses carry no entry.
+		return
+	}
+	c.forgetKey(e.key, e.id)
+	if c.onRemove != nil {
+		c.onRemove(e.val)
+	}
 }
 
-// Set inserts or updates an entry. ristretto may reject the Set if the
-// admission policy deems the key not hot enough; we still record the key
-// in keysIndex so RemoveByPrefix can find and clear it.
+// onReject handles the admission race where two Sets of a key that is not
+// yet resident both enter the set buffer: the first is admitted, the
+// second is rejected as a duplicate even though it was the latest Set.
+// The key must stay indexed under the surviving entry, which a Get here
+// (outside any shard lock) can see. onExit runs right after and finds the
+// id no longer matches.
+func (c *lruCache[K, V]) onReject(item *ristretto.Item[lruEntry[K, V]]) {
+	e := item.Value
+	if e.id == 0 {
+		return
+	}
+	stored, ok := c.inner.Get(e.key)
+	if !ok {
+		return
+	}
+	c.keysIndex.Compute(e.key, func(cur uint64, loaded bool) (uint64, bool) {
+		if loaded && cur == e.id {
+			return stored.id, false
+		}
+		return cur, !loaded
+	})
+}
+
+// forgetKey removes key from keysIndex if id is still its current owner.
+func (c *lruCache[K, V]) forgetKey(key K, id uint64) {
+	c.keysIndex.Compute(key, func(cur uint64, loaded bool) (uint64, bool) {
+		if loaded && cur != id {
+			return cur, false
+		}
+		return 0, true
+	})
+}
+
+// Get returns (value, true) on hit, (zero, false) on miss.
+func (c *lruCache[K, V]) Get(key K) (V, bool) {
+	e, ok := c.inner.Get(key)
+	return e.val, ok
+}
+
+// Set inserts or updates an entry. The key is indexed immediately so
+// RemoveByPrefix can reach it while it awaits admission; the callbacks
+// above un-index it if ristretto ends up not keeping it.
 //
 // Asynchronous: the value becomes visible after ristretto's internal
 // ring buffer drains (sub-millisecond). Call Wait() if you need sync.
 func (c *lruCache[K, V]) Set(key K, value V) {
-	c.keysIndex.Store(key, struct{}{})
 	cost := int64(1)
 	if c.cost != nil {
 		cost = c.cost(value)
@@ -158,11 +226,16 @@ func (c *lruCache[K, V]) Set(key K, value V) {
 			cost = 1
 		}
 	}
-	if c.ttl > 0 {
-		c.inner.SetWithTTL(key, value, cost, c.ttl)
-		return
+	id := c.nextID.Add(1)
+	c.keysIndex.Store(key, id)
+	if !c.inner.SetWithTTL(key, lruEntry[K, V]{key: key, id: id, val: value}, cost, c.ttl) {
+		// Dropped before reaching the admission policy (set buffer full);
+		// ristretto fires no callback for these.
+		c.forgetKey(key, id)
+		if c.onRemove != nil {
+			c.onRemove(value)
+		}
 	}
-	c.inner.Set(key, value, cost)
 }
 
 // Delete removes an entry; no-op when missing.
@@ -176,13 +249,7 @@ func (c *lruCache[K, V]) Delete(key K) {
 // Smart store already performs on a group-wide flush.
 func (c *lruCache[K, V]) Clear() {
 	c.inner.Clear()
-	// xsync.MapOf has no Clear on v3 ≤ 3.0.x and a Clear on 3.1+; the
-	// Range-Delete loop works on both versions and costs O(N) with
-	// N ≤ MaxCost, which is bounded by design.
-	c.keysIndex.Range(func(k K, _ struct{}) bool {
-		c.keysIndex.Delete(k)
-		return true
-	})
+	c.keysIndex.Clear()
 }
 
 // Resize changes the cost budget (entry-count mode). ristretto evicts in
@@ -224,25 +291,19 @@ func (c *lruCache[K, V]) Close() {
 }
 
 // RemoveByPrefix removes all entries whose string key has the given prefix.
-// Implemented by walking keysIndex (bounded by MaxCost) rather than the
-// underlying ristretto, which has no key iterator. Zombie entries — keys
-// evicted by the admission policy but still in keysIndex — are cleaned up
-// incidentally.
+// Implemented by walking keysIndex (exactly the resident and pending keys)
+// rather than the underlying ristretto, which has no key iterator.
 func (c *lruCache[K, V]) RemoveByPrefix(prefix string) {
 	// Collect first so we don't mutate while Range is walking.
 	var drop []K
-	c.keysIndex.Range(func(k K, _ struct{}) bool {
+	c.keysIndex.Range(func(k K, _ uint64) bool {
 		if s, ok := any(k).(string); ok && strings.HasPrefix(s, prefix) {
 			drop = append(drop, k)
 		}
 		return true
 	})
-	if len(drop) == 0 {
-		return
-	}
 	for _, k := range drop {
-		c.inner.Del(k)
-		c.keysIndex.Delete(k)
+		c.Delete(k)
 	}
 }
 

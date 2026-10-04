@@ -8,7 +8,6 @@ import (
 	"sync/atomic"
 
 	"github.com/VividCortex/ewma"
-	"github.com/caio/go-tdigest/v4"
 )
 
 // shortRTTEwmaAge and shortSuccessEwmaAge are the "average metric age"
@@ -82,11 +81,11 @@ func isDeleteOp(t int) bool {
 }
 
 const (
-	KeyTypePrefetch     = "prefetch"
-	KeyTypeNode         = "node"
-	KeyTypeStats        = "stats"
-	KeyTypeRanking      = "ranking"
-	KeyTypeHostFailures = "failures"
+	KeyTypePrefetch       = "prefetch"
+	KeyTypeNode           = "node"
+	KeyTypeStats          = "stats"
+	KeyTypeRanking        = "ranking"
+	KeyTypeHostFailures   = "failures"
 	KeyTypeManualPin      = "manual"   // smart/manual/<cfg>/<grp>
 	KeyTypeKnownDead      = "dead"     // smart/dead/<cfg>/<grp>/<node>
 	KeyTypeBreaker        = "breaker"  // smart/breaker/<cfg>/<grp>/<node>
@@ -101,10 +100,10 @@ const (
 const (
 	DefaultMinSampleCount = 2
 
-	MaxTargetsLimit      = 5000
-	MinTargetsLimit      = 500
-	MaxBatchThreshLimit  = 300
-	MinBatchThreshLimit  = 50
+	MaxTargetsLimit     = 5000
+	MinTargetsLimit     = 500
+	MaxBatchThreshLimit = 300
+	MinBatchThreshLimit = 50
 
 	AllowedWeight = 0.4
 
@@ -171,23 +170,10 @@ type StatsRecord struct {
 	MaxDownloadRate    float64            `json:"max_download_rate"`
 	ConnectionDuration float64            `json:"connection_duration"`
 
-	// RTTDigest is an optional caio/go-tdigest/v4 serialisation of the
-	// latency (first-byte) samples collected since the digest was reset.
-	// Empty or nil when SampleCount < tdigestWarmupSamples — the per-
-	// record overhead (~1 KiB at compression=100) isn't justified until
-	// enough data exists for quantile estimates to be meaningful.
-	//
-	// Currently consumed only by diagnostics (QuantileRTT); the weight
-	// function still uses mean+stddev. A future P2 switch can migrate
-	// the weight formula to P95 once production data confirms the
-	// distributions are skewed enough to benefit.
-	//
-	// Forward compatibility: both encoding/json and vmihailenco/msgpack
-	// treat an unknown optional field as zero on decode, so older builds
-	// reading records written by newer builds will silently ignore this
-	// field. omitempty keeps the wire size unchanged for records that
-	// haven't accumulated enough samples yet.
-	RTTDigest []byte `json:"rtt_digest,omitempty"`
+	// Rows written by older builds may also carry "rtt_digest", a
+	// serialised latency t-digest nothing read back. Both decoders skip
+	// unknown fields, so those rows still load and lose the blob the next
+	// time the (target, node) pair is written.
 }
 
 // modelInputPool recycles ModelInput structs. recordStats allocates one
@@ -237,12 +223,6 @@ func ReleaseStatsRecord(r *StatsRecord) {
 	if r == nil {
 		return
 	}
-	// Weights and RTTDigest both hold variable-size allocations (map
-	// entries and the serialised t-digest buffer respectively). Nil
-	// them before the struct-zero so the pooled instance doesn't carry
-	// a previous record's memory into the next user.
-	r.Weights = nil
-	r.RTTDigest = nil
 	*r = StatsRecord{}
 	statsRecordPool.Put(r)
 }
@@ -548,13 +528,13 @@ type UnwrapMap struct {
 // two different truths and UIs need both:
 //
 //   - Weight = raw average weight across targets, SAME scale as the
-//              internal CalculateWeight output used at dial selection.
-//              Typically ~0.3 (bad) to ~3 (excellent). This is what
-//              operators paste into logs to correlate API vs. debug.
+//     internal CalculateWeight output used at dial selection.
+//     Typically ~0.3 (bad) to ~3 (excellent). This is what
+//     operators paste into logs to correlate API vs. debug.
 //
 //   - Score  = 0-100 percentage for progress-bar UIs. Normalised against
-//              the group's current max so bar fills always look meaningful
-//              even when absolute weights bunch up.
+//     the group's current max so bar fills always look meaningful
+//     even when absolute weights bunch up.
 //
 // Previous versions only exposed Score as "Weight", which confused users
 // comparing ClashAPI output against the debug logs — debug prints raw
@@ -646,14 +626,6 @@ type AtomicStatsRecord struct {
 	weightsMu sync.Mutex
 	weights   map[string]float64
 
-	// rttDigest accumulates first-byte latency samples into a t-digest
-	// (caio/go-tdigest/v4) so we can surface p50/p95/p99 without storing
-	// raw samples. Mutex-protected because TDigest.Add mutates internal
-	// centroid state. Lazily allocated on first Add so idle records (no
-	// dials yet) don't pay the ~2 KiB in-memory digest cost.
-	rttDigestMu sync.Mutex
-	rttDigest   *tdigest.TDigest
-
 	// ewmaMu guards both shortRTT and shortSuccess — ewma.MovingAverage
 	// is NOT safe for concurrent Add so we serialise access. Reads
 	// (.Value()) could race-read without corruption but would return
@@ -662,8 +634,8 @@ type AtomicStatsRecord struct {
 	ewmaMu sync.Mutex
 
 	// shortRTT tracks the recent-window moving average of first-byte
-	// latency (ms). Complements the full-history Welford mean + t-digest
-	// quantiles by giving the weight function a short-horizon signal:
+	// latency (ms). Complements the full-history Welford mean by giving
+	// the weight function a short-horizon signal:
 	// a node whose shortRTT is much higher than its ctMean gets flagged
 	// as "currently slow" even if its long-term stats still look fine.
 	//
@@ -691,19 +663,13 @@ type AtomicStatsRecord struct {
 	// ≈ 160 KB, well within budget.
 	longRTT     ewma.MovingAverage
 	longSuccess ewma.MovingAverage
+
+	// config / group / target / node identify the recordCache slot the
+	// record was created for. Set once by GetOrCreateAtomicRecord before
+	// the record is published, read-only afterwards; the per-group record
+	// index keys on them.
+	config, group, target, node string
 }
-
-// tdigestCompression controls the centroid budget for each record's
-// RTT digest. 100 is a good middle — ≤ 1 % quantile error across the
-// CDF, ~1 KiB serialised size.
-const tdigestCompression = 100
-
-// tdigestWarmupSamples is the sample-count threshold below which we do
-// NOT serialise the digest into the bbolt record. With fewer than this
-// many samples the quantile estimates are too noisy to be useful, and
-// the extra bytes per row add up fast across 16 Smart groups × many
-// proxies × many targets.
-const tdigestWarmupSamples = 20
 
 func NewAtomicStatsRecord() *AtomicStatsRecord {
 	return &AtomicStatsRecord{
@@ -871,10 +837,8 @@ func (r *AtomicStatsRecord) UpdateConnectTimeSample(sampleMS int64) {
 	r.varianceMu.Unlock()
 }
 
-// UpdateLatencySample mirrors UpdateConnectTimeSample for first-byte latency.
-// Additionally it feeds the sample into the per-record t-digest so p50/p95/p99
-// estimates become available via (*AtomicStatsRecord).QuantileRTT once enough
-// samples have accumulated.
+// UpdateLatencySample mirrors UpdateConnectTimeSample for first-byte latency
+// and also feeds the short/long-window RTT EWMAs.
 func (r *AtomicStatsRecord) UpdateLatencySample(sampleMS int64) {
 	if sampleMS <= 0 {
 		return
@@ -891,20 +855,6 @@ func (r *AtomicStatsRecord) UpdateLatencySample(sampleMS int64) {
 	delta2 := x - r.latMean
 	r.latM2 += delta * delta2
 	r.varianceMu.Unlock()
-
-	r.rttDigestMu.Lock()
-	if r.rttDigest == nil {
-		td, err := tdigest.New(tdigest.Compression(tdigestCompression))
-		if err == nil {
-			r.rttDigest = td
-		}
-	}
-	if r.rttDigest != nil {
-		// Add error is only returned on NaN/negative — we already guarded
-		// with sampleMS > 0 above, so the ignore is safe.
-		_ = r.rttDigest.Add(x)
-	}
-	r.rttDigestMu.Unlock()
 
 	// Feed the recent-window EWMA too. Separated from the Welford path
 	// because shortRTT has its own mutex and we want to keep the
@@ -985,62 +935,6 @@ func (r *AtomicStatsRecord) LongSuccessRate() float64 {
 	r.ewmaMu.Lock()
 	defer r.ewmaMu.Unlock()
 	return r.longSuccess.Value()
-}
-
-// QuantileRTT returns the estimated first-byte latency in milliseconds
-// at quantile q (0..1) together with ok=true when the digest has enough
-// samples for a meaningful answer (>= tdigestWarmupSamples). Below that
-// threshold it returns 0, false so callers can fall back to mean+stddev.
-func (r *AtomicStatsRecord) QuantileRTT(q float64) (float64, bool) {
-	if r == nil {
-		return 0, false
-	}
-	r.rttDigestMu.Lock()
-	defer r.rttDigestMu.Unlock()
-	if r.rttDigest == nil || r.rttDigest.Count() < tdigestWarmupSamples {
-		return 0, false
-	}
-	return r.rttDigest.Quantile(q), true
-}
-
-// loadRTTDigestBytes deserialises a payload previously produced by the
-// snapshot path into the record's digest. Called from the bbolt
-// hydration path so a restart retains observed quantile history.
-// Silently ignores decode errors — a corrupted digest shouldn't brick
-// the record; it just means we start the digest from empty.
-func (r *AtomicStatsRecord) loadRTTDigestBytes(b []byte) {
-	if len(b) == 0 {
-		return
-	}
-	td, err := tdigest.New(tdigest.Compression(tdigestCompression))
-	if err != nil {
-		return
-	}
-	if err := td.FromBytes(b); err != nil {
-		return
-	}
-	r.rttDigestMu.Lock()
-	r.rttDigest = td
-	r.rttDigestMu.Unlock()
-}
-
-// rttDigestBytes returns the serialised digest, or nil when the digest
-// has < tdigestWarmupSamples samples. Used on the snapshot-to-record
-// path in CreateStatsSnapshot.
-func (r *AtomicStatsRecord) rttDigestBytes() []byte {
-	if r == nil {
-		return nil
-	}
-	r.rttDigestMu.Lock()
-	defer r.rttDigestMu.Unlock()
-	if r.rttDigest == nil || r.rttDigest.Count() < tdigestWarmupSamples {
-		return nil
-	}
-	b, err := r.rttDigest.AsBytes()
-	if err != nil {
-		return nil
-	}
-	return b
 }
 
 // ConnectTimeStdDev returns the sample standard deviation (√(M2/(n-1)))
@@ -1186,7 +1080,6 @@ func (r *AtomicStatsRecord) CreateStatsSnapshot() *StatsRecord {
 	out.MaxDownloadRate = r.loadFloat(&r.maxDownloadRate)
 	out.ConnectionDuration = r.loadFloat(&r.duration)
 	out.Weights = r.GetAllWeights()
-	out.RTTDigest = r.rttDigestBytes()
 	return out
 }
 

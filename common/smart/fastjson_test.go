@@ -48,7 +48,9 @@ func TestMsgpackRoundtrip(t *testing.T) {
 
 // BenchmarkMarshalStatsRecord compares msgpack vs goccy/go-json on the
 // actual write-path payload shape. Run with
-//   go test -bench=BenchmarkMarshal -benchmem -run=^$
+//
+//	go test -bench=BenchmarkMarshal -benchmem -run=^$
+//
 // TestMsgpackSniffFallback: a hand-crafted msgpack payload (simulating
 // a forward-compat scenario where we later switch write path to msgpack)
 // must still decode correctly through UnmarshalStatsRecord.

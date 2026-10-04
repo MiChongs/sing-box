@@ -69,6 +69,13 @@ func MarshalStatsRecord(r *StatsRecord) ([]byte, error) {
 // first-byte sniff, handling the migration window where bbolt still
 // contains JSON records written by older builds.
 func UnmarshalStatsRecord(data []byte, out *StatsRecord) error {
+	return unmarshalRecord(data, out)
+}
+
+// unmarshalRecord decodes a stored stats record into any struct that uses
+// StatsRecord's json tags. Fields absent from out are skipped by both
+// decoders, which lets readers decode just the subset they need.
+func unmarshalRecord(data []byte, out any) error {
 	if isMsgpack(data) {
 		dec := msgpack.NewDecoder(bytes.NewReader(data))
 		dec.SetCustomStructTag("json")

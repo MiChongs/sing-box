@@ -28,7 +28,7 @@ func TestByteBudgetEvictsBySize(t *testing.T) {
 	// Count survivors via the key index (bounded by admission). The live
 	// set must be on the order of budget/valueBytes (~10), not `inserted`.
 	survivors := 0
-	c.keysIndex.Range(func(k string, _ struct{}) bool {
+	c.keysIndex.Range(func(k string, _ uint64) bool {
 		if _, ok := c.Get(k); ok {
 			survivors++
 		}

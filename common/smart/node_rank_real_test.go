@@ -35,7 +35,7 @@ func stageStats(t *testing.T, store *Store, group, config, target, node string, 
 // freshStore spins up an isolated bbolt + Store under t.TempDir so each
 // test owns its DB and doesn't see pollution from earlier runs through
 // the package-global singletons. Cleans up automatically.
-func freshStore(t *testing.T) *Store {
+func freshStore(t testing.TB) *Store {
 	t.Helper()
 	dir := t.TempDir()
 	db, err := bbolt.Open(filepath.Join(dir, "test.db"), 0600, nil)
@@ -51,10 +51,18 @@ func freshStore(t *testing.T) *Store {
 	// the previous test's (now-closed) db handle and would silently
 	// return empty results from every read. Force the swap by writing
 	// globalDB directly; package-internal access lets us bypass the
-	// sync.Once for tests without touching production semantics.
+	// sync.Once for tests without touching production semantics. The swap
+	// happens under flushMu so the background flusher is never mid-commit,
+	// and writes earlier tests left queued are dropped with their database.
 	s := GetOrInitStore(db)
+	flushMu.Lock()
+	globalQueueMu.Lock()
+	clear(globalQueueOps)
+	globalQueueOps = globalQueueOps[:0]
+	clear(globalQueueIdx)
+	globalQueueMu.Unlock()
 	globalDB = db
-	s.FlushQueue(true)
+	flushMu.Unlock()
 	if dbResultCache != nil {
 		dbResultCache.Clear()
 	}
@@ -70,6 +78,7 @@ func freshStore(t *testing.T) *Store {
 	if targetCache != nil {
 		targetCache.Clear()
 	}
+	invalidateStatsIndexes(FormatDBKey())
 	return s
 }
 

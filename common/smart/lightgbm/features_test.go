@@ -26,12 +26,12 @@ func TestExtractASNFeature(t *testing.T) {
 	// mihomo parity: name-keyword match takes precedence; numeric fallback
 	// requires the string to START with digits (regex ^(\d+)).
 	cases := map[string]int{
-		"":                      0,
-		"AS13335 cloudflare":    6,  // cloudflare keyword wins
-		"AS15169 google llc":    1,  // google keyword wins
-		"200 some unknown":      50, // pure digits → 200 < 1000
-		"50000 smallprovider":   53, // 50000 in [50000, 150000)
-		"999999 future":         54, // >= 150000
+		"":                    0,
+		"AS13335 cloudflare":  6,  // cloudflare keyword wins
+		"AS15169 google llc":  1,  // google keyword wins
+		"200 some unknown":    50, // pure digits → 200 < 1000
+		"50000 smallprovider": 53, // 50000 in [50000, 150000)
+		"999999 future":       54, // >= 150000
 	}
 	for input, want := range cases {
 		got := extractASNFeature(input)
@@ -45,15 +45,15 @@ func TestExtractDomainTypeFeature(t *testing.T) {
 	// mihomo parity: IPv4 literal is detected FIRST (returns 1), even if it
 	// would also match DNS keywords like 1.1.1.1.
 	cases := map[string]int{
-		"":                    0,
-		"1.1.1.1":             1, // IPv4 literal short-circuits to 1
-		"dns.google":          6, // DNS keyword (not IPv4)
-		"www.youtube.com":     2, // streaming
-		"steam.com":           3, // game
-		"zoom.us":             4, // communication
-		"api.stripe.com":      5, // api
-		"example.gov":         14,
-		"example.edu":         15,
+		"":                0,
+		"1.1.1.1":         1, // IPv4 literal short-circuits to 1
+		"dns.google":      6, // DNS keyword (not IPv4)
+		"www.youtube.com": 2, // streaming
+		"steam.com":       3, // game
+		"zoom.us":         4, // communication
+		"api.stripe.com":  5, // api
+		"example.gov":     14,
+		"example.edu":     15,
 	}
 	for input, want := range cases {
 		got := extractDomainTypeFeature(input)

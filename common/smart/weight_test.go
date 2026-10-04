@@ -93,7 +93,7 @@ func TestCalculateWeight_BayesianSmoothing(t *testing.T) {
 // TestIdentifyScene_Realtime: gaming signature classification.
 func TestIdentifyScene_Realtime(t *testing.T) {
 	scene := identifyConnectionScene(
-		true, 40,  // UDP, 40ms latency
+		true, 40, // UDP, 40ms latency
 		0.5, 0.6, // small symmetric bytes
 		200, 200, // small rates
 		1.0,   // 1 min duration
