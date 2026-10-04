@@ -33,6 +33,8 @@ func TestSelectorInterruptRoutedConnections(t *testing.T) {
 						ctx = interrupt.ContextWithIsResourceDownload(ctx)
 					}
 					logger := log.NewNOPFactory().NewLogger("test")
+					scope := adapter.NewScope(ctx, logger)
+					t.Cleanup(func() { require.NoError(t, scope.Close()) })
 					manager := NewConnectionManager(logger)
 					incoming := newSelectorInterruptTestConn()
 					remote := newSelectorInterruptTestConn()
@@ -50,7 +52,7 @@ func TestSelectorInterruptRoutedConnections(t *testing.T) {
 						})
 						require.NoError(t, err)
 						selector := raw.(*group.Selector)
-						require.NoError(t, selector.Start())
+						require.NoError(t, selector.Start(adapter.StartStateStart, scope))
 						return selector
 					}
 					groupCtx := service.ContextWith[adapter.OutboundManager](ctx, &testL3OutboundManager{outbounds: map[string]adapter.Outbound{"leaf": leaf}})
@@ -65,15 +67,13 @@ func TestSelectorInterruptRoutedConnections(t *testing.T) {
 						raw, err := group.NewURLTest(groupCtx, nil, logger, "urltest", option.URLTestOutboundOptions{GroupCommonOption: option.GroupCommonOption{Outbounds: []string{"leaf"}}})
 						require.NoError(t, err)
 						urltest := raw.(*group.URLTest)
-						require.NoError(t, urltest.Start())
-						t.Cleanup(func() { require.NoError(t, urltest.Close()) })
+						require.NoError(t, urltest.Start(adapter.StartStateStart, scope))
 						selected = urltest
 					case "loadbalance":
 						raw, err := group.NewLoadBalance(groupCtx, nil, logger, "loadbalance", option.LoadBalanceOutboundOptions{GroupCommonOption: option.GroupCommonOption{Outbounds: []string{"leaf"}}, Strategy: group.StrategyRoundRobin})
 						require.NoError(t, err)
 						balance := raw.(*group.LoadBalance)
-						require.NoError(t, balance.Start())
-						t.Cleanup(func() { require.NoError(t, balance.Close()) })
+						require.NoError(t, balance.Start(adapter.StartStateStart, scope))
 						selected = balance
 					case "handler", "nested-handler":
 						handler = &selectorInterruptTestHandler{selectorInterruptTestOutbound: leaf}

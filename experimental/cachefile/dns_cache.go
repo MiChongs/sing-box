@@ -2,6 +2,7 @@ package cachefile
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"time"
 
@@ -127,12 +128,12 @@ func (c *CacheFile) ClearDNSCache() error {
 	})
 }
 
-func (c *CacheFile) loopCacheCleanup(interval time.Duration, cleanupFunc func()) {
+func (c *CacheFile) loopCacheCleanup(ctx context.Context, interval time.Duration, cleanupFunc func()) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-c.done:
+		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			cleanupFunc()

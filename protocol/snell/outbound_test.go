@@ -50,7 +50,7 @@ func TestOutboundMultiplexEnabled(t *testing.T) {
 			})
 			require.NoError(t, err)
 			require.Equal(t, reuse, created.(*Outbound).MultiplexEnabled())
-			require.NoError(t, created.(*Outbound).Close())
+			require.NoError(t, created.(*Outbound).close())
 		}
 	}
 }
@@ -138,7 +138,7 @@ func TestV6QUICProxyModeConfiguration(t *testing.T) {
 			} else {
 				require.Nil(t, outbound.quicDestCache)
 			}
-			require.NoError(t, outbound.Close())
+			require.NoError(t, outbound.close())
 		})
 	}
 }
@@ -400,7 +400,7 @@ func TestOutboundIdleConnections(t *testing.T) {
 			outbound.SetKeepIdleConnections(false)
 			outbound.CloseIdleConnections()
 		})
-		require.NoError(t, outbound.Close())
+		require.NoError(t, outbound.close())
 	})
 	t.Run("client", func(t *testing.T) {
 		client := &lazyPacketTestClient{}

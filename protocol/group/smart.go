@@ -679,7 +679,18 @@ func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 // parsePolicyPriority moved to smart_priority.go (richer prefix grammar
 // + multiplicative aggregation + per-tag factor cache).
 
-func (s *Smart) Start() error {
+func (s *Smart) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	switch stage {
+	case adapter.StartStateStart:
+		return s.startGroup()
+	case adapter.StartStateStarted:
+		scope.Add(s.close)
+		return s.postStart()
+	}
+	return nil
+}
+
+func (s *Smart) startGroup() error {
 	if s.useAllProviders {
 		for _, provider := range s.provider.Providers() {
 			s.providers[provider.Tag()] = provider
@@ -730,7 +741,7 @@ func (s *Smart) Start() error {
 	return nil
 }
 
-func (s *Smart) PostStart() error {
+func (s *Smart) postStart() error {
 	// 在 PostStart 阶段重新应用配置中的算法。NewSmart 构造阶段虽然
 	// 已经调用了 SetAlgorithm，但 logFactory 尚未 Start()，日志会
 	// 被丢弃且无法确认。这里重新应用确保：
@@ -1087,7 +1098,7 @@ func (s *Smart) stopScheduledTasks() {
 	s.scheduledTasks = nil
 }
 
-func (s *Smart) Close() error {
+func (s *Smart) close() error {
 	s.started.Store(false)
 	if s.taskCancel != nil {
 		s.taskCancel()

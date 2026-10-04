@@ -19,7 +19,7 @@ func TestRulesSnapshotConcurrentClose(t *testing.T) {
 			}
 		})
 	}
-	require.NoError(t, router.Close())
+	require.NoError(t, router.closeRules())
 	workers.Wait()
 	require.Empty(t, router.Rules())
 }

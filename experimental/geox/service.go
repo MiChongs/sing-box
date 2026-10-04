@@ -133,13 +133,14 @@ func (s *Service) Dependencies() []string { return nil }
 // Start brings up the service. When AutoUpdate is enabled, downloaders are
 // spawned for every configured URL. When AutoUpdate is disabled, a single
 // best-effort fetch is attempted for any missing file.
-func (s *Service) Start(stage adapter.StartStage) error {
+func (s *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
 	if !s.options.Enabled {
 		return nil
 	}
+	scope.Add(s.close)
 
 	interval := time.Duration(s.options.UpdateInterval)
 	if interval <= 0 {
@@ -262,7 +263,7 @@ func (s *Service) resolveDetour() assetdl.Dialer {
 }
 
 // Close stops all downloaders.
-func (s *Service) Close() error {
+func (s *Service) close() error {
 	s.dlMu.Lock()
 	defer s.dlMu.Unlock()
 	for _, dl := range s.dls {

@@ -220,13 +220,13 @@ func (a *Adapter) Close() error {
 	var err error
 	for _, ob := range outbounds {
 		if _, isEndpoint := a.endpoint.Get(ob.Tag()); isEndpoint {
-			if err2 := a.endpoint.Remove(ob.Tag()); err2 != nil {
+			if err2 := a.removeEndpoint(ob.Tag()); err2 != nil {
 				err = E.Append(err, err2, func(err error) error {
 					return E.Cause(err, "close endpoint [", ob.Tag(), "]")
 				})
 			}
 		} else {
-			if err2 := a.outbound.Remove(ob.Tag()); err2 != nil {
+			if err2 := a.removeOutbound(ob.Tag()); err2 != nil {
 				err = E.Append(err, err2, func(err error) error {
 					return E.Cause(err, "close outbound [", ob.Tag(), "]")
 				})
@@ -406,7 +406,7 @@ func (a *Adapter) removeUselessEndpoints(newTags []string) {
 	var toDelete []string
 	for _, ob := range snap {
 		if _, isEndpoint := a.endpoint.Get(ob.Tag()); isEndpoint && !exists[ob.Tag()] {
-			if err := a.endpoint.Remove(ob.Tag()); err != nil {
+			if err := a.removeEndpoint(ob.Tag()); err != nil {
 				a.logger.Error(err, "close endpoint [", ob.Tag(), "]")
 			}
 			toDelete = append(toDelete, ob.Tag())
@@ -437,9 +437,27 @@ func (a *Adapter) removeUseless(newTags []string) {
 	a.outboundsAccess.RUnlock()
 	for _, opt := range snap {
 		if !exists[opt.Tag()] {
-			if err := a.outbound.Remove(opt.Tag()); err != nil {
+			if err := a.removeOutbound(opt.Tag()); err != nil {
 				a.logger.Error(err, "close outbound [", opt.Tag(), "]")
 			}
 		}
 	}
+}
+
+// removeOutbound and removeEndpoint drop provider members while the box is
+// running, through the managers' runtime removal.
+func (a *Adapter) removeOutbound(tag string) error {
+	remover, loaded := a.outbound.(adapter.RuntimeComponentRemover)
+	if !loaded {
+		return E.New("outbound manager does not support runtime removal")
+	}
+	return remover.Remove(tag)
+}
+
+func (a *Adapter) removeEndpoint(tag string) error {
+	remover, loaded := a.endpoint.(adapter.RuntimeComponentRemover)
+	if !loaded {
+		return E.New("endpoint manager does not support runtime removal")
+	}
+	return remover.Remove(tag)
 }

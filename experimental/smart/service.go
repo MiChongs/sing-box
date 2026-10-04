@@ -89,15 +89,19 @@ func (s *Service) Dependencies() []string { return nil }
 // Start brings up the service. Heavy resources (model load, downloader,
 // collector file) are deferred to first opt-in by a Smart group — this
 // avoids spinning up a downloader if no group actually uses ML.
-func (s *Service) Start(stage adapter.StartStage) error {
-	if stage == adapter.StartStateStart {
+func (s *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	switch stage {
+	case adapter.StartStateInitialize:
+		// The downloader and collector exist from construction on.
+		scope.Add(s.close)
+	case adapter.StartStateStart:
 		s.started = true
 	}
 	return nil
 }
 
 // Close tears down shared resources.
-func (s *Service) Close() error {
+func (s *Service) close() error {
 	if s.dl != nil {
 		_ = s.dl.Close()
 	}

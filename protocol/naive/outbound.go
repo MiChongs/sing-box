@@ -224,7 +224,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}, nil
 }
 
-func (h *Outbound) Start(stage adapter.StartStage) error {
+func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
@@ -232,6 +232,7 @@ func (h *Outbound) Start(stage adapter.StartStage) error {
 	if err != nil {
 		return err
 	}
+	scope.Add(h.client.Close)
 	h.logger.Info("NaiveProxy started, version: ", h.client.Engine().Version())
 	return nil
 }
@@ -261,10 +262,6 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 
 func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	h.client.CloseAllConnections()
-}
-
-func (h *Outbound) Close() error {
-	return h.client.Close()
 }
 
 func (h *Outbound) Client() *cronet.NaiveClient {

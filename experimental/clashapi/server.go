@@ -189,8 +189,15 @@ func (s *Server) Name() string {
 	return "clash server"
 }
 
-func (s *Server) Start(stage adapter.StartStage) error {
+func (s *Server) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	switch stage {
+	case adapter.StartStateInitialize:
+		scope.Add(func() error {
+			return common.Close(
+				common.PtrOrNil(s.urlTestHistory),
+				common.PtrOrNil(s.cleaner),
+			)
+		})
 	case adapter.StartStateStart:
 		if s.externalUIDownloadDetour != "" && (s.externalUIHTTPClient == nil || s.externalUIHTTPClient.IsEmpty()) {
 			deprecated.Report(s.ctx, deprecated.OptionLegacyClashAPIExternalUIDownloadDetour)
@@ -200,6 +207,7 @@ func (s *Server) Start(stage adapter.StartStage) error {
 			break
 		}
 		s.ctx, s.updateCancel = context.WithCancel(s.ctx)
+		scope.Add(s.stopExternalUIUpdate)
 		var forceUpdate bool
 		if s.externalUI != "" && s.cacheFile != nil {
 			if savedExternalUI := s.cacheFile.LoadExternalUI("ExternalUI"); savedExternalUI != nil {
@@ -232,6 +240,7 @@ func (s *Server) Start(stage adapter.StartStage) error {
 		if err != nil {
 			return E.Cause(err, "external controller listen error")
 		}
+		scope.Add(s.httpServer.Close)
 		s.logger.Info("restful api listening at ", listener.Addr())
 		go func() {
 			err = s.httpServer.Serve(listener)
@@ -267,18 +276,14 @@ func (s *Server) loopUpdate() {
 	}
 }
 
-func (s *Server) Close() error {
+func (s *Server) stopExternalUIUpdate() error {
 	if s.updateCancel != nil {
 		s.updateCancel()
 	}
 	if s.updateDone != nil {
 		<-s.updateDone
 	}
-	return common.Close(
-		common.PtrOrNil(s.httpServer),
-		common.PtrOrNil(s.urlTestHistory),
-		common.PtrOrNil(s.cleaner),
-	)
+	return nil
 }
 
 func authentication(serverSecret string) func(next http.Handler) http.Handler {

@@ -28,31 +28,29 @@ import (
 var _ adapter.Router = (*Router)(nil)
 
 type Router struct {
-	ctx               context.Context
-	logger            log.ContextLogger
-	inbound           adapter.InboundManager
-	outbound          adapter.OutboundManager
-	dns               adapter.DNSRouter
-	dnsTransport      adapter.DNSTransportManager
-	connection        adapter.ConnectionManager
-	network           adapter.NetworkManager
-	httpClientManager adapter.HTTPClientManager
-	rules             []adapter.Rule
-	ruleByUUID        map[string]adapter.Rule
-	needFindProcess   bool
-	needFindNeighbor  bool
-	leaseFiles        []string
-	ruleSets          []adapter.RuleSet
-	ruleSetMap        map[string]adapter.RuleSet
-	ruleSetUpdater    *R.RuleSetUpdater
-	processSearcher   process.Searcher
-	processCache      *freelru.Cache[processCacheKey, processCacheEntry]
-	neighborResolver  adapter.NeighborResolver
-	pauseManager      pause.Manager
-	trackers          []adapter.ConnectionTracker
-	platformInterface adapter.PlatformInterface
-	started           bool
-
+	ctx                    context.Context
+	logger                 log.ContextLogger
+	inbound                adapter.InboundManager
+	outbound               adapter.OutboundManager
+	dns                    adapter.DNSRouter
+	dnsTransport           adapter.DNSTransportManager
+	connection             adapter.ConnectionManager
+	network                adapter.NetworkManager
+	httpClientManager      adapter.HTTPClientManager
+	rules                  []adapter.Rule
+	ruleByUUID             map[string]adapter.Rule
+	needFindProcess        bool
+	needFindNeighbor       bool
+	leaseFiles             []string
+	ruleSets               []adapter.RuleSet
+	ruleSetMap             map[string]adapter.RuleSet
+	ruleSetUpdater         *R.RuleSetUpdater
+	processSearcher        process.Searcher
+	processCache           *freelru.Cache[processCacheKey, processCacheEntry]
+	neighborResolver       adapter.NeighborResolver
+	pauseManager           pause.Manager
+	trackers               []adapter.ConnectionTracker
+	platformInterface      adapter.PlatformInterface
 	processLookupMode      process.LookupMode
 	processCacheGeneration atomic.Uint64
 
@@ -120,10 +118,17 @@ func (r *Router) Initialize(rules []option.Rule, ruleSets []option.RuleSet) erro
 	return nil
 }
 
-func (r *Router) Start(stage adapter.StartStage) error {
+func (r *Router) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	monitor := taskmonitor.New(r.logger, C.StartTimeout)
 	switch stage {
 	case adapter.StartStateInitialize:
+		scope.Add(func() error {
+			r.quicSniffCache.Close()
+			return nil
+		})
+		for _, ruleSet := range r.ruleSets {
+			scope.Add(ruleSet.Close)
+		}
 		if r.needFindNeighbor {
 			if r.platformInterface != nil && r.platformInterface.UsePlatformNeighborResolver() {
 				monitor.Start("initialize neighbor resolver")
@@ -134,6 +139,7 @@ func (r *Router) Start(stage adapter.StartStage) error {
 					r.logger.Error(E.Cause(err, "start neighbor resolver"))
 				} else {
 					r.neighborResolver = resolver
+					scope.Add(resolver.Close)
 				}
 			} else {
 				monitor.Start("initialize neighbor resolver")
@@ -149,6 +155,7 @@ func (r *Router) Start(stage adapter.StartStage) error {
 						r.logger.Error(E.Cause(err, "start neighbor resolver"))
 					} else {
 						r.neighborResolver = resolver
+						scope.Add(resolver.Close)
 					}
 				}
 			}
@@ -181,6 +188,9 @@ func (r *Router) Start(stage adapter.StartStage) error {
 			startContext.Close()
 		}
 		r.ruleSetUpdater = R.NewRuleSetUpdater(r.ctx, r.ruleSets)
+		if r.ruleSetUpdater != nil {
+			scope.Add(r.ruleSetUpdater.Close)
+		}
 		r.network.Initialize(r.ruleSets)
 		needFindProcess := r.needFindProcess
 		needFindNeighbor := r.needFindNeighbor
@@ -217,6 +227,7 @@ func (r *Router) Start(stage adapter.StartStage) error {
 			}
 		}
 		if r.processSearcher != nil {
+			scope.Add(r.processSearcher.Close)
 			processCache := common.Must1(freelru.New[processCacheKey, processCacheEntry](256, maphash.NewHasher[processCacheKey]().Hash32, true))
 			processCache.SetLifetime(200 * time.Millisecond)
 			r.processCache = processCache
@@ -261,6 +272,7 @@ func (r *Router) Start(stage adapter.StartStage) error {
 		}
 	case adapter.StartStatePostStart:
 		for i, rule := range r.rules {
+			scope.Add(rule.Close)
 			monitor.Start("initialize rule[", i, "]")
 			err := rule.Start()
 			monitor.Finish()
@@ -271,7 +283,6 @@ func (r *Router) Start(stage adapter.StartStage) error {
 		if r.ruleSetUpdater != nil {
 			r.ruleSetUpdater.Start()
 		}
-		r.started = true
 		return nil
 	case adapter.StartStateStarted:
 		for _, ruleSet := range r.ruleSets {
@@ -280,48 +291,6 @@ func (r *Router) Start(stage adapter.StartStage) error {
 		runtime.GC()
 	}
 	return nil
-}
-
-func (r *Router) Close() error {
-	r.quicSniffCache.Close()
-	monitor := taskmonitor.New(r.logger, C.StopTimeout)
-	var err error
-	if r.neighborResolver != nil {
-		monitor.Start("close neighbor resolver")
-		err = E.Append(err, r.neighborResolver.Close(), func(closeErr error) error {
-			return E.Cause(closeErr, "close neighbor resolver")
-		})
-		monitor.Finish()
-	}
-	for i, rule := range r.rules {
-		monitor.Start("close rule[", i, "]")
-		err = E.Append(err, rule.Close(), func(err error) error {
-			return E.Cause(err, "close rule[", i, "]")
-		})
-		monitor.Finish()
-	}
-	if r.ruleSetUpdater != nil {
-		monitor.Start("close rule-set updater")
-		err = E.Append(err, r.ruleSetUpdater.Close(), func(err error) error {
-			return E.Cause(err, "close rule-set updater")
-		})
-		monitor.Finish()
-	}
-	for i, ruleSet := range r.ruleSets {
-		monitor.Start("close rule-set[", i, "]")
-		err = E.Append(err, ruleSet.Close(), func(err error) error {
-			return E.Cause(err, "close rule-set[", i, "]")
-		})
-		monitor.Finish()
-	}
-	if r.processSearcher != nil {
-		monitor.Start("close process searcher")
-		err = E.Append(err, r.processSearcher.Close(), func(err error) error {
-			return E.Cause(err, "close process searcher")
-		})
-		monitor.Finish()
-	}
-	return err
 }
 
 func (r *Router) RuleSets() []adapter.RuleSet {

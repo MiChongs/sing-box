@@ -33,7 +33,6 @@ func TestResourceDownloadRequestContext(t *testing.T) {
 		return nil, r.Context().Err()
 	})}
 	p := newDashboard(ctx, log.NewNOPFactory().NewLogger("test"), option.APIDashboardOptions{})
-	defer p.cancel()
 	p.httpClient = client
 	require.ErrorIs(t, p.fetch(ctx), context.Canceled)
 	require.True(t, called)

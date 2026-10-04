@@ -100,7 +100,10 @@ func (s *Selector) Network() []string {
 	return selected.Network()
 }
 
-func (s *Selector) Start() error {
+func (s *Selector) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage != adapter.StartStateStart {
+		return nil
+	}
 	s.providerAccess.Lock()
 	defer s.providerAccess.Unlock()
 	if s.useAllProviders {

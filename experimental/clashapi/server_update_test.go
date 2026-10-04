@@ -64,6 +64,6 @@ func TestExternalUIConcurrentChecksAndClose(t *testing.T) {
 	require.False(t, server.lastUpdated.IsZero())
 	server.updateDone = make(chan struct{})
 	go server.loopUpdate()
-	require.NoError(t, server.Close())
+	require.NoError(t, server.stopExternalUIUpdate())
 	require.ErrorIs(t, server.checkAndDownloadExternalUI(false), context.Canceled)
 }

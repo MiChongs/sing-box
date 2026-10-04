@@ -33,12 +33,13 @@ func TestStoreResetPreservesReservationsAfterUncleanRestart(t *testing.T) {
 					Path:        path,
 					StoreFakeIP: true,
 				})
-				require.NoError(t, cache.Start(adapter.StartStateInitialize))
+				scope := adapter.NewScope(context.Background(), logger.NOP())
+				require.NoError(t, cache.Start(adapter.StartStateInitialize, scope))
 				closed := false
 				closeCache := func() {
 					if !closed {
 						closed = true
-						require.NoError(t, cache.Close())
+						require.NoError(t, scope.Close())
 					}
 				}
 				t.Cleanup(closeCache)

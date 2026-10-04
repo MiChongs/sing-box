@@ -728,7 +728,7 @@ func parseHysteria2Link(link string) (option.Outbound, error) {
 		case "down":
 			options.DownMbps, _ = strconv.Atoi(value)
 		case "mport":
-			options.ServerPorts = clashPorts(value)
+			options.ServerPorts = option.LegacyListable[string](clashPorts(value))
 		case "obfs":
 			if value == "salamander" {
 				Obfs.Type = "salamander"

@@ -74,7 +74,10 @@ func TestV6InboundEnablesQUICProxyCompatibility(t *testing.T) {
 			)
 			require.NoError(t, err)
 			inbound := created.(*Inbound)
-			t.Cleanup(func() { require.NoError(t, inbound.Close()) })
+			t.Cleanup(func() {
+				inbound.quicAuth.Close()
+				inbound.udpNat.Close()
+			})
 			require.NotNil(t, inbound.udpNat)
 			require.NotNil(t, inbound.quicAuth)
 
@@ -120,8 +123,9 @@ func TestSnellInboundStartsQUICProxyListener(t *testing.T) {
 			)
 			require.NoError(t, err)
 			inbound := created.(*Inbound)
-			t.Cleanup(func() { require.NoError(t, inbound.Close()) })
-			require.NoError(t, inbound.Start(adapter.StartStateStart))
+			scope := adapter.NewScope(context.Background(), log.NewNOPFactory().Logger())
+			t.Cleanup(func() { require.NoError(t, scope.Close()) })
+			require.NoError(t, inbound.Start(adapter.StartStateStart, scope))
 			require.NotNil(t, inbound.listener.TCPListener())
 			require.NotNil(t, inbound.listener.UDPConn())
 		})

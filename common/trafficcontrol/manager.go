@@ -62,7 +62,6 @@ type Manager struct {
 	eventSubscriber *observable.Subscriber[ConnectionEvent]
 	eventObserver   *observable.Observer[ConnectionEvent]
 	observer        atomic.Pointer[connectionObserverHolder]
-	cleaner         *cleanup.Cleaner
 }
 
 func NewManager() *Manager {
@@ -76,20 +75,15 @@ func (m *Manager) Name() string {
 	return "traffic manager"
 }
 
-func (m *Manager) Start(stage adapter.StartStage) error {
+func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage == adapter.StartStateInitialize {
 		m.eventObserver = observable.NewObserver(m.eventSubscriber, 64)
-		m.cleaner = cleanup.Add(m.cleanupClosedConnections)
-	}
-	return nil
-}
-
-func (m *Manager) Close() error {
-	if m.cleaner != nil {
-		m.cleaner.Close()
-	}
-	if m.eventObserver != nil {
-		return m.eventObserver.Close()
+		scope.Add(m.eventObserver.Close)
+		cleaner := cleanup.Add(m.cleanupClosedConnections)
+		scope.Add(func() error {
+			cleaner.Close()
+			return nil
+		})
 	}
 	return nil
 }

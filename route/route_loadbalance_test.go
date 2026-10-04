@@ -38,8 +38,9 @@ func newRouteLoadBalance(t *testing.T, strategy string) *group.LoadBalance {
 	})
 	require.NoError(t, err)
 	balance := outbound.(*group.LoadBalance)
-	require.NoError(t, balance.Start())
-	t.Cleanup(func() { require.NoError(t, balance.Close()) })
+	scope := adapter.NewScope(context.Background(), logger.NOP())
+	t.Cleanup(func() { require.NoError(t, scope.Close()) })
+	require.NoError(t, balance.Start(adapter.StartStateStart, scope))
 	return balance
 }
 
@@ -58,8 +59,9 @@ func TestResolveLoadBalanceChainAndTrackerSnapshot(t *testing.T) {
 			require.Equal(t, "first", chain[2].Tag())
 			metadata.OutboundChain = chain
 			traffic := trafficcontrol.NewManager()
-			require.NoError(t, traffic.Start(adapter.StartStateInitialize))
-			defer traffic.Close()
+			trafficScope := adapter.NewScope(context.Background(), logger.NOP())
+			require.NoError(t, traffic.Start(adapter.StartStateInitialize, trafficScope))
+			defer trafficScope.Close()
 			conn, peer := net.Pipe()
 			defer peer.Close()
 			tracked := traffic.RoutedConnection(context.Background(), conn, metadata, nil, outer)

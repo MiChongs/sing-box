@@ -1,12 +1,14 @@
 package trafficcontrol
 
 import (
+	"context"
 	"runtime"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing/common/logger"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/stretchr/testify/require"
@@ -27,8 +29,9 @@ func (t *testTracker) Close() error {
 func TestClosedConnectionsLimit(t *testing.T) {
 	manager := NewManager()
 	manager.SetClosedConnectionsTTL(time.Hour)
-	require.NoError(t, manager.Start(adapter.StartStateInitialize))
-	t.Cleanup(func() { require.NoError(t, manager.Close()) })
+	scope := adapter.NewScope(context.Background(), logger.NOP())
+	t.Cleanup(func() { require.NoError(t, scope.Close()) })
+	require.NoError(t, manager.Start(adapter.StartStateInitialize, scope))
 	manager.SetClosedConnectionsLimit(2)
 
 	ids := make([]uuid.UUID, 3)
@@ -70,8 +73,9 @@ func TestClosedConnectionsLimit(t *testing.T) {
 
 func TestConnectionEvents(t *testing.T) {
 	manager := NewManager()
-	require.NoError(t, manager.Start(adapter.StartStateInitialize))
-	t.Cleanup(func() { require.NoError(t, manager.Close()) })
+	scope := adapter.NewScope(context.Background(), logger.NOP())
+	t.Cleanup(func() { require.NoError(t, scope.Close()) })
+	require.NoError(t, manager.Start(adapter.StartStateInitialize, scope))
 	subscription, _, err := manager.SubscribeEvents()
 	require.NoError(t, err)
 	defer manager.UnSubscribeEvents(subscription)
@@ -126,8 +130,9 @@ func TestClosedConnectionsTTLCleanup(t *testing.T) {
 
 func TestClosedConnectionsGCCleanupWithoutTTL(t *testing.T) {
 	manager := NewManager()
-	require.NoError(t, manager.Start(adapter.StartStateInitialize))
-	t.Cleanup(func() { require.NoError(t, manager.Close()) })
+	scope := adapter.NewScope(context.Background(), logger.NOP())
+	t.Cleanup(func() { require.NoError(t, scope.Close()) })
+	require.NoError(t, manager.Start(adapter.StartStateInitialize, scope))
 	tracker := &testTracker{metadata: TrackerMetadata{
 		ID: uuid.Must(uuid.NewV4()), Upload: new(atomic.Int64), Download: new(atomic.Int64),
 	}}

@@ -408,7 +408,7 @@ func (h *HysteriaOption) Build() any {
 	outbound := &option.HysteriaOutboundOptions{
 		DialerOptions: h.DialerOptions.Build(),
 		ServerOptions: h.ServerOptions.Build(),
-		ServerPorts:   clashPorts(h.Ports),
+		ServerPorts:   option.LegacyListable[string](clashPorts(h.Ports)),
 		HopInterval:   badoption.Duration(h.HopInterval),
 		Up:            clashSpeedToNetworkBytes(h.Up),
 		UpMbps:        h.UpSpeed,
@@ -456,7 +456,7 @@ func (h *Hysteria2Option) Build() any {
 	return &option.Hysteria2OutboundOptions{
 		DialerOptions:               h.DialerOptions.Build(),
 		ServerOptions:               h.ServerOptions.Build(),
-		ServerPorts:                 clashPorts(h.Ports),
+		ServerPorts:                 option.LegacyListable[string](clashPorts(h.Ports)),
 		HopInterval:                 badoption.Duration(h.HopInterval),
 		UpMbps:                      clashSpeedToIntMbps(h.Up),
 		DownMbps:                    clashSpeedToIntMbps(h.Down),
@@ -674,7 +674,7 @@ func clashWireGuardPeer(peer ClashWireGuardPeerOption, persistentKeepalive int) 
 		Port:                        uint16(peer.Port),
 		PublicKey:                   peer.PublicKey,
 		PreSharedKey:                peer.PreSharedKey,
-		AllowedIPs:                  allowedIPs,
+		AllowedIPs:                  option.LegacyListable[netip.Prefix](allowedIPs),
 		PersistentKeepaliveInterval: uint16(persistentKeepalive),
 		Reserved:                    []uint8(peer.Reserved),
 	}

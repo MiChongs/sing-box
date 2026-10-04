@@ -239,7 +239,7 @@ func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	}
 }
 
-func (h *Outbound) Close() error {
+func (h *Outbound) close() error {
 	if h.quicDestCache != nil {
 		h.quicDestCache.Close()
 	}
@@ -318,6 +318,14 @@ func (h *Outbound) isRecentQUICDest(source M.Socksaddr, destination M.Socksaddr)
 	}
 	_, loaded := h.quicDestCache.LoadAndRefresh(quicDestCacheKey{source: source, destination: destination})
 	return loaded
+}
+
+func (h *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage != adapter.StartStateInitialize {
+		return nil
+	}
+	scope.Add(h.close)
+	return nil
 }
 
 func (h *Outbound) markQUICDest(source M.Socksaddr, destination M.Socksaddr) uint64 {

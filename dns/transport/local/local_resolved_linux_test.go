@@ -325,7 +325,7 @@ func TestResolvedScopeSelectionWithFallback(t *testing.T) {
 	servers := func(transport adapter.DNSTransport) []resolvedServer {
 		return []resolvedServer{{primaryTransport: transport}}
 	}
-	serverSet := &resolvedServerSet{scopes: []resolvedScope{
+	serverSet := &resolvedServerSet{scopes: []*resolvedScope{
 		{defaultRoute: true, fallback: true, servers: servers(fallback)},
 		{defaultRoute: true, servers: servers(global)},
 		{domains: []string{"internal.example."}, servers: servers(link)},
@@ -336,14 +336,14 @@ func TestResolvedScopeSelectionWithFallback(t *testing.T) {
 	}{
 		{"public.example.", global}, {"host.internal.example.", link},
 	} {
-		got := serverSet.selectServers(test.name)
-		if len(got) != 1 || got[0].primaryTransport != test.want {
+		got := serverSet.selectScopes(test.name)
+		if len(got) != 1 || len(got[0].servers) != 1 || got[0].servers[0].primaryTransport != test.want {
 			t.Fatalf("wrong DNS scope for %s: %v", test.name, got)
 		}
 	}
 	serverSet.scopes = serverSet.scopes[:1]
-	got := serverSet.selectServers("public.example.")
-	if len(got) != 1 || got[0].primaryTransport != fallback {
+	got := serverSet.selectScopes("public.example.")
+	if len(got) != 1 || len(got[0].servers) != 1 || got[0].servers[0].primaryTransport != fallback {
 		t.Fatalf("lost resolved fallback DNS: %v", got)
 	}
 }

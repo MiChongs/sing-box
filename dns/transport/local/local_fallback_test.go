@@ -77,7 +77,12 @@ func fallbackTestTransport(t *testing.T, resolver ResolvedResolver, destination 
 		preferredResolver: &PreferredDomainResolver{}, resolved: resolver, dialer: N.SystemDialer,
 		configSource: &fallbackTestConfig{&systemconfig.Config{Servers: []M.Socksaddr{destination}, Ndots: 1, Attempts: 1, Timeout: time.Second}},
 	}
-	t.Cleanup(func() { _ = transport.Close() })
+	t.Cleanup(func() {
+		_ = transport.configSource.Close()
+		if transport.resolved != nil {
+			_ = transport.resolved.Close()
+		}
+	})
 	return transport
 }
 

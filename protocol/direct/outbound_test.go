@@ -10,6 +10,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
@@ -32,7 +33,9 @@ func TestFlowDomainResolveOptionsDuringFirstDial(t *testing.T) {
 	})
 	require.NoError(t, err)
 	outbound := rawOutbound.(*Outbound)
-	t.Cleanup(func() { require.NoError(t, outbound.Close()) })
+	scope := adapter.NewScope(context.Background(), logger.NOP())
+	t.Cleanup(func() { require.NoError(t, scope.Close()) })
+	require.NoError(t, outbound.Start(adapter.StartStateInitialize, scope))
 	expected := adapter.DNSQueryOptions{
 		Transport:    transport,
 		Strategy:     C.DomainStrategyIPv4Only,

@@ -6,79 +6,59 @@ import (
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/taskmonitor"
-	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-var _ adapter.EndpointManager = (*Manager)(nil)
+var (
+	_ adapter.EndpointManager         = (*Manager)(nil)
+	_ adapter.RuntimeComponentRemover = (*Manager)(nil)
+)
 
 type Manager struct {
-	logger        log.ContextLogger
 	registry      adapter.EndpointRegistry
 	access        sync.Mutex
-	started       bool
-	stage         adapter.StartStage
+	scope         *adapter.Scope
 	endpoints     []adapter.Endpoint
 	endpointByTag map[string]adapter.Endpoint
+	// runtime holds endpoints created after the manager started (outbound
+	// providers); they are started through every stage on creation.
+	runtime map[adapter.Endpoint]struct{}
 }
 
-func NewManager(logger log.ContextLogger, registry adapter.EndpointRegistry) *Manager {
+func NewManager(registry adapter.EndpointRegistry) *Manager {
 	return &Manager{
-		logger:        logger,
 		registry:      registry,
 		endpointByTag: make(map[string]adapter.Endpoint),
+		runtime:       make(map[adapter.Endpoint]struct{}),
 	}
 }
 
-func (m *Manager) Start(stage adapter.StartStage) error {
+func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	m.access.Lock()
 	defer m.access.Unlock()
-	if m.started && m.stage >= stage {
-		panic("already started")
+	if stage == adapter.StartStateInitialize {
+		m.scope = scope
 	}
-	m.started = true
-	m.stage = stage
 	if stage == adapter.StartStateStart {
-		// started with outbound manager
 		return nil
 	}
 	for _, endpoint := range m.endpoints {
+		if _, isRuntime := m.runtime[endpoint]; isRuntime {
+			continue
+		}
 		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
-		done := adapter.LogElapsed(m.logger, stage, " ", name)
-		err := adapter.LegacyStart(endpoint, stage)
-		done()
+		err := scope.Start(name, endpoint, stage)
 		if err != nil {
-			return E.Cause(err, stage, " ", name)
+			return err
 		}
 	}
 	return nil
 }
 
-func (m *Manager) Close() error {
-	m.access.Lock()
-	defer m.access.Unlock()
-	if !m.started {
-		return nil
-	}
-	m.started = false
-	endpoints := m.endpoints
-	m.endpoints = nil
-	monitor := taskmonitor.New(m.logger, C.StopTimeout)
-	var err error
-	for _, endpoint := range endpoints {
-		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
-		done := adapter.LogElapsed(m.logger, "close ", name)
-		monitor.Start("close ", name)
-		err = E.Append(err, endpoint.Close(), func(err error) error {
-			return E.Cause(err, "close ", name)
-		})
-		monitor.Finish()
-		done()
-	}
-	return nil
+func (m *Manager) StartEndpoint(endpoint adapter.Endpoint) error {
+	return m.scope.Start("endpoint/"+endpoint.Type()+"["+endpoint.Tag()+"]", endpoint, adapter.StartStateStart)
 }
 
 func (m *Manager) Endpoints() []adapter.Endpoint {
@@ -94,63 +74,61 @@ func (m *Manager) Get(tag string) (adapter.Endpoint, bool) {
 	return endpoint, found
 }
 
-func (m *Manager) Remove(tag string) error {
-	m.access.Lock()
-	endpoint, found := m.endpointByTag[tag]
-	if !found {
-		m.access.Unlock()
-		return os.ErrInvalid
-	}
-	delete(m.endpointByTag, tag)
-	index := common.Index(m.endpoints, func(it adapter.Endpoint) bool {
-		return it == endpoint
-	})
-	if index == -1 {
-		panic("invalid endpoint index")
-	}
-	m.endpoints = append(m.endpoints[:index], m.endpoints[index+1:]...)
-	started := m.started
-	m.access.Unlock()
-	if started {
-		return endpoint.Close()
-	}
-	return nil
-}
-
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options any) error {
 	endpoint, err := m.registry.Create(ctx, router, logger, tag, outboundType, options)
 	if err != nil {
 		return err
 	}
 	m.access.Lock()
-	defer m.access.Unlock()
-	if m.started {
-		name := "endpoint/" + endpoint.Type() + "[" + endpoint.Tag() + "]"
-		for _, stage := range adapter.ListStartStages {
-			done := adapter.LogElapsed(m.logger, stage, " ", name)
-			err = adapter.LegacyStart(endpoint, stage)
-			done()
-			if err != nil {
-				return E.Cause(err, stage, " ", name)
-			}
+	scope := m.scope
+	_, loaded := m.endpointByTag[tag]
+	m.access.Unlock()
+	if scope == nil {
+		if loaded {
+			return E.New("duplicate endpoint tag: ", tag)
+		}
+	} else {
+		// Start before swapping, so a replaced endpoint keeps serving until
+		// its successor is ready.
+		err = adapter.StartRuntimeComponent(scope, "endpoint/"+endpoint.Type()+"["+tag+"]", endpoint)
+		if err != nil {
+			return err
 		}
 	}
-	if existsEndpoint, loaded := m.endpointByTag[tag]; loaded {
-		if m.started {
-			err = existsEndpoint.Close()
-			if err != nil {
-				return E.Cause(err, "close endpoint/", existsEndpoint.Type(), "[", existsEndpoint.Tag(), "]")
-			}
-		}
-		existsIndex := common.Index(m.endpoints, func(it adapter.Endpoint) bool {
-			return it == existsEndpoint
+	m.access.Lock()
+	replaced := m.endpointByTag[tag]
+	if replaced != nil {
+		m.endpoints = common.Filter(m.endpoints, func(it adapter.Endpoint) bool {
+			return it != replaced
 		})
-		if existsIndex == -1 {
-			panic("invalid endpoint index")
-		}
-		m.endpoints = append(m.endpoints[:existsIndex], m.endpoints[existsIndex+1:]...)
+		delete(m.runtime, replaced)
 	}
 	m.endpoints = append(m.endpoints, endpoint)
 	m.endpointByTag[tag] = endpoint
+	if scope != nil {
+		m.runtime[endpoint] = struct{}{}
+	}
+	m.access.Unlock()
+	if replaced != nil {
+		return adapter.CloseRuntimeComponent(scope, replaced)
+	}
 	return nil
+}
+
+// Remove drops an endpoint while the box is running (outbound providers).
+func (m *Manager) Remove(tag string) error {
+	m.access.Lock()
+	endpoint, loaded := m.endpointByTag[tag]
+	if !loaded {
+		m.access.Unlock()
+		return os.ErrInvalid
+	}
+	delete(m.endpointByTag, tag)
+	delete(m.runtime, endpoint)
+	m.endpoints = common.Filter(m.endpoints, func(it adapter.Endpoint) bool {
+		return it != endpoint
+	})
+	scope := m.scope
+	m.access.Unlock()
+	return adapter.CloseRuntimeComponent(scope, endpoint)
 }

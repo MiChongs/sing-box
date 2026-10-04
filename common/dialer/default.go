@@ -432,10 +432,17 @@ func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr, 
 	if err != nil {
 		return conn, err
 	}
-	if d.disableGSO {
-		if udpConn, loaded := conn.(*net.UDPConn); loaded {
-			conn = bufio.NewUDPConnWithoutGSO(udpConn)
+	if nativeConn, isUDPConn := conn.(*net.UDPConn); isUDPConn {
+		var rawConn syscall.RawConn
+		rawConn, err = nativeConn.SyscallConn()
+		if err != nil {
+			conn.Close()
+			return nil, err
 		}
+		if d.disableGSO {
+			conn = bufio.NewUDPConnWithoutGSO(nativeConn)
+		}
+		conn = &udpConn{Conn: conn, rawConn: rawConn}
 	}
 	conn = bindEBPFSelfBypassConnLifecycle(d.networkManager, conn)
 	if d.connectionManager != nil {

@@ -165,7 +165,20 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 func (s *URLTest) Hidden() bool { return s.hidden }
 func (s *URLTest) Icon() string { return s.icon }
 
-func (s *URLTest) Start() error {
+func (s *URLTest) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	switch stage {
+	case adapter.StartStateStart:
+		return s.startGroup()
+	case adapter.StartStateStarted:
+		s.postStart()
+		scope.Add(func() error {
+			return common.Close(common.PtrOrNil(s.group))
+		})
+	}
+	return nil
+}
+
+func (s *URLTest) startGroup() error {
 	s.providerAccess.Lock()
 	defer s.providerAccess.Unlock()
 	if s.useAllProviders {
@@ -213,7 +226,7 @@ func (s *URLTest) Start() error {
 	return nil
 }
 
-func (s *URLTest) PostStart() error {
+func (s *URLTest) postStart() {
 	// Restore the manually-pinned outbound (if any) from CacheFile before
 	// the group starts dispatching dials. Mirrors Selector's
 	// cacheFile.LoadSelected path but only applies when the pinned tag
@@ -221,8 +234,8 @@ func (s *URLTest) PostStart() error {
 	// dropped it; in that case we silently fall back to auto-selection
 	// rather than dialling a vanished node).
 	//
-	// Why at PostStart and not Start: the group's state is populated in
-	// Start; PostStart is the earliest point at which findOutboundByTag
+	// Why at the started stage and not start: the group's state is populated
+	// in startGroup; postStart is the earliest point at which findOutboundByTag
 	// can resolve the pin tag. Reloading here also means the
 	// user-visible Selected() / PinnedTag() reflect the pin immediately
 	// after startup, before any health-check runs.
@@ -254,7 +267,6 @@ func (s *URLTest) PostStart() error {
 		}
 	}
 	s.group.PostStart()
-	return nil
 }
 
 // persistManualPin writes the pin tag to CacheFile so it survives core
@@ -273,12 +285,6 @@ func (s *URLTest) persistManualPin(tag string) {
 	if err := cacheFile.StoreSelected(s.Tag(), tag); err != nil {
 		s.logger.Error("persist manual pin: ", err)
 	}
-}
-
-func (s *URLTest) Close() error {
-	return common.Close(
-		common.PtrOrNil(s.group),
-	)
 }
 
 // Selected returns the member traffic for network is routed through: the

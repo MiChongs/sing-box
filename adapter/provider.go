@@ -37,7 +37,6 @@ type ProviderManager interface {
 	Lifecycle
 	Providers() []Provider
 	Get(tag string) (Provider, bool)
-	Remove(tag string) error
 	Create(ctx context.Context, router Router, logFactory log.Factory, tag string, providerType string, options any) error
 }
 

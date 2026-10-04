@@ -117,7 +117,20 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 func (s *LoadBalance) Hidden() bool { return s.hidden }
 func (s *LoadBalance) Icon() string { return s.icon }
 
-func (s *LoadBalance) Start() error {
+func (s *LoadBalance) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	switch stage {
+	case adapter.StartStateStart:
+		return s.startGroup()
+	case adapter.StartStateStarted:
+		s.group.PostStart()
+		scope.Add(func() error {
+			return common.Close(common.PtrOrNil(s.group))
+		})
+	}
+	return nil
+}
+
+func (s *LoadBalance) startGroup() error {
 	s.providerAccess.Lock()
 	defer s.providerAccess.Unlock()
 	if s.useAllProviders {
@@ -163,17 +176,6 @@ func (s *LoadBalance) Start() error {
 		s.providers[providerTag].RegisterCallback(s.onProviderUpdated)
 	}
 	return nil
-}
-
-func (s *LoadBalance) PostStart() error {
-	s.group.PostStart()
-	return nil
-}
-
-func (s *LoadBalance) Close() error {
-	return common.Close(
-		common.PtrOrNil(s.group),
-	)
 }
 
 // A load-balance group has no global selection. Querying it must not consume

@@ -59,7 +59,6 @@ func TestResolverDiscoveryPolicy(t *testing.T) {
 					options.DisableCache = true
 					router, err := NewRouter(ctx, log.NewNOPFactory(), options)
 					require.NoError(t, err)
-					t.Cleanup(func() { require.NoError(t, router.Close()) })
 					router.legacyDNSMode = mode == "legacy" || mode == "legacy-reject"
 					reject := mode == "rules-reject" || mode == "legacy-reject"
 					var rejectRule *legacyAliasRule
@@ -144,7 +143,6 @@ func TestResolverDiscoveryQueryScope(t *testing.T) {
 			t.Parallel()
 			router, err := NewRouter(context.Background(), log.NewNOPFactory(), option.DNSOptions{})
 			require.NoError(t, err)
-			t.Cleanup(func() { require.NoError(t, router.Close()) })
 			message := new(mDNS.Msg)
 			message.SetQuestion(testCase.name, testCase.qtype)
 			exchangeCtx, earlyResponse, err := router.prepareExchange(context.Background(), message)

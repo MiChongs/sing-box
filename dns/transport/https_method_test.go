@@ -66,7 +66,7 @@ func TestHTTPSRequestMethods(t *testing.T) {
 			require.NoError(t, err)
 			transport := NewHTTPSRaw(dns.TransportAdapter{}, nil, nil, destination, method, http.Header{}, M.Socksaddr{}, nil)
 			transport.transport.httpTransport = http.DefaultTransport.(*http.Transport).Clone()
-			defer transport.Close()
+			defer transport.Reset()
 			message := new(mDNS.Msg).SetQuestion("example.com.", mDNS.TypeA)
 			response, err := transport.exchange(context.Background(), message)
 			require.NoError(t, err)

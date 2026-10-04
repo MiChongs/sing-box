@@ -44,8 +44,9 @@ func TestOutboundOptions(t *testing.T) {
 		require.Equal(t, !disableReuse, outbound.MultiplexEnabled())
 		require.NotNil(t, outbound.clientOptions.ClientMetadata)
 		require.Empty(t, *outbound.clientOptions.ClientMetadata)
-		require.NoError(t, outbound.Start(adapter.StartStateInitialize))
-		require.NoError(t, outbound.Close())
+		scope := adapter.NewScope(context.Background(), logger.NOP())
+		require.NoError(t, outbound.Start(adapter.StartStateInitialize, scope))
+		require.NoError(t, scope.Close())
 	}
 }
 
@@ -56,7 +57,6 @@ func TestIdleMethodsBeforeStart(t *testing.T) {
 		outbound.SetKeepIdleConnections(false)
 		outbound.CloseIdleConnections()
 	})
-	require.NoError(t, outbound.Close())
 }
 
 func TestALPNFallbackRequiresTLS(t *testing.T) {

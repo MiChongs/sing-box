@@ -10,7 +10,6 @@ import (
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 )
@@ -22,8 +21,6 @@ type Manager struct {
 	logger        log.ContextLogger
 	registry      adapter.ProviderRegistry
 	access        sync.Mutex
-	started       bool
-	stage         adapter.StartStage
 	providers     []adapter.Provider
 	providerByTag map[string]adapter.Provider
 }
@@ -40,52 +37,43 @@ func NewManager(ctx context.Context, logger logger.ContextLogger, registry adapt
 func (m *Manager) Initialize() {
 }
 
-func (m *Manager) Start(stage adapter.StartStage) error {
-	m.access.Lock()
-	if m.started && m.stage >= stage {
-		panic("already started")
-	}
-	m.started = true
-	m.stage = stage
-	providers := m.providers
-	m.access.Unlock()
-	if stage == adapter.StartStateStart && len(providers) > 0 {
-		startContext := adapter.NewHTTPStartContext()
-		defer startContext.Close()
-		for _, provider := range providers {
-			if contextStarter, ok := provider.(interface {
-				StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
-			}); ok {
-				err := contextStarter.StartContext(m.ctx, startContext)
-				if err != nil {
-					return E.Cause(err, stage, " provider/", provider.Type(), "[", provider.Tag(), "]")
-				}
-			}
-		}
+func (m *Manager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	if stage != adapter.StartStateStart {
 		return nil
 	}
-	return nil
-}
-
-func (m *Manager) Close() error {
-	monitor := taskmonitor.New(m.logger, C.StopTimeout)
 	m.access.Lock()
-	if !m.started {
-		m.access.Unlock()
+	providers := m.providers
+	m.access.Unlock()
+	if len(providers) == 0 {
 		return nil
 	}
-	m.started = false
-	providers := m.providers
-	m.providers = nil
-	m.access.Unlock()
-	var err error
+	startContext := adapter.NewHTTPStartContext()
+	defer startContext.Close()
 	for _, provider := range providers {
+		name := "provider/" + provider.Type() + "[" + provider.Tag() + "]"
+		// Register the cleanup first so a provider that fails to start is
+		// still closed with the box.
 		if closer, isCloser := provider.(io.Closer); isCloser {
-			monitor.Start("close provider/", provider.Type(), "[", provider.Tag(), "]")
-			err = E.Append(err, closer.Close(), func(err error) error {
-				return E.Cause(err, "close provider/", provider.Type(), "[", provider.Tag(), "]")
+			scope.Add(func() error {
+				done := adapter.LogElapsed(m.logger, "close ", name)
+				monitor := taskmonitor.New(m.logger, C.StopTimeout)
+				monitor.Start("close ", name)
+				err := closer.Close()
+				monitor.Finish()
+				done()
+				if err != nil {
+					return E.Cause(err, "close ", name)
+				}
+				return nil
 			})
-			monitor.Finish()
+		}
+		if contextStarter, ok := provider.(interface {
+			StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
+		}); ok {
+			err := contextStarter.StartContext(m.ctx, startContext)
+			if err != nil {
+				return E.Cause(err, stage, " ", name)
+			}
 		}
 	}
 	return nil
@@ -104,68 +92,18 @@ func (m *Manager) Get(tag string) (adapter.Provider, bool) {
 	return provider, found
 }
 
-func (m *Manager) Remove(tag string) error {
-	m.access.Lock()
-	provider, found := m.providerByTag[tag]
-	if !found {
-		m.access.Unlock()
-		return os.ErrInvalid
-	}
-	delete(m.providerByTag, tag)
-	index := common.Index(m.providers, func(it adapter.Provider) bool {
-		return it == provider
-	})
-	if index == -1 {
-		panic("invalid provider index")
-	}
-	m.providers = append(m.providers[:index], m.providers[index+1:]...)
-	started := m.started
-	m.access.Unlock()
-	if started {
-		return common.Close(provider)
-	}
-	return nil
-}
-
 func (m *Manager) Create(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, providerType string, options any) error {
 	if tag == "" {
 		return os.ErrInvalid
 	}
-
 	provider, err := m.registry.CreateProvider(ctx, router, logFactory, tag, providerType, options)
 	if err != nil {
 		return err
 	}
 	m.access.Lock()
 	defer m.access.Unlock()
-	if m.started {
-		if m.stage >= adapter.StartStateStart {
-			if contextStarter, ok := provider.(interface {
-				StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error
-			}); ok {
-				startContext := adapter.NewHTTPStartContext()
-				err = contextStarter.StartContext(m.ctx, startContext)
-				startContext.Close()
-				if err != nil {
-					return E.Cause(err, "start provider/", provider.Type(), "[", provider.Tag(), "]")
-				}
-			}
-		}
-	}
-	if existsProvider, loaded := m.providerByTag[tag]; loaded {
-		if m.started {
-			err = common.Close(existsProvider)
-			if err != nil {
-				return E.Cause(err, "close provider", provider.Type(), "[", existsProvider.Tag(), "]")
-			}
-		}
-		existsIndex := common.Index(m.providers, func(it adapter.Provider) bool {
-			return it == existsProvider
-		})
-		if existsIndex == -1 {
-			panic("invalid provider index")
-		}
-		m.providers = append(m.providers[:existsIndex], m.providers[existsIndex+1:]...)
+	if _, loaded := m.providerByTag[tag]; loaded {
+		return E.New("duplicate provider tag: ", tag)
 	}
 	m.providers = append(m.providers, provider)
 	m.providerByTag[tag] = provider
