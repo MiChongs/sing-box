@@ -29,6 +29,11 @@ type defaultFactory struct {
 	level             Level
 	subscriber        *observable.Subscriber[Entry]
 	observer          *observable.Observer[Entry]
+	// subscriptions tracks live Subscribe callers (Clash API /logs,
+	// dashboards). Without any, entries above the configured level have
+	// no reader and are not formatted at all.
+	subscriptions     sync.Map
+	subscriptionCount atomic.Int32
 	startAccess       sync.Mutex
 	started           atomic.Bool
 	pendingEntries    []pendingEntry
@@ -139,11 +144,25 @@ func (f *defaultFactory) NewLogger(tag string) ContextLogger {
 }
 
 func (f *defaultFactory) Subscribe() (subscription observable.Subscription[Entry], done <-chan struct{}, err error) {
-	return f.observer.Subscribe()
+	subscription, done, err = f.observer.Subscribe()
+	if err == nil {
+		f.subscriptions.Store(subscription, struct{}{})
+		f.subscriptionCount.Add(1)
+	}
+	return
 }
 
 func (f *defaultFactory) UnSubscribe(sub observable.Subscription[Entry]) {
 	f.observer.UnSubscribe(sub)
+	if _, loaded := f.subscriptions.LoadAndDelete(sub); loaded {
+		f.subscriptionCount.Add(-1)
+	}
+}
+
+// observed reports whether any subscriber currently reads the observable
+// log stream.
+func (f *defaultFactory) observed() bool {
+	return f.needObservable && f.subscriptionCount.Load() > 0
 }
 
 func (f *defaultFactory) output(ctx context.Context, level Level, tag string, message string, timestamp time.Time) {
@@ -157,7 +176,7 @@ func (f *defaultFactory) output(ctx context.Context, level Level, tag string, me
 			os.Exit(1)
 		}
 	}
-	if f.needObservable {
+	if f.observed() {
 		f.subscriber.Emit(Entry{level, f.formatter.FormatSimple(ctx, tag, message)})
 	}
 	platformWriters := f.loadPlatformWriters()
@@ -179,7 +198,7 @@ type observableLogger struct {
 func (l *observableLogger) Log(ctx context.Context, level Level, args []any) {
 	level = OverrideLevelFromContext(level, ctx)
 	platformWriters := l.loadPlatformWriters()
-	if level > l.level && len(platformWriters) == 0 && !l.needObservable {
+	if level > l.level && len(platformWriters) == 0 && !l.observed() {
 		return
 	}
 	nowTime := time.Now()
