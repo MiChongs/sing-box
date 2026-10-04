@@ -482,7 +482,10 @@ jobs:
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          PREV=$(git tag --sort=-creatordate | grep -v -F -x "$TAG" | head -n1 || true)
+          # 取当前 tag 祖先链上最近的 xiaobaf14g tag。按创建时间取最新 tag 会
+          # 选中同步进来的上游 tag（历史被改写、与当前 tag 无共同近祖），
+          # changelog 会膨胀到数万个提交。
+          PREV=$(git describe --tags --abbrev=0 --match 'v*-xiaobaf14g*' "${TAG}^" 2>/dev/null || true)
           echo "prev=$PREV" | tee -a "$GITHUB_OUTPUT"
 
       - name: Build categorized changelog (external)
@@ -495,6 +498,9 @@ jobs:
           fromTag: ${{ steps.prevtag.outputs.prev }}
           toTag:   ${{ needs.prepare.outputs.tag }}
           failOnError: false
+          # 写文件而不是经 env 传给下一步：changelog 很长时 env 会超过
+          # 单个参数 128KB 的上限（Argument list too long）。
+          outputFile: CHANGELOG_BODY.md
           mode: COMMIT
           fetchReleaseInformation: false
           commitMode: true
@@ -509,7 +515,6 @@ jobs:
           SERVER_URL:   ${{ github.server_url }}
           RUN_ID:       ${{ github.run_id }}
           IS_PRE:       ${{ needs.prepare.outputs.prerelease }}
-          CL_BODY:      ${{ steps.cl.outputs.changelog }}
           CL_COUNT:     ${{ steps.cl.outputs.changes }}
         run: |
           set -euo pipefail
@@ -544,8 +549,13 @@ jobs:
             echo ""
             echo "---"
             echo ""
-            if [ -n "${CL_BODY:-}" ]; then
-              printf '%s\n' "$CL_BODY"
+            # GitHub Release 正文上限 125000 字符，留出头尾和 artifacts 表格的余量。
+            if [ -s CHANGELOG_BODY.md ] && [ "$(wc -c < CHANGELOG_BODY.md)" -gt 90000 ]; then
+              head -c 90000 CHANGELOG_BODY.md | sed '$d'
+              echo ""
+              echo "_… 更多提交见 ${RANGE_LINE}_"
+            elif [ -s CHANGELOG_BODY.md ]; then
+              cat CHANGELOG_BODY.md
             else
               echo "_No noteworthy changes in this range._"
             fi
@@ -553,6 +563,8 @@ jobs:
             echo "---"
             echo ""
             echo "## Artifacts"
+            echo ""
+            echo "> 带 \`-ebpf\` 后缀的是启用 eBPF 入站 (\`with_ebpf\`) 的构建，其余功能与同平台普通版一致。"
             echo ""
             if ls builds/*.tar.gz >/dev/null 2>&1; then
               echo "| File | Size |"
