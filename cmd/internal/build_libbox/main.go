@@ -323,7 +323,7 @@ func buildAndroidBinary() {
 	} else {
 		tags = append([]string{}, sharedTags...)
 	}
-	tags = append(tags, "with_naive_outbound", "netgo")
+	tags = append(tags, "with_naive_outbound", "with_xhttp", "with_ebpf", "netgo")
 	// deduplicate
 	seen := make(map[string]bool)
 	deduped := tags[:0]

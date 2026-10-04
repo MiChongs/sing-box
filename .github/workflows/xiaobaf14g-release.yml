@@ -198,7 +198,8 @@ jobs:
               TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_ccm,with_ocm,with_cloudflared,with_xhttp,badlinkname,tfogo_checklinkname0'
               ;;
             others)
-              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_xhttp,badlinkname,tfogo_checklinkname0'
+              # with_ebpf only compiles on linux/android; darwin builds get the stub.
+              TAGS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_xhttp,with_ebpf,badlinkname,tfogo_checklinkname0'
               ;;
           esac
           echo "tags=$TAGS" | tee -a "$GITHUB_OUTPUT"

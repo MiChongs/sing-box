@@ -13,7 +13,7 @@ DIST="${DIST:-dist}"
 
 TAGS_WINDOWS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_purego,with_xhttp,badlinkname,tfogo_checklinkname0'
 TAGS_FREEBSD='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_ccm,with_ocm,with_cloudflared,with_xhttp,badlinkname,tfogo_checklinkname0'
-TAGS_OTHERS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_xhttp,badlinkname,tfogo_checklinkname0'
+TAGS_OTHERS='with_gvisor,with_quic,with_dhcp,with_wireguard,with_utls,with_acme,with_clash_api,with_tailscale,with_ccm,with_ocm,with_cloudflared,with_xhttp,with_ebpf,badlinkname,tfogo_checklinkname0'
 
 LDFLAGS="-s -w -X internal/godebug.defaultGODEBUG=multipathtcp=0 -checklinkname=0 -buildid= -X github.com/sagernet/sing-box/constant.Version=${VERSION}"
 
