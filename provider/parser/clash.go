@@ -256,7 +256,7 @@ func (v *VmessOption) Build() any {
 		DialerOptions:               v.DialerOptions.Build(),
 		ServerOptions:               v.ServerOptions.Build(),
 		UUID:                        v.UUID,
-		Security:                    v.Cipher,
+		Security:                    resolveVMessAutoSecurity(v.Cipher),
 		AlterId:                     v.AlterID,
 		GlobalPadding:               v.GlobalPadding,
 		AuthenticatedLength:         v.AuthenticatedLength,

@@ -437,6 +437,7 @@ func parseVMessLink(link string) (option.Outbound, error) {
 	if TLSOptions.Enabled {
 		options.TLS = &TLSOptions
 	}
+	options.Security = resolveVMessAutoSecurity(options.Security)
 	outbound.Options = &options
 	return outbound, nil
 }
