@@ -379,6 +379,7 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	var lastUpdated time.Time
 	var lastEtag string
 	var saveSub *adapter.SavedBinary
+	var staleRecord bool
 	if s.cacheFile != nil {
 		if saveSub = s.cacheFile.LoadSubscription(s.Tag()); saveSub != nil {
 			if len(saveSub.URLHash) > 0 && !bytes.Equal(saveSub.URLHash, s.urlHash[:]) {
@@ -413,14 +414,18 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 		if closeErr != nil {
 			return false, closeErr
 		}
-		if saveSub != nil {
-			if !s.hash.Equal(hash.MakeHash(content)) {
-				return false, E.New("load outbound provider cache file failed: validation failed")
-			}
+		fileHash := hash.MakeHash(content)
+		if saveSub != nil && s.hash.Equal(fileHash) {
 			lastUpdated = saveSub.LastUpdated
 			lastEtag = saveSub.LastEtag
 		} else {
+			// The file was replaced without this cache record (another core
+			// version sharing the directory, or an external edit). Load the file
+			// itself; its modification time drives the next update and the
+			// record's ETag no longer describes it.
 			lastUpdated = fileInfo.ModTime()
+			s.hash = fileHash
+			staleRecord = saveSub != nil
 		}
 	} else if saveSub != nil && len(saveSub.Content) > 0 {
 		content = saveSub.Content
@@ -434,6 +439,17 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	}
 	s.UpdateGroups()
 	s.lastUpdated, s.lastEtag = lastUpdated, lastEtag
+	if staleRecord {
+		s.logger.Info("outbound provider file ", s.path, " changed since it was cached, loaded it from disk")
+		err := s.cacheFile.SaveSubscription(s.Tag(), &adapter.SavedBinary{
+			Hash:        s.hash,
+			LastUpdated: lastUpdated,
+			URLHash:     s.urlHash[:],
+		})
+		if err != nil {
+			s.logger.Error("save outbound provider cache file: ", err)
+		}
+	}
 	return true, nil
 }
 

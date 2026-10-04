@@ -128,3 +128,70 @@ func TestBranchCacheMigrationAndIsolation(t *testing.T) {
 		})
 	}
 }
+
+// legacyBranchSavedBinary encodes records the way branch releases did before
+// the branch envelope: the static file hash precedes the official fields.
+func legacyBranchSavedBinary(t *testing.T, version byte, value *adapter.SavedBinary) []byte {
+	t.Helper()
+	var buffer bytes.Buffer
+	buffer.WriteByte(version)
+	for _, field := range [][]byte{value.Hash.Bytes(), value.Content} {
+		_, err := varbin.WriteUvarint(&buffer, uint64(len(field)))
+		require.NoError(t, err)
+		buffer.Write(field)
+	}
+	require.NoError(t, binary.Write(&buffer, binary.BigEndian, value.LastUpdated.Unix()))
+	_, err := varbin.WriteUvarint(&buffer, uint64(len(value.LastEtag)))
+	require.NoError(t, err)
+	buffer.WriteString(value.LastEtag)
+	if version == 2 {
+		_, err = varbin.WriteUvarint(&buffer, uint64(len(value.URLHash)))
+		require.NoError(t, err)
+		buffer.Write(value.URLHash)
+	}
+	return buffer.Bytes()
+}
+
+func TestLegacyBranchRecordMigration(t *testing.T) {
+	cache := New(context.Background(), logger.NOP(), option.CacheFileOptions{Path: filepath.Join(t.TempDir(), "cache.db")})
+	scope := adapter.NewScope(context.Background(), logger.NOP())
+	require.NoError(t, cache.Start(adapter.StartStateInitialize, scope))
+	defer scope.Close()
+	staticFile := &adapter.SavedBinary{Hash: hash.MakeHash([]byte("rule-set file")), LastUpdated: time.Unix(1750000000, 0), LastEtag: "\"etag\"", URLHash: []byte("0123456789abcdef0123456789abcdef")}
+	inline := &adapter.SavedBinary{Hash: hash.MakeHash([]byte("inline rules")), Content: []byte("inline rules"), LastUpdated: time.Unix(1750000000, 0), LastEtag: "etag", URLHash: []byte("url")}
+	records := map[string][]byte{
+		"static-v2": legacyBranchSavedBinary(t, 2, staticFile),
+		"inline-v2": legacyBranchSavedBinary(t, 2, inline),
+		"inline-v1": legacyBranchSavedBinary(t, 1, inline),
+	}
+	require.NoError(t, cache.DB.Update(func(tx *bbolt.Tx) error {
+		bucket, err := cache.createBucket(tx, bucketRuleSet)
+		if err != nil {
+			return err
+		}
+		for tag, record := range records {
+			if err = bucket.Put([]byte(tag), record); err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+	require.Equal(t, staticFile, cache.LoadRuleSet("static-v2"), "keep the static file hash of old branch records")
+	require.Equal(t, inline, cache.LoadRuleSet("inline-v2"))
+	inlineV1 := *inline
+	inlineV1.URLHash = nil
+	require.Equal(t, &inlineV1, cache.LoadRuleSet("inline-v1"))
+
+	for _, bad := range [][]byte{
+		append(bytes.Clone(records["static-v2"]), 0),
+		records["static-v2"][:len(records["static-v2"])-1],
+		legacyBranchSavedBinary(t, 2, &adapter.SavedBinary{Hash: hash.MakeHash([]byte("other")), Content: []byte("inline rules")}),
+	} {
+		_, err := unmarshalLegacyBranchBinary(bad)
+		require.Error(t, err)
+	}
+	// Official records in the same bucket must not be taken for old branch ones.
+	official := &adapter.SavedBinary{Content: []byte("0123456789abcdef"), LastUpdated: time.Unix(1750000000, 0)}
+	_, err := unmarshalLegacyBranchBinary(legacySavedBinary(t, 2, official))
+	require.Error(t, err)
+}

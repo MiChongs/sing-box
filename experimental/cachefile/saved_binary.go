@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"io"
 	"os"
+	"time"
 
 	"github.com/sagernet/bbolt"
 	"github.com/sagernet/sing-box/adapter"
@@ -106,6 +107,12 @@ func (c *CacheFile) loadBranchBinary(kind []byte, tag string, legacy bool) *adap
 		if len(data) == 0 || (data[0] != 1 && data[0] != 2) {
 			return os.ErrInvalid
 		}
+		// Earlier branch releases wrote this bucket in their own layout, with
+		// the static file hash in front of the content.
+		if legacyBranch, err := unmarshalLegacyBranchBinary(data); err == nil {
+			result = legacyBranch
+			return nil
+		}
 		result = new(adapter.SavedBinary)
 		if err := result.UnmarshalBinary(data); err != nil {
 			return err
@@ -139,4 +146,78 @@ func (c *CacheFile) saveBranchBinary(kind []byte, tag string, value *adapter.Sav
 		}
 		return bucket.Put([]byte(tag), data)
 	})
+}
+
+// unmarshalLegacyBranchBinary decodes records written by branch releases before
+// the branch envelope: version, hash, content, last updated, etag and (since
+// version 2) URL hash. It only accepts a record it consumes exactly, so upstream
+// records in the same bucket fall through to the upstream decoder.
+func unmarshalLegacyBranchBinary(data []byte) (*adapter.SavedBinary, error) {
+	reader := bytes.NewReader(data)
+	version, err := reader.ReadByte()
+	if err != nil {
+		return nil, err
+	}
+	if version != 1 && version != 2 {
+		return nil, E.New("unsupported legacy branch cache version: ", version)
+	}
+	value := new(adapter.SavedBinary)
+	hashBytes, err := readLegacyBytes(reader)
+	if err != nil {
+		return nil, err
+	}
+	if len(hashBytes) != value.Hash.Len() {
+		return nil, E.New("invalid legacy branch cache hash length: ", len(hashBytes))
+	}
+	err = value.Hash.UnmarshalBinary(hashBytes)
+	if err != nil {
+		return nil, err
+	}
+	value.Content, err = readLegacyBytes(reader)
+	if err != nil {
+		return nil, err
+	}
+	var lastUpdated int64
+	err = binary.Read(reader, binary.BigEndian, &lastUpdated)
+	if err != nil {
+		return nil, err
+	}
+	value.LastUpdated = time.Unix(lastUpdated, 0)
+	etag, err := readLegacyBytes(reader)
+	if err != nil {
+		return nil, err
+	}
+	value.LastEtag = string(etag)
+	if version >= 2 {
+		value.URLHash, err = readLegacyBytes(reader)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if reader.Len() != 0 {
+		return nil, E.New("trailing data in legacy branch cache record")
+	}
+	if len(value.Content) > 0 && !value.Hash.Equal(hash.MakeHash(value.Content)) {
+		return nil, E.New("legacy branch cache hash does not match its content")
+	}
+	return value, nil
+}
+
+func readLegacyBytes(reader *bytes.Reader) ([]byte, error) {
+	length, err := binary.ReadUvarint(reader)
+	if err != nil {
+		return nil, err
+	}
+	if length > uint64(reader.Len()) {
+		return nil, E.New("invalid legacy branch cache field length: ", length)
+	}
+	if length == 0 {
+		return nil, nil
+	}
+	value := make([]byte, int(length))
+	_, err = io.ReadFull(reader, value)
+	if err != nil {
+		return nil, err
+	}
+	return value, nil
 }

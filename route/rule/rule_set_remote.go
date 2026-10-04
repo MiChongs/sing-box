@@ -273,6 +273,7 @@ func (s *RemoteRuleSet) loadCacheFile() (bool, error) {
 	var lastUpdated time.Time
 	var lastEtag string
 	var savedSet *adapter.SavedBinary
+	var staleRecord bool
 	if s.cacheFile != nil {
 		if savedSet = s.cacheFile.LoadRuleSet(s.tag); savedSet != nil {
 			if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
@@ -307,14 +308,18 @@ func (s *RemoteRuleSet) loadCacheFile() (bool, error) {
 		if closeErr != nil {
 			return false, closeErr
 		}
-		if savedSet != nil {
-			if !s.hash.Equal(hash.MakeHash(content)) {
-				return false, E.New("load rule-set cache file failed: validation failed")
-			}
+		fileHash := hash.MakeHash(content)
+		if savedSet != nil && s.hash.Equal(fileHash) {
 			lastUpdated = savedSet.LastUpdated
 			lastEtag = savedSet.LastEtag
 		} else {
+			// The file was replaced without this cache record (another core
+			// version sharing the directory, or an external edit). Load the file
+			// itself; its modification time drives the next update and the
+			// record's ETag no longer describes it.
 			lastUpdated = info.ModTime()
+			s.hash = fileHash
+			staleRecord = savedSet != nil
 		}
 	} else if savedSet != nil && len(savedSet.Content) > 0 {
 		content = savedSet.Content
@@ -328,6 +333,17 @@ func (s *RemoteRuleSet) loadCacheFile() (bool, error) {
 	}
 	s.setUpdatedTime(lastUpdated)
 	s.lastEtag = lastEtag
+	if staleRecord {
+		s.logger.Info("rule-set file ", s.path, " changed since it was cached, loaded it from disk")
+		err := s.cacheFile.SaveRuleSet(s.tag, &adapter.SavedBinary{
+			Hash:        s.hash,
+			LastUpdated: lastUpdated,
+			URLHash:     s.urlHash[:],
+		})
+		if err != nil {
+			s.logger.Error("save rule-set cache: ", err)
+		}
+	}
 	return true, nil
 }
 
