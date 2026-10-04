@@ -28,6 +28,7 @@ service StartedService {
   rpc CloseAllConnections(google.protobuf.Empty) returns(google.protobuf.Empty) {}
   rpc GetDeprecatedWarnings(google.protobuf.Empty) returns(DeprecatedWarnings) {}
   rpc GetStartedAt(google.protobuf.Empty) returns(StartedAt) {}
+  rpc GetEBPFDiagnostics(google.protobuf.Empty) returns(EBPFDiagnosticsResponse) {}
 
   rpc SubscribeOutbounds(google.protobuf.Empty) returns (stream OutboundList) {}
   rpc StartNetworkQualityTest(NetworkQualityTestRequest) returns (stream NetworkQualityTestProgress) {}
@@ -36,9 +37,23 @@ service StartedService {
   rpc StartTailscalePing(TailscalePingRequest) returns (stream TailscalePingResponse) {}
   rpc SetTailscaleExitNode(SetTailscaleExitNodeRequest) returns (google.protobuf.Empty) {}
   rpc TailscaleLogout(TailscaleLogoutRequest) returns (google.protobuf.Empty) {}
+  rpc GetTailscaleCertificate(TailscaleCertificateRequest) returns (TailscaleCertificate) {}
   rpc StartTailscaleSSHSession(stream TailscaleSSHClientMessage) returns (stream TailscaleSSHServerMessage) {}
+  rpc SubscribeTaildropInbox(SubscribeTaildropInboxRequest) returns (stream TaildropInbox) {}
+  rpc MarkTaildropInboxRead(MarkTaildropInboxReadRequest) returns (google.protobuf.Empty) {}
+  rpc SendTaildropFiles(stream TaildropSendClientMessage) returns (stream TaildropSendServerMessage) {}
+  rpc DownloadTaildropFile(DownloadTaildropFileRequest) returns (stream DownloadTaildropFileChunk) {}
+  rpc DeleteTaildropFile(DeleteTaildropFileRequest) returns (google.protobuf.Empty) {}
+  rpc CancelTaildropReceiving(CancelTaildropReceivingRequest) returns (google.protobuf.Empty) {}
   rpc ProvideUSBDevices(stream USBProviderMessage) returns (stream USBServerMessage) {}
   rpc SubscribeUSBIPServerStatus(google.protobuf.Empty) returns (stream USBIPServerStatusUpdate) {}
+  rpc SubscribeOpenConnectStatus(google.protobuf.Empty) returns (stream OpenConnectStatusUpdate) {}
+  rpc SubmitOpenConnectAuthResponse(OpenConnectAuthResponseSubmission) returns (google.protobuf.Empty) {}
+  rpc CancelOpenConnectAuthChallenge(OpenConnectAuthChallengeCancel) returns (google.protobuf.Empty) {}
+  rpc SubscribeOpenVPNStatus(google.protobuf.Empty) returns (stream OpenVPNStatusUpdate) {}
+  rpc SubmitOpenVPNChallengeResponse(OpenVPNChallengeSubmission) returns (google.protobuf.Empty) {}
+  rpc CancelOpenVPNChallenge(OpenVPNChallengeCancel) returns (google.protobuf.Empty) {}
+  rpc SubscribeNotifications(google.protobuf.Empty) returns (stream NotificationEvent) {}
 }
 
 message Version {
@@ -270,13 +285,19 @@ message TailscaleStatusUpdate {
 message TailscaleEndpointStatus {
   string endpointTag = 1;
   string backendState = 2;
-  string authURL = 3;
-  string networkName = 4;
-  string magicDNSSuffix = 5;
-  TailscalePeer self = 6;
-  repeated TailscaleUserGroup userGroups = 7;
-  TailscalePeer exitNode = 8;
-  bool keyAuth = 9;
+  string stateText = 3;
+  string authURL = 4;
+  string networkName = 5;
+  string magicDNSSuffix = 6;
+  TailscalePeer self = 7;
+  repeated TailscaleUserGroup userGroups = 8;
+  TailscalePeer exitNode = 9;
+  bool keyAuth = 10;
+  bool canShareFiles = 11;
+  int32 waitingFileCount = 12;
+  int32 receivingFileCount = 13;
+  int32 unreadFileCount = 14;
+  repeated string certDomains = 15;
 }
 
 message TailscaleUserGroup {
@@ -304,6 +325,7 @@ message TailscalePeer {
   repeated string sshHostKeys = 14;
   bool shareeNode = 15;
   int64 lastSeen = 16;
+  bool canReceiveFiles = 17;
 }
 
 message TailscalePingRequest {
@@ -318,6 +340,7 @@ message TailscalePingResponse {
   int32 derpRegionID = 4;
   string derpRegionCode = 5;
   string error = 6;
+  string peerRelay = 7;
 }
 
 message SetTailscaleExitNodeRequest {
@@ -327,6 +350,17 @@ message SetTailscaleExitNodeRequest {
 
 message TailscaleLogoutRequest {
   string endpointTag = 1;
+}
+
+message TailscaleCertificateRequest {
+  string endpointTag = 1;
+  string domain = 2;
+  int64 minValiditySeconds = 3;
+}
+
+message TailscaleCertificate {
+  bytes certificatePEM = 1;
+  bytes privateKeyPEM = 2;
 }
 
 message TailscaleSSHClientMessage {
@@ -390,6 +424,94 @@ message TailscaleSSHExit {
 
 message TailscaleSSHError {
   string message = 1;
+}
+
+message SubscribeTaildropInboxRequest {
+  string endpointTag = 1;
+}
+
+message MarkTaildropInboxReadRequest {
+  string endpointTag = 1;
+}
+
+message TaildropInbox {
+  string endpointTag = 1;
+  repeated TaildropFile files = 2;
+  repeated TaildropReceivingFile receiving = 3;
+}
+
+message TaildropFile {
+  string name = 1;
+  int64 size = 2;
+  string senderName = 3;
+  int64 modifiedAt = 4;
+}
+
+message TaildropReceivingFile {
+  string name = 1;
+  int64 size = 2;
+  int64 receivedBytes = 3;
+  string senderID = 4;
+  string senderName = 5;
+}
+
+message TaildropSendClientMessage {
+  oneof message {
+    TaildropSendStart start = 1;
+    TaildropFileChunk chunk = 2;
+    TaildropFileDone fileDone = 3;
+  }
+}
+
+message TaildropSendStart {
+  string endpointTag = 1;
+  string peerStableID = 2;
+  repeated TaildropOutgoingFile files = 3;
+}
+
+message TaildropOutgoingFile {
+  string name = 1;
+  int64 size = 2;
+}
+
+message TaildropFileChunk {
+  bytes data = 1;
+}
+
+message TaildropFileDone {}
+
+message TaildropSendServerMessage {
+  oneof message {
+    TaildropSendProgress progress = 1;
+    int64 receivedBytes = 2;
+  }
+}
+
+message TaildropSendProgress {
+  int32 fileIndex = 1;
+  int64 sentBytes = 2;
+  bool fileCompleted = 3;
+}
+
+message DownloadTaildropFileRequest {
+  string endpointTag = 1;
+  string name = 2;
+}
+
+message DownloadTaildropFileChunk {
+  int64 size = 1;
+  bytes data = 2;
+}
+
+message DeleteTaildropFileRequest {
+  string endpointTag = 1;
+  string name = 2;
+}
+
+message CancelTaildropReceivingRequest {
+  string endpointTag = 1;
+  string senderID = 2;
+  string name = 3;
 }
 
 message USBProviderMessage {
@@ -517,4 +639,321 @@ enum USBBackend {
   USB_BACKEND_DYNAMIC = 2;
   USB_BACKEND_DARWIN_IOKIT = 3;
   USB_BACKEND_WINDOWS_VBOXUSB = 4;
+}
+
+message OpenConnectStatusUpdate {
+  repeated OpenConnectEndpointStatus endpoints = 1;
+}
+
+message OpenConnectEndpointStatus {
+  string endpointTag = 1;
+  string state = 2;
+  string stateText = 3;
+  OpenConnectAuthChallenge authChallenge = 4;
+  string error = 5;
+  OpenConnectTunnelInfo tunnelInfo = 6;
+}
+
+message OpenConnectTunnelInfo {
+  string server = 1;
+  string flavor = 2;
+  string transport = 3;
+  repeated string ipv4 = 4;
+  repeated string ipv6 = 5;
+  repeated string dns = 6;
+  uint32 mtu = 7;
+  int64 connectedSince = 8;
+}
+
+message OpenConnectAuthChallenge {
+  string id = 1;
+  string banner = 2;
+  string message = 3;
+  string error = 4;
+  oneof challenge {
+    OpenConnectAuthForm form = 5;
+    OpenConnectBrowserRequest browser = 6;
+  }
+}
+
+message OpenConnectAuthForm {
+  repeated OpenConnectAuthFormField fields = 1;
+}
+
+message OpenConnectAuthFormField {
+  string submissionKey = 1;
+  string name = 2;
+  string label = 3;
+  string kind = 4;
+  string value = 5;
+  repeated OpenConnectAuthFormChoice options = 6;
+}
+
+message OpenConnectAuthFormChoice {
+  string value = 1;
+  string label = 2;
+}
+
+message OpenConnectBrowserRequest {
+  string url = 1;
+  string finalURL = 2;
+  repeated string cookieNames = 3;
+  repeated string headerNames = 4;
+  repeated string callbackURLPrefixes = 5;
+  repeated string earlyCookieNames = 6;
+  string cacheID = 7;
+}
+
+message OpenConnectBrowserCookie {
+  string name = 1;
+  string value = 2;
+}
+
+message OpenConnectBrowserHeader {
+  string name = 1;
+  repeated string values = 2;
+}
+
+message OpenConnectAuthFormResponse {
+  map<string, string> values = 1;
+}
+
+message OpenConnectBrowserResult {
+  string finalURL = 1;
+  repeated OpenConnectBrowserCookie cookies = 2;
+  repeated OpenConnectBrowserHeader headers = 3;
+}
+
+message OpenConnectAuthResponseSubmission {
+  string endpointTag = 1;
+  string challengeID = 2;
+  oneof response {
+    OpenConnectAuthFormResponse form = 3;
+    OpenConnectBrowserResult browser = 4;
+  }
+}
+
+message OpenConnectAuthChallengeCancel {
+  string endpointTag = 1;
+  string challengeID = 2;
+}
+
+message OpenVPNStatusUpdate {
+  repeated OpenVPNEndpointStatus endpoints = 1;
+}
+
+message OpenVPNEndpointStatus {
+  string endpointTag = 1;
+  string state = 2;
+  string stateText = 3;
+  OpenVPNChallenge challenge = 4;
+  string error = 5;
+  OpenVPNTunnelInfo tunnelInfo = 6;
+}
+
+message OpenVPNTunnelInfo {
+  string server = 1;
+  reserved 2;
+  string network = 3;
+  repeated string ipv4 = 4;
+  repeated string ipv6 = 5;
+  repeated string dns = 6;
+  uint32 mtu = 7;
+  int64 connectedSince = 8;
+  string cipher = 9;
+}
+
+message OpenVPNChallenge {
+  string id = 1;
+  string kind = 2;
+  string username = 3;
+  string message = 4;
+  string url = 5;
+  string secretMessage = 6;
+  bool echo = 7;
+  string previousError = 8;
+  int64 deadline = 9;
+}
+
+message OpenVPNChallengeSubmission {
+  string endpointTag = 1;
+  string challengeID = 2;
+  string username = 3;
+  string password = 4;
+  string secret = 5;
+}
+
+message OpenVPNChallengeCancel {
+  string endpointTag = 1;
+  string challengeID = 2;
+}
+
+message NotificationEvent {
+  oneof event {
+    Notification send = 1;
+    NotificationCancel cancel = 2;
+  }
+}
+
+message Notification {
+  string identifier = 1;
+  string typeName = 2;
+  int32 typeID = 3;
+  string title = 4;
+  string subtitle = 5;
+  string body = 6;
+  string openURL = 7;
+}
+
+message NotificationCancel {
+  string identifier = 1;
+  int32 typeID = 2;
+}
+
+message EBPFDiagnosticsResponse {
+  repeated EBPFInboundDiagnostics inbounds = 1;
+  EBPFKernelRuntimeDiagnostics kernelRuntime = 2;
+  int32 schemaVersion = 3;
+}
+
+message EBPFKernelRuntimeDiagnostics {
+  int64 observedAt = 1;
+  repeated EBPFProgramDiagnostics programs = 2;
+  string programsError = 3;
+  EBPFMapOccupancyDiagnostics mapOccupancy = 4;
+}
+
+message EBPFProgramDiagnostics {
+  uint32 id = 1;
+  string name = 2;
+  string type = 3;
+  int32 mapCount = 4;
+  repeated uint32 mapIDs = 5;
+}
+
+message EBPFMapOccupancyDiagnostics {
+  string status = 1;
+  repeated EBPFMapDiagnostics maps = 2;
+  string error = 3;
+}
+
+message EBPFMapDiagnostics {
+  uint32 id = 1;
+  string name = 2;
+  string type = 3;
+  uint32 maxEntries = 4;
+  uint32 keySize = 5;
+  uint32 valueSize = 6;
+  uint32 flags = 7;
+  uint32 entries = 8;
+  bool supported = 9;
+  string error = 10;
+}
+
+message EBPFInboundDiagnostics {
+  reserved 1;
+  int64 observedAt = 2;
+  string tag = 3;
+  string state = 4;
+  bool localEnabled = 5;
+  string localDataPlane = 6;
+  bool sharedEnabled = 7;
+  string sharedDataPlane = 8;
+  bool fakeIPICMPReply = 9;
+  repeated EBPFAttachmentDiagnostics attachments = 10;
+  string lastError = 11;
+  optional int64 lastErrorAt = 12;
+  optional int64 lastRecoveryAt = 13;
+  bool recoveryPending = 14;
+  bool recoveryUnrecoverable = 15;
+  optional int64 nextRetryAt = 16;
+  int64 udpSessionCount = 23;
+  EBPFUDPReplySocketDiagnostics udpReplySockets = 24;
+  EBPFCounters counters = 25;
+  EBPFUDPNATDiagnostics udpNAT = 26;
+  EBPFBypassRuleSetDiagnostics localBypassRuleSet = 27;
+  EBPFBypassRuleSetDiagnostics sharedBypassRuleSet = 28;
+  string localCgroupAttachMode = 29;
+  string localUdpCleanupMode = 30;
+  string localUdpUserspaceCleanupMode = 31;
+  string localUdpStorageMode = 32;
+  string localUdpTimeMode = 33;
+  string tcBackendMode = 34;
+  string tcListenerLookupMode = 35;
+  string tcAttachmentMode = 36;
+  string tcDeliveryInterface = 37;
+  int32 tcDeliveryInterfaceIndex = 38;
+  uint32 tcRoutingMark = 39;
+  int32 tcRoutingTable = 40;
+  int32 tcRoutingPriority = 41;
+  int32 tcAttachmentCount = 42;
+  int32 tcRetiredAttachmentCount = 43;
+  int32 tcRetiredDeliveryCount = 44;
+  bool tcRequiresRebuild = 45;
+  string tcHealthStatus = 46;
+  optional int64 tcLastHealthCheckAt = 47;
+  optional int64 tcLastReconcileAt = 48;
+  uint64 tcNetworkGeneration = 49;
+}
+
+message EBPFAttachmentDiagnostics {
+  string interfaceName = 1;
+  int32 interfaceIndex = 2;
+  string role = 3;
+  string framing = 4;
+  string mechanism = 5;
+  bool icmpEchoReply = 6;
+}
+
+message EBPFBypassRuleSetBackendState {
+  uint64 version = 1;
+  bool known = 2;
+}
+
+message EBPFBypassRuleSetDiagnostics {
+  bool consistent = 1;
+  bool pending = 2;
+  uint64 policyVersion = 3;
+  uint64 expectedPolicyVersion = 4;
+  uint64 retryCount = 5;
+  map<string, EBPFBypassRuleSetBackendState> backendState = 6;
+}
+
+message EBPFUDPReplySocketDiagnostics {
+  int64 count = 1;
+  int64 peak = 2;
+  int64 evicted = 3;
+  int64 capacityRejected = 4;
+}
+
+message EBPFCounters {
+  uint64 assignmentLookupFailures = 1;
+  uint64 tcSocketLookupFailures = 2;
+  uint64 tcSKAssignFailures = 3;
+  uint64 tcAssignmentUpdateFailures = 4;
+  uint64 tcLocalFragmentPasses = 5;
+  uint64 tcSharedFragmentPasses = 6;
+  uint64 tokenReservationFailures = 7;
+  uint64 rewriteFailures = 8;
+  reserved 9, 10;
+  uint64 sharedIngressFragmentPasses = 11;
+  uint64 sharedEgressFragmentPasses = 12;
+  uint64 sharedReconcileFailures = 13;
+  uint64 recoveryAttempts = 14;
+  uint64 recoverySuccesses = 15;
+  uint64 recoveryFailures = 16;
+  uint64 fakeIPICMPReplies = 17;
+  uint64 fakeIPICMPPassThrough = 18;
+  uint64 fakeIPICMPRewriteFailureDrops = 19;
+}
+
+message EBPFUDPNATDiagnostics {
+  int64 activeSessions = 1;
+  uint64 createdSessions = 2;
+  uint64 capacityEvictions = 3;
+  uint64 queueDrops = 4;
+  uint64 socketReleaseEvents = 5;
+  uint64 socketReleaseMatched = 6;
+  uint64 pendingReleaseCapacityRejected = 7;
+  uint64 releaseNotificationDrops = 8;
 }

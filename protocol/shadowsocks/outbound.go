@@ -13,6 +13,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/transport/sip003"
 	"github.com/sagernet/sing-shadowsocks2"
+	"github.com/sagernet/sing-shadowsocks2/shadowaead_2022"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -25,6 +26,12 @@ import (
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.ShadowsocksOutboundOptions](registry, C.TypeShadowsocks, NewOutbound)
 }
+
+var (
+	_ adapter.OutboundWithMultiplex   = (*Outbound)(nil)
+	_ adapter.InterfaceUpdateListener = (*Outbound)(nil)
+	_ adapter.IdleConnectionKeeper    = (*Outbound)(nil)
+)
 
 type Outbound struct {
 	outbound.Adapter
@@ -124,9 +131,25 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	}
 }
 
-func (h *Outbound) InterfaceUpdated() {
+func (h *Outbound) MultiplexEnabled() bool {
+	return h.multiplexDialer != nil
+}
+
+func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	if h.multiplexDialer != nil {
 		h.multiplexDialer.Reset()
+	}
+}
+
+func (h *Outbound) SetKeepIdleConnections(keep bool) {
+	if h.multiplexDialer != nil {
+		h.multiplexDialer.SetKeepIdleConnections(keep)
+	}
+}
+
+func (h *Outbound) CloseIdleConnections() {
+	if h.multiplexDialer != nil {
+		h.multiplexDialer.CloseIdleConnections()
 	}
 }
 
@@ -153,6 +176,29 @@ func (h *shadowsocksDialer) DialContext(ctx context.Context, network string, des
 		}
 		if err != nil {
 			return nil, err
+		}
+		if _, is2022 := h.method.(*shadowaead_2022.Method); is2022 {
+			// SS2022 saves the request salt at the end of its first write. Finish
+			// that write before exposing the connection to concurrent readers.
+			handshakeCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
+			defer cancel()
+			closed := make(chan struct{})
+			stop := context.AfterFunc(handshakeCtx, func() {
+				outConn.Close()
+				close(closed)
+			})
+			conn, handshakeErr := h.method.DialConn(outConn, destination)
+			if !stop() {
+				<-closed
+			}
+			if handshakeCtx.Err() != nil {
+				handshakeErr = handshakeCtx.Err()
+			}
+			if handshakeErr != nil {
+				outConn.Close()
+				return nil, handshakeErr
+			}
+			return conn, nil
 		}
 		return h.method.DialEarlyConn(outConn, destination), nil
 	case N.NetworkUDP:

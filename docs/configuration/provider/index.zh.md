@@ -2,7 +2,8 @@
 
 !!! quote "sing-box 1.14.0 中的更改"
 
-    :material-plus: [http_client](#http_client)  
+    :material-plus: [http_client](#http_client)
+
     :material-delete-clock: [download_detour](#download_detour)
 
 ### 结构
@@ -25,7 +26,8 @@
             "timeout": "",
           },
           "override_dialer": {},
-          "override_tls": {}
+          "override_tls": {},
+          "override_anytls": {}
         }
       ]
     }
@@ -46,6 +48,7 @@
             "timeout": "",
           },
           "url": "",
+          "path": "",
           "exclude": "",
           "include": "",
           "user_agent": "",
@@ -53,6 +56,8 @@
           "update_interval": "",
           "override_dialer": {},
           "override_tls": {},
+
+          "override_anytls": {},
 
           // Deprecated
 
@@ -100,6 +105,10 @@
 
 健康检查的超时时间。默认为 `3s`。
 
+##### override_anytls
+
+覆写订阅内容的 AnyTLS 字段，参阅 [AnyTLS 字段覆写](/zh/configuration/provider/override_anytls/)。
+
 ##### override_dialer
 
 覆写订阅内容的拨号字段, 参阅 [拨号字段覆写](/zh/configuration/provider/override_dialer/)。
@@ -127,6 +136,22 @@
 ==必填==
 
 订阅源的 URL。
+
+#### path
+
+用于存储已下载订阅源的路径。
+
+缓存元数据存储于 `cache.db`。
+
+与 `initial_path` 冲突。
+
+#### initial_path
+
+初始订阅源内容的路径。
+
+仅在启用 `cache.db` 订阅缓存且不存在可用缓存时读取。该路径不会作为持久缓存路径使用。
+
+与 `path` 冲突。
 
 #### exclude
 
@@ -160,4 +185,4 @@
 
 #### update_interval
 
-更新订阅的时间间隔。最小为 `1m`，默认为 `24h`。
+更新订阅的时间间隔。最小为 `1h`，默认为 `24h`。

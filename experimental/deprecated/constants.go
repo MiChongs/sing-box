@@ -36,10 +36,14 @@ func (n Note) Impending() bool {
 }
 
 func (n Note) Message() string {
+	return n.MessageForLocale(locale.Current())
+}
+
+func (n Note) MessageForLocale(selectedLocale *locale.Locale) string {
 	if n.MigrationLink != "" {
-		return fmt.Sprintf(locale.Current().DeprecatedMessage, n.Description, n.DeprecatedVersion, n.ScheduledVersion)
+		return fmt.Sprintf(selectedLocale.DeprecatedMessage, n.Description, n.DeprecatedVersion, n.ScheduledVersion)
 	} else {
-		return fmt.Sprintf(locale.Current().DeprecatedMessageNoLink, n.Description, n.DeprecatedVersion, n.ScheduledVersion)
+		return fmt.Sprintf(selectedLocale.DeprecatedMessageNoLink, n.Description, n.DeprecatedVersion, n.ScheduledVersion)
 	}
 }
 
@@ -169,6 +173,16 @@ var OptionImplicitDefaultHTTPClient = Note{
 	ScheduledVersion:  "1.16.0",
 	EnvName:           "IMPLICIT_DEFAULT_HTTP_CLIENT",
 }
+
+var OptionTunStack = Note{
+	Name:              "tun-stack",
+	Description:       "`stack` option in TUN",
+	DeprecatedVersion: "1.15.0",
+	ScheduledVersion:  "1.17.0",
+	EnvName:           "TUN_STACK",
+	MigrationLink:     "https://sing-box.sagernet.org/migration/#migrate-tun-stack",
+}
+
 var Options = []Note{
 	OptionOutboundDNSRuleItem,
 	OptionMissingDomainResolver,
@@ -183,4 +197,5 @@ var Options = []Note{
 	OptionLegacyClashAPIExternalUIDownloadDetour,
 	OptionLegacyProviderDownloadDetour,
 	OptionImplicitDefaultHTTPClient,
+	OptionTunStack,
 }

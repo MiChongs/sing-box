@@ -4,7 +4,6 @@ import (
 	"context"
 	"net"
 	"net/netip"
-	"slices"
 	"time"
 
 	"github.com/sagernet/sing-box/common/tlsspoof"
@@ -55,6 +54,12 @@ type InboundContext struct {
 	User        string
 	Outbound    string
 
+	// power report
+
+	RouteRule     string
+	RouteOutbound string
+	OutboundChain []Outbound
+
 	// sniffer
 
 	Protocol     string
@@ -63,6 +68,8 @@ type InboundContext struct {
 	SniffContext any
 	SnifferNames []string
 	SniffError   error
+	// Destination used for QUIC sniff caching, before routing overrides.
+	SniffDestination M.Socksaddr
 
 	// cache
 
@@ -90,14 +97,19 @@ type InboundContext struct {
 
 	DestinationAddresses                []netip.Addr
 	DNSResponse                         *dns.Msg
+	NamedDNSResponses                   map[string]*dns.Msg
 	DestinationAddressMatchFromResponse bool
 	SourceGeoIPCode                     string
 	GeoIPCode                           string
 	ProcessInfo                         *ConnectionOwner
+	ProcessInfoResolver                 func() *ConnectionOwner `json:"-"`
 	SourceMACAddress                    net.HardwareAddr
 	SourceHostname                      string
 	QueryType                           uint16
+	QueryClientSubnet                   netip.Prefix
+	QueryDNSSEC                         bool
 	FakeIP                              bool
+	PreMatch                            bool
 	DestOverride                        bool
 
 	// rule cache
@@ -109,34 +121,19 @@ type InboundContext struct {
 	SourcePortMatch              bool
 	DestinationAddressMatch      bool
 	DestinationPortMatch         bool
-	DidMatch                     bool
+	DeferredIPCIDRMatchGroups    uint8
 	IgnoreDestinationIPCIDRMatch bool
-
-	// extended metadata
-	Extended *InboundContextExtended
 }
 
-type InboundContextExtended struct {
-	RealOutboundChain []string
-}
-
-func (c *InboundContext) InitExtended() {
-	if c.Extended == nil {
-		c.Extended = new(InboundContextExtended)
+// ResolveProcessInfo upgrades a UID/package lookup only when a path matcher
+// needs it, without mutating the metadata or its cached owner. The resolver is
+// shared safely by copies of the connection metadata.
+// Inbound/platform-provided owners without a resolver remain authoritative.
+func (c *InboundContext) ResolveProcessInfo() *ConnectionOwner {
+	if c.ProcessInfoResolver != nil {
+		return c.ProcessInfoResolver()
 	}
-}
-
-func (c *InboundContext) AppendRealOutbound(tag string) {
-	if c.Extended != nil {
-		c.Extended.RealOutboundChain = append(c.Extended.RealOutboundChain, tag)
-	}
-}
-
-func (c *InboundContext) GetRealOutboundChain() []string {
-	if c.Extended != nil {
-		return c.Extended.RealOutboundChain
-	}
-	return nil
+	return c.ProcessInfo
 }
 
 func (c *InboundContext) ResetRuleCache() {
@@ -150,7 +147,7 @@ func (c *InboundContext) ResetRuleMatchCache() {
 	c.SourcePortMatch = false
 	c.DestinationAddressMatch = false
 	c.DestinationPortMatch = false
-	c.DidMatch = false
+	c.DeferredIPCIDRMatchGroups = 0
 }
 
 func (c *InboundContext) DNSResponseAddressesForMatch() []netip.Addr {
@@ -200,8 +197,28 @@ func DNSResponseAddresses(response *dns.Msg) []netip.Addr {
 
 type inboundContextKey struct{}
 
+type dnsTransportTagKey struct{}
+
+func ContextWithDNSTransportTag(ctx context.Context, transportTag string) context.Context {
+	return context.WithValue(ctx, (*dnsTransportTagKey)(nil), transportTag)
+}
+
+func DNSTransportTagFromContext(ctx context.Context) (string, bool) {
+	transportTag, loaded := ctx.Value((*dnsTransportTagKey)(nil)).(string)
+	return transportTag, loaded
+}
+
+func ContextForMultiplexSession(ctx context.Context) context.Context {
+	var sessionContext InboundContext
+	metadata := ContextFrom(ctx)
+	if metadata != nil {
+		sessionContext.Outbound = metadata.Outbound
+	}
+	ctx = ContextWithDNSTransportTag(ctx, "")
+	return WithContext(ctx, &sessionContext)
+}
+
 func WithContext(ctx context.Context, inboundContext *InboundContext) context.Context {
-	inboundContext.InitExtended()
 	return context.WithValue(ctx, (*inboundContextKey)(nil), inboundContext)
 }
 
@@ -213,40 +230,17 @@ func ContextFrom(ctx context.Context) *InboundContext {
 	return metadata.(*InboundContext)
 }
 
-// ExtendContext 派生一个与父 metadata 隔离的副本。
-//
-// 修复点：此前 shallow copy 会令父子 InboundContext 共享 Extended 指针，
-// 子 ctx 中的 AppendRealOutbound 可能因 slice append 扩容写回父级 backing
-// array，造成 RealOutboundChain 污染。此处深拷贝 Extended 及其 slice，
-// 保证"派生副本修改不影响父"的语义契约。性能代价极小（仅当 Extended 非空），
-// 并为后续对象池化优化奠定清晰的所有权边界。
 func ExtendContext(ctx context.Context) (context.Context, *InboundContext) {
 	var newMetadata InboundContext
 	if metadata := ContextFrom(ctx); metadata != nil {
 		newMetadata = *metadata
-		if metadata.Extended != nil {
-			ext := *metadata.Extended
-			if len(ext.RealOutboundChain) > 0 {
-				ext.RealOutboundChain = slices.Clone(ext.RealOutboundChain)
-			}
-			newMetadata.Extended = &ext
-		}
 	}
 	return WithContext(ctx, &newMetadata), &newMetadata
 }
 
-// OverrideContext 在原地派生副本，用于需要覆盖部分字段但不暴露新 metadata 指针的场景。
-// 同 ExtendContext，Extended 做深拷贝以避免共享污染。
 func OverrideContext(ctx context.Context) context.Context {
 	if metadata := ContextFrom(ctx); metadata != nil {
 		newMetadata := *metadata
-		if metadata.Extended != nil {
-			ext := *metadata.Extended
-			if len(ext.RealOutboundChain) > 0 {
-				ext.RealOutboundChain = slices.Clone(ext.RealOutboundChain)
-			}
-			newMetadata.Extended = &ext
-		}
 		return WithContext(ctx, &newMetadata)
 	}
 	return ctx

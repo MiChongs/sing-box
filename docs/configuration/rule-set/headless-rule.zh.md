@@ -18,6 +18,12 @@ icon: material/new-box
     :material-plus: [network_is_expensive](#network_is_expensive)  
     :material-plus: [network_is_constrained](#network_is_constrained)
 
+### domain_match_strategy
+
+源格式的默认规则和逻辑规则支持 `domain_match_strategy`。逻辑规则的策略会传递给未指定策略的子规则，否则使用路由级默认策略。
+
+当前二进制规则集格式无法保留显式策略，编译此类规则会报错，请使用源格式。在 iOS 上，这些源规则会保留在内存中，不转换为 mmap 存储。
+
 ### 结构
 
 !!! question "自 sing-box 1.8.0 起"
@@ -136,8 +142,7 @@ icon: material/new-box
 !!! quote "sing-box 1.14.0 中的更改"
 
     当 DNS 规则引用此规则集时，此字段现在也会在 DNS 规则被未指定具体
-    DNS 服务器的内部域名解析匹配时生效。此前只有来自客户端的 DNS 查询
-    才会评估此字段。完整列表参阅
+    DNS 服务器的内部域名解析匹配时生效。参阅
     [迁移指南](/zh/migration/#dns-规则中的-ip_version-和-query_type-行为更改)。
 
     当 DNS 规则引用了包含此字段的规则集时，该 DNS 规则在同一 DNS 配置中
@@ -232,7 +237,7 @@ DNS 查询类型。值可以为整数或者类型名称字符串。
 
 !!! quote ""
 
-    仅在 Android 与 Apple 平台图形客户端中支持。
+    仅在 Android 与 Apple 平台图形客户端、安卓核心中支持。
 
 匹配网络类型。
 

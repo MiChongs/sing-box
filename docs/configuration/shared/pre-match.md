@@ -4,6 +4,11 @@ icon: material/new-box
 
 # Pre-match
 
+!!! quote "Changes in sing-box 1.14.0"
+
+    :material-alert: [route](#route)  
+    :material-plus: [sniff](#sniff)
+
 !!! quote "Changes in sing-box 1.13.0"
 
     :material-plus: [bypass](#bypass)
@@ -12,11 +17,11 @@ Pre-match is rule matching that runs before the connection is established.
 
 ### How it works
 
-When TUN receives a connection request, the connection has not yet been established,
-so no connection data can be read. In this phase, sing-box runs the routing rules in pre-match mode.
+When an L3 inbound (TUN, WireGuard, Tailscale, OpenConnect, OpenVPN, or MASQUE) receives a connection request, the connection has not yet been established:
+for TCP connections no connection data is available, while for UDP connections only the first packet is available.
+In this phase, sing-box runs the routing rules in pre-match mode.
 
-Since connection data is unavailable, only actions that do not require connection data can be executed.
-When a rule matches an action that requires an established connection, pre-match stops at that rule.
+When a rule matches an action that requires more connection data than available, pre-match stops at that rule.
 
 ### Supported actions
 
@@ -28,9 +33,41 @@ See [reject](/configuration/route/rule_action/#reject) for details.
 
 #### route
 
-Route ICMP connections to the specified outbound for direct reply.
+!!! quote "Changes in sing-box 1.14.0"
+
+    Since sing-box 1.14.0, TCP and UDP connections can also be forwarded at L3;
+    previously only ICMP connections were supported.
+
+Forward connections directly at L3 to the specified outbound,
+without going through L3 to L4 translation.
+
+Supported targets:
+
+- ICMP connections: Direct and Bridge outbounds, and WireGuard / Tailscale / OpenConnect / OpenVPN / MASQUE endpoints.
+- TCP and UDP connections: Bridge outbounds, and WireGuard / Tailscale / OpenConnect / OpenVPN / MASQUE endpoints.
+
+L3 forwarding also applies when no rule matches and the default outbound is a supported
+target; for outbound groups, the currently selected outbound is used.
+
+For unresolved domain destinations restored from FakeIP or overridden by
+protocol sniffing, the selected outbound's domain resolver is used: WireGuard,
+Tailscale, OpenConnect, OpenVPN, and MASQUE use `inner_domain_resolver`, while Direct and Bridge use
+`domain_resolver`. An earlier `resolve` action without `match_only` takes precedence and can override
+this behavior.
 
 See [route](/configuration/route/rule_action/#route) for details.
+
+#### sniff
+
+!!! question "Since sing-box 1.14.0"
+
+For UDP connections, sniffing runs on the first packet and rule matching continues with the sniffed metadata.
+
+When sniffers require more data (like a fragmented QUIC Client Hello), pre-match stops at that rule.
+
+For TCP connections, pre-match always stops at that rule.
+
+See [sniff](/configuration/route/rule_action/#sniff) for details.
 
 #### bypass
 

@@ -5,6 +5,7 @@ package resolved
 import (
 	"context"
 	"net"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -80,6 +81,36 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		ThreadUnsafePacketWriter: true,
 	})
 	return inbound, nil
+}
+
+// IsDNSListener reports whether a local DNS fallback would send queries back to this service.
+func (i *Service) IsDNSListener(destination M.Socksaddr) bool {
+	options := i.listener.ListenOptions()
+	if destination.Port != options.ListenPort {
+		return false
+	}
+	address := options.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1})).Unmap()
+	if !address.IsUnspecified() {
+		return address == destination.Addr.Unmap()
+	}
+	if address.Is4() && !destination.Addr.Unmap().Is4() {
+		return false
+	}
+	if destination.Addr.IsLoopback() {
+		return true
+	}
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		// Conservatively reject fallback when a wildcard listener cannot be checked.
+		return true
+	}
+	for _, localAddress := range addresses {
+		prefix, err := netip.ParsePrefix(localAddress.String())
+		if err == nil && prefix.Addr().Unmap() == destination.Addr.Unmap() {
+			return true
+		}
+	}
+	return false
 }
 
 func (i *Service) Start(stage adapter.StartStage) error {
@@ -173,7 +204,7 @@ func (i *Service) exchangePacket0(ctx context.Context, buffer *buf.Buffer, oob [
 	if err != nil {
 		return err
 	}
-	responseBuffer, err := dns.TruncateDNSMessage(&message, response, 0)
+	responseBuffer, err := dns.TruncateDNSMessage(&message, response, 0, 0)
 	if err != nil {
 		return err
 	}
@@ -185,12 +216,12 @@ func (i *Service) exchangePacket0(ctx context.Context, buffer *buf.Buffer, oob [
 func (i *Service) onNetworkUpdate() {
 	i.linkAccess.Lock()
 	defer i.linkAccess.Unlock()
-	var deleteIfIndex []int
 	for ifIndex, link := range i.links {
-		iif, err := i.network.InterfaceFinder().ByIndex(int(ifIndex))
-		if err != nil || iif != link.iif {
-			deleteIfIndex = append(deleteIfIndex, int(ifIndex))
+		netInterface, err := net.InterfaceByIndex(int(ifIndex))
+		if err == nil && netInterface.Name == link.iif.Name {
+			continue
 		}
+		delete(i.links, ifIndex)
 		i.defaultRouteSequence = common.Filter(i.defaultRouteSequence, func(it int32) bool {
 			return it != ifIndex
 		})
@@ -198,16 +229,15 @@ func (i *Service) onNetworkUpdate() {
 			i.deleteCallback(link)
 		}
 	}
-	for _, ifIndex := range deleteIfIndex {
-		delete(i.links, int32(ifIndex))
-	}
 }
 
 func (conf *TransportLink) nameList(ndots int, name string) []string {
-	search := common.Map(common.Filter(conf.domain, func(it LinkDomain) bool {
+	search := common.Filter(common.Map(common.Filter(conf.domain, func(it LinkDomain) bool {
 		return !it.RoutingOnly
 	}), func(it LinkDomain) string {
-		return it.Domain
+		return mDNS.Fqdn(it.Domain)
+	}), func(it string) bool {
+		return it != "."
 	})
 
 	l := len(name)

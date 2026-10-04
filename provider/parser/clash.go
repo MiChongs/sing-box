@@ -399,23 +399,37 @@ type HysteriaOption struct {
 func (h *HysteriaOption) Build() any {
 	h.TLS = true
 	h.TFO = h.FastOpen
-	return &option.HysteriaOutboundOptions{
-		DialerOptions:               h.DialerOptions.Build(),
-		ServerOptions:               h.ServerOptions.Build(),
-		ServerPorts:                 clashPorts(h.Ports),
-		HopInterval:                 badoption.Duration(h.HopInterval),
-		Up:                          clashSpeedToNetworkBytes(h.Up),
-		UpMbps:                      h.UpSpeed,
-		Down:                        clashSpeedToNetworkBytes(h.Down),
-		DownMbps:                    h.DownSpeed,
-		Obfs:                        h.Obfs,
-		Auth:                        []byte(h.Auth),
-		AuthString:                  h.AuthString,
-		ReceiveWindowConn:           uint64(h.ReceiveWindowConn),
-		ReceiveWindow:               uint64(h.ReceiveWindow),
-		DisableMTUDiscovery:         h.DisableMTUDiscovery,
+	outbound := &option.HysteriaOutboundOptions{
+		DialerOptions: h.DialerOptions.Build(),
+		ServerOptions: h.ServerOptions.Build(),
+		ServerPorts:   clashPorts(h.Ports),
+		HopInterval:   badoption.Duration(h.HopInterval),
+		Up:            clashSpeedToNetworkBytes(h.Up),
+		UpMbps:        h.UpSpeed,
+		Down:          clashSpeedToNetworkBytes(h.Down),
+		DownMbps:      h.DownSpeed,
+		Obfs:          h.Obfs,
+		Auth:          []byte(h.Auth),
+		AuthString:    h.AuthString,
+		QUICOptions: option.QUICOptions{
+			HTTP2Options: option.HTTP2Options{
+				ConnectionReceiveWindow: clashMemoryBytes(h.ReceiveWindowConn),
+				StreamReceiveWindow:     clashMemoryBytes(h.ReceiveWindow),
+			},
+			DisablePathMTUDiscovery: h.DisableMTUDiscovery,
+		},
 		OutboundTLSOptionsContainer: clashTLSOptions(h.Server, &h.TLSOptions),
 	}
+	return outbound
+}
+
+func clashMemoryBytes(value int) *byteformats.MemoryBytes {
+	if value == 0 {
+		return nil
+	}
+	var result byteformats.MemoryBytes
+	_ = result.UnmarshalJSON(strconv.AppendInt(nil, int64(value), 10))
+	return &result
 }
 
 type Hysteria2Option struct {
@@ -486,19 +500,19 @@ type SnellOption struct {
 }
 
 func (s *SnellOption) Build() any {
-	version := s.Version
-	if version == 5 {
-		version = 4
-	}
 	return &option.SnellOutboundOptions{
-		DialerOptions: s.DialerOptions.Build(),
-		ServerOptions: s.ServerOptions.Build(),
-		PSK:           s.PSK,
-		Version:       version,
-		Reuse:         s.Reuse,
-		Network:       clashSnellNetworks(s.UDP),
-		ObfsMode:      clashStringOption(s.ObfsOpts, "mode"),
-		ObfsHost:      clashStringOption(s.ObfsOpts, "host"),
+		Version: s.Version,
+		AbstractSnellOutboundOptions: option.AbstractSnellOutboundOptions{
+			DialerOptions: s.DialerOptions.Build(),
+			ServerOptions: s.ServerOptions.Build(),
+			PSK:           s.PSK,
+			Reuse:         s.Reuse,
+			Network:       clashSnellNetworks(s.UDP),
+		},
+		ObfsOptions: option.SnellObfsClientOptions{
+			ObfsMode: clashStringOption(s.ObfsOpts, "mode"),
+			ObfsHost: clashStringOption(s.ObfsOpts, "host"),
+		},
 	}
 }
 
@@ -511,6 +525,7 @@ type AnyTLSOption struct {
 	IdleSessionCheckInterval int    `yaml:"idle-session-check-interval,omitempty"`
 	IdleSessionTimeout       int    `yaml:"idle-session-timeout,omitempty"`
 	MinIdleSession           int    `yaml:"min-idle-session,omitempty"`
+	DisableReuse             bool   `yaml:"disable-reuse,omitempty"`
 }
 
 func (a *AnyTLSOption) Build() any {
@@ -523,6 +538,7 @@ func (a *AnyTLSOption) Build() any {
 		IdleSessionCheckInterval:    badoption.Duration(a.IdleSessionCheckInterval),
 		IdleSessionTimeout:          badoption.Duration(a.IdleSessionTimeout),
 		MinIdleSession:              a.MinIdleSession,
+		DisableReuse:                a.DisableReuse,
 	}
 }
 
@@ -803,11 +819,13 @@ type DialerOptions struct {
 
 func (b *DialerOptions) Build() option.DialerOptions {
 	return option.DialerOptions{
-		Detour:        b.DialerProxy,
-		BindInterface: b.Interface,
-		TCPFastOpen:   b.TFO,
-		TCPMultiPath:  b.MPTCP,
-		RoutingMark:   option.FwMark(b.RoutingMark),
+		Detour: b.DialerProxy,
+		AbstractDialerOptions: option.AbstractDialerOptions{
+			BindInterface: b.Interface,
+			TCPFastOpen:   b.TFO,
+			TCPMultiPath:  b.MPTCP,
+			RoutingMark:   option.FwMark(b.RoutingMark),
+		},
 	}
 }
 

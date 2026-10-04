@@ -10,21 +10,23 @@ import (
 	"github.com/sagernet/sing-box/dns"
 	dnsOutbound "github.com/sagernet/sing-box/protocol/dns"
 	R "github.com/sagernet/sing-box/route/rule"
-	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
-	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/udpnat2"
 
 	mDNS "github.com/miekg/dns"
 )
 
 func (r *Router) hijackDNSStream(ctx context.Context, conn net.Conn, metadata adapter.InboundContext) error {
+	r.searchProcessInfo(ctx, &metadata)
 	metadata.Destination = M.Socksaddr{}
+	err := N.ReportConnHandshakeSuccess(conn, conn)
+	if err != nil {
+		return E.Cause(err, "report handshake success")
+	}
 	for {
 		conn.SetReadDeadline(time.Now().Add(C.DNSTimeout))
-		err := dnsOutbound.HandleStreamDNSRequest(ctx, r.dns, conn, metadata)
+		err = dnsOutbound.HandleStreamDNSRequest(ctx, r.dns, conn, metadata)
 		if err != nil {
 			if !E.IsClosedOrCanceled(err) {
 				return err
@@ -36,26 +38,14 @@ func (r *Router) hijackDNSStream(ctx context.Context, conn net.Conn, metadata ad
 }
 
 func (r *Router) hijackDNSPacket(ctx context.Context, conn N.PacketConn, packetBuffers []*N.PacketBuffer, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) error {
-	if natConn, isNatConn := conn.(udpnat.Conn); isNatConn {
-		metadata.Destination = M.Socksaddr{}
-		for _, packet := range packetBuffers {
-			buffer := packet.Buffer
-			destination := packet.Destination
-			N.PutPacketBuffer(packet)
-			go ExchangeDNSPacket(ctx, r.dns, r.logger, r.network, natConn, buffer, metadata, destination)
-		}
-		natConn.SetHandler(&dnsHijacker{
-			router:         r.dns,
-			logger:         r.logger,
-			networkManager: r.network,
-			conn:           conn,
-			ctx:            ctx,
-			metadata:       metadata,
-			onClose:        onClose,
-		})
-		return nil
+	r.searchProcessInfo(ctx, &metadata)
+	err := N.ReportPacketConnHandshakeSuccess(conn, nil)
+	if err != nil {
+		N.ReleaseMultiPacketBuffer(packetBuffers)
+		err = E.Cause(err, "report handshake success")
+	} else {
+		err = dnsOutbound.NewDNSPacketConnection(ctx, r.dns, conn, packetBuffers, metadata)
 	}
-	err := dnsOutbound.NewDNSPacketConnection(ctx, r.dns, conn, packetBuffers, metadata)
 	N.CloseOnHandshakeFailure(conn, onClose, err)
 	if err != nil && !E.IsClosedOrCanceled(err) {
 		return E.Cause(err, "process DNS packet")
@@ -63,56 +53,37 @@ func (r *Router) hijackDNSPacket(ctx context.Context, conn N.PacketConn, packetB
 	return nil
 }
 
-func ExchangeDNSPacket(ctx context.Context, router adapter.DNSRouter, logger logger.ContextLogger, networkManager adapter.NetworkManager, conn N.PacketConn, buffer *buf.Buffer, metadata adapter.InboundContext, destination M.Socksaddr) {
-	err := exchangeDNSPacket(ctx, router, conn, buffer, metadata, destination)
-	if err == nil || R.IsRejected(err) || E.IsClosedOrCanceled(err) {
-		return
-	}
-	if isTransientUnreachable(err) {
-		if transientDNSLogThrottle.allow() {
-			logger.DebugContext(ctx, E.Cause(err, "process DNS packet (transient, auto-retry)"))
-		}
-		return
-	}
-	logger.ErrorContext(ctx, E.Cause(err, "process DNS packet"))
-}
-
-func exchangeDNSPacket(ctx context.Context, router adapter.DNSRouter, conn N.PacketConn, buffer *buf.Buffer, metadata adapter.InboundContext, destination M.Socksaddr) error {
+func (r *Router) HijackDNSPacket(ctx context.Context, payload []byte, writer N.PacketWriter, metadata adapter.InboundContext) {
 	var message mDNS.Msg
-	err := message.Unpack(buffer.Bytes())
-	buffer.Release()
+	err := message.Unpack(payload)
 	if err != nil {
-		return E.Cause(err, "unpack request")
+		r.logger.ErrorContext(ctx, E.Cause(err, "process DNS packet: unpack request"))
+		return
 	}
-	response, err := router.Exchange(adapter.WithContext(ctx, &metadata), &message, adapter.DNSQueryOptions{})
+	r.searchProcessInfo(ctx, &metadata)
+	destination := metadata.Destination
+	metadata.Destination = M.Socksaddr{}
+	r.dns.ExchangeAsync(adapter.WithContext(ctx, &metadata), &message, adapter.DNSQueryOptions{}, func(response *mDNS.Msg, exchangeErr error) {
+		if exchangeErr == nil {
+			exchangeErr = r.writeDNSPacketResponse(&message, response, writer, destination)
+		}
+		if exchangeErr == nil || R.IsRejected(exchangeErr) || E.IsClosedOrCanceled(exchangeErr) {
+			return
+		}
+		if isTransientUnreachable(exchangeErr) {
+			if transientDNSLogThrottle.allow() {
+				r.logger.DebugContext(ctx, E.Cause(exchangeErr, "process DNS packet (transient, auto-retry)"))
+			}
+			return
+		}
+		r.logger.ErrorContext(ctx, E.Cause(exchangeErr, "process DNS packet"))
+	})
+}
+
+func (r *Router) writeDNSPacketResponse(message *mDNS.Msg, response *mDNS.Msg, writer N.PacketWriter, destination M.Socksaddr) error {
+	responseBuffer, err := dns.TruncateDNSMessage(message, response, N.CalculateFrontHeadroom(writer), N.CalculateRearHeadroom(writer))
 	if err != nil {
 		return err
 	}
-	responseBuffer, err := dns.TruncateDNSMessage(&message, response, 1024)
-	if err != nil {
-		return err
-	}
-	err = conn.WritePacket(responseBuffer, destination)
-	return err
-}
-
-type dnsHijacker struct {
-	router         adapter.DNSRouter
-	logger         logger.ContextLogger
-	networkManager adapter.NetworkManager
-	conn           N.PacketConn
-	ctx            context.Context
-	metadata       adapter.InboundContext
-	onClose        N.CloseHandlerFunc
-}
-
-func (h *dnsHijacker) NewPacketEx(buffer *buf.Buffer, destination M.Socksaddr) {
-	go ExchangeDNSPacket(h.ctx, h.router, h.logger, h.networkManager, h.conn, buffer, h.metadata, destination)
-}
-
-func (h *dnsHijacker) Close() error {
-	if h.onClose != nil {
-		h.onClose(nil)
-	}
-	return nil
+	return writer.WritePacket(responseBuffer, destination)
 }

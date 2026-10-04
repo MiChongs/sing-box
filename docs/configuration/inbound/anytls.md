@@ -83,3 +83,7 @@ Fallback server configuration. Disabled if `fallback` and `fallback_for_alpn` ar
 Fallback server configuration for specified ALPN.
 
 If not empty, TLS fallback requests with ALPN not in this table will be rejected.
+
+Requires TLS. If no ALPN is negotiated, `fallback` is used; the connection is
+rejected when no default fallback is configured. The original request data is
+forwarded to the selected fallback server.

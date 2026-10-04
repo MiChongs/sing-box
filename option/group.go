@@ -4,7 +4,7 @@ import "github.com/sagernet/sing/common/json/badoption"
 
 type SelectorOutboundOptions struct {
 	GroupCommonOption
-	Default                   string `json:"default,omitempty"`
+	Default                   string `json:"default,omitempty" reference:"outbound"`
 	InterruptExistConnections bool   `json:"interrupt_exist_connections,omitempty"`
 }
 
@@ -20,8 +20,8 @@ type URLTestOutboundOptions struct {
 }
 
 type GroupCommonOption struct {
-	Outbounds       []string          `json:"outbounds"`
-	Providers       []string          `json:"providers"`
+	Outbounds       []string          `json:"outbounds" reference:"outbound"`
+	Providers       []string          `json:"providers" reference:"provider"`
 	Exclude         *badoption.Regexp `json:"exclude,omitempty"`
 	Include         *badoption.Regexp `json:"include,omitempty"`
 	UseAllProviders bool              `json:"use_all_providers,omitempty"`
@@ -36,10 +36,9 @@ type URLTestFallbackOptions struct {
 
 type LoadBalanceOutboundOptions struct {
 	GroupCommonOption
-	URL                       string             `json:"url,omitempty"`
-	Interval                  badoption.Duration `json:"interval,omitempty"`
-	IdleTimeout               badoption.Duration `json:"idle_timeout,omitempty"`
-	TTL                       badoption.Duration `json:"ttl,omitempty"`
-	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
-	Strategy                  string             `json:"strategy,omitempty"`
+	URL         string             `json:"url,omitempty"`
+	Interval    badoption.Duration `json:"interval,omitempty"`
+	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`
+	TTL         badoption.Duration `json:"ttl,omitempty"`
+	Strategy    string             `json:"strategy,omitempty"`
 }

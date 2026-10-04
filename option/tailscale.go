@@ -3,7 +3,9 @@ package option
 import (
 	"net/netip"
 	"net/url"
+	"reflect"
 
+	"github.com/sagernet/sing-box/schema"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
 	"github.com/sagernet/sing/common/json/badoption"
@@ -26,6 +28,7 @@ type TailscaleEndpointOptions struct {
 	AdvertiseRoutes            []netip.Prefix             `json:"advertise_routes,omitempty"`
 	AdvertiseExitNode          bool                       `json:"advertise_exit_node,omitempty"`
 	AdvertiseTags              badoption.Listable[string] `json:"advertise_tags,omitempty"`
+	ListenPort                 uint16                     `json:"listen_port,omitempty"`
 	RelayServerPort            *uint16                    `json:"relay_server_port,omitempty"`
 	RelayServerStaticEndpoints []netip.AddrPort           `json:"relay_server_static_endpoints,omitempty"`
 	SystemInterface            bool                       `json:"system_interface,omitempty"`
@@ -34,6 +37,12 @@ type TailscaleEndpointOptions struct {
 	SystemInterfaceMTU         uint32                     `json:"system_interface_mtu,omitempty"`
 	UDPTimeout                 UDPTimeoutCompat           `json:"udp_timeout,omitempty"`
 	SSHServer                  *TailscaleSSHServerOptions `json:"ssh_server,omitempty"`
+	TaildropDirectory          string                     `json:"taildrop_directory,omitempty"`
+	OnDemand                   bool                       `json:"on_demand,omitempty"`
+}
+
+func (o *TailscaleEndpointOptions) TakeInnerDomainResolverOptions() *DomainResolveOptions {
+	return o.InnerDomainResolver
 }
 
 type _TailscaleSSHServerOptions struct {
@@ -60,6 +69,15 @@ func (o *TailscaleSSHServerOptions) UnmarshalJSON(bytes []byte) error {
 	return json.UnmarshalDisallowUnknownFields(bytes, (*_TailscaleSSHServerOptions)(o))
 }
 
+func (o TailscaleSSHServerOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	objectForm := schema.StrictObject()
+	err := builder.FlattenStruct(objectForm, reflect.TypeFor[TailscaleSSHServerOptions]())
+	if err != nil {
+		return nil, err
+	}
+	return schema.AnyOf(schema.BooleanNode(), objectForm), nil
+}
+
 type TailscaleDNSServerOptions struct {
 	Endpoint               string `json:"endpoint,omitempty"`
 	AcceptDefaultResolvers bool   `json:"accept_default_resolvers,omitempty"`
@@ -76,6 +94,8 @@ type DERPServiceOptions struct {
 	ConfigPath           string                                          `json:"config_path,omitempty"`
 	VerifyClientEndpoint badoption.Listable[string]                      `json:"verify_client_endpoint,omitempty"`
 	VerifyClientURL      badoption.Listable[*DERPVerifyClientURLOptions] `json:"verify_client_url,omitempty"`
+	VerifyClientInbound  badoption.Listable[string]                      `json:"verify_client_inbound,omitempty"`
+	VerifyClientKey      badoption.Listable[string]                      `json:"verify_client_key,omitempty"`
 	Home                 string                                          `json:"home,omitempty"`
 	MeshWith             badoption.Listable[*DERPMeshOptions]            `json:"mesh_with,omitempty"`
 	MeshPSK              string                                          `json:"mesh_psk,omitempty"`
@@ -131,6 +151,15 @@ func (d *DERPVerifyClientURLOptions) UnmarshalJSON(bytes []byte) error {
 	return nil
 }
 
+func (d DERPVerifyClientURLOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	objectForm, err := describeHTTPClientObject(builder)
+	if err != nil {
+		return nil, err
+	}
+	objectForm.Properties.Put("url", schema.StringNode())
+	return schema.AnyOf(schema.StringNode(), objectForm), nil
+}
+
 type DERPMeshOptions struct {
 	ServerOptions
 	Host string `json:"host,omitempty"`
@@ -139,7 +168,7 @@ type DERPMeshOptions struct {
 }
 
 type _DERPSTUNListenOptions struct {
-	Enabled bool
+	Enabled bool `json:"enabled,omitempty"`
 	ListenOptions
 }
 
@@ -168,4 +197,13 @@ func (d *DERPSTUNListenOptions) UnmarshalJSON(bytes []byte) error {
 		return nil
 	}
 	return json.Unmarshal(bytes, (*_DERPSTUNListenOptions)(d))
+}
+
+func (d DERPSTUNListenOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	objectForm := schema.StrictObject()
+	err := builder.FlattenStruct(objectForm, reflect.TypeFor[DERPSTUNListenOptions]())
+	if err != nil {
+		return nil, err
+	}
+	return schema.AnyOf(schema.UnsignedNode(16), objectForm), nil
 }

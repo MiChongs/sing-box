@@ -1,25 +1,42 @@
 package option
 
-import "github.com/sagernet/sing/common/json/badoption"
+import (
+	"github.com/sagernet/sing/common/byteformats"
+	"github.com/sagernet/sing/common/json/badoption"
+)
 
 type ExperimentalOptions struct {
-	CacheFile           *CacheFileOptions `json:"cache_file,omitempty"`
-	ClashAPI            *ClashAPIOptions  `json:"clash_api,omitempty"`
-	V2RayAPI            *V2RayAPIOptions  `json:"v2ray_api,omitempty"`
-	Debug               *DebugOptions     `json:"debug,omitempty"`
-	URLTestUnifiedDelay bool              `json:"urltest_unified_delay,omitempty"`
-	Smart               *SmartOptions     `json:"smart,omitempty"`
-	GeoX                *GeoXOptions      `json:"geox,omitempty"`
+	CacheFile           *CacheFileOptions     `json:"cache_file,omitempty"`
+	ClashAPI            *ClashAPIOptions      `json:"clash_api,omitempty"`
+	Observability       *ObservabilityOptions `json:"observability,omitempty"`
+	V2RayAPI            *V2RayAPIOptions      `json:"v2ray_api,omitempty"`
+	Debug               *DebugOptions         `json:"debug,omitempty"`
+	URLTestUnifiedDelay bool                  `json:"urltest_unified_delay,omitempty"`
+	Smart               *SmartOptions         `json:"smart,omitempty"`
+	GeoX                *GeoXOptions          `json:"geox,omitempty"`
+}
+
+type ObservabilityOptions struct {
+	Enabled           bool               `json:"enabled,omitempty"`
+	RecentConnections int                `json:"recent_connections,omitempty"`
+	RecentTTL         badoption.Duration `json:"recent_ttl,omitempty"`
+	TopKSize          int                `json:"top_k_size,omitempty"`
+	ExposeSensitive   bool               `json:"expose_sensitive,omitempty"`
 }
 
 type CacheFileOptions struct {
-	Enabled     bool               `json:"enabled,omitempty"`
-	Path        string             `json:"path,omitempty"`
-	CacheID     string             `json:"cache_id,omitempty"`
-	StoreFakeIP bool               `json:"store_fakeip,omitempty"`
-	StoreRDRC   bool               `json:"store_rdrc,omitempty"`
-	RDRCTimeout badoption.Duration `json:"rdrc_timeout,omitempty"`
-	StoreDNS    bool               `json:"store_dns,omitempty"`
+	Enabled       bool                     `json:"enabled,omitempty"`
+	Path          string                   `json:"path,omitempty"`
+	CacheID       string                   `json:"cache_id,omitempty"`
+	StoreFakeIP   bool                     `json:"store_fakeip,omitempty"`
+	StoreDNS      bool                     `json:"store_dns,omitempty"`
+	BufferSize    *byteformats.MemoryBytes `json:"buffer_size,omitempty"`
+	FlushInterval badoption.Duration       `json:"flush_interval,omitempty"`
+
+	// Deprecated: replaced by store_dns
+	StoreRDRC bool `json:"store_rdrc,omitempty" schema:"omit"`
+	// Deprecated: replaced by store_dns
+	RDRCTimeout badoption.Duration `json:"rdrc_timeout,omitempty" schema:"omit"`
 }
 
 type ClashAPIOptions struct {
@@ -30,22 +47,21 @@ type ClashAPIOptions struct {
 	ExternalUIUpdateInterval         badoption.Duration         `json:"external_ui_update_interval,omitempty"`
 	Secret                           string                     `json:"secret,omitempty"`
 	DefaultMode                      string                     `json:"default_mode,omitempty"`
-	ModeList                         []string                   `json:"-"`
 	AccessControlAllowOrigin         badoption.Listable[string] `json:"access_control_allow_origin,omitempty"`
 	AccessControlAllowPrivateNetwork bool                       `json:"access_control_allow_private_network,omitempty"`
 
 	// Deprecated: migrated to global cache file
-	CacheFile string `json:"cache_file,omitempty"`
+	CacheFile string `json:"cache_file,omitempty" schema:"omit"`
 	// Deprecated: migrated to global cache file
-	CacheID string `json:"cache_id,omitempty"`
+	CacheID string `json:"cache_id,omitempty" schema:"omit"`
 	// Deprecated: migrated to global cache file
-	StoreMode bool `json:"store_mode,omitempty"`
+	StoreMode bool `json:"store_mode,omitempty" schema:"omit"`
 	// Deprecated: migrated to global cache file
-	StoreSelected bool `json:"store_selected,omitempty"`
+	StoreSelected bool `json:"store_selected,omitempty" schema:"omit"`
 	// Deprecated: migrated to global cache file
-	StoreFakeIP bool `json:"store_fakeip,omitempty"`
+	StoreFakeIP bool `json:"store_fakeip,omitempty" schema:"omit"`
 	// Deprecated: use external_ui_http_client instead
-	ExternalUIDownloadDetour string `json:"external_ui_download_detour,omitempty"`
+	ExternalUIDownloadDetour string `json:"external_ui_download_detour,omitempty" reference:"outbound" schema:"omit"`
 }
 
 type V2RayAPIOptions struct {

@@ -3,7 +3,6 @@ package adapter
 import (
 	"context"
 	"net/netip"
-	"time"
 
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -23,13 +22,24 @@ type Outbound interface {
 
 type OutboundWithPreferredRoutes interface {
 	Outbound
-	PreferredDomain(domain string) bool
-	PreferredAddress(address netip.Addr) bool
+	PreferredDomain(metadata *InboundContext, domain string) bool
+	PreferredAddress(metadata *InboundContext, address netip.Addr) bool
 }
 
-type DirectRouteOutbound interface {
+type OutboundWithMultiplex interface {
 	Outbound
-	NewDirectRouteConnection(metadata InboundContext, routeContext tun.DirectRouteContext, timeout time.Duration) (tun.DirectRouteDestination, error)
+	MultiplexEnabled() bool
+}
+
+type FlowOutbound interface {
+	Outbound
+	tun.Port
+	PreMatchFlow(network string, destination netip.Addr) PreMatchAction
+}
+
+type FlowOutboundDomainResolver interface {
+	FlowOutbound
+	FlowDomainResolveOptions() DNSQueryOptions
 }
 
 type OutboundRegistry interface {
@@ -44,4 +54,13 @@ type OutboundManager interface {
 	Default() Outbound
 	Remove(tag string) error
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, outboundType string, options any) error
+}
+
+type IdleConnectionKeeper interface {
+	SetKeepIdleConnections(keep bool)
+	CloseIdleConnections()
+}
+
+type Referrer interface {
+	References() []string
 }

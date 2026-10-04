@@ -14,7 +14,6 @@ import (
 	"github.com/sagernet/sing-box/common/tlsspoof"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
-	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
@@ -75,7 +74,9 @@ func NewRuleAction(ctx context.Context, logger logger.ContextLogger, action opti
 			RuleActionRouteOptions: routeOptions,
 		}, nil
 	case C.RuleActionTypeDirect:
-		directDialer, err := dialer.New(ctx, option.DialerOptions(action.DirectOptions), false)
+		directDialer, err := dialer.New(ctx, option.DialerOptions{
+			AbstractDialerOptions: action.DirectOptions.AbstractDialerOptions,
+		}, false)
 		if err != nil {
 			return nil, err
 		}
@@ -132,7 +133,8 @@ func NewDNSRuleAction(logger logger.ContextLogger, action option.DNSRuleAction) 
 		return nil
 	case C.RuleActionTypeRoute:
 		return &RuleActionDNSRoute{
-			Server: action.RouteOptions.Server,
+			Server:      action.RouteOptions.Server,
+			Speculative: action.RouteOptions.Speculative,
 			RuleActionDNSRouteOptions: RuleActionDNSRouteOptions{
 				Strategy:               C.DomainStrategy(action.RouteOptions.Strategy),
 				Timeout:                time.Duration(action.RouteOptions.Timeout),
@@ -140,18 +142,22 @@ func NewDNSRuleAction(logger logger.ContextLogger, action option.DNSRuleAction) 
 				DisableOptimisticCache: action.RouteOptions.DisableOptimisticCache,
 				RewriteTTL:             action.RouteOptions.RewriteTTL,
 				ClientSubnet:           netip.Prefix(common.PtrValueOrDefault(action.RouteOptions.ClientSubnet)),
+				RemoveClientSubnet:     action.RouteOptions.RemoveClientSubnet,
 			},
 		}
 	case C.RuleActionTypeEvaluate:
 		return &RuleActionEvaluate{
-			Server: action.RouteOptions.Server,
+			Server:      action.EvaluateOptions.Server,
+			Tag:         action.EvaluateOptions.Tag,
+			Speculative: action.EvaluateOptions.Speculative,
 			RuleActionDNSRouteOptions: RuleActionDNSRouteOptions{
-				Strategy:               C.DomainStrategy(action.RouteOptions.Strategy),
-				Timeout:                time.Duration(action.RouteOptions.Timeout),
-				DisableCache:           action.RouteOptions.DisableCache,
-				DisableOptimisticCache: action.RouteOptions.DisableOptimisticCache,
-				RewriteTTL:             action.RouteOptions.RewriteTTL,
-				ClientSubnet:           netip.Prefix(common.PtrValueOrDefault(action.RouteOptions.ClientSubnet)),
+				Strategy:               C.DomainStrategy(action.EvaluateOptions.Strategy),
+				Timeout:                time.Duration(action.EvaluateOptions.Timeout),
+				DisableCache:           action.EvaluateOptions.DisableCache,
+				DisableOptimisticCache: action.EvaluateOptions.DisableOptimisticCache,
+				RewriteTTL:             action.EvaluateOptions.RewriteTTL,
+				ClientSubnet:           netip.Prefix(common.PtrValueOrDefault(action.EvaluateOptions.ClientSubnet)),
+				RemoveClientSubnet:     action.EvaluateOptions.RemoveClientSubnet,
 			},
 		}
 	case C.RuleActionTypeRespond:
@@ -164,6 +170,7 @@ func NewDNSRuleAction(logger logger.ContextLogger, action option.DNSRuleAction) 
 			DisableOptimisticCache: action.RouteOptionsOptions.DisableOptimisticCache,
 			RewriteTTL:             action.RouteOptionsOptions.RewriteTTL,
 			ClientSubnet:           netip.Prefix(common.PtrValueOrDefault(action.RouteOptionsOptions.ClientSubnet)),
+			RemoveClientSubnet:     action.RouteOptionsOptions.RemoveClientSubnet,
 		}
 	case C.RuleActionTypeReject:
 		return &RuleActionReject{
@@ -290,7 +297,8 @@ func (r *RuleActionRouteOptions) Descriptions() []string {
 }
 
 type RuleActionDNSRoute struct {
-	Server string
+	Server      string
+	Speculative bool
 	RuleActionDNSRouteOptions
 }
 
@@ -299,11 +307,13 @@ func (r *RuleActionDNSRoute) Type() string {
 }
 
 func (r *RuleActionDNSRoute) String() string {
-	return formatDNSRouteAction("route", r.Server, r.RuleActionDNSRouteOptions)
+	return formatDNSRouteAction("route", r.Server, r.Speculative, r.RuleActionDNSRouteOptions)
 }
 
 type RuleActionEvaluate struct {
-	Server string
+	Server      string
+	Tag         string
+	Speculative bool
 	RuleActionDNSRouteOptions
 }
 
@@ -312,7 +322,7 @@ func (r *RuleActionEvaluate) Type() string {
 }
 
 func (r *RuleActionEvaluate) String() string {
-	return formatDNSRouteAction("evaluate", r.Server, r.RuleActionDNSRouteOptions)
+	return formatDNSRouteAction("evaluate", r.Server, r.Speculative, r.RuleActionDNSRouteOptions)
 }
 
 type RuleActionRespond struct{}
@@ -325,9 +335,12 @@ func (r *RuleActionRespond) String() string {
 	return "respond"
 }
 
-func formatDNSRouteAction(action string, server string, options RuleActionDNSRouteOptions) string {
+func formatDNSRouteAction(action string, server string, speculative bool, options RuleActionDNSRouteOptions) string {
 	var descriptions []string
 	descriptions = append(descriptions, server)
+	if speculative {
+		descriptions = append(descriptions, "speculative")
+	}
 	if options.DisableCache {
 		descriptions = append(descriptions, "disable-cache")
 	}
@@ -343,6 +356,9 @@ func formatDNSRouteAction(action string, server string, options RuleActionDNSRou
 	if options.ClientSubnet.IsValid() {
 		descriptions = append(descriptions, F.ToString("client-subnet=", options.ClientSubnet))
 	}
+	if options.RemoveClientSubnet {
+		descriptions = append(descriptions, "remove-client-subnet")
+	}
 	return F.ToString(action, "(", strings.Join(descriptions, ","), ")")
 }
 
@@ -353,6 +369,7 @@ type RuleActionDNSRouteOptions struct {
 	DisableOptimisticCache bool
 	RewriteTTL             *uint32
 	ClientSubnet           netip.Prefix
+	RemoveClientSubnet     bool
 }
 
 func (r *RuleActionDNSRouteOptions) Type() string {
@@ -376,6 +393,9 @@ func (r *RuleActionDNSRouteOptions) String() string {
 	if r.ClientSubnet.IsValid() {
 		descriptions = append(descriptions, F.ToString("client-subnet=", r.ClientSubnet))
 	}
+	if r.RemoveClientSubnet {
+		descriptions = append(descriptions, "remove-client-subnet")
+	}
 	return F.ToString("route-options(", strings.Join(descriptions, ","), ")")
 }
 
@@ -391,6 +411,11 @@ func (r *RuleActionDirect) Type() string {
 func (r *RuleActionDirect) String() string {
 	return "direct" + r.description
 }
+
+var (
+	ErrReset = E.New("connection reset")
+	ErrDrop  = E.New("packet dropped")
+)
 
 type RejectedError struct {
 	Cause error
@@ -450,9 +475,9 @@ func (r *RuleActionReject) Error(ctx context.Context) error {
 	var returnErr error
 	switch r.Method {
 	case C.RuleActionRejectMethodDefault:
-		returnErr = &RejectedError{tun.ErrReset}
+		returnErr = &RejectedError{ErrReset}
 	case C.RuleActionRejectMethodDrop:
-		return &RejectedError{tun.ErrDrop}
+		return &RejectedError{ErrDrop}
 	case C.RuleActionRejectMethodReply:
 		return nil
 	default:
@@ -472,7 +497,7 @@ func (r *RuleActionReject) Error(ctx context.Context) error {
 		if ctx != nil {
 			r.logger.DebugContext(ctx, "dropped due to flooding")
 		}
-		return &RejectedError{tun.ErrDrop}
+		return &RejectedError{ErrDrop}
 	}
 	return returnErr
 }
@@ -499,6 +524,7 @@ func (r *RuleActionSniff) Type() string {
 }
 
 func (r *RuleActionSniff) build() error {
+	var quicEnabled bool
 	for _, name := range r.SnifferNames {
 		switch name {
 		case C.ProtocolTLS:
@@ -507,7 +533,7 @@ func (r *RuleActionSniff) build() error {
 			r.StreamSniffers = append(r.StreamSniffers, sniff.HTTPHost)
 		case C.ProtocolQUIC:
 			r.PacketSniffers = append(r.PacketSniffers, sniff.QUICClientHello)
-			r.PacketSniffers = append(r.PacketSniffers, sniff.QUICShortHeader)
+			quicEnabled = true
 		case C.ProtocolDNS:
 			r.StreamSniffers = append(r.StreamSniffers, sniff.StreamDomainNameQuery)
 			r.PacketSniffers = append(r.PacketSniffers, sniff.DomainNameQuery)
@@ -528,6 +554,10 @@ func (r *RuleActionSniff) build() error {
 		default:
 			return E.New("unknown sniffer: ", name)
 		}
+	}
+	if quicEnabled {
+		// Short headers are ambiguous; try the other configured protocols first.
+		r.PacketSniffers = append(r.PacketSniffers, sniff.QUICShortHeader)
 	}
 	return nil
 }

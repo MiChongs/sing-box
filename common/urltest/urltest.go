@@ -15,9 +15,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sagernet/sing-anytls"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/smart/tcpinfo"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-mux"
+	"github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -25,9 +29,25 @@ import (
 	"github.com/sagernet/sing/common/observable"
 )
 
+type unifiedDelayKey struct{}
+
+// ContextWithUnifiedDelay binds the measurement policy to one instance or request.
+func ContextWithUnifiedDelay(ctx context.Context, enabled bool) context.Context {
+	return context.WithValue(ctx, unifiedDelayKey{}, enabled)
+}
+
+func UnifiedDelayFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	enabled, _ := ctx.Value(unifiedDelayKey{}).(bool)
+	return enabled
+}
+
 // ════════════════ HistoryStorage ════════════════
 
 var _ adapter.URLTestHistoryStorage = (*HistoryStorage)(nil)
+
 type HistoryStorage struct {
 	delayHistory sync.Map
 	updateHooks  []*observable.Subscriber[struct{}]
@@ -188,11 +208,29 @@ func URLTestWithDetail(ctx context.Context, link string, detour N.Dialer, detail
 
 // URLTestWithDetailAndStatus is the canonical probe entry point.
 //
-// Design: dial the proxy once, hand the conn to net/http.Transport for
-// HTTP/1.1 request/response. This works across all protocols (TCP, QUIC
-// streams, WireGuard/gVisor netstack, Tailscale, Shadowsocks+plugins)
-// because they all return net.Conn-compatible objects.
-func URLTestWithDetailAndStatus(ctx context.Context, link string, detour N.Dialer, detail *URLTestDetail, matcher *StatusMatcher) (t uint16, err error) {
+// Multiplexed outbounds get a warm-up probe first so the measured probe
+// reuses the established session instead of timing the session handshake.
+func URLTestWithDetailAndStatus(ctx context.Context, link string, detour N.Dialer, detail *URLTestDetail, matcher *StatusMatcher) (uint16, error) {
+	multiplexOutbound, isMultiplexOutbound := common.Cast[adapter.OutboundWithMultiplex](detour)
+	if isMultiplexOutbound && multiplexOutbound.MultiplexEnabled() {
+		warmContext := adapter.ContextWithKeepSession(ctx)
+		warmContext = mux.ContextWithKeepSession(warmContext)
+		warmContext = anytls.ContextWithKeepSession(warmContext)
+		warmContext = contextWithQUICKeepSession(warmContext)
+		warmContext = snell.ContextWithKeepSession(warmContext)
+		_, err := urlTestWithDetailAndStatus(warmContext, link, detour, nil, matcher)
+		if err != nil {
+			return 0, err
+		}
+	}
+	return urlTestWithDetailAndStatus(ctx, link, detour, detail, matcher)
+}
+
+// urlTestWithDetailAndStatus dials the proxy once and hands the conn to
+// net/http.Transport for HTTP/1.1 request/response. This works across all
+// protocols (TCP, QUIC streams, WireGuard/gVisor netstack, Tailscale,
+// Shadowsocks+plugins) because they all return net.Conn-compatible objects.
+func urlTestWithDetailAndStatus(ctx context.Context, link string, detour N.Dialer, detail *URLTestDetail, matcher *StatusMatcher) (t uint16, err error) {
 	if link == "" {
 		link = "https://www.gstatic.com/generate_204"
 	}
@@ -278,7 +316,7 @@ func URLTestWithDetailAndStatus(ctx context.Context, link string, detour N.Diale
 	firstByteMS := probe1.firstByteMS()
 
 	// ── Phase 4 (optional): warm-conn second request for unified_delay ──
-	if C.URLTestUnifiedDelay {
+	if UnifiedDelayFromContext(ctx) {
 		probe2 := newProbeTrace()
 		second := time.Now()
 		secondResp, ignoredErr := client.Do(baseReq.WithContext(httptrace.WithClientTrace(ctx, probe2.hooks())))

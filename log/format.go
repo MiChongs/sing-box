@@ -6,8 +6,6 @@ import (
 	"strings"
 	"time"
 
-	F "github.com/sagernet/sing/common/format"
-
 	"github.com/logrusorgru/aurora"
 )
 
@@ -20,164 +18,171 @@ type Formatter struct {
 	DisableLineBreak bool
 }
 
-// ════════════════ Pre-computed color cache ════════════════
-//
-// aurora.Colorize uses a 6x6x6 color cube (216 colors) and computes luma per-call
-// to pick readable colors. That's 6 float ops + ANSI string formatting EVERY log line.
-// We precompute the aurora.Color value for each of the 216 possible ID mod values
-// once at startup, then just look up by index.
-
-var idColors [216]aurora.Color
-
-func init() {
-	for i := 0; i < 216; i++ {
-		color := aurora.Color(i) % 215
-		row := uint(color / 36)
-		column := uint(color % 36)
-
-		r := float32(row * 51)
-		g := float32(column / 6 * 51)
-		b := float32((column % 6) * 51)
-		luma := 0.2126*r + 0.7152*g + 0.0722*b
-		if luma < 60 {
-			row = 5 - row
-			column = 35 - column
-			color = aurora.Color(row*36 + column)
-		}
-		color += 16
-		color = color << 16
-		color |= 1 << 14
-		idColors[i] = color
-	}
-}
-
-// colorForID returns the precomputed aurora color for a given log ID.
-// Zero arithmetic in hot path.
-func colorForID(id uint32) aurora.Color {
-	return idColors[uint8(id)%216]
-}
-
-// Pre-computed level strings with ANSI color codes (colored) and plain.
-// Avoids aurora.XXX().String() allocation on every log call.
 var (
-	levelColored = [...]string{
-		LevelPanic: aurora.Red("PANIC").String(),
-		LevelFatal: aurora.Red("FATAL").String(),
-		LevelError: aurora.Red("ERROR").String(),
-		LevelWarn:  aurora.Yellow("WARN").String(),
-		LevelInfo:  aurora.Cyan("INFO").String(),
-		LevelDebug: aurora.White("DEBUG").String(),
-		LevelTrace: aurora.White("TRACE").String(),
-	}
-	levelPlain = [...]string{
-		LevelPanic: "PANIC",
-		LevelFatal: "FATAL",
-		LevelError: "ERROR",
-		LevelWarn:  "WARN",
-		LevelInfo:  "INFO",
-		LevelDebug: "DEBUG",
-		LevelTrace: "TRACE",
-	}
+	levelLabels        [LevelTrace + 1]string
+	coloredLevelLabels [LevelTrace + 1]string
 )
 
-func formatLevelFast(level Level, disableColors bool) string {
-	idx := int(level)
-	if idx < 0 || idx >= len(levelPlain) {
-		return strings.ToUpper(FormatLevel(level))
+func init() {
+	for level := LevelPanic; level <= LevelTrace; level++ {
+		label := strings.ToUpper(FormatLevel(level))
+		levelLabels[level] = label
+		switch level {
+		case LevelDebug, LevelTrace:
+			coloredLevelLabels[level] = aurora.White(label).String()
+		case LevelInfo:
+			coloredLevelLabels[level] = aurora.Cyan(label).String()
+		case LevelWarn:
+			coloredLevelLabels[level] = aurora.Yellow(label).String()
+		case LevelError, LevelFatal, LevelPanic:
+			coloredLevelLabels[level] = aurora.Red(label).String()
+		}
 	}
-	if disableColors {
-		return levelPlain[idx]
-	}
-	return levelColored[idx]
 }
 
 func (f Formatter) Format(ctx context.Context, level Level, tag string, message string, timestamp time.Time) string {
-	levelString := formatLevelFast(level, f.DisableColors)
-	if tag != "" {
-		message = tag + ": " + message
-	}
 	var id ID
 	var hasId bool
 	if ctx != nil {
 		id, hasId = IDFromContext(ctx)
 	}
+	var builder strings.Builder
+	builder.Grow(len(tag) + len(message) + 64)
+	f.writePrefix(&builder, level, timestamp)
 	if hasId {
-		activeDuration := FormatDuration(time.Since(id.CreatedAt))
-		if !f.DisableColors {
-			// Pre-computed color lookup — zero arithmetic
-			message = F.ToString("[", aurora.Colorize(id.ID, colorForID(id.ID)).String(), " ", activeDuration, "] ", message)
-		} else {
-			message = F.ToString("[", id.ID, " ", activeDuration, "] ", message)
-		}
+		f.writeIdPrefix(&builder, id)
 	}
-	switch {
-	case f.DisableTimestamp:
-		message = levelString + " " + message
-	case f.FullTimestamp:
-		message = timestamp.Format(f.TimestampFormat) + " " + levelString + " " + message
-	default:
-		message = levelString + "[" + xd(int(timestamp.Sub(f.BaseTime)/time.Second), 4) + "] " + message
+	if tag != "" {
+		builder.WriteString(tag)
+		builder.WriteString(": ")
 	}
 	if f.DisableLineBreak {
-		if message[len(message)-1] == '\n' {
-			message = message[:len(message)-1]
-		}
+		builder.WriteString(strings.TrimSuffix(message, "\n"))
 	} else {
-		if message[len(message)-1] != '\n' {
-			message += "\n"
+		builder.WriteString(message)
+		if !strings.HasSuffix(message, "\n") {
+			builder.WriteByte('\n')
 		}
 	}
-	return message
+	return builder.String()
 }
 
-func (f Formatter) FormatWithSimple(ctx context.Context, level Level, tag string, message string, timestamp time.Time) (string, string) {
-	levelString := formatLevelFast(level, f.DisableColors)
-	if tag != "" {
-		message = tag + ": " + message
-	}
-	messageSimple := message
+func (f Formatter) FormatSimple(ctx context.Context, tag string, message string) string {
 	var id ID
 	var hasId bool
 	if ctx != nil {
 		id, hasId = IDFromContext(ctx)
 	}
+	if !hasId && tag == "" {
+		return message
+	}
+	var builder strings.Builder
+	builder.Grow(len(tag) + len(message) + 32)
 	if hasId {
-		activeDuration := FormatDuration(time.Since(id.CreatedAt))
-		if !f.DisableColors {
-			message = F.ToString("[", aurora.Colorize(id.ID, colorForID(id.ID)).String(), " ", activeDuration, "] ", message)
-		} else {
-			message = F.ToString("[", id.ID, " ", activeDuration, "] ", message)
-		}
-		messageSimple = F.ToString("[", id.ID, " ", activeDuration, "] ", messageSimple)
+		builder.WriteByte('[')
+		writeUint(&builder, uint64(id.ID))
+		builder.WriteByte(' ')
+		writeDuration(&builder, time.Since(id.CreatedAt))
+		builder.WriteString("] ")
+	}
+	if tag != "" {
+		builder.WriteString(tag)
+		builder.WriteString(": ")
+	}
+	builder.WriteString(message)
+	return builder.String()
+}
+
+func (f Formatter) writePrefix(builder *strings.Builder, level Level, timestamp time.Time) {
+	var levelString string
+	if int(level) >= len(levelLabels) {
+		levelString = "UNKNOWN"
+	} else if f.DisableColors {
+		levelString = levelLabels[level]
+	} else {
+		levelString = coloredLevelLabels[level]
 	}
 	switch {
 	case f.DisableTimestamp:
-		message = levelString + " " + message
+		builder.WriteString(levelString)
+		builder.WriteByte(' ')
 	case f.FullTimestamp:
-		message = timestamp.Format(f.TimestampFormat) + " " + levelString + " " + message
+		var timeBuffer [64]byte
+		builder.Write(timestamp.AppendFormat(timeBuffer[:0], f.TimestampFormat))
+		builder.WriteByte(' ')
+		builder.WriteString(levelString)
+		builder.WriteByte(' ')
 	default:
-		message = levelString + "[" + xd(int(timestamp.Sub(f.BaseTime)/time.Second), 4) + "] " + message
+		builder.WriteString(levelString)
+		builder.WriteByte('[')
+		seconds := strconv.AppendInt(make([]byte, 0, 20), int64(timestamp.Sub(f.BaseTime)/time.Second), 10)
+		for pad := 4 - len(seconds); pad > 0; pad-- {
+			builder.WriteByte('0')
+		}
+		builder.Write(seconds)
+		builder.WriteString("] ")
 	}
-	if message[len(message)-1] != '\n' {
-		message += "\n"
-	}
-	return message, messageSimple
 }
 
-func xd(value int, x int) string {
-	message := strconv.Itoa(value)
-	for len(message) < x {
-		message = "0" + message
+func (f Formatter) writeIdPrefix(builder *strings.Builder, id ID) {
+	builder.WriteByte('[')
+	if f.DisableColors {
+		writeUint(builder, uint64(id.ID))
+	} else {
+		builder.WriteString("\x1b[38;5;")
+		writeUint(builder, uint64(colorForID(id.ID)))
+		builder.WriteByte('m')
+		writeUint(builder, uint64(id.ID))
+		builder.WriteString("\x1b[0m")
 	}
-	return message
+	builder.WriteByte(' ')
+	writeDuration(builder, time.Since(id.CreatedAt))
+	builder.WriteString("] ")
+}
+
+func colorForID(value uint32) uint8 {
+	color := uint8(value) % 215
+	row := uint(color / 36)
+	column := uint(color % 36)
+	r := float32(row * 51)
+	g := float32(column / 6 * 51)
+	b := float32((column % 6) * 51)
+	luma := 0.2126*r + 0.7152*g + 0.0722*b
+	if luma < 60 {
+		row = 5 - row
+		column = 35 - column
+		color = uint8(row*36 + column)
+	}
+	return color + 16
+}
+
+func writeUint(builder *strings.Builder, value uint64) {
+	builder.Write(strconv.AppendUint(make([]byte, 0, 20), value, 10))
+}
+
+func writeInt(builder *strings.Builder, value int64) {
+	builder.Write(strconv.AppendInt(make([]byte, 0, 20), value, 10))
+}
+
+func writeDuration(builder *strings.Builder, duration time.Duration) {
+	if duration < time.Second {
+		writeInt(builder, duration.Milliseconds())
+		builder.WriteString("ms")
+	} else if duration < time.Minute {
+		writeInt(builder, int64(duration.Seconds()))
+		builder.WriteByte('.')
+		writeInt(builder, int64(duration.Seconds()*100)%100)
+		builder.WriteByte('s')
+	} else {
+		writeInt(builder, int64(duration.Minutes()))
+		builder.WriteByte('m')
+		writeInt(builder, int64(duration.Seconds())%60)
+		builder.WriteByte('s')
+	}
 }
 
 func FormatDuration(duration time.Duration) string {
-	if duration < time.Second {
-		return F.ToString(duration.Milliseconds(), "ms")
-	} else if duration < time.Minute {
-		return F.ToString(int64(duration.Seconds()), ".", int64(duration.Seconds()*100)%100, "s")
-	} else {
-		return F.ToString(int64(duration.Minutes()), "m", int64(duration.Seconds())%60, "s")
-	}
+	var builder strings.Builder
+	writeDuration(&builder, duration)
+	return builder.String()
 }

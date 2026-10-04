@@ -19,10 +19,15 @@
 
 ### 字段
 
-| 类型          | 格式                        |
-|-------------|---------------------------|
-| `wireguard` | [WireGuard](./wireguard/) |
-| `tailscale` | [Tailscale](./tailscale/) |
+| 类型               | 格式                                      |
+|------------------|-----------------------------------------|
+| `wireguard`      | [WireGuard](./wireguard/)               |
+| `tailscale`      | [Tailscale](./tailscale/)               |
+| `openconnect`    | [OpenConnect 客户端](./openconnect/)       |
+| `openvpn-client` | [OpenVPN 客户端](./openvpn-client/)         |
+| `openvpn-server` | [OpenVPN 服务器](./openvpn-server/)         |
+| `masque-client`  | [MASQUE 客户端](./masque-client/)           |
+| `masque-server`  | [MASQUE 服务器](./masque-server/)           |
 
 #### tag
 

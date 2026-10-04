@@ -17,11 +17,11 @@ type DirectInboundOptions struct {
 type _DirectOutboundOptions struct {
 	DialerOptions
 	DirectDomainStrategy DomainStrategy `json:"direct_domain_strategy,omitempty"`
-	ProxyProtocol        uint8          `json:"proxy_protocol,omitempty"`
+	ProxyProtocol        uint8          `json:"proxy_protocol,omitempty" enum:"0,1,2"`
 	// Deprecated: Use Route Action instead
-	OverrideAddress string `json:"override_address,omitempty"`
+	OverrideAddress string `json:"override_address,omitempty" schema:"omit"`
 	// Deprecated: Use Route Action instead
-	OverridePort uint16 `json:"override_port,omitempty"`
+	OverridePort uint16 `json:"override_port,omitempty" schema:"omit"`
 }
 
 type DirectOutboundOptions _DirectOutboundOptions

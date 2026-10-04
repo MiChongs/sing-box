@@ -139,7 +139,10 @@ func RegisterSmart(registry *outbound.Registry) {
 	outbound.Register[option.SmartOutboundOptions](registry, C.TypeSmart, NewSmart)
 }
 
-var _ adapter.OutboundGroup = (*Smart)(nil)
+var (
+	_ adapter.OutboundGroup        = (*Smart)(nil)
+	_ adapter.DialingOutboundGroup = (*Smart)(nil)
+)
 
 // smartGroupState is an immutable snapshot of the outbound list.
 type smartGroupState struct {
@@ -1259,9 +1262,37 @@ func (s *Smart) SelectOutbound(tag string) bool {
 	return false
 }
 
-// Selected returns the pinned node tag, or "" when Smart is in automatic mode.
+// PinnedTag returns the pinned node tag, or "" when Smart is in automatic mode.
 // Surfaced in Clash API output as the `fixed` field.
-func (s *Smart) Selected() string { return s.getManualSelected() }
+func (s *Smart) PinnedTag() string { return s.getManualSelected() }
+
+// Selected reports the node Smart would most likely hand traffic to right
+// now (see Now). Smart chooses per connection inside DialContext, so this is
+// a best global guess used by the Clash API and RealTag, not a routing
+// decision.
+func (s *Smart) Selected(string) adapter.Outbound {
+	tag := s.Now()
+	if tag == "" {
+		return nil
+	}
+	detour, loaded := s.outboundMgr.Outbound(tag)
+	if !loaded {
+		return nil
+	}
+	return detour
+}
+
+// DialThroughGroup keeps Smart in the dial path: every connection must go
+// through DialContext / ListenPacket so selection, learning and breakers see
+// it, instead of the router dialing Selected() directly.
+func (s *Smart) DialThroughGroup() {}
+
+func (s *Smart) AttachConnection(closer io.Closer) func() {
+	if s.interruptGroup == nil {
+		return func() {}
+	}
+	return s.interruptGroup.Add(closer, true)
+}
 
 // ConfigName returns the Smart store's config namespace ("singbox" in this
 // fork — mihomo used the config filename). Exposed for ClashAPI routes that
@@ -1368,7 +1399,7 @@ func (s *Smart) DiagnosticSnapshot() map[string]any {
 		"policy_priority": s.PolicyPriorityRules(),
 		"members":         len(s.All()),
 		"now":             s.Now(),
-		"fixed":           s.Selected(),
+		"fixed":           s.PinnedTag(),
 		"test_url":        s.TestURL(),
 	}
 
@@ -1826,7 +1857,7 @@ func (s *Smart) Now() string {
 	// we fell back), return the LAST SUCCESSFULLY DIALLED node so
 	// the Clash API surfaces the real current traffic path instead
 	// of the user's intention. The user's pin is preserved in
-	// Selected() / `fixed` and will be reinstated once the pin
+	// PinnedTag() / `fixed` and will be reinstated once the pin
 	// recovers — see maybeResumePin.
 	if pinned := s.getManualSelected(); pinned != "" && !s.pinSuspended.Load() {
 		return pinned

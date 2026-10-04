@@ -14,28 +14,17 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// Handle owns a WinDivert kernel device handle plus a private event for
-// overlapped I/O. Methods on *Handle are not safe for concurrent use
-// across goroutines (there is a single shared event per Handle).
-//
-// addr is a per-Handle Address buffer the IOCTL struct embeds a pointer
-// to. It lives on the heap (as a field of a heap-allocated Handle) so
-// the pointer value stored as bytes in the ioctl buffer remains valid
-// across stack growth between buildIoctl* and the DeviceIoControl
-// syscall — stack-local Address values are not safe for this pattern
-// because Go's escape analysis does not see the pointer through the
-// unsafe.Pointer → uintptr → bytes conversion.
 type Handle struct {
-	device   windows.Handle
-	event    windows.Handle
-	closing  sync.Once
-	closeErr error
-	addr     Address
+	device       windows.Handle
+	event        windows.Handle
+	closing      sync.Once
+	closeErr     error
+	addr         Address
+	recvAddrs    []Address
+	recvAddrsLen uint32
+	sendAddrs    []Address
 }
 
-// Filter may be nil for "reject all", suitable for send-only handles.
-// Requires Administrator on first call per process (installs the kernel
-// driver via SCM); subsequent calls reuse the running driver.
 func Open(filter *Filter, layer Layer, priority int16, flags Flag) (*Handle, error) {
 	err := validateOpenArgs(layer, priority, flags)
 	if err != nil {
@@ -48,29 +37,9 @@ func Open(filter *Filter, layer Layer, priority int16, flags Flag) (*Handle, err
 	if err != nil {
 		return nil, err
 	}
-	device, err := openDevice()
+	device, err := acquireDevice()
 	if err != nil {
-		if !errors.Is(err, windows.ERROR_FILE_NOT_FOUND) &&
-			!errors.Is(err, windows.ERROR_PATH_NOT_FOUND) {
-			if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-				return nil, E.Cause(err, "windivert: open device (administrator required)")
-			}
-			return nil, E.Cause(err, "windivert: open device")
-		}
-		// Device node missing: kernel driver not loaded. Install + retry.
-		// Matches WinDivertOpen's lazy-install path; avoids racing StartService
-		// against a still-loaded driver whose SCM record is marked for deletion.
-		err = ensureDriver()
-		if err != nil {
-			return nil, err
-		}
-		device, err = openDevice()
-		if err != nil {
-			if errors.Is(err, windows.ERROR_ACCESS_DENIED) {
-				return nil, E.Cause(err, "windivert: open device (administrator required)")
-			}
-			return nil, E.Cause(err, "windivert: open device")
-		}
+		return nil, err
 	}
 	event, err := windows.CreateEvent(nil, 1, 0, nil) // manual reset, unsignaled
 	if err != nil {
@@ -122,8 +91,6 @@ func validateOpenArgs(layer Layer, priority int16, flags Flag) error {
 
 func (h *Handle) initialize(layer Layer, priority int16, flags Flag) error {
 	in := buildIoctlInitialize(layer, priority, flags)
-	// WINDIVERT_VERSION is a 64-byte packed struct; only the first 20
-	// bytes (magic, major, minor, bits) carry data, the rest is reserved.
 	var outBuf [versionStructSize]byte
 	binary.LittleEndian.PutUint64(outBuf[0:8], magicDLL)
 	binary.LittleEndian.PutUint32(outBuf[8:12], versionMajor)
@@ -154,7 +121,6 @@ func (h *Handle) startup(filterBin []byte, filterFlags uint64) error {
 	return nil
 }
 
-// If the handle is closed mid-Recv the error wraps ERROR_OPERATION_ABORTED.
 func (h *Handle) Recv(buf []byte) (int, Address, error) {
 	if len(buf) == 0 {
 		return 0, Address{}, E.New("windivert: recv: zero-length buffer")
@@ -169,10 +135,56 @@ func (h *Handle) Recv(buf []byte) (int, Address, error) {
 	return int(n), h.addr, nil
 }
 
+// BatchMax is WINDIVERT_BATCH_MAX: the driver caps both directions at 255
+// packets per ioctl.
+const BatchMax = 255
+
+const addressSize = uint32(unsafe.Sizeof(Address{}))
+
+// The driver packs packets back-to-back into buf with no padding and copies
+// exactly each packet's IP total length, and returns as soon as at least one
+// packet is available.
+func (h *Handle) RecvBatch(buf []byte) (int, []Address, error) {
+	if len(buf) < MTUMax {
+		return 0, nil, E.New("windivert: recv batch: buffer smaller than MTUMax")
+	}
+	if h.recvAddrs == nil {
+		h.recvAddrs = make([]Address, BatchMax)
+	}
+	h.recvAddrsLen = uint32(len(h.recvAddrs)) * addressSize
+	in := buildIoctlRecvBatch(&h.recvAddrs[0], &h.recvAddrsLen)
+	n, err := doIoctl(h.device, ioctlRecv, in[:], buf, h.event)
+	runtime.KeepAlive(h)
+	if err != nil {
+		return 0, nil, err
+	}
+	return int(n), h.recvAddrs[:h.recvAddrsLen/addressSize], nil
+}
+
+// The driver recovers packet boundaries from the IP total-length fields and
+// rejects the whole batch if they do not add up to len(buf).
+func (h *Handle) SendBatch(buf []byte, addrs []Address) (int, error) {
+	if len(addrs) == 0 || len(addrs) > BatchMax {
+		return 0, E.New("windivert: send batch: invalid packet count ", len(addrs))
+	}
+	if len(buf) == 0 {
+		return 0, E.New("windivert: send batch: empty buffer")
+	}
+	if h.sendAddrs == nil {
+		h.sendAddrs = make([]Address, BatchMax)
+	}
+	copy(h.sendAddrs, addrs)
+	in := buildIoctlSend(&h.sendAddrs[0], uint32(len(addrs))*addressSize)
+	n, err := doIoctl(h.device, ioctlSend, in[:], buf, h.event)
+	runtime.KeepAlive(h)
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
 // The address's Outbound flag controls whether the packet is sent toward
 // the wire (outbound=true) or delivered up the stack (outbound=false).
-// IfIdx and SubIfIdx can stay zero — the driver uses the routing table
-// when IfIdx=0.
 func (h *Handle) Send(packet []byte, addr *Address) (int, error) {
 	if len(packet) == 0 {
 		return 0, E.New("windivert: send: empty packet")
@@ -181,7 +193,7 @@ func (h *Handle) Send(packet []byte, addr *Address) (int, error) {
 		return 0, E.New("windivert: send: nil address")
 	}
 	h.addr = *addr
-	in := buildIoctlSend(&h.addr)
+	in := buildIoctlSend(&h.addr, addressSize)
 	n, err := doIoctl(h.device, ioctlSend, in[:], packet, h.event)
 	runtime.KeepAlive(h)
 	if err != nil {
@@ -190,7 +202,6 @@ func (h *Handle) Send(packet []byte, addr *Address) (int, error) {
 	return int(n), nil
 }
 
-// Idempotent. Aborts any in-flight I/O on the handle.
 func (h *Handle) Close() error {
 	h.closing.Do(func() {
 		var errs []error
@@ -255,15 +266,11 @@ const ioctlSize = 16
 // carry data; the rest is reserved zero padding.
 const versionStructSize = 64
 
-// doIoctl performs a single synchronous (blocking) overlapped
-// DeviceIoControl. The handle is opened with FILE_FLAG_OVERLAPPED so
-// DeviceIoControl returns ERROR_IO_PENDING; we then wait for completion
-// via GetOverlappedResult. Event is passed in so callers can reuse it
-// across calls on the same handle (avoids per-call CreateEvent).
+// NtDeviceIoControlFile clears the event to nonsignaled before queuing each
+// request, so one event can be reused across calls without ResetEvent.
 func doIoctl(handle windows.Handle, code uint32, in []byte, out []byte, event windows.Handle) (uint32, error) {
 	var overlapped windows.Overlapped
 	overlapped.HEvent = event
-	_ = windows.ResetEvent(event)
 
 	var inPtr *byte
 	var inLen uint32
@@ -279,7 +286,10 @@ func doIoctl(handle windows.Handle, code uint32, in []byte, out []byte, event wi
 	}
 	var returned uint32
 	err := windows.DeviceIoControl(handle, code, inPtr, inLen, outPtr, outLen, &returned, &overlapped)
-	if err != nil && !errors.Is(err, windows.ERROR_IO_PENDING) {
+	if err == nil {
+		return returned, nil
+	}
+	if !errors.Is(err, windows.ERROR_IO_PENDING) {
 		return 0, err
 	}
 	err = windows.GetOverlappedResult(handle, &overlapped, &returned, true)
@@ -305,10 +315,8 @@ func buildIoctlStartup(filterFlags uint64) [ioctlSize]byte {
 	return buf
 }
 
-// buildIoctlRecv packs a user-space pointer to a WINDIVERT_ADDRESS into
-// the ioctl struct. The driver dereferences it to write the address for
-// the received packet. Caller must keep the Address alive via
-// runtime.KeepAlive.
+// The driver dereferences the packed pointer to write the received packet's
+// WINDIVERT_ADDRESS.
 func buildIoctlRecv(addr *Address) [ioctlSize]byte {
 	var buf [ioctlSize]byte
 	binary.LittleEndian.PutUint64(buf[0:8], uint64(uintptr(unsafe.Pointer(addr))))
@@ -316,9 +324,18 @@ func buildIoctlRecv(addr *Address) [ioctlSize]byte {
 	return buf
 }
 
-func buildIoctlSend(addr *Address) [ioctlSize]byte {
+// addr_len_ptr carries the Address array capacity in bytes; the driver
+// overwrites it with the bytes actually written (packet count × 80).
+func buildIoctlRecvBatch(addrs *Address, addrsLen *uint32) [ioctlSize]byte {
 	var buf [ioctlSize]byte
-	binary.LittleEndian.PutUint64(buf[0:8], uint64(uintptr(unsafe.Pointer(addr))))
-	binary.LittleEndian.PutUint64(buf[8:16], uint64(unsafe.Sizeof(Address{})))
+	binary.LittleEndian.PutUint64(buf[0:8], uint64(uintptr(unsafe.Pointer(addrs))))
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(uintptr(unsafe.Pointer(addrsLen))))
+	return buf
+}
+
+func buildIoctlSend(addrs *Address, addrsLen uint32) [ioctlSize]byte {
+	var buf [ioctlSize]byte
+	binary.LittleEndian.PutUint64(buf[0:8], uint64(uintptr(unsafe.Pointer(addrs))))
+	binary.LittleEndian.PutUint64(buf[8:16], uint64(addrsLen))
 	return buf
 }

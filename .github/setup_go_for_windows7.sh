@@ -2,14 +2,14 @@
 
 set -euo pipefail
 
-VERSION="1.25.11"
+VERSION="1.26.8"
 PATCH_COMMITS=(
-  "466f6c7a29bc098b0d4c987b803c779222894a11"
-  "1bdabae205052afe1dadb2ad6f1ba612cdbc532a"
-  "a90777dcf692dd2168577853ba743b4338721b06"
-  "f6bddda4e8ff58a957462a1a09562924d5f3d05c"
-  "bed309eff415bcb3c77dd4bc3277b682b89a388d"
-  "34b899c2fb39b092db4fa67c4417e41dc046be4b"
+  "a4ae550aa148b04c9d4890e98bee63aede5c4b53"
+  "95b851f661584711faa8115b3234a461044f4510"
+  "b0bf0a863cf218b9bb0d6c013903ab160ae0c39b"
+  "7c7a2a0d68920f8764d9a3aeae7ad1067a17b3fa"
+  "ba34356e82f3c12a7303d2231e6ea0e42bbbb3bf"
+  "472a88edbc2a42feb53fa31d29ab54d33840dca6"
 )
 CURL_ARGS=(
   -fL
@@ -29,9 +29,9 @@ mv go go_win7
 cd go_win7
 
 # modify from https://github.com/restic/restic/issues/4636#issuecomment-1896455557
-# these patch URLs only work on golang1.25.x
-# that means after golang1.26 release it must be changed
-# see: https://github.com/MetaCubeX/go/commits/release-branch.go1.25/
+# these patch URLs only work on golang1.26.x
+# that means after golang1.27 release it must be changed
+# see: https://github.com/MetaCubeX/go/commits/release-branch.go1.26/
 # revert:
 # 693def151adff1af707d82d28f55dba81ceb08e1: "crypto/rand,runtime: switch RtlGenRandom for ProcessPrng"
 # 7c1157f9544922e96945196b47b95664b1e39108: "net: remove sysSocket fallback for Windows 7"

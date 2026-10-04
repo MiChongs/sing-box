@@ -9,6 +9,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	boxService "github.com/sagernet/sing-box/adapter/service"
+	"github.com/sagernet/sing-box/common/badhttp"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
@@ -18,13 +19,12 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
-	sHTTP "github.com/sagernet/sing/protocol/http"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/render"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"golang.org/x/net/http2/h2c" //nolint:staticcheck
 )
 
 func RegisterRealmService(registry *boxService.Registry) {
@@ -65,7 +65,7 @@ func NewRealmService(ctx context.Context, logger log.ContextLogger, tag string, 
 	chiRouter.Use(middleware.RequestSize(maxRequestBodyBytes))
 	chiRouter.Use(func(handler http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			logger.DebugContext(r.Context(), r.Method, " ", r.RequestURI, " ", sHTTP.SourceAddress(r))
+			logger.DebugContext(r.Context(), r.Method, " ", r.RequestURI, " ", badhttp.SourceAddress(r))
 			handler.ServeHTTP(w, r)
 		})
 	})
@@ -98,6 +98,7 @@ func NewRealmService(ctx context.Context, logger log.ContextLogger, tag string, 
 			Listen:  options.ListenOptions,
 		}),
 		httpServer: &http.Server{
+			//nolint:staticcheck
 			Handler: h2c.NewHandler(chiRouter, &http2.Server{
 				IdleTimeout:                  time.Duration(options.IdleTimeout),
 				ReadIdleTimeout:              time.Duration(options.KeepAlivePeriod),

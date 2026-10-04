@@ -17,12 +17,15 @@ import (
 
 type systemTLSConfig struct {
 	serverName                 string
+	certificateServerName      string
 	nextProtos                 []string
 	handshakeTimeout           time.Duration
 	minVersion                 uint16
 	maxVersion                 uint16
 	insecure                   bool
 	anchorOnly                 bool
+	certificatePinSHA256       []byte
+	certificateSHA256          [][]byte
 	certificatePublicKeySHA256 [][]byte
 	timeFunc                   func() time.Time
 	store                      adapter.CertificateStore
@@ -34,6 +37,13 @@ func (c *systemTLSConfig) ServerName() string {
 
 func (c *systemTLSConfig) SetServerName(serverName string) {
 	c.serverName = serverName
+}
+
+func (c *systemTLSConfig) verificationServerName() string { //nolint:unused // Used by platform-specific TLS engines.
+	if c.certificateServerName != "" {
+		return c.certificateServerName
+	}
+	return c.serverName
 }
 
 func (c *systemTLSConfig) NextProtos() []string {
@@ -63,12 +73,15 @@ func (c *systemTLSConfig) Client(conn net.Conn) (Conn, error) {
 func (c *systemTLSConfig) clone() systemTLSConfig {
 	return systemTLSConfig{
 		serverName:                 c.serverName,
+		certificateServerName:      c.certificateServerName,
 		nextProtos:                 append([]string(nil), c.nextProtos...),
 		handshakeTimeout:           c.handshakeTimeout,
 		minVersion:                 c.minVersion,
 		maxVersion:                 c.maxVersion,
 		insecure:                   c.insecure,
 		anchorOnly:                 c.anchorOnly,
+		certificatePinSHA256:       append([]byte(nil), c.certificatePinSHA256...),
+		certificateSHA256:          append([][]byte(nil), c.certificateSHA256...),
 		certificatePublicKeySHA256: append([][]byte(nil), c.certificatePublicKeySHA256...),
 		timeFunc:                   c.timeFunc,
 		store:                      c.store,
@@ -86,7 +99,11 @@ func newSystemTLSConfig(ctx context.Context, serverAddress string, options optio
 	} else if serverAddress != "" {
 		serverName = serverAddress
 	}
-	if serverName == "" && !options.Insecure && !allowEmptyServerName {
+	verificationServerName := options.CertificateServerName
+	if verificationServerName == "" {
+		verificationServerName = serverName
+	}
+	if verificationServerName == "" && !options.Insecure && !allowEmptyServerName {
 		return systemTLSConfig{}, SystemTLSValidated{}, errMissingServerName
 	}
 	handshakeTimeout := C.TCPTimeout
@@ -95,12 +112,15 @@ func newSystemTLSConfig(ctx context.Context, serverAddress string, options optio
 	}
 	return systemTLSConfig{
 		serverName:                 serverName,
+		certificateServerName:      options.CertificateServerName,
 		nextProtos:                 append([]string(nil), options.ALPN...),
 		handshakeTimeout:           handshakeTimeout,
 		minVersion:                 validated.MinVersion,
 		maxVersion:                 validated.MaxVersion,
-		insecure:                   options.Insecure || len(options.CertificatePublicKeySHA256) > 0,
+		insecure:                   len(validated.CertificatePinSHA256) > 0 || options.Insecure || len(options.CertificateSHA256) > 0 || len(options.CertificatePublicKeySHA256) > 0,
 		anchorOnly:                 validated.Exclusive,
+		certificatePinSHA256:       validated.CertificatePinSHA256,
+		certificateSHA256:          append([][]byte(nil), options.CertificateSHA256...),
 		certificatePublicKeySHA256: append([][]byte(nil), options.CertificatePublicKeySHA256...),
 		timeFunc:                   ntp.TimeFuncFromContext(ctx),
 		store:                      validated.Store,

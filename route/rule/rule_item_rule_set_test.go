@@ -9,7 +9,6 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
-	tun "github.com/sagernet/sing-tun"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/x/list"
 
@@ -23,8 +22,11 @@ type ruleSetItemTestRouter struct {
 
 func (r *ruleSetItemTestRouter) Start(adapter.StartStage) error { return nil }
 func (r *ruleSetItemTestRouter) Close() error                   { return nil }
-func (r *ruleSetItemTestRouter) PreMatch(adapter.InboundContext, tun.DirectRouteContext, time.Duration, bool) (tun.DirectRouteDestination, error) {
-	return nil, nil
+func (r *ruleSetItemTestRouter) PreMatch(adapter.InboundContext, []byte) adapter.PreMatchResult {
+	return adapter.PreMatchResult{}
+}
+
+func (r *ruleSetItemTestRouter) HijackDNSPacket(context.Context, []byte, N.PacketWriter, adapter.InboundContext) {
 }
 
 func (r *ruleSetItemTestRouter) RouteConnection(context.Context, net.Conn, adapter.InboundContext) error {
@@ -69,16 +71,26 @@ type countingRuleSet struct {
 	refs atomic.Int32
 }
 
-func (s *countingRuleSet) Name() string                                                  { return s.name }
-func (s *countingRuleSet) Type() string                                                  { return "local" }
-func (s *countingRuleSet) Format() string                                                { return "source" }
-func (s *countingRuleSet) UpdatedTime() time.Time                                        { return time.Time{} }
-func (s *countingRuleSet) Update(context.Context) error                                  { return nil }
+func (s *countingRuleSet) Name() string { return s.name }
+
+func (s *countingRuleSet) Type() string { return "local" }
+
+func (s *countingRuleSet) Format() string { return "source" }
+
+func (s *countingRuleSet) UpdatedTime() time.Time { return time.Time{} }
+
+func (s *countingRuleSet) Update(context.Context) error { return nil }
+
 func (s *countingRuleSet) StartContext(context.Context, *adapter.HTTPStartContext) error { return nil }
-func (s *countingRuleSet) PostStart() error                                              { return nil }
-func (s *countingRuleSet) Metadata() adapter.RuleSetMetadata                             { return adapter.RuleSetMetadata{} }
-func (s *countingRuleSet) ExtractIPSet() []*netipx.IPSet                                 { return nil }
-func (s *countingRuleSet) IncRef()                                                       { s.refs.Add(1) }
+
+func (s *countingRuleSet) PostStart() error { return nil }
+
+func (s *countingRuleSet) Metadata() adapter.RuleSetMetadata { return adapter.RuleSetMetadata{} }
+
+func (s *countingRuleSet) ExtractIPSet() []*netipx.IPSet { return nil }
+
+func (s *countingRuleSet) IncRef() { s.refs.Add(1) }
+
 func (s *countingRuleSet) DecRef() {
 	if s.refs.Add(-1) < 0 {
 		panic("rule-set: negative refs")
@@ -90,10 +102,14 @@ func (s *countingRuleSet) RegisterCallback(adapter.RuleSetUpdateCallback) *list.
 }
 func (s *countingRuleSet) UnregisterCallback(*list.Element[adapter.RuleSetUpdateCallback]) {}
 func (s *countingRuleSet) Close() error                                                    { return nil }
-func (s *countingRuleSet) RuleCount() uint64                                               { return 0 }
-func (s *countingRuleSet) Match(*adapter.InboundContext) bool                              { return true }
-func (s *countingRuleSet) String() string                                                  { return s.name }
-func (s *countingRuleSet) RefCount() int32                                                 { return s.refs.Load() }
+
+func (s *countingRuleSet) RuleCount() uint64 { return 0 }
+
+func (s *countingRuleSet) Match(*adapter.InboundContext) bool { return true }
+
+func (s *countingRuleSet) String() string { return s.name }
+
+func (s *countingRuleSet) RefCount() int32 { return s.refs.Load() }
 
 func TestRuleSetItemCloseReleasesRefs(t *testing.T) {
 	t.Parallel()

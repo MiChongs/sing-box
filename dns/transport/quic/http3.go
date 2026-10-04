@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/quic-go/http3"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/badhttp"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
@@ -21,14 +22,13 @@ import (
 	"github.com/sagernet/sing-box/dns/transport"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
-	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	sHTTP "github.com/sagernet/sing/protocol/http"
 
 	mDNS "github.com/miekg/dns"
 )
@@ -92,7 +92,7 @@ func NewHTTP3(ctx context.Context, logger log.ContextLogger, tag string, options
 	if path == "" {
 		path = "/dns-query"
 	}
-	err = sHTTP.URLSetPath(&destinationURL, path)
+	err = badhttp.URLSetPath(&destinationURL, path)
 	if err != nil {
 		return nil, err
 	}
@@ -102,6 +102,9 @@ func NewHTTP3(ctx context.Context, logger log.ContextLogger, tag string, options
 	}
 	if !serverAddr.IsValid() {
 		return nil, E.New("invalid server address: ", serverAddr)
+	}
+	if options.Method == "" {
+		options.Method = http.MethodPost
 	}
 	t := &HTTP3Transport{
 		TransportAdapter: dns.NewTransportAdapterWithRemoteOptions(C.DNSTypeHTTP3, tag, options.RemoteDNSServerOptions),
@@ -124,11 +127,17 @@ func (t *HTTP3Transport) newTransport() *http3.Transport {
 			if dialErr != nil {
 				return nil, dialErr
 			}
-			quicConn, dialErr := quic.DialEarly(ctx, bufio.NewUnbindPacketConn(conn), conn.RemoteAddr(), tlsCfg, cfg)
+			quicConn, dialErr := quic.DialEarlyConn(ctx, conn, tlsCfg, qtls.ConfigWithGSO(qtls.ConfigWithGSO(cfg, t.dialer), conn))
 			if dialErr != nil {
 				conn.Close()
 				return nil, dialErr
 			}
+			// quic-go does not take ownership of the packet conn passed to
+			// DialEarly: when the connection ends it only stops reading.
+			go func() {
+				<-quicConn.Context().Done()
+				conn.Close()
+			}()
 			return quicConn, nil
 		},
 		TLSClientConfig: t.tlsConfig,
@@ -170,7 +179,7 @@ func (t *HTTP3Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 	var body io.Reader
 	switch t.method {
 	case http.MethodGet:
-		query := url.Values{}
+		query := destination.Query()
 		query.Set("dns", base64.RawURLEncoding.EncodeToString(rawMessage))
 		destination.RawQuery = query.Encode()
 	case http.MethodPost:
@@ -218,4 +227,10 @@ func (t *HTTP3Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 		return nil, err
 	}
 	return &responseMessage, nil
+}
+
+func (t *HTTP3Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+	go func() {
+		callback(t.Exchange(ctx, message))
+	}()
 }

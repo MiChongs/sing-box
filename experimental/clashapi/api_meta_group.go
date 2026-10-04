@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/batch"
 	"github.com/sagernet/sing/common/json/badjson"
+	N "github.com/sagernet/sing/common/network"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
@@ -78,7 +79,7 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(r.Context(), time.Millisecond*time.Duration(timeout))
+		ctx, cancel := context.WithTimeout(urltest.ContextWithUnifiedDelay(r.Context(), urltest.UnifiedDelayFromContext(server.ctx)), time.Millisecond*time.Duration(timeout))
 		defer cancel()
 
 		var result map[string]uint16
@@ -124,7 +125,7 @@ func testGroupMembers(ctx context.Context, server *Server, outboundGroup adapter
 
 	for _, detour := range outbounds {
 		tag := detour.Tag()
-		realTag := group.RealTag(detour)
+		realTag := group.RealTag(detour, N.NetworkTCP)
 		if checked[realTag] {
 			continue
 		}

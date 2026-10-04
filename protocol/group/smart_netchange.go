@@ -192,7 +192,7 @@ func (s *Smart) cancelInFlightDials() int {
 // Runs in the caller's goroutine — must be fast and non-blocking. All
 // real work is handed off to the shared timing wheel via a one-shot
 // scheduled task.
-func (s *Smart) InterfaceUpdated() {
+func (s *Smart) InterfaceUpdated(context.Context) {
 	if s == nil || !s.started.Load() {
 		return
 	}

@@ -17,6 +17,7 @@ type PlatformInterface interface {
 	ReadWIFIState() *WIFIState
 	ClearDNSCache()
 	SendNotification(notification *Notification) error
+	CancelNotification(identifier string, typeID int32) error
 	StartNeighborMonitor(listener NeighborUpdateListener) error
 	CloseNeighborMonitor(listener NeighborUpdateListener) error
 	RegisterMyInterface(name string)
@@ -27,6 +28,40 @@ type PlatformInterface interface {
 	LookupSFTPServer() (string, error)
 	ReadSystemSSHHostKey() (string, error)
 	TailscaleHostname() string
+	UsePlatformBridge() bool
+	CreateBridge(options *BridgeOptions) (BridgeSession, error)
+	UsePlatformAutoRedirect() bool
+	CreateAutoRedirect(options []byte, handler AutoRedirectHandler) (AutoRedirectSession, error)
+}
+
+type AutoRedirectHandler interface {
+	JudgeFlow(ipProtocol int32, sourceAddress string, sourcePort int32, destinationAddress string, destinationPort int32, firstPacket []byte) (int32, error)
+	RedirectListenerFileDescriptor() (int32, error)
+	RouteAddressSetFileDescriptor() (int32, error)
+	WriteLog(level int32, message string)
+}
+
+type AutoRedirectSession interface {
+	Close() error
+	UpdateRouteAddressSet() error
+}
+
+type BridgeOptions struct {
+	BridgeName string
+	MTU        int32
+	Inet4Port  string
+	Inet6Port  string
+	Interface  string
+	RuleIndex  int32
+	RouteTable int32
+}
+
+type BridgeSession interface {
+	FileDescriptor() int32
+	Name() string
+	Inet6Active() bool
+	SetEgress(interfaceName string) error
+	Close() error
 }
 
 type PlatformUser struct {
@@ -55,7 +90,16 @@ type ConnectionOwner struct {
 	UserId              int32
 	UserName            string
 	ProcessPath         string
+	processPaths        []string
 	androidPackageNames []string
+}
+
+func (c *ConnectionOwner) SetProcessPaths(paths StringIterator) {
+	c.processPaths = iteratorToArray[string](paths)
+}
+
+func (c *ConnectionOwner) ProcessPaths() StringIterator {
+	return newIterator(c.processPaths)
 }
 
 func (c *ConnectionOwner) SetAndroidPackageNames(names StringIterator) {
@@ -68,6 +112,7 @@ func (c *ConnectionOwner) AndroidPackageNames() StringIterator {
 
 type InterfaceUpdateListener interface {
 	UpdateDefaultInterface(interfaceName string, interfaceIndex int32, isExpensive bool, isConstrained bool)
+	UpdateNetworkPath(networkPath string)
 }
 
 const (
@@ -84,9 +129,11 @@ type NetworkInterface struct {
 	Addresses StringIterator
 	Flags     int32
 
-	Type      int32
-	DNSServer StringIterator
-	Metered   bool
+	Type            int32
+	DNSServer       StringIterator
+	DNSSearchDomain StringIterator
+	Gateway         StringIterator
+	Metered         bool
 }
 
 type WIFIState struct {

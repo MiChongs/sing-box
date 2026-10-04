@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
@@ -74,12 +76,22 @@ func newDashboard(ctx context.Context, logger log.ContextLogger, options option.
 }
 
 func (d *dashboard) start() error {
-	transport, err := d.resolveTransport()
+	_, err := filemanager.ReadDir(d.ctx, d.path)
+	if err != nil && !os.IsNotExist(err) {
+		return E.Cause(err, "read dashboard directory")
+	}
+	status := d.loadState()
+	if status == dashboardUserProvided {
+		d.logger.Info("dashboard: serving user-provided files at ", d.path, ", auto-update disabled")
+		return nil
+	}
+	httpClientManager := service.FromContext[adapter.HTTPClientManager](d.ctx)
+	transport, err := httpClientManager.ResolveTransport(d.ctx, d.logger, common.PtrValueOrDefault(d.options.HTTPClient))
 	if err != nil {
 		return E.Cause(err, "create dashboard http client")
 	}
 	d.httpClient = &http.Client{Transport: transport}
-	go d.loopUpdate()
+	go d.loopUpdate(status)
 	return nil
 }
 
@@ -91,21 +103,6 @@ func (d *dashboard) close() error {
 	return nil
 }
 
-func (d *dashboard) resolveTransport() (adapter.HTTPTransport, error) {
-	httpClientManager := service.FromContext[adapter.HTTPClientManager](d.ctx)
-	if httpClientManager == nil {
-		return nil, E.New("missing http client manager in context")
-	}
-	if d.options.HTTPClient != nil && !d.options.HTTPClient.IsEmpty() {
-		return httpClientManager.ResolveTransport(d.ctx, d.logger, *d.options.HTTPClient)
-	}
-	defaultTransport := httpClientManager.DefaultTransport()
-	if defaultTransport == nil {
-		return nil, E.New("default http client transport is not initialized")
-	}
-	return defaultTransport, nil
-}
-
 func (d *dashboard) serveHTTP(writer http.ResponseWriter, request *http.Request) {
 	if strings.HasPrefix(request.URL.Path, dashboardRoutePrefix) {
 		d.fileServer.ServeHTTP(writer, request)
@@ -114,12 +111,7 @@ func (d *dashboard) serveHTTP(writer http.ResponseWriter, request *http.Request)
 	http.Redirect(writer, request, dashboardRoutePrefix, http.StatusFound)
 }
 
-func (d *dashboard) loopUpdate() {
-	status := d.loadState()
-	if status == dashboardUserProvided {
-		d.logger.Info("dashboard: serving user-provided files at ", d.path, ", auto-update disabled")
-		return
-	}
+func (d *dashboard) loopUpdate(status dashboardStatus) {
 	var nextUpdate time.Time
 	if status == dashboardManaged {
 		nextUpdate = d.lastUpdated.Add(d.updateInterval)
@@ -147,7 +139,7 @@ func (d *dashboard) loopUpdate() {
 }
 
 func (d *dashboard) loadState() dashboardStatus {
-	entries, err := os.ReadDir(d.path)
+	entries, err := filemanager.ReadDir(d.ctx, d.path)
 	if err != nil {
 		return dashboardEmpty
 	}
@@ -155,12 +147,12 @@ func (d *dashboard) loadState() dashboardStatus {
 		return dashboardEmpty
 	}
 	etagPath := filepath.Join(d.path, dashboardEtagFileName)
-	etagBytes, err := os.ReadFile(etagPath)
+	etagBytes, err := filemanager.ReadFile(d.ctx, etagPath)
 	if err != nil {
 		return dashboardUserProvided
 	}
 	d.lastEtag = strings.TrimSpace(string(etagBytes))
-	info, err := os.Stat(etagPath)
+	info, err := filemanager.Stat(d.ctx, etagPath)
 	if err == nil {
 		d.lastUpdated = info.ModTime()
 	}
@@ -168,6 +160,7 @@ func (d *dashboard) loadState() dashboardStatus {
 }
 
 func (d *dashboard) fetch(ctx context.Context) error {
+	ctx = interrupt.ContextWithIsResourceDownload(ctx)
 	d.logger.Info("updating dashboard from URL: ", d.url)
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, d.url, nil)
 	if err != nil {
@@ -212,7 +205,7 @@ func (d *dashboard) extract(body io.Reader, etag string) error {
 		return err
 	}
 	tempZipPath := tempFile.Name()
-	defer os.Remove(tempZipPath)
+	defer filemanager.Remove(d.ctx, tempZipPath)
 	_, err = io.Copy(tempFile, body)
 	tempFile.Close()
 	if err != nil {
@@ -271,7 +264,7 @@ func (d *dashboard) extract(body io.Reader, etag string) error {
 	if err != nil {
 		return err
 	}
-	return os.Rename(tempDir, d.path)
+	return filemanager.Rename(d.ctx, tempDir, d.path)
 }
 
 func extractZipEntry(ctx context.Context, file *zip.File, savePath string) error {

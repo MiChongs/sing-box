@@ -44,6 +44,6 @@ func generatePinSHA256(args []string) error {
 		return err
 	}
 	hash := sha256.Sum256(cert.Raw)
-	os.Stdout.WriteString("SHA256 fingerprint: " + hex.EncodeToString(hash[:]) + "\n")
-	return nil
+	_, err = os.Stdout.WriteString("SHA256 fingerprint: " + hex.EncodeToString(hash[:]) + "\n")
+	return err
 }

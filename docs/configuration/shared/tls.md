@@ -2,6 +2,11 @@
 icon: material/new-box
 ---
 
+!!! quote "Changes in sing-box 1.15.0"
+
+    :material-plus: [certificate_sha256](#certificate_sha256)  
+    :material-plus: [client_certificate_sha256](#client_certificate_sha256)
+
 !!! quote "Changes in sing-box 1.14.0"
 
     :material-plus: [certificate_provider](#certificate_provider)  
@@ -9,6 +14,7 @@ icon: material/new-box
     :material-plus: [spoof](#spoof)  
     :material-plus: [spoof_method](#spoof_method)  
     :material-plus: [engine](#engine)  
+    :material-plus: [certificate_server_name](#certificate_server_name)<br>
     :material-delete-clock: [acme](#acme-fields)
 
 !!! quote "Changes in sing-box 1.13.0"
@@ -53,6 +59,7 @@ icon: material/new-box
   "client_authentication": "",
   "client_certificate": [],
   "client_certificate_path": [],
+  "client_certificate_sha256": [],
   "client_certificate_public_key_sha256": [],
   "key": [],
   "key_path": "",
@@ -114,6 +121,7 @@ icon: material/new-box
   "engine": "",
   "disable_sni": false,
   "server_name": "",
+  "certificate_server_name": "",
   "insecure": false,
   "alpn": [],
   "min_version": "",
@@ -122,7 +130,9 @@ icon: material/new-box
   "curve_preferences": [],
   "certificate": "",
   "certificate_path": "",
+  "certificate_sha256": [],
   "certificate_public_key_sha256": [],
+  "certificate_pin_sha256": "",
   "client_certificate": [],
   "client_certificate_path": "",
   "client_key": [],
@@ -211,12 +221,15 @@ Values:
 Supported fields:
 
 * `server_name`
+* `certificate_server_name`
 * `insecure`
 * `alpn`
 * `min_version`
 * `max_version`
 * `certificate` / `certificate_path`
+* `certificate_sha256`
 * `certificate_public_key_sha256`
+* `certificate_pin_sha256`
 * `handshake_timeout`
 
 Unsupported fields:
@@ -237,32 +250,9 @@ Unsupported fields:
 
 !!! note ""
 
-    TLS 1.3 is only negotiated on Windows 11 or Windows Server 2022 and newer. On older Windows versions, Schannel caps the connection at TLS 1.2 even when `max_version` is `1.3`.
+    TLS 1.3 is only negotiated on Windows 11 or Windows Server 2022 and newer.
 
 The default version range is TLS 1.2 to TLS 1.3, matching the `go` engine.
-
-Supported fields:
-
-* `server_name`
-* `insecure`
-* `alpn`
-* `min_version`
-* `max_version`
-* `certificate` / `certificate_path`
-* `certificate_public_key_sha256`
-* `handshake_timeout`
-
-Unsupported fields:
-
-* `disable_sni`
-* `cipher_suites`
-* `curve_preferences`
-* `client_certificate` / `client_certificate_path` / `client_key` / `client_key_path`
-* `fragment` / `record_fragment`
-* `kernel_tx` / `kernel_rx`
-* `ech`
-* `utls`
-* `reality`
 
 #### disable_sni
 
@@ -272,9 +262,21 @@ Do not send server name in ClientHello.
 
 #### server_name
 
-Used to verify the hostname on the returned certificates unless insecure is given.
+Used to verify the hostname on the returned certificates unless `certificate_server_name` or `insecure` is given.
 
 It is also included in the client's handshake to support virtual hosting unless it is an IP address.
+
+#### certificate_server_name
+
+!!! question "Since sing-box 1.14.0"
+
+==Client only==
+
+Overrides the server name used to verify the hostname on the returned certificates.
+
+Unlike `server_name`, this option does not affect the server name included in the ClientHello (SNI).
+
+If empty, `server_name` is used for certificate hostname verification.
 
 #### insecure
 
@@ -295,8 +297,7 @@ See [Application-Layer Protocol Negotiation](https://en.wikipedia.org/wiki/Appli
 
 The minimum TLS version that is acceptable.
 
-By default, TLS 1.2 is currently used as the minimum when acting as a
-client, and TLS 1.0 when acting as a server.
+TLS 1.2 is used by default.
 
 #### max_version
 
@@ -338,6 +339,48 @@ Server certificates chain line array, in PEM format.
 
 The path to server certificate chain, in PEM format.
 
+
+#### certificate_sha256
+
+!!! question "Since sing-box 1.15.0"
+
+==Client only==
+
+List of SHA-256 hashes of server certificates, in base64 format.
+
+The hash is computed over the whole DER-encoded certificate. Use `certificate_public_key_sha256` to pin only the public key.
+
+To generate the SHA-256 hash for a certificate, use the following commands:
+
+```bash
+# For a certificate file
+openssl x509 -in certificate.pem -outform der | openssl dgst -sha256 -binary | openssl enc -base64
+
+# For a certificate from a remote server
+echo | openssl s_client -servername example.com -connect example.com:443 2>/dev/null | openssl x509 -outform der | openssl dgst -sha256 -binary | openssl enc -base64
+```
+
+#### certificate_pin_sha256
+
+==Client only==
+
+A single SHA-256 fingerprint of the whole DER-encoded certificate, in hexadecimal format.
+Uppercase, lowercase, colon separators and surrounding whitespace are accepted.
+
+A matching leaf certificate is accepted without checking its hostname, validity period or system trust chain.
+A matching CA certificate in the chain is used as a trust anchor; the leaf's chain, hostname, validity period and server-auth usage are then verified.
+The pinned CA must appear in the chain obtained by the engine; system engines may provide a chain built by the operating system.
+
+Mutually exclusive with `certificate_sha256`, `certificate_public_key_sha256`, `certificate`, `certificate_path` and enabled `reality`; configuring them together is an error.
+May be combined with `insecure: true`, which does not bypass pin verification.
+Supported by Go TLS, uTLS, Apple/Windows TLS and the Apple HTTP engine.
+Go TLS and uTLS also allow `disable_sni`; CA pins still verify the target hostname.
+
+Generate the fingerprint with:
+
+```bash
+sing-box generate pinsha256 certificate.crt
+```
 
 #### certificate_public_key_sha256
 
@@ -421,7 +464,7 @@ Available values:
 * `verify-if-given`
 * `require-and-verify`
 
-One of `client_certificate`, `client_certificate_path`, or `client_certificate_public_key_sha256` is required
+One of `client_certificate`, `client_certificate_path`, `client_certificate_sha256`, or `client_certificate_public_key_sha256` is required
 if this option is set to `verify-if-given`, or `require-and-verify`.
 
 #### client_certificate
@@ -443,6 +486,16 @@ Client certificate chain line array, in PEM format.
     Will be automatically reloaded if file modified.
 
 List of path to client certificate chain, in PEM format.
+
+#### client_certificate_sha256
+
+!!! question "Since sing-box 1.15.0"
+
+==Server only==
+
+List of SHA-256 hashes of client certificates, in base64 format.
+
+The hash is computed over the whole DER-encoded certificate, see [certificate_sha256](#certificate_sha256).
 
 #### client_certificate_public_key_sha256
 
@@ -687,16 +740,8 @@ Fragment TLS handshake into multiple TLS records to bypass firewalls.
 Inject a forged TLS ClientHello carrying a whitelisted SNI before the real one,
 to fool SNI-filtering middleboxes that permit specific hostnames.
 
-The forged segment is a copy of the real ClientHello with only the SNI value
-replaced by the value of this field, so TLS fingerprinting cannot distinguish
-it from the real one. The receiving server drops the forged segment
-(see `spoof_method`) while the middlebox treats it as a legitimate session.
-
-Requires raw-socket access (`CAP_NET_RAW` on Linux, root on macOS);
-on Linux, `CAP_NET_ADMIN` is additionally required because the send sequence
-number is read via `TCP_REPAIR`.
-On Windows, Administrator is required to install the embedded WinDivert kernel
-driver on first use. Windows on ARM64 is not supported.
+Requires `CAP_NET_RAW` and `CAP_NET_ADMIN` on Linux, root on macOS, and
+Administrator on Windows. Windows on ARM64 is not supported.
 
 #### spoof_method
 
@@ -711,8 +756,8 @@ How the forged segment is rejected by the real server.
 | `wrong-sequence` (default) | The forged segment's TCP sequence number is placed before the server's receive window.                         |
 | `wrong-checksum`           | The forged segment's TCP checksum is deliberately invalid.                                                     |
 | `wrong-ack`                | The forged segment's TCP acknowledgment number is placed before the server's send window.                      |
-| `wrong-md5`                | The forged segment carries a TCP-MD5 signature option, which the server rejects since no MD5 key is negotiated. |
-| `wrong-timestamp`          | The forged segment carries a backdated TCP timestamp, which the server rejects as a PAWS replay. Linux/Windows only; not supported on macOS. |
+| `wrong-md5`                | The forged segment carries a TCP-MD5 signature option.                                                         |
+| `wrong-timestamp`          | The forged segment carries a backdated TCP timestamp. Linux/Windows only; not supported on macOS.              |
 
 ### ACME Fields
 

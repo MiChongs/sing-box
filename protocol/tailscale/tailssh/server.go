@@ -1,4 +1,4 @@
-//go:build with_gvisor
+//go:build with_tailscale
 
 package tailssh
 
@@ -15,7 +15,6 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
-	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -28,6 +27,7 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
+	"github.com/sagernet/sing/service/filemanager"
 	tsDNS "github.com/sagernet/tailscale/net/dns"
 	"github.com/sagernet/tailscale/tailcfg"
 	"github.com/sagernet/tailscale/tsnet"
@@ -93,7 +93,7 @@ type activeSession struct {
 	cancel context.CancelFunc
 }
 
-func New(tsnetServer *tsnet.Server, platformInterface adapter.PlatformInterface, options *option.TailscaleSSHServerOptions, logger logger.ContextLogger) (*Server, error) {
+func New(ctx context.Context, tsnetServer *tsnet.Server, platformInterface adapter.PlatformInterface, options *option.TailscaleSSHServerOptions, logger logger.ContextLogger) (*Server, error) {
 	s := &Server{
 		tsnetServer:       tsnetServer,
 		platformInterface: platformInterface,
@@ -104,7 +104,7 @@ func New(tsnetServer *tsnet.Server, platformInterface adapter.PlatformInterface,
 		done:              make(chan struct{}),
 		activeConns:       make(map[*activeSession]struct{}),
 	}
-	s.serverCtx, s.serverCancel = context.WithCancel(context.Background())
+	s.serverCtx, s.serverCancel = context.WithCancel(ctx)
 	hostSigner, err := s.loadOrGenerateHostKey()
 	if err != nil {
 		return nil, err
@@ -132,7 +132,7 @@ func (s *Server) loadOrGenerateHostKey() (gossh.Signer, error) {
 	if isPrivilegedUser() {
 		systemKey := systemHostKeyPath()
 		if systemKey != "" {
-			keyData, err := os.ReadFile(systemKey)
+			keyData, err := filemanager.ReadFile(s.serverCtx, systemKey)
 			if err == nil {
 				signer, parseErr := gossh.ParsePrivateKey(keyData)
 				if parseErr == nil {
@@ -144,7 +144,7 @@ func (s *Server) loadOrGenerateHostKey() (gossh.Signer, error) {
 		}
 	}
 	keyPath := filepath.Join(s.tsnetServer.Dir, "ssh_host_ed25519_key")
-	keyData, err := os.ReadFile(keyPath)
+	keyData, err := filemanager.ReadFile(s.serverCtx, keyPath)
 	if err == nil {
 		signer, parseErr := gossh.ParsePrivateKey(keyData)
 		if parseErr == nil {
@@ -163,11 +163,11 @@ func (s *Server) loadOrGenerateHostKey() (gossh.Signer, error) {
 	}
 	pemData := pem.EncodeToMemory(keyBytes)
 	dir := filepath.Dir(keyPath)
-	err = os.MkdirAll(dir, 0o700)
+	err = filemanager.MkdirAll(s.serverCtx, dir, 0o700)
 	if err != nil {
 		return nil, err
 	}
-	err = os.WriteFile(keyPath, pemData, 0o600)
+	err = filemanager.WriteFile(s.serverCtx, keyPath, pemData, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +287,7 @@ func (s *Server) authenticate(ctx gliderssh.Context, conn gossh.ConnMetadata) (*
 		s.logger.Warn("SSH auth: unknown peer ", remoteAddrPort)
 		return nil, &gossh.PartialSuccessError{}
 	}
-	netMap := localBackend.NetMap()
+	netMap := localBackend.NetMapNoPeers()
 	if netMap == nil || netMap.SSHPolicy == nil {
 		s.logger.Warn("SSH auth: no SSH policy")
 		return nil, &gossh.PartialSuccessError{}
@@ -419,7 +419,7 @@ func (s *Server) holdAndDelegate(ctx context.Context, action *tailcfg.SSHAction,
 		srcNodeIP = node.Addresses().At(0).Addr()
 	}
 	var dstNodeID string
-	netMap := lb.NetMap()
+	netMap := lb.NetMapNoPeers()
 	if netMap != nil && netMap.SelfNode.Valid() {
 		dstNodeID = fmt.Sprint(int64(netMap.SelfNode.ID()))
 	}
@@ -556,7 +556,7 @@ func (s *Server) handleSession(session gliderssh.Session) {
 		session.Exit(1)
 		return
 	}
-	err = verifyShellIdentity(localUser)
+	err = verifyShellIdentity(s.platformInterface, localUser)
 	if err != nil {
 		s.logger.Warn("shell rejected for ", localUser.Username, ": ", err)
 		fmt.Fprintf(session.Stderr(), "%s\r\n", err)
@@ -565,17 +565,13 @@ func (s *Server) handleSession(session gliderssh.Session) {
 	}
 	var agentSocketPath string
 	if connInfo.action.AllowAgentForwarding && !s.disableForwarding && gliderssh.AgentRequested(session) {
-		agentListener, listenErr := gliderssh.NewAgentListener()
-		if listenErr == nil {
+		agentListener, err := newAgentListener(localUser)
+		if err == nil {
 			defer agentListener.Close()
 			agentSocketPath = agentListener.Addr().String()
-			// The agent socket is created as the server identity; hand it to the
-			// target user so SSH_AUTH_SOCK is reachable after privileges drop.
-			prepareErr := prepareAgentSocket(agentSocketPath, localUser.Uid, localUser.Gid)
-			if prepareErr != nil {
-				s.logger.Warn("prepare agent socket: ", prepareErr)
-			}
 			go gliderssh.ForwardAgentConnections(agentListener, session)
+		} else {
+			s.logger.Warn("create agent listener: ", err)
 		}
 	}
 	env := s.buildEnvironment(session, connInfo, localUser)
@@ -586,11 +582,13 @@ func (s *Server) handleSession(session gliderssh.Session) {
 	session.DisablePTYEmulation()
 	command := session.RawCommand()
 	var term string
-	var rows, cols uint16
+	var rows, cols, widthPixels, heightPixels uint16
 	if isPty {
 		term = ptyReq.Term
 		rows = clampWindowDimension(ptyReq.Window.Height)
 		cols = clampWindowDimension(ptyReq.Window.Width)
+		widthPixels = clampWindowDimension(ptyReq.Window.WidthPixels)
+		heightPixels = clampWindowDimension(ptyReq.Window.HeightPixels)
 	}
 	var rec *recording
 	recorderList, onFailure := recorders(connInfo)
@@ -615,12 +613,14 @@ func (s *Server) handleSession(session gliderssh.Session) {
 		}
 	}
 	shellSession, err := s.backend.OpenSession(shellRequest{
-		User:    localUser,
-		Command: command,
-		Env:     env,
-		Term:    term,
-		Rows:    rows,
-		Cols:    cols,
+		User:         localUser,
+		Command:      command,
+		Env:          env,
+		Term:         term,
+		Rows:         rows,
+		Cols:         cols,
+		WidthPixels:  widthPixels,
+		HeightPixels: heightPixels,
 	})
 	if err != nil {
 		s.logger.Error("failed to open shell session: ", err)
@@ -665,7 +665,12 @@ func (s *Server) handleSession(session gliderssh.Session) {
 			for win := range winCh {
 				shellAccess.Lock()
 				if shellAlive {
-					shellSession.Resize(clampWindowDimension(win.Height), clampWindowDimension(win.Width))
+					shellSession.Resize(
+						clampWindowDimension(win.Height),
+						clampWindowDimension(win.Width),
+						clampWindowDimension(win.WidthPixels),
+						clampWindowDimension(win.HeightPixels),
+					)
 				}
 				shellAccess.Unlock()
 			}
@@ -748,7 +753,7 @@ func (s *Server) handleSFTP(ctx context.Context, session gliderssh.Session, conn
 		s.serveBuiltinSFTP(ctx, session, localUser)
 		return
 	}
-	err = verifyShellIdentity(localUser)
+	err = verifyShellIdentity(s.platformInterface, localUser)
 	if err != nil {
 		s.logger.Warn("sftp rejected for ", localUser.Username, ": ", err)
 		fmt.Fprintf(session.Stderr(), "%s\r\n", err)
@@ -758,7 +763,7 @@ func (s *Server) handleSFTP(ctx context.Context, session gliderssh.Session, conn
 	env := s.buildEnvironment(session, connInfo, localUser)
 	sftpSession, err := s.backend.OpenSession(shellRequest{
 		User:    localUser,
-		Command: sftpCommand(sftpPath),
+		Command: sftpCommand(sftpPath, localUser.Shell),
 		Env:     env,
 	})
 	if err != nil {
@@ -811,8 +816,11 @@ func (s *Server) buildEnvironment(session gliderssh.Session, connInfo *sshConnIn
 		"USER="+localUser.Username,
 		"HOME="+localUser.HomeDir,
 		"SHELL="+localUser.Shell,
-		"PATH="+defaultPathEnv(),
 	)
+	defaultPath := defaultPathEnv(s.platformInterface)
+	if defaultPath != "" {
+		env = append(env, "PATH="+defaultPath)
+	}
 	env = append(env, platformEnvironment(localUser)...)
 	remoteAddr := session.RemoteAddr()
 	localAddr := session.LocalAddr()
@@ -832,7 +840,7 @@ func (s *Server) buildEnvironment(session gliderssh.Session, connInfo *sshConnIn
 	// capability, matching upstream's capability gate.
 	acceptEnv := connInfo.acceptEnv
 	if len(acceptEnv) > 0 {
-		netMap := s.tsnetServer.ExportLocalBackend().NetMap()
+		netMap := s.tsnetServer.ExportLocalBackend().NetMapNoPeers()
 		if netMap == nil || !netMap.HasCap(tailcfg.NodeAttrSSHEnvironmentVariables) {
 			acceptEnv = nil
 		}
@@ -958,7 +966,7 @@ func (s *Server) allowReverseUnixForward(ctx gliderssh.Context, socketPath strin
 
 func (s *Server) OnReconfig(cfg *wgcfg.Config, routerCfg *router.Config, dnsCfg *tsDNS.Config) {
 	localBackend := s.tsnetServer.ExportLocalBackend()
-	netMap := localBackend.NetMap()
+	netMap := localBackend.NetMapNoPeers()
 	if netMap == nil || netMap.SSHPolicy == nil {
 		return
 	}

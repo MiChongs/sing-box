@@ -2,7 +2,8 @@
 
 !!! quote "Changes in sing-box 1.14.0"
 
-    :material-plus: [http_client](#http_client)  
+    :material-plus: [http_client](#http_client)
+
     :material-delete-clock: [download_detour](#download_detour)
 
 ### Structure
@@ -25,7 +26,8 @@ List of subscription providers.
             "timeout": "",
           },
           "override_dialer": {},
-          "override_tls": {}
+          "override_tls": {},
+          "override_anytls": {}
         }
       ]
     }
@@ -46,6 +48,7 @@ List of subscription providers.
             "timeout": "",
           },
           "url": "",
+          "path": "",
           "exclude": "",
           "include": "",
           "user_agent": "",
@@ -53,6 +56,8 @@ List of subscription providers.
           "update_interval": "",
           "override_dialer": {},
           "override_tls": {},
+
+          "override_anytls": {},
 
           // Deprecated
 
@@ -100,6 +105,10 @@ Health check interval. The minimum value is `1m`, the default value is `10m`.
 
 Health check timeout. the default value is `3s`.
 
+##### override_anytls
+
+Override AnyTLS fields of outbounds in provider, see [AnyTLS Fields Override](/configuration/provider/override_anytls/) for details.
+
 ##### override_dialer
 
 Override dialer fields of outbounds in provider, see [Dialer Fields Override](/configuration/provider/override_dialer/) for details.
@@ -127,6 +136,22 @@ Local file path.
 ==Required==
 
 URL to the provider.
+
+#### path
+
+Path used to store the downloaded provider.
+
+The cache metadata is stored in `cache.db`.
+
+Conflicts with `initial_path`.
+
+#### initial_path
+
+Path to the initial provider content.
+
+It is loaded only when provider caching in `cache.db` is enabled and no cached provider is available. It is not used as the persistent cache path.
+
+Conflicts with `path`.
 
 #### exclude
 
@@ -160,4 +185,4 @@ Tag of the outbound used to download from the provider.
 
 #### update_interval
 
-Update interval. The minimum value is `1m`, the default value is `24h`.
+Update interval. The minimum value is `1h`, the default value is `24h`.

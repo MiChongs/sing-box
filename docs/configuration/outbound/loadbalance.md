@@ -1,3 +1,7 @@
+When this group is referenced, all candidate outbounds, including provider members,
+are treated as referenced for idle connection management, regardless of health-check
+results. This keeps their on-demand dependencies available for selection.
+
 ### Structure
 
 ```json
@@ -21,8 +25,7 @@
   "interval": "",
   "idle_timeout": "",
   "ttl": "10m",
-  "use_all_providers": false,
-  "interrupt_exist_connections": false
+  "use_all_providers": false
 }
 ```
 
@@ -80,9 +83,3 @@ The time to live used for `sticky-sessions` strategy  timeout. `10m` will be use
 #### use_all_providers
 
 Whether to use all providers for testing. `false` will be used if empty.
-
-#### interrupt_exist_connections
-
-Interrupt existing connections when the selected outbound has changed.
-
-Only inbound connections are affected by this setting, internal connections will always be interrupted.

@@ -82,12 +82,16 @@ func clearProxySelection(w http.ResponseWriter, r *http.Request) {
 		// also auto-clears on the next user-triggered speed test, so
 		// DELETE just mirrors that lifecycle for UIs that bind the
 		// "release fixed" button to the REST verb.
-		previous := p.Selected()
+		previous := p.PinnedTag()
 		p.SelectOutbound("")
+		var now string
+		if selected := p.Selected(N.NetworkTCP); selected != nil {
+			now = selected.Tag()
+		}
 		render.JSON(w, r, render.M{
 			"group":        p.Tag(),
 			"previous_pin": previous,
-			"now":          p.Now(),
+			"now":          now,
 		})
 	default:
 		render.Status(r, http.StatusBadRequest)
@@ -209,9 +213,7 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	info.Put("type", clashType)
 	info.Put("name", detour.Tag())
 	info.Put("udp", common.Contains(detour.Network(), N.NetworkUDP))
-
-	realTag := adapter.OutboundTag(detour)
-	delayHistory := server.urlTestHistory.LoadURLTestHistory(realTag)
+	delayHistory := server.urlTestHistory.LoadURLTestHistory(group.RealTag(detour, N.NetworkTCP))
 	if delayHistory != nil {
 		info.Put("history", []*adapter.URLTestHistory{delayHistory})
 		// Alive: history exists and is fresh (within 10 minutes)
@@ -224,14 +226,25 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	}
 
 	if groupOutbound, isGroup := detour.(adapter.OutboundGroup); isGroup {
-		info.Put("now", groupOutbound.Now())
+		var now string
+		if selected := groupOutbound.Selected(N.NetworkTCP); selected != nil {
+			now = selected.Tag()
+		}
+		info.Put("now", now)
 		allTags := groupOutbound.All()
 		info.Put("all", allTags)
 		// mihomo-compatible dashboard hints. Always emitted (no
 		// omitempty) so front-ends can rely on the field's presence —
 		// `hidden=false`, `icon=""` are the documented "absent" sentinels.
-		info.Put("hidden", groupOutbound.Hidden())
-		info.Put("icon", groupOutbound.Icon())
+		var (
+			hidden bool
+			icon   string
+		)
+		if hint, isHint := groupOutbound.(adapter.OutboundGroupHint); isHint {
+			hidden, icon = hint.Hidden(), hint.Icon()
+		}
+		info.Put("hidden", hidden)
+		info.Put("icon", icon)
 
 		// URLTest's temporary manual pin surfaces like Smart's `fixed`
 		// so metacubexd / zashboard can render a uniform "pinned" chip
@@ -239,7 +252,7 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 		// URLTest doesn't have a separate "pin suspended" state — if
 		// the pin is still in the snapshot it remains in effect.
 		if ut, ok := detour.(*group.URLTest); ok {
-			selected := ut.Selected()
+			selected := ut.PinnedTag()
 			info.Put("fixed", selected)
 			info.Put("fixedSuspended", false)
 			info.Put("fixedActive", selected)
@@ -250,7 +263,7 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 			info.Put("useASN", sg.UseASN())
 			info.Put("useLightGBM", sg.UseLightGBM())
 			info.Put("collectData", sg.CollectData())
-			info.Put("fixed", sg.Selected())
+			info.Put("fixed", sg.PinnedTag())
 			// pin suspension state — true when Smart had to fall back
 			// to an algorithm-selected node because the user's pin
 			// just failed a dial (and the breaker hasn't tripped
@@ -263,9 +276,9 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 			suspended := sg.PinSuspended()
 			info.Put("fixedSuspended", suspended)
 			if suspended {
-				info.Put("fixedActive", groupOutbound.Now())
+				info.Put("fixedActive", now)
 			} else {
-				info.Put("fixedActive", sg.Selected())
+				info.Put("fixedActive", sg.PinnedTag())
 			}
 			// Live algorithm + anti-flap window so /proxies dashboards
 			// can verify what's actually in effect (especially after a
@@ -407,6 +420,30 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 	render.NoContent(w, r)
 }
 
+func groupContains(outboundManager adapter.OutboundManager, outboundGroup adapter.OutboundGroup, tag string, visited map[string]bool) bool {
+	for _, memberTag := range outboundGroup.All() {
+		if memberTag == tag {
+			return true
+		}
+		member, loaded := outboundManager.Outbound(memberTag)
+		if !loaded {
+			continue
+		}
+		if group.RealTag(member, N.NetworkTCP) == tag {
+			return true
+		}
+		memberGroup, isGroup := member.(adapter.OutboundGroup)
+		if !isGroup || visited[memberTag] {
+			continue
+		}
+		visited[memberTag] = true
+		if groupContains(outboundManager, memberGroup, tag, visited) {
+			return true
+		}
+	}
+	return false
+}
+
 // getProxyDelay performs multi-sample delay testing for accuracy.
 // Tests up to 3 times and returns the median for stable results.
 func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) {
@@ -434,14 +471,15 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		// uses), and explicit unpin is available via DELETE /proxies/<tag>
 		// or PUT {"name":""} when the user really wants it.
 
-		realTag := group.RealTag(proxy)
+		realTag := group.RealTag(proxy, N.NetworkTCP)
 		timeoutDuration := time.Millisecond * time.Duration(timeout)
+		testContext := urltest.ContextWithUnifiedDelay(r.Context(), urltest.UnifiedDelayFromContext(server.ctx))
 
 		// Multi-sample: test up to 3 times, collect valid results
 		const maxSamples = 3
 		var samples []uint16
 		for i := 0; i < maxSamples; i++ {
-			ctx, cancel := context.WithTimeout(r.Context(), timeoutDuration)
+			ctx, cancel := context.WithTimeout(testContext, timeoutDuration)
 			t, testErr := urltest.URLTest(ctx, url, proxy)
 			cancel()
 			if testErr != nil || t == 0 {
@@ -456,7 +494,7 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 
 		if len(samples) == 0 {
 			// All attempts failed — check if it was a timeout
-			ctx, cancel := context.WithTimeout(r.Context(), timeoutDuration)
+			ctx, cancel := context.WithTimeout(testContext, timeoutDuration)
 			_, _ = urltest.URLTest(ctx, url, proxy)
 			timedOut := ctx.Err() != nil
 			cancel()
@@ -479,6 +517,16 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			Time:  time.Now(),
 			Delay: delay,
 		})
+		for _, detour := range server.outbound.Outbounds() {
+			urlTestGroup, isURLTestGroup := detour.(adapter.URLTestGroup)
+			if !isURLTestGroup {
+				continue
+			}
+			if !groupContains(server.outbound, urlTestGroup, realTag, map[string]bool{detour.Tag(): true}) {
+				continue
+			}
+			urlTestGroup.PerformUpdateCheck()
+		}
 
 		render.JSON(w, r, render.M{
 			"delay": delay,

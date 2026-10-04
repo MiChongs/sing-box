@@ -72,7 +72,7 @@ UDP over TCP 配置。
 
 此选项与 [domain_resolver](/zh/configuration/shared/dial/#domain_resolver) 格式相同。
 
-未设置时使用默认DNS。
+未设置时使用默认 DNS。
 
 ### 拨号字段
 

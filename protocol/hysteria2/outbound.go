@@ -14,10 +14,10 @@ import (
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/tls"
+	"github.com/sagernet/sing-box/common/udpgso"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/tuic"
 	qtls "github.com/sagernet/sing-quic"
 	"github.com/sagernet/sing-quic/hysteria"
 	"github.com/sagernet/sing-quic/hysteria2"
@@ -36,8 +36,10 @@ func RegisterOutbound(registry *outbound.Registry) {
 }
 
 var (
-	_ adapter.Outbound                = (*tuic.Outbound)(nil)
-	_ adapter.InterfaceUpdateListener = (*tuic.Outbound)(nil)
+	_ adapter.Outbound                = (*Outbound)(nil)
+	_ adapter.InterfaceUpdateListener = (*Outbound)(nil)
+	_ adapter.IdleConnectionKeeper    = (*Outbound)(nil)
+	_ adapter.OutboundWithMultiplex   = (*Outbound)(nil)
 )
 
 type Outbound struct {
@@ -56,7 +58,6 @@ type Outbound struct {
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.Hysteria2OutboundOptions) (adapter.Outbound, error) {
-	options.UDPFragmentDefault = true
 	if options.TLS == nil || !options.TLS.Enabled {
 		return nil, C.ErrTLSRequired
 	}
@@ -86,21 +87,25 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 			return nil, E.New("unknown obfs type: ", options.Obfs.Type)
 		}
 	}
+	realmSTUNServersIsDomain := options.Realm != nil && options.Realm.STUNServersIsDomain()
 	outboundDialer, err := dialer.NewWithOptions(dialer.Options{
-		Context:        ctx,
-		Options:        options.DialerOptions,
-		RemoteIsDomain: options.ServerIsDomain(),
+		Context:          ctx,
+		Options:          options.DialerOptions,
+		RemoteIsDomain:   options.ServerIsDomain() || realmSTUNServersIsDomain,
+		ResolverOnDetour: realmSTUNServersIsDomain,
+		NewDialer:        realmSTUNServersIsDomain,
 	})
 	if err != nil {
 		return nil, err
 	}
 	var realmOptions *realm.Options
 	if options.Realm != nil {
-		queryOptions, err := adapter.DNSQueryOptionsFrom(ctx, options.DialerOptions.DomainResolver)
-		if err != nil {
-			return nil, err
+		var queryOptions adapter.DNSQueryOptions
+		if realmSTUNServersIsDomain {
+			queryOptions = outboundDialer.(dialer.ResolveDialer).QueryOptions()
 		}
-		httpClientTransport, err := service.FromContext[adapter.HTTPClientManager](ctx).ResolveTransport(ctx, logger, common.PtrValueOrDefault(options.Realm.HTTPClient))
+		var httpClientTransport adapter.HTTPTransport
+		httpClientTransport, err = service.FromContext[adapter.HTTPClientManager](ctx).ResolveTransport(ctx, logger, common.PtrValueOrDefault(options.Realm.HTTPClient))
 		if err != nil {
 			return nil, E.Cause(err, "create realm http client")
 		}
@@ -121,7 +126,14 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 				}
 				return dnsRouter.Lookup(ctx, host, dnsOptions)
 			},
-			Logger: logger,
+			Logger:    logger,
+			IPVersion: options.Realm.IPVersion,
+		}
+		if options.Realm.PortMapping != nil && options.Realm.PortMapping.Enabled {
+			realmOptions.PortMapping = &realm.PortMappingOptions{
+				Timeout:  time.Duration(options.Realm.PortMapping.Timeout),
+				Lifetime: time.Duration(options.Realm.PortMapping.Lifetime),
+			}
 		}
 	}
 	networkList := options.Network.Build()
@@ -143,6 +155,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		Password:           options.Password,
 		TLSConfig:          tlsConfig,
 		QUICOptions: qtls.QUICOptions{
+			DisableGSO:              udpgso.Disabled(options.UDPGSO),
 			IdleTimeout:             options.IdleTimeout.Build(),
 			KeepAlivePeriod:         options.KeepAlivePeriod.Build(),
 			StreamReceiveWindow:     options.StreamReceiveWindow.Value(),
@@ -153,6 +166,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		},
 		UDPDisabled:  !common.Contains(networkList, N.NetworkUDP),
 		BBRProfile:   options.BBRProfile,
+		ChromeParrot: !options.DisableChromeParrot,
 		RealmOptions: realmOptions,
 	})
 	if err != nil {
@@ -205,7 +219,7 @@ func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return h.client.ListenPacket(ctx)
 }
 
-func (h *Outbound) InterfaceUpdated() {
+func (h *Outbound) InterfaceUpdated(ctx context.Context) {
 	// Idempotency gate: collapse duplicate InterfaceUpdated calls
 	// delivered within 1s. The upstream route layer coalesces to
 	// one Reset per burst, but stray late callbacks + any external
@@ -221,6 +235,18 @@ func (h *Outbound) InterfaceUpdated() {
 		return
 	}
 	h.client.CloseWithError(E.New("network changed"))
+}
+
+func (h *Outbound) MultiplexEnabled() bool {
+	return true
+}
+
+func (h *Outbound) SetKeepIdleConnections(keep bool) {
+	h.client.SetKeepIdleConnections(keep)
+}
+
+func (h *Outbound) CloseIdleConnections() {
+	h.client.CloseIdleConnections()
 }
 
 func (h *Outbound) Close() error {

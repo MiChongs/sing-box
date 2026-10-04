@@ -128,6 +128,7 @@ type Service struct {
 	ctx            context.Context
 	logger         log.ContextLogger
 	credentialPath string
+	detour         string
 	credentials    *oauthCredentials
 	users          []option.OCMUser
 	dialer         N.Dialer
@@ -179,6 +180,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		usageTracker = &AggregatedUsage{
 			LastUpdated:  time.Now(),
 			Combinations: make([]CostCombination, 0),
+			ctx:          ctx,
 			filePath:     options.UsagesPath,
 			logger:       logger,
 		}
@@ -186,6 +188,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 
 	service := &Service{
 		Adapter:        boxService.NewAdapter(C.TypeOCM, tag),
+		detour:         options.Detour,
 		ctx:            ctx,
 		logger:         logger,
 		credentialPath: options.CredentialPath,
@@ -222,7 +225,7 @@ func (s *Service) Start(stage adapter.StartStage) error {
 
 	s.userManager.UpdateUsers(s.users)
 
-	credentials, err := platformReadCredentials(s.credentialPath)
+	credentials, err := platformReadCredentials(s.ctx, s.credentialPath)
 	if err != nil {
 		return E.Cause(err, "read credentials")
 	}
@@ -292,7 +295,7 @@ func (s *Service) getAccessToken() (string, error) {
 
 	s.credentials = newCredentials
 
-	err = platformWriteCredentials(newCredentials, s.credentialPath)
+	err = platformWriteCredentials(s.ctx, newCredentials, s.credentialPath)
 	if err != nil {
 		s.logger.Warn("persist refreshed token: ", err)
 	}
@@ -704,4 +707,11 @@ func (s *Service) startWebSocketShutdown() []*webSocketSession {
 		webSocketSessions = append(webSocketSessions, session)
 	}
 	return webSocketSessions
+}
+
+func (s *Service) References() []string {
+	if s.detour == "" {
+		return nil
+	}
+	return []string{s.detour}
 }

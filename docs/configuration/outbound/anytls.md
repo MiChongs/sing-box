@@ -17,6 +17,8 @@ icon: material/new-box
   "idle_session_check_interval": "30s",
   "idle_session_timeout": "30s",
   "min_idle_session": 5,
+  "client_metadata": "",
+  "disable_reuse": false,
   "tls": {},
 
   ... // Dial Fields
@@ -55,6 +57,18 @@ In the check, close sessions that have been idle for longer than this. Default: 
 
 In the check, at least the first `n` idle sessions are kept open. Default value: `n`=0
 
+#### client_metadata
+
+!!! question "Since sing-box 1.13.16"
+
+Check [AnyTLS client metadata](/manual/misc/anytls-client-metadata/).
+
+When omitted, sends `sing-anytls/0.0.13 sing-box/<version>` for compatibility. This is a legacy identity, not the version of the rewritten library. An explicit empty string sends an empty `client=` setting without client identification.
+
+#### disable_reuse
+
+Disable TLS connection reuse. Default: false.
+
 #### tls
 
 ==Required==
@@ -64,3 +78,5 @@ TLS configuration, see [TLS](/configuration/shared/tls/#outbound).
 ### Dial Fields
 
 See [Dial Fields](/configuration/shared/dial/) for details.
+
+`tcp_fast_open` is supported.

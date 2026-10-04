@@ -2,9 +2,11 @@ package rule
 
 import (
 	"context"
+	"errors"
 	"io"
-	"os"
+	"io/fs"
 	"path/filepath"
+	"strings"
 
 	"github.com/sagernet/fswatch"
 	"github.com/sagernet/sing-box/adapter"
@@ -14,7 +16,6 @@ import (
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
-	"github.com/sagernet/sing/common/rw"
 	"github.com/sagernet/sing/service/filemanager"
 )
 
@@ -25,12 +26,12 @@ type LocalRuleSet struct {
 	watcher *fswatch.Watcher
 }
 
-func NewLocalRuleSet(ctx context.Context, logger logger.ContextLogger, options option.RuleSet) (*LocalRuleSet, error) {
+func NewLocalRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (*LocalRuleSet, error) {
 	ruleSet := &LocalRuleSet{
 		abstractRuleSet: abstractRuleSet{
 			ctx:    ctx,
 			logger: logger,
-			tag:    options.Tag,
+			tag:    tag,
 			sType:  options.Type,
 			format: options.Format,
 		},
@@ -44,7 +45,7 @@ func NewLocalRuleSet(ctx context.Context, logger logger.ContextLogger, options o
 			return nil, err
 		}
 	} else {
-		path, err := ruleSet.getPath(ctx, options.Path)
+		path, err := ruleSet.getPath(ctx, strings.ReplaceAll(options.Path, C.RuleSetTagPlaceholder, tag))
 		if err != nil {
 			return nil, err
 		}
@@ -58,7 +59,7 @@ func NewLocalRuleSet(ctx context.Context, logger logger.ContextLogger, options o
 			Callback: func(path string) {
 				uErr := ruleSet.reloadFile(path)
 				if uErr != nil {
-					logger.ErrorContext(log.ContextWithNewID(context.Background()), E.Cause(uErr, "reload rule-set ", options.Tag))
+					logger.ErrorContext(log.ContextWithNewID(context.Background()), E.Cause(uErr, "reload rule-set ", tag))
 				}
 			},
 		})
@@ -81,12 +82,12 @@ func (s *LocalRuleSet) StartContext(ctx context.Context, startContext *adapter.H
 }
 
 func (s *LocalRuleSet) reloadFile(path string) error {
-	file, err := os.Open(path)
+	file, err := filemanager.Open(s.ctx, path)
 	if err != nil {
 		return err
 	}
+	defer file.Close()
 	content, err := io.ReadAll(file)
-	file.Close()
 	if err != nil {
 		return err
 	}
@@ -94,11 +95,11 @@ func (s *LocalRuleSet) reloadFile(path string) error {
 	if err != nil {
 		return err
 	}
-	fs, err := os.Stat(path)
+	info, err := file.Stat()
 	if err != nil {
 		return err
 	}
-	s.lastUpdated = fs.ModTime()
+	s.setUpdatedTime(info.ModTime())
 	return nil
 }
 
@@ -114,8 +115,12 @@ func (s *LocalRuleSet) getPath(ctx context.Context, path string) (string, error)
 	}
 	path = filemanager.BasePath(ctx, path)
 	path, _ = filepath.Abs(path)
-	if rw.IsDir(path) {
+	info, err := filemanager.Stat(ctx, path)
+	if err == nil && info.IsDir() {
 		return "", E.New("rule_set path is a directory: ", path)
+	}
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return "", E.Cause(err, "check rule-set path")
 	}
 	return path, nil
 }

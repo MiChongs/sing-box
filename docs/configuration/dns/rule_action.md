@@ -8,7 +8,10 @@ icon: material/new-box
     :material-plus: [evaluate](#evaluate)  
     :material-plus: [respond](#respond)  
     :material-plus: [disable_optimistic_cache](#disable_optimistic_cache)  
-    :material-plus: [timeout](#timeout)
+    :material-plus: [timeout](#timeout)  
+    :material-plus: [race](#race)  
+    :material-plus: [speculative](#speculative)  
+    :material-plus: [remove_client_subnet](#remove_client_subnet)
 
 !!! quote "Changes in sing-box 1.12.0"
 
@@ -17,18 +20,57 @@ icon: material/new-box
 
 !!! question "Since sing-box 1.11.0"
 
+### Structure
+
+```json
+{
+  "action": "",
+  "race": false,
+
+  ... // Action Fields
+}
+```
+
+#### action
+
+The action to perform. `route` will be used by default.
+
+#### race
+
+!!! question "Since sing-box 1.14.0"
+
+Only available with `route`, `respond`, `reject` and `predefined` actions.
+
+Requires [`match_response`](/configuration/dns/rule/#match_response) (for logical rules, in sub-rules).
+Conflict with `speculative`.
+
+By default, rules are matched one after another in listed order: a rule with `match_response`
+waits for its referenced responses, and no later rule is matched until it has been judged.
+
+A rule with `race` enabled does not hold this order: rule matching continues past it while its
+referenced responses are still pending, so the matching of race rules runs in parallel — with
+each other and with the rules after them. Each race rule is judged once its referenced
+responses are available, and the first race rule that matches terminates rule evaluation
+immediately; the remaining queries are canceled.
+
+Rules without `race` still take effect strictly in listed order: while a preceding race rule is
+not yet judged, the action of any other matched rule is held until none of the race rules
+matched.
+
 ### route
 
 ```json
 {
   "action": "route",  // default
   "server": "",
+  "speculative": false,
   "strategy": "",
   "disable_cache": false,
   "disable_optimistic_cache": false,
   "rewrite_ttl": null,
   "timeout": "",
-  "client_subnet": null
+  "client_subnet": null,
+  "remove_client_subnet": false
 }
 ```
 
@@ -39,6 +81,18 @@ icon: material/new-box
 ==Required==
 
 Tag of target server.
+
+#### speculative
+
+!!! question "Since sing-box 1.14.0"
+
+Conflict with `race`. Has no effect without a preceding `race` rule.
+
+By default, no query is sent in parallel with pending race rules: a matched `route` action
+holds its query until none of the race rules matched.
+
+When `speculative` is enabled, the query is sent as soon as the rule matches, in parallel with
+the pending race rules; its response is used only after none of the race rules matched.
 
 #### strategy
 
@@ -82,6 +136,14 @@ If value is an IP address instead of prefix, `/32` or `/128` will be appended au
 
 Will override `dns.client_subnet`.
 
+#### remove_client_subnet
+
+!!! question "Since sing-box 1.14.0"
+
+Remove the `edns0-subnet` OPT extra record from the query, and suppress `dns.client_subnet`.
+
+Conflict with `client_subnet`.
+
 ### evaluate
 
 !!! question "Since sing-box 1.14.0"
@@ -90,11 +152,14 @@ Will override `dns.client_subnet`.
 {
   "action": "evaluate",
   "server": "",
+  "tag": "",
+  "speculative": false,
   "disable_cache": false,
   "disable_optimistic_cache": false,
   "rewrite_ttl": null,
   "timeout": "",
-  "client_subnet": null
+  "client_subnet": null,
+  "remove_client_subnet": false
 }
 ```
 
@@ -104,14 +169,32 @@ Unlike `route`, it does **not** terminate rule evaluation.
 
 Only allowed on top-level DNS rules (not inside logical sub-rules).
 Rules that use [`match_response`](/configuration/dns/rule/#match_response) or Response Match Fields
-require a preceding top-level rule with `evaluate` action. A rule's own `evaluate` action
-does not satisfy this requirement, because matching happens before the action runs.
+require a preceding top-level rule with `evaluate` action.
 
 #### server
 
 ==Required==
 
 Tag of target server.
+
+#### tag
+
+Tag of the evaluated response.
+
+A tagged response is only referenced via [`match_response`](/configuration/dns/rule/#match_response) with the tag;
+`match_response: true` references the response of the latest `evaluate` action without `tag`.
+
+#### speculative
+
+!!! question "Since sing-box 1.14.0"
+
+Has no effect without a preceding `race` rule.
+
+By default, no query is sent in parallel with pending race rules: a matched `evaluate` action
+holds its query, and rule matching stops there, until none of the race rules matched.
+
+When `speculative` is enabled, the query is sent as soon as the rule matches, in parallel with
+the pending race rules, and rule matching continues without waiting for them.
 
 #### disable_cache
 
@@ -143,6 +226,14 @@ If value is an IP address instead of prefix, `/32` or `/128` will be appended au
 
 Will override `dns.client_subnet`.
 
+#### remove_client_subnet
+
+!!! question "Since sing-box 1.14.0"
+
+Remove the `edns0-subnet` OPT extra record from the query, and suppress `dns.client_subnet`.
+
+Conflict with `client_subnet`.
+
 ### respond
 
 !!! question "Since sing-box 1.14.0"
@@ -155,8 +246,6 @@ Will override `dns.client_subnet`.
 
 `respond` terminates rule evaluation and returns the evaluated response from a preceding [`evaluate`](/configuration/dns/rule_action/#evaluate) action.
 
-This action does not send a new DNS query and has no extra options.
-
 Only allowed after a preceding top-level `evaluate` rule. If the action is reached without an evaluated response at runtime, the request fails with an error instead of falling through to later rules.
 
 ### route-options
@@ -168,7 +257,8 @@ Only allowed after a preceding top-level `evaluate` rule. If the action is reach
   "disable_optimistic_cache": false,
   "rewrite_ttl": null,
   "timeout": "",
-  "client_subnet": null
+  "client_subnet": null,
+  "remove_client_subnet": false
 }
 ```
 

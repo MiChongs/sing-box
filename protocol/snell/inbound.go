@@ -1,11 +1,10 @@
-package snellprotocol
+package snell
 
 import (
 	"context"
 	"net"
-	"sync"
+	"os"
 
-	snell "github.com/reF1nd/sing-snell"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
@@ -14,18 +13,23 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	obfs "github.com/sagernet/sing-box/transport/simple-obfs"
+	snellprotocol "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/snellv5"
+	"github.com/sagernet/sing-snell/snellv6"
 	"github.com/sagernet/sing/common/auth"
 	"github.com/sagernet/sing/common/buf"
 	E "github.com/sagernet/sing/common/exceptions"
+	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	udpnat "github.com/sagernet/sing/common/udpnat2"
 )
 
 func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.SnellInboundOptions](registry, C.TypeSnell, NewInbound)
 }
+
+var _ adapter.TCPInjectableInbound = (*Inbound)(nil)
 
 type Inbound struct {
 	inbound.Adapter
@@ -33,100 +37,133 @@ type Inbound struct {
 	router   adapter.ConnectionRouterEx
 	logger   logger.ContextLogger
 	listener *listener.Listener
-	service  *snell.Service
+	service  snellprotocol.Service
+	users    []option.SnellUser
+	version  int
 	obfsMode string
-	obfsHost string
-	// v5 QUIC proxy state
-	psk          []byte
-	userPSKs     [][]byte // non-nil in multi-user mode; used for QUIC proxy auth
-	version      int
-	udpNat       *udpnat.Service
-	quicSessions sync.Map // key: netip.AddrPort → *snell.QUICProxySession
-	// multi-user state
-	users []option.SnellUser
+	udpNat   *quicProxyNATService
+	quicAuth *quicProxyAuthenticationService
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SnellInboundOptions) (adapter.Inbound, error) {
-	if options.PSK == "" && len(options.Users) == 0 {
-		return nil, E.New("snell: psk or users is required")
-	}
-	if options.PSK != "" && len(options.Users) > 0 {
-		return nil, E.New("snell: psk and users are mutually exclusive")
-	}
-
-	switch options.ObfsMode {
-	case "", "http":
-	case "tls":
-		ver := options.Version
-		if ver == 0 {
-			ver = snell.DefaultVersion
-		}
-		if ver >= snell.Version4 {
-			return nil, E.New("snell: obfs_mode TLS is insecure and not supported for v4/v5; use ShadowTLS instead")
-		}
-	default:
-		return nil, E.New("snell: unsupported obfs mode: ", options.ObfsMode)
-	}
-
-	i := &Inbound{
+	inbound := &Inbound{
 		Adapter:  inbound.NewAdapter(C.TypeSnell, tag),
 		ctx:      ctx,
 		router:   uot.NewRouter(router, logger),
 		logger:   logger,
-		obfsMode: options.ObfsMode,
-		obfsHost: options.ObfsHost,
-		psk:      []byte(options.PSK),
-		version:  options.Version,
 		users:    options.Users,
+		version:  options.Version,
+		obfsMode: options.ObfsOptions.ObfsMode,
 	}
-
-	networks := []string{N.NetworkTCP}
-	if options.Version >= snell.Version5 {
-		networks = append(networks, N.NetworkUDP)
-		i.udpNat = udpnat.New((*inboundUDPHandler)(i), i.preparePacketConnection, snell.QUICProxySessionIdleTimeout, false)
+	if err := validateSnellInboundObfs(options.Version, options.ObfsOptions.ObfsMode); err != nil {
+		return nil, err
 	}
-	var serviceConfig snell.ServiceConfig
+	authentication := snellprotocol.MultiUserAuthenticationUserKey
+	if options.MultiUserAuthentication == "psk" {
+		authentication = snellprotocol.MultiUserAuthenticationPSK
+	}
+	var userList []int
+	var keyList [][]byte
 	if len(options.Users) > 0 {
-		users := make([]snell.User, len(options.Users))
-		userPSKs := make([][]byte, len(options.Users))
-		for j, u := range options.Users {
-			users[j] = snell.User{Name: u.Name, PSK: []byte(u.PSK)}
-			userPSKs[j] = []byte(u.PSK)
-		}
-		i.userPSKs = userPSKs
-		serviceConfig = snell.ServiceConfig{
-			Users:      users,
-			Version:    options.Version,
-			UDPEnabled: true,
-			Handler:    (*inboundHandler)(i),
-			UDPHandler: (*inboundUDPHandler)(i),
-			Logger:     logger,
-		}
-	} else {
-		serviceConfig = snell.ServiceConfig{
-			PSK:        []byte(options.PSK),
-			Version:    options.Version,
-			UDPEnabled: true,
-			Handler:    (*inboundHandler)(i),
-			UDPHandler: (*inboundUDPHandler)(i),
-			Logger:     logger,
+		userList = make([]int, len(options.Users))
+		keyList = make([][]byte, len(options.Users))
+		for index, user := range options.Users {
+			userList[index] = index
+			if authentication == snellprotocol.MultiUserAuthenticationPSK {
+				keyList[index] = []byte(user.PSK)
+			} else {
+				keyList[index] = []byte(user.UserKey)
+			}
 		}
 	}
-	service, err := snell.NewService(serviceConfig)
+	var err error
+	switch options.Version {
+	case 5:
+		serviceOptions := snellv5.ServiceOptions{
+			PSK:                     []byte(options.PSK),
+			Handler:                 inbound,
+			MultiUserAuthentication: authentication,
+		}
+		inbound.service, err = newSnellV5Service(serviceOptions, userList, keyList)
+	case 6:
+		var mode snellv6.Mode
+		mode, err = snellv6.ParseMode(options.V6Options.Mode)
+		if err != nil {
+			return nil, err
+		}
+		serviceOptions := snellv6.ServerOptions{
+			PSK:                     []byte(options.PSK),
+			Mode:                    mode,
+			Handler:                 inbound,
+			MultiUserAuthentication: authentication,
+		}
+		if len(options.Users) > 0 {
+			var service *snellv6.MultiService[int]
+			service, err = snellv6.NewMultiService[int](serviceOptions)
+			if err != nil {
+				return nil, err
+			}
+			err = service.UpdateUsers(userList, keyList)
+			inbound.service = service
+		} else {
+			inbound.service, err = snellv6.NewService(serviceOptions)
+		}
+	case 0:
+		return nil, E.New("snell: missing version")
+	default:
+		return nil, E.New("snell: unsupported version: ", options.Version)
+	}
 	if err != nil {
 		return nil, err
 	}
-	i.service = service
-
-	i.listener = listener.New(listener.Options{
+	var quicParser quicProxyInitParser
+	if options.Version == 5 {
+		var loaded bool
+		quicParser, loaded = inbound.service.(quicProxyInitParser)
+		if !loaded {
+			return nil, E.New("snell: version 5 service does not support QUIC proxy init parsing")
+		}
+	} else {
+		quicService, createErr := newSnellV5Service(snellv5.ServiceOptions{
+			PSK:                     []byte(options.PSK),
+			Handler:                 inbound,
+			MultiUserAuthentication: authentication,
+		}, userList, keyList)
+		if createErr != nil {
+			return nil, E.Cause(createErr, "create Snell v6 QUIC Proxy compatibility service")
+		}
+		var loaded bool
+		quicParser, loaded = quicService.(quicProxyInitParser)
+		if !loaded {
+			return nil, E.New("snell: version 5 service does not support QUIC proxy init parsing")
+		}
+	}
+	listenerOptions := listener.Options{
 		Context:           ctx,
 		Logger:            logger,
-		Network:           networks,
+		Network:           []string{N.NetworkTCP, N.NetworkUDP},
 		Listen:            options.ListenOptions,
-		ConnectionHandler: i,
-		PacketHandler:     (*inboundPacketHandler)(i),
-	})
-	return i, nil
+		ConnectionHandler: inbound,
+		PacketHandler:     (*inboundPacketHandler)(inbound),
+	}
+	inbound.udpNat = newQUICProxyNATService((*inboundUDPHandler)(inbound), inbound.preparePacketConnection, snellprotocol.QUICProxySessionIdleTimeout)
+	inbound.quicAuth = newQUICProxyAuthenticationService(quicParser, inbound.udpNat, logger)
+	inbound.listener = listener.New(listenerOptions)
+	return inbound, nil
+}
+
+func newSnellV5Service(options snellv5.ServiceOptions, userList []int, keyList [][]byte) (snellprotocol.Service, error) {
+	if len(userList) == 0 {
+		return snellv5.NewService(options)
+	}
+	service, err := snellv5.NewMultiService[int](options)
+	if err != nil {
+		return nil, err
+	}
+	if err = service.UpdateUsers(userList, keyList); err != nil {
+		return nil, err
+	}
+	return service, nil
 }
 
 func (h *Inbound) Start(stage adapter.StartStage) error {
@@ -137,78 +174,122 @@ func (h *Inbound) Start(stage adapter.StartStage) error {
 }
 
 func (h *Inbound) Close() error {
-	return h.listener.Close()
+	listenerErr := h.listener.Close()
+	if h.quicAuth != nil {
+		h.quicAuth.Close()
+	}
+	if h.udpNat != nil {
+		h.udpNat.Close()
+	}
+	return listenerErr
 }
 
 func (h *Inbound) NewConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
-	switch h.obfsMode {
-	case "http":
+	if h.obfsMode == "http" {
 		conn = obfs.NewHTTPObfsServer(conn)
-	case "tls":
-		conn = obfs.NewTLSObfsServer(conn)
 	}
 	err := h.service.NewConnection(adapter.WithContext(ctx, &metadata), conn, metadata.Source, onClose)
 	if err != nil {
 		N.CloseOnHandshakeFailure(conn, onClose, err)
-		h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+		if E.IsClosedOrCanceled(err) {
+			h.logger.DebugContext(ctx, "connection closed: ", err)
+		} else {
+			h.logger.ErrorContext(ctx, E.Cause(err, "process connection from ", metadata.Source))
+		}
 	}
 }
 
-type inboundHandler Inbound
+func (h *Inbound) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	_, metadata := adapter.ExtendContext(ctx)
+	if source.IsValid() {
+		metadata.Source = source
+	}
+	if destination.IsValid() {
+		metadata.Destination = destination
+	}
+	h.newConnection(ctx, conn, *metadata, onClose)
+}
 
-func (h *inboundHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	var metadata adapter.InboundContext
+func (h *Inbound) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
+	_, metadata := adapter.ExtendContext(ctx)
+	if source.IsValid() {
+		metadata.Source = source
+	}
+	if destination.IsValid() {
+		metadata.Destination = destination
+	}
+	h.newPacketConnection(ctx, conn, *metadata, onClose)
+}
+
+func (h *Inbound) newConnection(ctx context.Context, conn net.Conn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
 	metadata.Inbound = h.Tag()
 	metadata.InboundType = h.Type()
-	//nolint:staticcheck
-	metadata.InboundDetour = h.listener.ListenOptions().Detour
-	//nolint:staticcheck
-	metadata.Source = source
-	metadata.Destination = destination.Unwrap()
-	if userIdx, loaded := auth.UserFromContext[int](ctx); loaded && userIdx < len(h.users) {
-		metadata.User = h.users[userIdx].Name
+	if len(h.users) > 0 {
+		userIndex, loaded := auth.UserFromContext[int](ctx)
+		if !loaded {
+			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+			return
+		}
+		user := h.users[userIndex].Name
+		if user == "" {
+			user = F.ToString(userIndex)
+		} else {
+			metadata.User = user
+		}
+		h.logger.InfoContext(ctx, "[", user, "] inbound connection to ", metadata.Destination)
+	} else {
+		h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
 	}
-	h.logger.InfoContext(ctx, "inbound connection to ", metadata.Destination)
 	h.router.RouteConnectionEx(ctx, conn, metadata, onClose)
+}
+
+func (h *Inbound) newPacketConnection(ctx context.Context, conn N.PacketConn, metadata adapter.InboundContext, onClose N.CloseHandlerFunc) {
+	metadata.Inbound = h.Tag()
+	metadata.InboundType = h.Type()
+	if len(h.users) > 0 {
+		userIndex, loaded := auth.UserFromContext[int](ctx)
+		if !loaded {
+			N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
+			return
+		}
+		user := h.users[userIndex].Name
+		if user == "" {
+			user = F.ToString(userIndex)
+		} else {
+			metadata.User = user
+		}
+		h.logger.InfoContext(ctx, "[", user, "] inbound packet connection from ", metadata.Source)
+	} else {
+		h.logger.InfoContext(ctx, "inbound packet connection from ", metadata.Source)
+	}
+	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
+}
+
+func validateSnellInboundObfs(version int, obfsMode string) error {
+	if version != 5 || obfsMode == "" || obfsMode == "none" || obfsMode == "http" {
+		return nil
+	}
+	if obfsMode == "tls" {
+		return E.New("snell: TLS obfs is unsupported for version 5; use ShadowTLS instead")
+	}
+	return E.New("snell: version 5 only supports http obfs")
 }
 
 type inboundUDPHandler Inbound
 
 func (h *inboundUDPHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
-	var metadata adapter.InboundContext
-	metadata.Inbound = h.Tag()
-	metadata.InboundType = h.Type()
-	//nolint:staticcheck
-	metadata.InboundDetour = h.listener.ListenOptions().Detour
-	//nolint:staticcheck
-	metadata.Source = source
-	metadata.Destination = destination.Unwrap()
-	if userIdx, loaded := auth.UserFromContext[int](ctx); loaded && userIdx < len(h.users) {
-		metadata.User = h.users[userIdx].Name
-	}
-	h.logger.InfoContext(ctx, "inbound packet connection to ", metadata.Destination)
-	h.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
+	(*Inbound)(h).NewPacketConnectionEx(ctx, conn, source, destination, onClose)
 }
 
-// preparePacketConnection is the udpnat PrepareFunc for QUIC proxy sessions.
-// It returns a PacketWriter that sends raw UDP responses back to the client.
-// In multi-user mode, userData is *snell.QUICProxySession and carries the
-// matched UserIndex which is injected into the context for auth_user routing.
-func (h *Inbound) preparePacketConnection(source M.Socksaddr, destination M.Socksaddr, userData any) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc) {
+func (h *Inbound) preparePacketConnection(source M.Socksaddr, destination M.Socksaddr, session *snellprotocol.QUICProxySession) (context.Context, N.PacketWriter) {
 	ctx := log.ContextWithNewID(h.ctx)
-	if qsess, ok := userData.(*snell.QUICProxySession); ok && qsess != nil && qsess.UserIndex >= 0 {
-		ctx = auth.ContextWithUser(ctx, qsess.UserIndex)
+	ctx = session.Context(ctx)
+	return ctx, &quicProxyResponseWriter{
+		writer:     h.listener.PacketWriter(),
+		clientAddr: source,
 	}
-	return true, ctx, &quicProxyResponseWriter{
-			writer:     h.listener.PacketWriter(),
-			clientAddr: source,
-		}, func(err error) {
-			h.quicSessions.Delete(source.AddrPort())
-		}
 }
 
-// quicProxyResponseWriter rewrites the destination to the original client
-// address so that responses from the outbound go back to the right client.
 type quicProxyResponseWriter struct {
 	writer     N.PacketWriter
 	clientAddr M.Socksaddr
@@ -218,91 +299,56 @@ func (w *quicProxyResponseWriter) WritePacket(buffer *buf.Buffer, _ M.Socksaddr)
 	return w.writer.WritePacket(buffer, w.clientAddr)
 }
 
-// inboundPacketHandler handles raw UDP datagrams from the listener for
-// Snell v5 QUIC proxy mode. It decrypts the Snell framing to recover the
-// original UDP payload and target, then feeds it into udpnat so that
-// routing rules, domain sniffing and detour all apply normally.
 type inboundPacketHandler Inbound
+
+type quicProxyInitParser interface {
+	ParseQUICProxyInit(data []byte) (*snellprotocol.QUICProxySession, []byte, error)
+}
 
 func (h *inboundPacketHandler) NewPacket(buffer *buf.Buffer, source M.Socksaddr) {
 	defer buffer.Release()
-	if h.udpNat == nil {
-		return
-	}
 	data := buffer.Bytes()
-	if len(data) == 0 {
+	if len(data) == 0 || h.udpNat == nil {
 		return
 	}
-
-	val, hasSession := h.quicSessions.Load(source.AddrPort())
-	if hasSession {
-		qsess := val.(*snell.QUICProxySession)
-		qsess.Touch()
-
-		var payload []byte
-		if snell.IsQUICLooking(data[0]) {
-			// Raw QUIC short-header — forward as-is
-			payload = data
-		} else {
-			// Duplicate init frame — decrypt to recover raw UDP payload
-			var err error
-			payload, err = qsess.DecodeDuplicateInit(data)
-			if err != nil {
-				h.logger.Error("quic proxy: decode duplicate init: ", err)
-				return
-			}
-		}
-		if len(payload) > 0 {
-			// Pass qsess as userData so that if the udpnat entry was evicted
-			// (timeout race between the two maps), PrepareFunc correctly
-			// re-injects the user context on re-creation.
-			h.udpNat.NewPacket([][]byte{payload}, source, qsess.Target(), qsess)
-		}
+	if h.processSessionPacket(source, data) {
 		return
 	}
-
-	// No existing session
-	if snell.IsQUICLooking(data[0]) {
-		// QUIC-looking without a session context — discard
-		h.logger.Debug("quic proxy: discarding QUIC-looking packet without session from ", source)
-		return
-	}
-
-	// Parse Snell QUIC proxy init frame.  In multi-user mode try every PSK;
-	// in single-user mode use h.psk directly.
-	var qsess *snell.QUICProxySession
-	var firstPayload []byte
-	if len(h.userPSKs) > 0 {
-		var err error
-		qsess, firstPayload, err = snell.ParseQUICProxyInitMulti(h.userPSKs, data)
-		if err != nil {
-			h.logger.Error("quic proxy: parse init from ", source, ": ", err)
+	if snellprotocol.IsQUICLooking(data[0]) {
+		if h.quicAuth != nil && h.quicAuth.QueuePending(source, data) {
 			return
 		}
-	} else {
-		var err error
-		qsess, firstPayload, err = snell.ParseQUICProxyInit(h.psk, data)
-		if err != nil {
-			h.logger.Error("quic proxy: parse init from ", source, ": ", err)
+		if h.processSessionPacket(source, data) {
 			return
 		}
+		h.logger.Debug("quic proxy: discard packet without session from ", source)
+		return
 	}
-
-	// LoadOrStore so that if two concurrent goroutines both parse an init
-	// frame from the same source (very rare: same client port, same instant),
-	// only one session wins and both payloads are queued under the same
-	// crypto/user context.  This avoids a benign but unnecessary duplicate
-	// firstPayload delivery that a plain Store+NewPacket would cause.
-	if actual, loaded := h.quicSessions.LoadOrStore(source.AddrPort(), qsess); loaded {
-		qsess = actual.(*snell.QUICProxySession)
+	if h.quicAuth != nil && h.quicAuth.Submit(source, data) {
+		return
 	}
-
-	target := qsess.Target()
-	h.logger.Info("quic proxy: new session from ", source, " to ", target)
-
-	if len(firstPayload) > 0 {
-		// Pass qsess as userData so preparePacketConnection can inject the
-		// matched user index into the context for auth_user rule matching.
-		h.udpNat.NewPacket([][]byte{firstPayload}, source, target, qsess)
+	if h.processSessionPacket(source, data) {
+		return
 	}
+	h.logger.Debug("quic proxy: discard init while authentication queue is full from ", source)
+}
+
+func (h *inboundPacketHandler) processSessionPacket(source M.Socksaddr, data []byte) bool {
+	entry, loaded := h.udpNat.Session(source)
+	if !loaded {
+		return false
+	}
+	session := entry.session
+	session.Touch()
+	payload := data
+	if !snellprotocol.IsQUICLooking(data[0]) {
+		var err error
+		payload, err = session.DecodeDuplicateInit(data)
+		if err != nil {
+			h.logger.Debug("quic proxy: reject duplicate init from ", source, ": ", err)
+			return true
+		}
+	}
+	h.udpNat.NewPacket(entry, payload)
+	return true
 }

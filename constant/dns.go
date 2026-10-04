@@ -15,20 +15,22 @@ const (
 )
 
 const (
-	DNSTypeLegacy    = "legacy"
-	DNSTypeUDP       = "udp"
-	DNSTypeTCP       = "tcp"
-	DNSTypeTLS       = "tls"
-	DNSTypeHTTPS     = "https"
-	DNSTypeQUIC      = "quic"
-	DNSTypeHTTP3     = "h3"
-	DNSTypeLocal     = "local"
-	DNSTypeHosts     = "hosts"
-	DNSTypeFakeIP    = "fakeip"
-	DNSTypeDHCP      = "dhcp"
-	DNSTypeMDNS      = "mdns"
-	DNSTypeTailscale = "tailscale"
-	DNSTypeGroup     = "group"
+	DNSTypeLegacy      = "legacy"
+	DNSTypeUDP         = "udp"
+	DNSTypeTCP         = "tcp"
+	DNSTypeTLS         = "tls"
+	DNSTypeHTTPS       = "https"
+	DNSTypeQUIC        = "quic"
+	DNSTypeHTTP3       = "h3"
+	DNSTypeLocal       = "local"
+	DNSTypeHosts       = "hosts"
+	DNSTypeFakeIP      = "fakeip"
+	DNSTypeDHCP        = "dhcp"
+	DNSTypeMDNS        = "mdns"
+	DNSTypeTailscale   = "tailscale"
+	DNSTypeOpenConnect = "openconnect"
+	DNSTypeOpenVPN     = "openvpn"
+	DNSTypeGroup       = "group"
 )
 
 const (

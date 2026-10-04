@@ -35,21 +35,21 @@ func NewTransport(ctx context.Context, logger logger.ContextLogger, tag string, 
 	var cheapRebuild bool
 	switch options.Engine {
 	case C.TLSEngineApple:
-		inner, transportErr := newAppleTransport(ctx, logger, rawDialer, options)
-		if transportErr != nil {
-			return nil, transportErr
+		err = validateAppleTransport(ctx, options)
+		if err != nil {
+			return nil, err
 		}
-		managedTransport := &ManagedTransport{
-			dialer:  rawDialer,
-			headers: headers,
-			host:    host,
-			tag:     tag,
-			factory: func() (innerTransport, error) {
-				return newAppleTransport(ctx, logger, rawDialer, options)
+		return &ManagedTransport{
+			dialer:          rawDialer,
+			headers:         headers,
+			host:            host,
+			tag:             tag,
+			detour:          options.Detour,
+			defaultOutbound: options.DefaultOutbound,
+			factory: func(resourceDownload bool) (innerTransport, error) {
+				return newAppleTransport(ctx, logger, resourceDownloadDialer(rawDialer, resourceDownload), options)
 			},
-		}
-		managedTransport.epoch.Store(&transportEpoch{transport: inner})
-		return managedTransport, nil
+		}, nil
 	case "", C.TLSEngineGo:
 		cheapRebuild = true
 	default:
@@ -71,13 +71,15 @@ func NewTransport(ctx context.Context, logger logger.ContextLogger, tag string, 
 		return nil, err
 	}
 	managedTransport := &ManagedTransport{
-		cheapRebuild: cheapRebuild,
-		dialer:       rawDialer,
-		headers:      headers,
-		host:         host,
-		tag:          tag,
-		factory: func() (innerTransport, error) {
-			return newTransport(rawDialer, baseTLSConfig, options)
+		cheapRebuild:    cheapRebuild,
+		dialer:          rawDialer,
+		headers:         headers,
+		host:            host,
+		tag:             tag,
+		detour:          options.Detour,
+		defaultOutbound: options.DefaultOutbound,
+		factory: func(resourceDownload bool) (innerTransport, error) {
+			return newTransport(resourceDownloadDialer(rawDialer, resourceDownload), baseTLSConfig, options)
 		},
 	}
 	managedTransport.epoch.Store(&transportEpoch{transport: inner})

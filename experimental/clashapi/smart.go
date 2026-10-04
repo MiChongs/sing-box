@@ -227,7 +227,7 @@ func listSmartGroups(ctx context.Context) func(w http.ResponseWriter, r *http.Re
 				UseASN:      sg.UseASN(),
 				UseLightGBM: sg.UseLightGBM(),
 				CollectData: sg.CollectData(),
-				Fixed:       sg.Selected(),
+				Fixed:       sg.PinnedTag(),
 				Now:         sg.Now(),
 				Members:     len(sg.All()),
 				// Surface the parsed rules so operators can verify the

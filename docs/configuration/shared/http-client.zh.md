@@ -42,17 +42,19 @@ icon: material/new-box
 
 !!! warning ""
 
-    仅供实验用途：由于 CGO 和 Network.framework 占用的内存都很多，
-    不应在 iOS 和 tvOS 的热路径中使用。
+    仅供实验用途：不应在 iOS 和 tvOS 的热路径中使用。
 
 支持的字段：
 
 * `headers`
 * `tls.server_name`（必须与请求主机匹配）
+* `tls.certificate_server_name`
 * `tls.insecure`
 * `tls.min_version` / `tls.max_version`
 * `tls.certificate` / `tls.certificate_path`
+* `tls.certificate_sha256`
 * `tls.certificate_public_key_sha256`
+* `tls.certificate_pin_sha256`
 * 拨号字段
 
 不支持的字段：

@@ -4,8 +4,10 @@ import (
 	"context"
 	"net/http"
 	"net/netip"
+	"reflect"
 
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/schema"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -15,11 +17,12 @@ import (
 )
 
 type RawDNSOptions struct {
-	Servers            []DNSServerOptions `json:"servers,omitempty"`
-	Rules              []DNSRule          `json:"rules,omitempty"`
-	Final              string             `json:"final,omitempty"`
-	ReverseMapping     bool               `json:"reverse_mapping,omitempty"`
-	DefaultRejectRcode *DNSRejectRCode    `json:"default_reject_rcode,omitempty"`
+	Servers                []DNSServerOptions `json:"servers,omitempty"`
+	Rules                  []DNSRule          `json:"rules,omitempty"`
+	Final                  string             `json:"final,omitempty" reference:"dns_server"`
+	ReverseMapping         bool               `json:"reverse_mapping,omitempty"`
+	DefaultRejectRcode     *DNSRejectRCode    `json:"default_reject_rcode,omitempty"`
+	AllowResolverDiscovery bool               `json:"allow_resolver_discovery,omitempty"`
 	DNSClientOptions
 }
 
@@ -48,12 +51,23 @@ func (o *DNSOptions) UnmarshalJSONContext(ctx context.Context, content []byte) e
 	return badjson.UnmarshallExcludedContext(ctx, content, legacyOptions, &o.RawDNSOptions)
 }
 
+func (o DNSOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	return builder.Define("DNS", func() (*schema.Node, error) {
+		node := schema.StrictObject()
+		err := builder.FlattenStruct(node, reflect.TypeFor[RawDNSOptions]())
+		if err != nil {
+			return nil, err
+		}
+		return node, nil
+	})
+}
+
 type DNSClientOptions struct {
 	Strategy         DomainStrategy        `json:"strategy,omitempty"`
 	Timeout          badoption.Duration    `json:"timeout,omitempty"`
 	DisableCache     bool                  `json:"disable_cache,omitempty"`
 	DisableExpire    bool                  `json:"disable_expire,omitempty"`
-	IndependentCache bool                  `json:"independent_cache,omitempty"`
+	IndependentCache bool                  `json:"independent_cache,omitempty" schema:"omit"`
 	RoundRobinCache  bool                  `json:"round_robin_cache,omitempty"`
 	CacheCapacity    uint32                `json:"cache_capacity,omitempty"`
 	MinCacheTTL      uint32                `json:"min_cache_ttl,omitempty"`
@@ -73,7 +87,7 @@ func (o OptimisticDNSOptions) MarshalJSON() ([]byte, error) {
 	if o.Timeout == 0 {
 		return json.Marshal(o.Enabled)
 	}
-	return json.Marshal((_OptimisticDNSOptions)(o))
+	return json.Marshal(_OptimisticDNSOptions(o))
 }
 
 func (o *OptimisticDNSOptions) UnmarshalJSON(bytes []byte) error {
@@ -84,7 +98,17 @@ func (o *OptimisticDNSOptions) UnmarshalJSON(bytes []byte) error {
 	return json.UnmarshalDisallowUnknownFields(bytes, (*_OptimisticDNSOptions)(o))
 }
 
+func (o OptimisticDNSOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	objectForm := schema.StrictObject()
+	err := builder.FlattenStruct(objectForm, reflect.TypeFor[OptimisticDNSOptions]())
+	if err != nil {
+		return nil, err
+	}
+	return schema.AnyOf(schema.BooleanNode(), objectForm), nil
+}
+
 type DNSTransportOptionsRegistry interface {
+	OptionTypes() []string
 	CreateOptions(transportType string) (any, bool)
 }
 type _DNSServerOptions struct {
@@ -125,6 +149,16 @@ func (o *DNSServerOptions) UnmarshalJSONContext(ctx context.Context, content []b
 	}
 	o.Options = options
 	return nil
+}
+
+func (o DNSServerOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	return builder.Define("DNSServer", func() (*schema.Node, error) {
+		registry := service.FromContext[DNSTransportOptionsRegistry](builder.Context())
+		if registry == nil {
+			return nil, E.New("missing DNS transport options registry in context")
+		}
+		return registryUnion(builder, registry, nil, true)
+	})
 }
 
 type DNSServerAddressOptions struct {
@@ -172,18 +206,26 @@ func (v *HostsDNSPredefinedValue) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &s); err == nil {
 		addr, parseErr := netip.ParseAddr(s)
 		if parseErr == nil {
-			v.Addresses = []netip.Addr{addr}
+			*v = HostsDNSPredefinedValue{Addresses: []netip.Addr{addr}}
 		} else {
-			v.Domain = s
+			*v = HostsDNSPredefinedValue{Domain: s}
 		}
 		return nil
 	}
 	var addrs []netip.Addr
 	if err := json.Unmarshal(data, &addrs); err == nil {
-		v.Addresses = addrs
+		*v = HostsDNSPredefinedValue{Addresses: addrs}
 		return nil
 	}
 	return E.New("invalid predefined value: expected IP address(es) or domain name")
+}
+
+func (v HostsDNSPredefinedValue) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	addresses, err := builder.Describe(reflect.TypeFor[[]netip.Addr]())
+	if err != nil {
+		return nil, err
+	}
+	return schema.AnyOf(schema.StringNode(), addresses), nil
 }
 
 type HostsDNSServerOptions struct {
@@ -206,18 +248,9 @@ type RemoteDNSServerOptions struct {
 	DNSServerAddressOptions
 }
 
-type RemoteTCPDNSServerOptions struct {
-	RemoteDNSServerOptions
-	Reuse      bool `json:"reuse,omitempty"`
-	Pipeline   bool `json:"pipeline,omitempty"`
-	MaxQueries int  `json:"max_queries,omitempty"`
-}
-
 type RemoteTLSDNSServerOptions struct {
 	RemoteDNSServerOptions
 	OutboundTLSOptionsContainer
-	Pipeline   bool `json:"pipeline,omitempty"`
-	MaxQueries int  `json:"max_queries,omitempty"`
 }
 
 type _RemoteHTTPSDNSServerOptions struct {
@@ -228,17 +261,17 @@ type _RemoteHTTPSDNSServerOptions struct {
 }
 
 type GroupDNSServerOptions struct {
-	Servers []string `json:"servers"`
+	Servers []string `json:"servers" reference:"dns_server"`
 }
 
 type RemoteHTTPSDNSServerOptions _RemoteHTTPSDNSServerOptions
 
-func (o *RemoteHTTPSDNSServerOptions) MarshalJSONContext(ctx context.Context) ([]byte, error) {
+func (o RemoteHTTPSDNSServerOptions) MarshalJSONContext(ctx context.Context) ([]byte, error) {
 	switch o.Method {
 	case http.MethodPost:
 		o.Method = ""
 	}
-	return badjson.MarshallObjectsContext(ctx, (*_RemoteHTTPSDNSServerOptions)(o))
+	return badjson.MarshallObjectsContext(ctx, (*_RemoteHTTPSDNSServerOptions)(&o))
 }
 
 func (o *RemoteHTTPSDNSServerOptions) UnmarshalJSONContext(ctx context.Context, content []byte) error {
@@ -258,8 +291,8 @@ func (o *RemoteHTTPSDNSServerOptions) UnmarshalJSONContext(ctx context.Context, 
 }
 
 type FakeIPDNSServerOptions struct {
-	Inet4Range *badoption.Prefix `json:"inet4_range,omitempty"`
-	Inet6Range *badoption.Prefix `json:"inet6_range,omitempty"`
+	Inet4Range *badoption.Prefix `json:"inet4_range,omitempty" examples:"198.18.0.0/15"`
+	Inet6Range *badoption.Prefix `json:"inet6_range,omitempty" examples:"fc00::/18"`
 }
 
 type DHCPDNSServerOptions struct {

@@ -2,6 +2,11 @@
 icon: material/alert-decagram
 ---
 
+!!! quote "Changes in sing-box 1.15.0"
+
+    :material-plus: [dns_server_address](#dns_server_address)  
+    :material-plus: [dns_search_domain](#dns_search_domain)
+
 !!! quote "Changes in sing-box 1.14.0"
 
     :material-plus: [source_mac_address](#source_mac_address)  
@@ -14,6 +19,8 @@ icon: material/alert-decagram
     :material-plus: [response_ns](#response_ns)  
     :material-plus: [response_extra](#response_extra)  
     :material-plus: [package_name_regex](#package_name_regex)  
+    :material-plus: [query_client_subnet](#query_client_subnet)  
+    :material-plus: [query_dnssec](#query_dnssec)  
     :material-alert: [ip_version](#ip_version)  
     :material-alert: [query_type](#query_type)
 
@@ -77,6 +84,11 @@ icon: material/alert-decagram
           "HTTPS",
           32768
         ],
+        "query_client_subnet": [
+          "10.0.0.0/24",
+          "192.168.0.1"
+        ],
+        "query_dnssec": false,
         "network": "tcp",
         "auth_user": [
           "usera",
@@ -173,6 +185,16 @@ icon: material/alert-decagram
           "local",
           "ts-dns"
         ],
+        "dns_server_address": {
+          "local": [
+            "192.168.1.1/32"
+          ]
+        },
+        "dns_search_domain": {
+          "ts-dns": [
+            "example.ts.net"
+          ]
+        },
         "wifi_ssid": [
           "My WIFI"
         ],
@@ -238,13 +260,13 @@ icon: material/alert-decagram
 !!! note ""
 
     The default rule uses the following matching logic:  
-    (`domain` || `domain_suffix` || `domain_keyword` || `domain_regex` || `geosite`) &&  
+    (`domain` || `domain_suffix` || `domain_keyword` || `domain_regex` || `geosite` || `ip_cidr` || `ip_is_private` || `ip_accept_any`) &&  
     (`port` || `port_range`) &&  
-    (`source_geoip` || `source_ip_cidr` ｜｜ `source_ip_is_private`) &&  
+    (`source_geoip` || `source_ip_cidr` || `source_ip_is_private`) &&  
     (`source_port` || `source_port_range`) &&  
     `other fields`
 
-    Additionally, each branch inside an included rule-set can be considered merged into the outer rule, while different branches keep OR semantics.
+    When a rule-set contains only a single default rule without `invert`, its fields are considered merged into the outer rule per the logic above; otherwise, it is matched as an `other field`; different rule-sets always keep OR semantics.
 
 #### inbound
 
@@ -257,10 +279,8 @@ Tags of [Inbound](/configuration/inbound/).
     This field now also applies when a DNS rule is matched from an internal
     domain resolution that does not target a specific DNS server, such as a
     [`resolve`](../../route/rule_action/#resolve) route rule action without a
-    `server` set. In earlier versions, only DNS queries received from a
-    client evaluated this field. See
-    [Migration](/migration/#ip_version-and-query_type-behavior-changes-in-dns-rules)
-    for the full list.
+    `server` set. See
+    [Migration](/migration/#ip_version-and-query_type-behavior-changes-in-dns-rules).
 
     Setting this field makes the DNS rule incompatible in the same DNS
     configuration with Legacy Address Filter Fields in DNS rules, the Legacy
@@ -280,10 +300,8 @@ Not limited if empty.
     This field now also applies when a DNS rule is matched from an internal
     domain resolution that does not target a specific DNS server, such as a
     [`resolve`](../../route/rule_action/#resolve) route rule action without a
-    `server` set. In earlier versions, only DNS queries received from a
-    client evaluated this field. See
-    [Migration](/migration/#ip_version-and-query_type-behavior-changes-in-dns-rules)
-    for the full list.
+    `server` set. See
+    [Migration](/migration/#ip_version-and-query_type-behavior-changes-in-dns-rules).
 
     Setting this field makes the DNS rule incompatible in the same DNS
     configuration with Legacy Address Filter Fields in DNS rules, the Legacy
@@ -293,6 +311,22 @@ Not limited if empty.
     action and [`match_response`](#match_response).
 
 DNS query type. Values can be integers or type name strings.
+
+#### query_client_subnet
+
+!!! question "Since sing-box 1.14.0"
+
+Match the `edns0-subnet` OPT extra record (EDNS Client Subnet) in the query.
+
+A listed prefix matches when it is no more specific than the received client subnet and contains its address.
+
+If value is an IP address instead of prefix, `/32` or `/128` will be appended automatically.
+
+#### query_dnssec
+
+!!! question "Since sing-box 1.14.0"
+
+Match queries with the DNSSEC OK (`DO`) bit set.
 
 #### network
 
@@ -426,7 +460,7 @@ Match Clash mode.
 
 !!! quote ""
 
-    Only supported in graphical clients on Android and Apple platforms.
+    Only supported in graphical clients on Android and Apple platforms and in the Android core.
 
 Match network type.
 
@@ -509,13 +543,44 @@ Match source device hostname from DHCP leases.
 
 Match specified DNS servers' preferred domains.
 
-| Type        | Match                                                                        |
-|-------------|------------------------------------------------------------------------------|
-| `hosts`     | Match predefined entries and entries in hosts files                          |
-| `local`     | Match hosts entries, neighbor-resolved hosts, and mDNS local domains         |
-| `mdns`      | Match mDNS local domains (`*.local.` and IPv4/IPv6 link-local reverse zones) |
-| `tailscale` | Match MagicDNS hosts and DNS route suffixes                                  |
-| `resolved`  | Match split DNS and search domains from systemd-resolved links               |
+| Type          | Match                                                                        |
+|---------------|------------------------------------------------------------------------------|
+| `hosts`       | Match predefined entries and entries in hosts files                          |
+| `local`       | Match hosts entries, neighbor-resolved hosts, and mDNS local domains         |
+| `mdns`        | Match mDNS local domains (`*.local.` and IPv4/IPv6 link-local reverse zones) |
+| `tailscale`   | Match MagicDNS hosts and DNS route suffixes                                  |
+| `openconnect` | Match split DNS and search domains pushed by the VPN server                  |
+| `resolved`    | Match split DNS and search domains from systemd-resolved links               |
+
+#### dns_server_address
+
+!!! question "Since sing-box 1.15.0"
+
+Match specified DNS servers' server addresses.
+
+| Type          | Match                                         |
+|---------------|-----------------------------------------------|
+| `local`       | Match system DNS servers                      |
+| `dhcp`        | Match DNS servers from DHCP                   |
+| `resolved`    | Match DNS servers from systemd-resolved links |
+| `tailscale`   | Match DNS resolvers of the tailnet            |
+| `openvpn`     | Match DNS servers pushed by the VPN server    |
+| `openconnect` | Match DNS servers pushed by the VPN server    |
+
+#### dns_search_domain
+
+!!! question "Since sing-box 1.15.0"
+
+Match specified DNS servers' search domains.
+
+| Type          | Match                                            |
+|---------------|--------------------------------------------------|
+| `local`       | Match system search domains                      |
+| `dhcp`        | Match search domains from DHCP                   |
+| `resolved`    | Match search domains from systemd-resolved links |
+| `tailscale`   | Match search domains of the tailnet              |
+| `openvpn`     | Match search domains pushed by the VPN server    |
+| `openconnect` | Match search domains pushed by the VPN server    |
 
 #### wifi_ssid
 
@@ -563,7 +628,11 @@ Enable response-based matching. When enabled, this rule matches against the eval
 (set by a preceding [`evaluate`](/configuration/dns/rule_action/#evaluate) action)
 instead of only matching the original query.
 
-The evaluated response can also be returned directly by a later [`respond`](/configuration/dns/rule_action/#respond) action.
+`true` or the `tag` of an `evaluate` action: `true` matches against the response of the latest
+`evaluate` action without `tag`; a tag matches against the response of the `evaluate` action with the tag.
+
+The evaluated response can also be returned directly by a later [`respond`](/configuration/dns/rule_action/#respond) action;
+in a rule with a `match_response` tag, `respond` returns the tagged response.
 
 Required for Response Match Fields (`response_rcode`, `response_answer`, `response_ns`, `response_extra`).
 Also required for `ip_cidr`, `ip_is_private`, and `ip_accept_any` when used with `evaluate` or Response Match Fields.

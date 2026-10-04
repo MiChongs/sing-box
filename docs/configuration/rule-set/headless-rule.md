@@ -18,6 +18,12 @@ icon: material/new-box
     :material-plus: [network_is_expensive](#network_is_expensive)  
     :material-plus: [network_is_constrained](#network_is_constrained)
 
+### domain_match_strategy
+
+Source-format default and logical rules support `domain_match_strategy`. Logical rules pass their strategy to children that do not specify one; otherwise the route-level default applies.
+
+The current binary rule-set format cannot preserve an explicit strategy. Compiling such rules returns an error; use source format. On iOS, these source rules remain in memory instead of being converted to mmap storage.
+
 ### Structure
 
 !!! question "Since sing-box 1.8.0"
@@ -137,10 +143,8 @@ icon: material/new-box
 
     When a DNS rule references this rule-set, this field now also applies
     when the DNS rule is matched from an internal domain resolution that
-    does not target a specific DNS server. In earlier versions, only DNS
-    queries received from a client evaluated this field. See
-    [Migration](/migration/#ip_version-and-query_type-behavior-changes-in-dns-rules)
-    for the full list.
+    does not target a specific DNS server. See
+    [Migration](/migration/#ip_version-and-query_type-behavior-changes-in-dns-rules).
 
     When a DNS rule references a rule-set containing this field, the DNS
     rule is incompatible in the same DNS configuration with Legacy Address
@@ -239,7 +243,7 @@ Match android package name using regular expression.
 
 !!! quote ""
 
-    Only supported in graphical clients on Android and Apple platforms.
+    Only supported in graphical clients on Android and Apple platforms and in the Android core.
 
 Match network type.
 

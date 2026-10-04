@@ -1,3 +1,9 @@
+---
+icon: material/new-box
+---
+
+!!! question "Since sing-box 1.14.0"
+
 ### Structure
 
 ```json
@@ -7,14 +13,20 @@
 
   ... // Listen Fields
 
-  "psk": "my-pre-shared-key",
-  "version": 4,
-  "obfs_mode": "",
-  "obfs_host": ""
+  "version": 5,
+  "psk": "password",
+  "multi_user_authentication": "userkey",
+  "users": [
+    {
+      "name": "sekai",
+      "userkey": "user-password"
+    }
+  ],
+  "obfs_mode": ""
 }
 ```
 
-### Multi-User Structure
+### Version 6 Structure
 
 ```json
 {
@@ -23,19 +35,15 @@
 
   ... // Listen Fields
 
+  "version": 6,
+  "psk": "password",
   "users": [
     {
-      "name": "alice",
-      "psk": "alice-pre-shared-key"
-    },
-    {
-      "name": "bob",
-      "psk": "bob-pre-shared-key"
+      "name": "sekai",
+      "userkey": "user-password"
     }
   ],
-  "version": 4,
-  "obfs_mode": "",
-  "obfs_host": ""
+  "mode": ""
 }
 ```
 
@@ -45,43 +53,55 @@ See [Listen Fields](/configuration/shared/listen/) for details.
 
 ### Fields
 
+#### version
+
+==Required==
+
+The Snell protocol version, one of `5` `6`.
+
+Version `5` supports HTTP obfuscation and QUIC Proxy Mode. Version `6` replaces
+obfuscation with traffic shaping and requires 12 to 255 byte PSKs.
+
+For Surge compatibility, a version `6` inbound also listens on UDP at the Snell
+port and accepts the legacy v5 QUIC Proxy wire format. Standard v6 UDP traffic
+continues to use UDP over TCP.
+
 #### psk
 
-==Required if `users` is not set==
-
-The pre-shared key for single-user authentication. Mutually exclusive with `users`.
+Required in single-user and `userkey` multi-user modes. It must be omitted in
+`psk` multi-user mode.
 
 #### users
 
-==Required if `psk` is not set==
+Snell users.
 
-User list for multi-user mode. Each entry has a `name` and a `psk`. Mutually exclusive with `psk`.
+With `multi_user_authentication: userkey`, each user must contain `userkey` and
+must not contain `psk`. With `multi_user_authentication: psk`, each user must
+contain an independent `psk` and must not contain `userkey`.
 
-The matched user name is available to routing rules via `auth_user`.
+#### multi_user_authentication
 
-#### version
+Multi-user authentication mode, one of `userkey` or `psk`. Defaults to
+`userkey`. This option is only valid when `users` is configured.
 
-Snell protocol version. Must be `4` or `5`.
-
-Defaults to `4`.
-
-!!! note "QUIC Proxy Mode (v5)"
-    When `version` is `5`, the server automatically accepts QUIC traffic on the
-    same port. The destination address and the first QUIC Initial packet are
-    encrypted by Snell; subsequent packets are forwarded as-is (QUIC provides
-    its own encryption). No additional configuration is required.
+`psk` mode supports v5 and v6 `default` / `unshaped`. It is rejected for v6
+`unsafe-raw`, where the protocol does not use the PSK cryptographically.
 
 #### obfs_mode
 
-Simple-obfs obfuscation mode.
+==Version 5 only==
 
-One of `http` `tls`, or empty to disable.
+HTTP obfuscation mode, one of `none` `http`.
 
-!!! warning
-    TLS obfuscation is not supported for v4/v5. Use [ShadowTLS](/configuration/inbound/shadowtls/) instead.
+`none` is used by default.
 
-#### obfs_host
+TLS simple-obfs is intentionally unsupported. Use a [ShadowTLS](/configuration/inbound/shadowtls/)
+inbound in front of Snell when TLS camouflage is required.
 
-The obfuscation hostname used for HTTP/TLS obfuscation.
+#### mode
 
-Defaults to `bing.com` if not set.
+==Version 6 only==
+
+Traffic shaping mode, one of `default` `unshaped` `unsafe-raw`.
+
+`default` is used by default.

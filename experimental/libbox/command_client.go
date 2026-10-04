@@ -31,7 +31,8 @@ type CommandClient struct {
 	remote            *remoteConnection
 	ctx               context.Context
 	cancel            context.CancelFunc
-	clientMutex       sync.RWMutex
+	clientAccess      sync.RWMutex
+	connectAccess     sync.Mutex
 	standalone        bool
 }
 
@@ -80,13 +81,21 @@ func SetXPCDialer(dialer XPCDialer) {
 }
 
 func NewStandaloneCommandClient() *CommandClient {
-	return &CommandClient{standalone: true}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &CommandClient{
+		ctx:        ctx,
+		cancel:     cancel,
+		standalone: true,
+	}
 }
 
 func NewCommandClient(handler CommandClientHandler, options *CommandClientOptions) *CommandClient {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &CommandClient{
 		handler: handler,
 		options: common.PtrValueOrDefault(options),
+		ctx:     ctx,
+		cancel:  cancel,
 	}
 }
 
@@ -108,6 +117,7 @@ const (
 	commandClientDialAttempts  = 10
 	commandClientDialBaseDelay = 100 * time.Millisecond
 	commandClientDialStepDelay = 50 * time.Millisecond
+	commandClientProbeTimeout  = 2 * time.Second
 )
 
 func commandClientDialDelay(attempt int) time.Duration {
@@ -151,8 +161,8 @@ func networkConnectionFromFileDescriptor(fileDescriptor int32) (net.Conn, error)
 func localDialOptions(contextDialer func(context.Context, string) (net.Conn, error)) []grpc.DialOption {
 	options := []grpc.DialOption{
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithUnaryInterceptor(unaryClientAuthInterceptor),
-		grpc.WithStreamInterceptor(streamClientAuthInterceptor),
+		grpc.WithChainUnaryInterceptor(daemon.UnaryClientLocaleInterceptor, unaryClientAuthInterceptor),
+		grpc.WithChainStreamInterceptor(daemon.StreamClientLocaleInterceptor, streamClientAuthInterceptor),
 	}
 	if contextDialer != nil {
 		options = append(options, grpc.WithContextDialer(contextDialer))
@@ -162,19 +172,38 @@ func localDialOptions(contextDialer func(context.Context, string) (net.Conn, err
 
 // establishConnection dials the command server the client is bound to: the
 // local command server (over socket/XPC) or a remote API service.
-func (c *CommandClient) establishConnection() (*grpc.ClientConn, daemon.StartedServiceClient, error) {
+func (c *CommandClient) establishConnection(ctx context.Context) (*grpc.ClientConn, daemon.StartedServiceClient, error) {
 	if c.remote != nil {
-		return c.dialRemote()
+		return c.dialRemote(ctx)
 	}
 	target, contextDialer := dialTarget()
-	return c.dialWithRetry(target, localDialOptions(contextDialer), true)
+	return c.dialWithRetry(ctx, target, localDialOptions(contextDialer), !c.standalone)
 }
 
-// dialWithRetry connects to the local command server. The retry loop exists to
-// wait out the server starting up: WaitForReady keeps the probe redialing and
-// the loop reissues it with a growing delay, so a freshly launched extension is
-// picked up without surfacing a transient "unavailable" to the UI.
-func (c *CommandClient) dialWithRetry(target string, dialOptions []grpc.DialOption, retryDial bool) (*grpc.ClientConn, daemon.StartedServiceClient, error) {
+// dialWithRetry connects to the local command server. For a handler-bound
+// client the retry loop waits out the server starting up: WaitForReady keeps
+// the probe redialing and the loop reissues it with a growing delay, so a
+// freshly launched extension is picked up without surfacing a transient
+// "unavailable" to the UI. A standalone client issues a single fail-fast
+// probe instead: it serves a query from a UI that does not own the service
+// lifecycle, and a server that is not running is reported immediately.
+func (c *CommandClient) dialWithRetry(ctx context.Context, target string, dialOptions []grpc.DialOption, retryDial bool) (*grpc.ClientConn, daemon.StartedServiceClient, error) {
+	if !retryDial {
+		connection, err := grpc.NewClient(target, dialOptions...)
+		if err != nil {
+			return nil, nil, E.Cause(err, "create command client")
+		}
+		client := daemon.NewStartedServiceClient(connection)
+		probeCtx, cancel := context.WithTimeout(ctx, commandClientProbeTimeout)
+		_, err = client.GetStartedAt(probeCtx, &emptypb.Empty{}, grpc.WaitForReady(false))
+		cancel()
+		if err != nil {
+			connection.Close()
+			return nil, nil, E.Cause(err, "probe command server")
+		}
+		return connection, client, nil
+	}
+
 	var connection *grpc.ClientConn
 	var client daemon.StartedServiceClient
 	var lastError error
@@ -185,21 +214,25 @@ func (c *CommandClient) dialWithRetry(target string, dialOptions []grpc.DialOpti
 			connection, err = grpc.NewClient(target, dialOptions...)
 			if err != nil {
 				lastError = err
-				if !retryDial {
-					return nil, nil, E.Cause(err, "create command client")
+				select {
+				case <-ctx.Done():
+					return nil, nil, ctx.Err()
+				case <-time.After(commandClientDialDelay(attempt)):
 				}
-				time.Sleep(commandClientDialDelay(attempt))
 				continue
 			}
 			client = daemon.NewStartedServiceClient(connection)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), commandClientDialDelay(attempt))
-		_, err := client.GetStartedAt(ctx, &emptypb.Empty{}, grpc.WaitForReady(true))
+		probeCtx, cancel := context.WithTimeout(ctx, commandClientDialDelay(attempt))
+		_, err := client.GetStartedAt(probeCtx, &emptypb.Empty{}, grpc.WaitForReady(true))
 		cancel()
 		if err == nil {
 			return connection, client, nil
 		}
 		lastError = err
+		if ctx.Err() != nil {
+			break
+		}
 	}
 
 	if connection != nil {
@@ -208,15 +241,15 @@ func (c *CommandClient) dialWithRetry(target string, dialOptions []grpc.DialOpti
 	return nil, nil, E.Cause(lastError, "probe command server")
 }
 
-func (c *CommandClient) dialRemote() (*grpc.ClientConn, daemon.StartedServiceClient, error) {
+func (c *CommandClient) dialRemote(ctx context.Context) (*grpc.ClientConn, daemon.StartedServiceClient, error) {
 	connection, err := grpc.NewClient(c.remote.target, c.remote.dialOptions...)
 	if err != nil {
 		return nil, nil, E.Cause(err, "create remote command client")
 	}
 	client := daemon.NewStartedServiceClient(connection)
-	ctx, cancel := context.WithTimeout(context.Background(), commandClientRemoteProbeTimeout)
+	probeCtx, cancel := context.WithTimeout(ctx, commandClientRemoteProbeTimeout)
 	defer cancel()
-	_, err = client.GetStartedAt(ctx, &emptypb.Empty{})
+	_, err = client.GetStartedAt(probeCtx, &emptypb.Empty{})
 	if err != nil {
 		connection.Close()
 		return nil, nil, E.Cause(err, "connect to remote server")
@@ -225,66 +258,81 @@ func (c *CommandClient) dialRemote() (*grpc.ClientConn, daemon.StartedServiceCli
 }
 
 func (c *CommandClient) Connect() error {
-	c.clientMutex.Lock()
-	common.Close(common.PtrOrNil(c.grpcConn))
-
-	connection, client, err := c.establishConnection()
-	if err != nil {
-		c.clientMutex.Unlock()
-		return err
-	}
-	c.grpcConn = connection
-	c.grpcClient = client
-	c.grpcManagedClient = daemon.NewManagedServiceClient(connection)
-	c.ctx, c.cancel = context.WithCancel(context.Background())
-	c.clientMutex.Unlock()
-
-	c.handler.Connected()
-	return c.dispatchCommands()
+	return c.connect(c.establishConnection)
 }
 
 func (c *CommandClient) ConnectWithFD(fd int32) error {
-	c.clientMutex.Lock()
-	common.Close(common.PtrOrNil(c.grpcConn))
-
 	networkConnection, err := networkConnectionFromFileDescriptor(fd)
 	if err != nil {
-		c.clientMutex.Unlock()
 		return err
 	}
-	connection, client, err := c.dialWithRetry("passthrough:///xpc", localDialOptions(func(ctx context.Context, _ string) (net.Conn, error) {
-		return networkConnection, nil
-	}), false)
+	err = c.connect(func(ctx context.Context) (*grpc.ClientConn, daemon.StartedServiceClient, error) {
+		return c.dialWithRetry(ctx, "passthrough:///xpc", localDialOptions(func(context.Context, string) (net.Conn, error) {
+			return networkConnection, nil
+		}), false)
+	})
 	if err != nil {
 		networkConnection.Close()
-		c.clientMutex.Unlock()
+	}
+	return err
+}
+
+func (c *CommandClient) connect(dial func(context.Context) (*grpc.ClientConn, daemon.StartedServiceClient, error)) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	c.clientAccess.Lock()
+	c.cancel()
+	previousConnection := c.grpcConn
+	c.grpcConn = nil
+	c.grpcClient = nil
+	c.grpcManagedClient = nil
+	c.ctx = ctx
+	c.cancel = cancel
+	c.clientAccess.Unlock()
+	common.Close(common.PtrOrNil(previousConnection))
+
+	c.connectAccess.Lock()
+	if ctx.Err() != nil {
+		c.connectAccess.Unlock()
+		return ctx.Err()
+	}
+	c.closeConnection()
+	connection, client, err := dial(ctx)
+	if err != nil {
+		c.connectAccess.Unlock()
 		return err
+	}
+	c.clientAccess.Lock()
+	if ctx.Err() != nil {
+		c.clientAccess.Unlock()
+		c.connectAccess.Unlock()
+		connection.Close()
+		return ctx.Err()
 	}
 	c.grpcConn = connection
 	c.grpcClient = client
 	c.grpcManagedClient = daemon.NewManagedServiceClient(connection)
-	c.ctx, c.cancel = context.WithCancel(context.Background())
-	c.clientMutex.Unlock()
+	c.clientAccess.Unlock()
+	c.connectAccess.Unlock()
 
 	c.handler.Connected()
-	return c.dispatchCommands()
+	return c.dispatchCommands(client, ctx)
 }
 
-func (c *CommandClient) dispatchCommands() error {
+func (c *CommandClient) dispatchCommands(client daemon.StartedServiceClient, ctx context.Context) error {
 	for _, command := range c.options.commands {
 		switch command {
 		case CommandLog:
-			go c.handleLogStream()
+			go c.handleLogStream(client, ctx)
 		case CommandStatus:
-			go c.handleStatusStream()
+			go c.handleStatusStream(client, ctx)
 		case CommandGroup:
-			go c.handleGroupStream()
+			go c.handleGroupStream(client, ctx)
 		case CommandClashMode:
-			go c.handleClashModeStream()
+			go c.handleClashModeStream(client, ctx)
 		case CommandConnections:
-			go c.handleConnectionsStream()
+			go c.handleConnectionsStream(client, ctx)
 		case CommandOutbounds:
-			go c.handleOutboundsStream()
+			go c.handleOutboundsStream(client, ctx)
 		default:
 			return E.New("unknown command: ", command)
 		}
@@ -293,51 +341,64 @@ func (c *CommandClient) dispatchCommands() error {
 }
 
 func (c *CommandClient) Disconnect() error {
-	c.clientMutex.Lock()
-	defer c.clientMutex.Unlock()
-	if c.cancel != nil {
-		c.cancel()
-	}
-	return common.Close(common.PtrOrNil(c.grpcConn))
+	c.clientAccess.Lock()
+	c.cancel()
+	connection := c.grpcConn
+	c.grpcConn = nil
+	c.grpcClient = nil
+	c.grpcManagedClient = nil
+	c.clientAccess.Unlock()
+	return common.Close(common.PtrOrNil(connection))
 }
 
 func (c *CommandClient) getClientForCall() (daemon.StartedServiceClient, context.Context, error) {
-	c.clientMutex.RLock()
+	c.clientAccess.RLock()
 	if c.grpcClient != nil {
-		defer c.clientMutex.RUnlock()
+		defer c.clientAccess.RUnlock()
 		return c.grpcClient, c.ctx, nil
 	}
-	c.clientMutex.RUnlock()
+	ctx := c.ctx
+	c.clientAccess.RUnlock()
 
-	c.clientMutex.Lock()
-	defer c.clientMutex.Unlock()
+	c.connectAccess.Lock()
+	defer c.connectAccess.Unlock()
 
-	if c.grpcClient != nil {
-		return c.grpcClient, c.ctx, nil
+	c.clientAccess.RLock()
+	if ctx.Err() != nil {
+		c.clientAccess.RUnlock()
+		return nil, nil, ctx.Err()
 	}
+	if c.grpcClient != nil {
+		defer c.clientAccess.RUnlock()
+		return c.grpcClient, ctx, nil
+	}
+	c.clientAccess.RUnlock()
 
-	connection, client, err := c.establishConnection()
+	connection, client, err := c.establishConnection(ctx)
 	if err != nil {
 		return nil, nil, E.Cause(err, "get command client")
+	}
+	c.clientAccess.Lock()
+	if ctx.Err() != nil {
+		c.clientAccess.Unlock()
+		connection.Close()
+		return nil, nil, ctx.Err()
 	}
 	c.grpcConn = connection
 	c.grpcClient = client
 	c.grpcManagedClient = daemon.NewManagedServiceClient(connection)
-	if c.ctx == nil {
-		c.ctx, c.cancel = context.WithCancel(context.Background())
-	}
-	return c.grpcClient, c.ctx, nil
+	c.clientAccess.Unlock()
+	return client, ctx, nil
 }
 
 func (c *CommandClient) closeConnection() {
-	c.clientMutex.Lock()
-	defer c.clientMutex.Unlock()
-	if c.grpcConn != nil {
-		c.grpcConn.Close()
-		c.grpcConn = nil
-		c.grpcClient = nil
-		c.grpcManagedClient = nil
-	}
+	c.clientAccess.Lock()
+	connection := c.grpcConn
+	c.grpcConn = nil
+	c.grpcClient = nil
+	c.grpcManagedClient = nil
+	c.clientAccess.Unlock()
+	common.Close(common.PtrOrNil(connection))
 }
 
 func callWithResult[T any](c *CommandClient, call func(ctx context.Context, client daemon.StartedServiceClient) (T, error)) (T, error) {
@@ -361,9 +422,9 @@ func callManagedWithResult[T any](c *CommandClient, call func(ctx context.Contex
 	if c.standalone {
 		defer c.closeConnection()
 	}
-	c.clientMutex.RLock()
+	c.clientAccess.RLock()
 	client := c.grpcManagedClient
-	c.clientMutex.RUnlock()
+	c.clientAccess.RUnlock()
 	if client == nil {
 		var zero T
 		return zero, os.ErrClosed
@@ -371,14 +432,7 @@ func callManagedWithResult[T any](c *CommandClient, call func(ctx context.Contex
 	return call(ctx, client)
 }
 
-func (c *CommandClient) getStreamContext() (daemon.StartedServiceClient, context.Context) {
-	c.clientMutex.RLock()
-	defer c.clientMutex.RUnlock()
-	return c.grpcClient, c.ctx
-}
-
-func (c *CommandClient) handleLogStream() {
-	client, ctx := c.getStreamContext()
+func (c *CommandClient) handleLogStream(client daemon.StartedServiceClient, ctx context.Context) {
 	stream, err := client.SubscribeLog(ctx, &emptypb.Empty{})
 	if err != nil {
 		c.handler.Disconnected(E.Cause(err, "subscribe log").Error())
@@ -410,8 +464,7 @@ func (c *CommandClient) handleLogStream() {
 	}
 }
 
-func (c *CommandClient) handleStatusStream() {
-	client, ctx := c.getStreamContext()
+func (c *CommandClient) handleStatusStream(client daemon.StartedServiceClient, ctx context.Context) {
 	interval := c.options.StatusInterval
 
 	stream, err := client.SubscribeStatus(ctx, &daemon.SubscribeStatusRequest{
@@ -432,9 +485,7 @@ func (c *CommandClient) handleStatusStream() {
 	}
 }
 
-func (c *CommandClient) handleGroupStream() {
-	client, ctx := c.getStreamContext()
-
+func (c *CommandClient) handleGroupStream(client daemon.StartedServiceClient, ctx context.Context) {
 	stream, err := client.SubscribeGroups(ctx, &emptypb.Empty{})
 	if err != nil {
 		c.handler.Disconnected(E.Cause(err, "subscribe groups").Error())
@@ -451,9 +502,7 @@ func (c *CommandClient) handleGroupStream() {
 	}
 }
 
-func (c *CommandClient) handleClashModeStream() {
-	client, ctx := c.getStreamContext()
-
+func (c *CommandClient) handleClashModeStream(client daemon.StartedServiceClient, ctx context.Context) {
 	modeStatus, err := client.GetClashModeStatus(ctx, &emptypb.Empty{})
 	if err != nil {
 		if status.Code(err) != codes.NotFound {
@@ -495,8 +544,7 @@ func (c *CommandClient) handleClashModeStream() {
 	}
 }
 
-func (c *CommandClient) handleConnectionsStream() {
-	client, ctx := c.getStreamContext()
+func (c *CommandClient) handleConnectionsStream(client daemon.StartedServiceClient, ctx context.Context) {
 	interval := c.options.StatusInterval
 
 	stream, err := client.SubscribeConnections(ctx, &daemon.SubscribeConnectionsRequest{
@@ -518,9 +566,7 @@ func (c *CommandClient) handleConnectionsStream() {
 	}
 }
 
-func (c *CommandClient) handleOutboundsStream() {
-	client, ctx := c.getStreamContext()
-
+func (c *CommandClient) handleOutboundsStream(client daemon.StartedServiceClient, ctx context.Context) {
 	stream, err := client.SubscribeOutbounds(ctx, &emptypb.Empty{})
 	if err != nil {
 		c.handler.Disconnected(E.Cause(err, "subscribe outbounds").Error())
@@ -550,10 +596,10 @@ func (c *CommandClient) SelectOutbound(groupTag string, outboundTag string) erro
 	return nil
 }
 
-func (c *CommandClient) URLTest(groupTag string) error {
+func (c *CommandClient) URLTest(outboundTag string) error {
 	_, err := callWithResult(c, func(ctx context.Context, client daemon.StartedServiceClient) (*emptypb.Empty, error) {
 		return client.URLTest(ctx, &daemon.URLTestRequest{
-			OutboundTag: groupTag,
+			OutboundTag: outboundTag,
 		})
 	})
 	if err != nil {
@@ -879,32 +925,26 @@ func (c *CommandClient) StartSTUNTest(server string, outboundTag string, handler
 	return session, nil
 }
 
-func (c *CommandClient) SubscribeTailscaleStatus(handler TailscaleStatusHandler) (*TailscaleStatusSubscription, error) {
+func subscribeStatus[T any](c *CommandClient, session *streamSession, name string, start func(context.Context, daemon.StartedServiceClient) (grpc.ServerStreamingClient[T], error), onUpdate func(*T), onError func(string)) error {
 	client, parentCtx, err := c.getClientForCall()
 	if err != nil {
-		return nil, E.Cause(err, "subscribe tailscale status")
+		return E.Cause(err, "subscribe ", name)
 	}
 
 	streamCtx, cancel := context.WithCancel(parentCtx)
-	session := &TailscaleStatusSubscription{
-		streamSession: streamSession{
-			ctx:       streamCtx,
-			cancel:    cancel,
-			closeDone: make(chan struct{}),
-		},
+	*session = streamSession{
+		ctx:       streamCtx,
+		cancel:    cancel,
+		closeDone: make(chan struct{}),
 	}
 
-	failStart := func(cause error, message string) (*TailscaleStatusSubscription, error) {
+	stream, err := start(streamCtx, client)
+	if err != nil {
 		cancel()
 		if c.standalone {
 			c.closeConnection()
 		}
-		return nil, E.Cause(cause, message)
-	}
-
-	stream, err := client.SubscribeTailscaleStatus(streamCtx, &emptypb.Empty{})
-	if err != nil {
-		return failStart(err, "subscribe tailscale status")
+		return E.Cause(err, "subscribe ", name)
 	}
 
 	standalone := c.standalone
@@ -924,69 +964,137 @@ func (c *CommandClient) SubscribeTailscaleStatus(handler TailscaleStatusHandler)
 				if status.Code(recvErr) == codes.NotFound || status.Code(recvErr) == codes.Unavailable {
 					return
 				}
-				handler.OnError(E.Cause(recvErr, "tailscale status recv").Error())
+				onError(E.Cause(recvErr, name, " recv").Error())
 				return
 			}
-			handler.OnStatusUpdate(tailscaleStatusUpdateFromGRPC(event))
+			onUpdate(event)
 		}
 	}()
+	return nil
+}
 
+func (c *CommandClient) SubscribeTailscaleStatus(handler TailscaleStatusHandler) (*TailscaleStatusSubscription, error) {
+	session := new(TailscaleStatusSubscription)
+	err := subscribeStatus(c, &session.streamSession, "tailscale status", func(ctx context.Context, client daemon.StartedServiceClient) (grpc.ServerStreamingClient[daemon.TailscaleStatusUpdate], error) {
+		return client.SubscribeTailscaleStatus(ctx, &emptypb.Empty{})
+	}, func(update *daemon.TailscaleStatusUpdate) {
+		handler.OnStatusUpdate(tailscaleStatusUpdateFromGRPC(update))
+	}, handler.OnError)
+	if err != nil {
+		return nil, err
+	}
 	return session, nil
 }
 
 func (c *CommandClient) SubscribeUSBIPServerStatus(handler USBIPServerStatusHandler) (*USBIPServerStatusSubscription, error) {
-	client, parentCtx, err := c.getClientForCall()
+	session := new(USBIPServerStatusSubscription)
+	err := subscribeStatus(c, &session.streamSession, "usbip server status", func(ctx context.Context, client daemon.StartedServiceClient) (grpc.ServerStreamingClient[daemon.USBIPServerStatusUpdate], error) {
+		return client.SubscribeUSBIPServerStatus(ctx, &emptypb.Empty{})
+	}, func(update *daemon.USBIPServerStatusUpdate) {
+		handler.OnStatusUpdate(usbipServerStatusUpdateFromGRPC(update))
+	}, handler.OnError)
 	if err != nil {
-		return nil, E.Cause(err, "subscribe usbip server status")
+		return nil, err
 	}
-
-	streamCtx, cancel := context.WithCancel(parentCtx)
-	session := &USBIPServerStatusSubscription{
-		streamSession: streamSession{
-			ctx:       streamCtx,
-			cancel:    cancel,
-			closeDone: make(chan struct{}),
-		},
-	}
-
-	failStart := func(cause error, message string) (*USBIPServerStatusSubscription, error) {
-		cancel()
-		if c.standalone {
-			c.closeConnection()
-		}
-		return nil, E.Cause(cause, message)
-	}
-
-	stream, err := client.SubscribeUSBIPServerStatus(streamCtx, &emptypb.Empty{})
-	if err != nil {
-		return failStart(err, "subscribe usbip server status")
-	}
-
-	standalone := c.standalone
-	go func() {
-		defer func() {
-			close(session.closeDone)
-			if standalone {
-				c.closeConnection()
-			}
-		}()
-		for {
-			event, recvErr := stream.Recv()
-			if recvErr != nil {
-				if session.ctx.Err() != nil {
-					return
-				}
-				if status.Code(recvErr) == codes.NotFound || status.Code(recvErr) == codes.Unavailable {
-					return
-				}
-				handler.OnError(E.Cause(recvErr, "usbip server status recv").Error())
-				return
-			}
-			handler.OnStatusUpdate(usbipServerStatusUpdateFromGRPC(event))
-		}
-	}()
-
 	return session, nil
+}
+
+func (c *CommandClient) SubscribeOpenConnectStatus(handler OpenConnectStatusHandler) (*OpenConnectStatusSubscription, error) {
+	session := new(OpenConnectStatusSubscription)
+	err := subscribeStatus(c, &session.streamSession, "openconnect status", func(ctx context.Context, client daemon.StartedServiceClient) (grpc.ServerStreamingClient[daemon.OpenConnectStatusUpdate], error) {
+		return client.SubscribeOpenConnectStatus(ctx, &emptypb.Empty{})
+	}, func(update *daemon.OpenConnectStatusUpdate) {
+		handler.OnStatusUpdate(openConnectStatusUpdateFromGRPC(update))
+	}, handler.OnError)
+	if err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+func (c *CommandClient) SubmitOpenConnectAuthResponse(endpointTag string, challengeID string, response *OpenConnectAuthResponse) error {
+	submission := &daemon.OpenConnectAuthResponseSubmission{
+		EndpointTag: endpointTag,
+		ChallengeID: challengeID,
+	}
+	if response.formValues != nil {
+		submission.Response = &daemon.OpenConnectAuthResponseSubmission_Form{Form: &daemon.OpenConnectAuthFormResponse{
+			Values: response.formValues.values,
+		}}
+	}
+	if response.browserResult != nil {
+		submission.Response = &daemon.OpenConnectAuthResponseSubmission_Browser{Browser: &daemon.OpenConnectBrowserResult{
+			FinalURL: response.browserResult.FinalURL,
+			Cookies: common.Map(response.browserResult.cookies, func(cookie openConnectBrowserCookie) *daemon.OpenConnectBrowserCookie {
+				return &daemon.OpenConnectBrowserCookie{Name: cookie.Name, Value: cookie.Value}
+			}),
+			Headers: common.Map(response.browserResult.headers, func(header openConnectBrowserHeader) *daemon.OpenConnectBrowserHeader {
+				return &daemon.OpenConnectBrowserHeader{Name: header.Name, Values: header.Values}
+			}),
+		}}
+	}
+	_, err := callWithResult(c, func(ctx context.Context, client daemon.StartedServiceClient) (*emptypb.Empty, error) {
+		return client.SubmitOpenConnectAuthResponse(ctx, submission)
+	})
+	if err != nil {
+		return E.Cause(err, "submit openconnect authentication response")
+	}
+	return nil
+}
+
+func (c *CommandClient) CancelOpenConnectAuthChallenge(endpointTag string, challengeID string) error {
+	_, err := callWithResult(c, func(ctx context.Context, client daemon.StartedServiceClient) (*emptypb.Empty, error) {
+		return client.CancelOpenConnectAuthChallenge(ctx, &daemon.OpenConnectAuthChallengeCancel{
+			EndpointTag: endpointTag,
+			ChallengeID: challengeID,
+		})
+	})
+	if err != nil {
+		return E.Cause(err, "cancel openconnect authentication challenge")
+	}
+	return nil
+}
+
+func (c *CommandClient) SubscribeOpenVPNStatus(handler OpenVPNStatusHandler) (*OpenVPNStatusSubscription, error) {
+	session := new(OpenVPNStatusSubscription)
+	err := subscribeStatus(c, &session.streamSession, "openvpn status", func(ctx context.Context, client daemon.StartedServiceClient) (grpc.ServerStreamingClient[daemon.OpenVPNStatusUpdate], error) {
+		return client.SubscribeOpenVPNStatus(ctx, &emptypb.Empty{})
+	}, func(update *daemon.OpenVPNStatusUpdate) {
+		handler.OnStatusUpdate(openVPNStatusUpdateFromGRPC(update))
+	}, handler.OnError)
+	if err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+func (c *CommandClient) SubmitOpenVPNChallengeResponse(endpointTag string, challengeID string, response *OpenVPNChallengeResponse) error {
+	_, err := callWithResult(c, func(ctx context.Context, client daemon.StartedServiceClient) (*emptypb.Empty, error) {
+		return client.SubmitOpenVPNChallengeResponse(ctx, &daemon.OpenVPNChallengeSubmission{
+			EndpointTag: endpointTag,
+			ChallengeID: challengeID,
+			Username:    response.Username,
+			Password:    response.Password,
+			Secret:      response.Secret,
+		})
+	})
+	if err != nil {
+		return E.Cause(err, "submit openvpn challenge response")
+	}
+	return nil
+}
+
+func (c *CommandClient) CancelOpenVPNChallenge(endpointTag string, challengeID string) error {
+	_, err := callWithResult(c, func(ctx context.Context, client daemon.StartedServiceClient) (*emptypb.Empty, error) {
+		return client.CancelOpenVPNChallenge(ctx, &daemon.OpenVPNChallengeCancel{
+			EndpointTag: endpointTag,
+			ChallengeID: challengeID,
+		})
+	})
+	if err != nil {
+		return E.Cause(err, "cancel openvpn challenge")
+	}
+	return nil
 }
 
 func (c *CommandClient) SetTailscaleExitNode(endpointTag string, stableID string) error {
@@ -1116,9 +1224,7 @@ func (c *CommandClient) StartTailscaleSSHSession(opts *TailscaleSSHOptions, hand
 		closeDone: make(chan struct{}),
 	}
 
-	session.wg.Add(1)
-	go func() {
-		defer session.wg.Done()
+	session.wg.Go(func() {
 		for {
 			select {
 			case <-streamCtx.Done():
@@ -1146,11 +1252,9 @@ func (c *CommandClient) StartTailscaleSSHSession(opts *TailscaleSSHOptions, hand
 				}
 			}
 		}
-	}()
+	})
 
-	session.wg.Add(1)
-	go func() {
-		defer session.wg.Done()
+	session.wg.Go(func() {
 		for {
 			msg, recvErr := stream.Recv()
 			if recvErr == io.EOF {
@@ -1177,7 +1281,7 @@ func (c *CommandClient) StartTailscaleSSHSession(opts *TailscaleSSHOptions, hand
 				handler.OnError(payload.Error.Message)
 			}
 		}
-	}()
+	})
 
 	standalone := c.standalone
 	go func() {
@@ -1245,4 +1349,232 @@ func (c *CommandClient) ProvideUSBDevices(handler USBProviderHandler) (*USBProvi
 	}()
 
 	return session, nil
+}
+
+func (c *CommandClient) SubscribeTaildropInbox(endpointTag string, handler TaildropInboxHandler) (*TaildropInboxSubscription, error) {
+	session := new(TaildropInboxSubscription)
+	err := subscribeStatus(c, &session.streamSession, "taildrop inbox", func(ctx context.Context, client daemon.StartedServiceClient) (grpc.ServerStreamingClient[daemon.TaildropInbox], error) {
+		return client.SubscribeTaildropInbox(ctx, &daemon.SubscribeTaildropInboxRequest{EndpointTag: endpointTag})
+	}, func(update *daemon.TaildropInbox) {
+		handler.OnInboxUpdate(taildropInboxFromGRPC(update))
+	}, handler.OnError)
+	if err != nil {
+		return nil, err
+	}
+	return session, nil
+}
+
+func (c *CommandClient) SendTaildropFiles(options *TaildropSendOptions, handler TaildropSendHandler) (*TaildropSendSession, error) {
+	client, parentCtx, err := c.getClientForCall()
+	if err != nil {
+		return nil, E.Cause(err, "send taildrop files")
+	}
+
+	streamCtx, cancel := context.WithCancel(parentCtx)
+	failStart := func(cause error, message string) (*TaildropSendSession, error) {
+		cancel()
+		if c.standalone {
+			c.closeConnection()
+		}
+		return nil, E.Cause(cause, message)
+	}
+
+	stream, err := client.SendTaildropFiles(streamCtx)
+	if err != nil {
+		return failStart(err, "send taildrop files")
+	}
+
+	sendErr := stream.Send(&daemon.TaildropSendClientMessage{
+		Message: &daemon.TaildropSendClientMessage_Start{Start: &daemon.TaildropSendStart{
+			EndpointTag:  options.EndpointTag,
+			PeerStableID: options.PeerStableID,
+			Files:        options.files,
+		}},
+	})
+	if sendErr != nil {
+		return failStart(sendErr, "send taildrop start")
+	}
+	session := &TaildropSendSession{
+		streamSession: streamSession{
+			ctx:       streamCtx,
+			cancel:    cancel,
+			closeDone: make(chan struct{}),
+		},
+		stream: stream,
+	}
+
+	standalone := c.standalone
+	go func() {
+		defer func() {
+			close(session.closeDone)
+			if standalone {
+				c.closeConnection()
+			}
+		}()
+		for {
+			message, recvErr := stream.Recv()
+			if recvErr != nil {
+				switch {
+				case recvErr == io.EOF:
+					handler.OnFinish("")
+				case streamCtx.Err() == nil:
+					handler.OnFinish(E.Cause(recvErr, "taildrop send").Error())
+				}
+				cancel()
+				return
+			}
+			progress := message.GetProgress()
+			if progress == nil {
+				continue
+			}
+			if progress.FileCompleted {
+				handler.OnFileCompleted(progress.FileIndex, progress.SentBytes)
+			} else {
+				handler.OnProgress(progress.FileIndex, progress.SentBytes)
+			}
+		}
+	}()
+
+	return session, nil
+}
+
+func (c *CommandClient) DownloadTaildropFile(endpointTag string, name string, destinationPath string, handler TaildropDownloadHandler) (*TaildropDownloadSession, error) {
+	client, parentCtx, err := c.getClientForCall()
+	if err != nil {
+		return nil, E.Cause(err, "download taildrop file")
+	}
+
+	streamCtx, cancel := context.WithCancel(parentCtx)
+	failStart := func(cause error, message string) (*TaildropDownloadSession, error) {
+		cancel()
+		if c.standalone {
+			c.closeConnection()
+		}
+		return nil, E.Cause(cause, message)
+	}
+
+	stream, err := client.DownloadTaildropFile(streamCtx, &daemon.DownloadTaildropFileRequest{
+		EndpointTag: endpointTag,
+		Name:        name,
+	})
+	if err != nil {
+		return failStart(err, "download taildrop file")
+	}
+	firstChunk, err := stream.Recv()
+	if err != nil {
+		return failStart(err, "download taildrop file")
+	}
+	destinationFile, err := os.Create(destinationPath)
+	if err != nil {
+		return failStart(err, "download taildrop file")
+	}
+
+	session := &TaildropDownloadSession{
+		streamSession: streamSession{
+			ctx:       streamCtx,
+			cancel:    cancel,
+			closeDone: make(chan struct{}),
+		},
+	}
+
+	standalone := c.standalone
+	go func() {
+		defer func() {
+			close(session.closeDone)
+			if standalone {
+				c.closeConnection()
+			}
+		}()
+		totalSize := firstChunk.Size
+		var (
+			downloaded   int64
+			lastProgress time.Time
+		)
+		writeChunk := func(data []byte) error {
+			if len(data) == 0 {
+				return nil
+			}
+			_, writeErr := destinationFile.Write(data)
+			if writeErr != nil {
+				return writeErr
+			}
+			downloaded += int64(len(data))
+			now := time.Now()
+			if downloaded == totalSize || now.Sub(lastProgress) >= daemon.TaildropProgressMinInterval {
+				lastProgress = now
+				handler.OnProgress(downloaded, totalSize)
+			}
+			return nil
+		}
+		downloadErr := writeChunk(firstChunk.Data)
+		for downloadErr == nil {
+			var chunk *daemon.DownloadTaildropFileChunk
+			chunk, downloadErr = stream.Recv()
+			if downloadErr == io.EOF {
+				downloadErr = nil
+				break
+			}
+			if downloadErr != nil {
+				downloadErr = E.Cause(downloadErr, "download taildrop file")
+				break
+			}
+			downloadErr = writeChunk(chunk.Data)
+		}
+		if downloadErr == nil {
+			downloadErr = destinationFile.Close()
+		} else {
+			destinationFile.Close()
+		}
+		if downloadErr != nil {
+			os.Remove(destinationPath)
+			if streamCtx.Err() == nil {
+				handler.OnFinish(downloadErr.Error())
+			}
+			cancel()
+			return
+		}
+		handler.OnFinish("")
+		cancel()
+	}()
+
+	return session, nil
+}
+
+func (c *CommandClient) DeleteTaildropFile(endpointTag string, name string) error {
+	_, err := callWithResult(c, func(ctx context.Context, client daemon.StartedServiceClient) (*emptypb.Empty, error) {
+		return client.DeleteTaildropFile(ctx, &daemon.DeleteTaildropFileRequest{
+			EndpointTag: endpointTag,
+			Name:        name,
+		})
+	})
+	if err != nil {
+		return E.Cause(err, "delete taildrop file")
+	}
+	return nil
+}
+
+func (c *CommandClient) CancelTaildropReceiving(endpointTag string, senderID string, name string) error {
+	_, err := callWithResult(c, func(ctx context.Context, client daemon.StartedServiceClient) (*emptypb.Empty, error) {
+		return client.CancelTaildropReceiving(ctx, &daemon.CancelTaildropReceivingRequest{
+			EndpointTag: endpointTag,
+			SenderID:    senderID,
+			Name:        name,
+		})
+	})
+	if err != nil {
+		return E.Cause(err, "cancel taildrop receiving")
+	}
+	return nil
+}
+
+func (c *CommandClient) MarkTaildropInboxRead(endpointTag string) error {
+	_, err := callWithResult(c, func(ctx context.Context, client daemon.StartedServiceClient) (*emptypb.Empty, error) {
+		return client.MarkTaildropInboxRead(ctx, &daemon.MarkTaildropInboxReadRequest{
+			EndpointTag: endpointTag,
+		})
+	})
+	if err != nil {
+		return E.Cause(err, "mark taildrop inbox read")
+	}
+	return nil
 }

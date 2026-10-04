@@ -51,11 +51,21 @@ func (s *abstractRuleSet) Format() string {
 }
 
 func (s *abstractRuleSet) RuleCount() uint64 {
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return s.ruleCount
 }
 
 func (s *abstractRuleSet) UpdatedTime() time.Time {
+	s.access.RLock()
+	defer s.access.RUnlock()
 	return s.lastUpdated
+}
+
+func (s *abstractRuleSet) setUpdatedTime(updatedAt time.Time) {
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.lastUpdated = updatedAt
 }
 
 func (s *abstractRuleSet) String() string {
@@ -121,7 +131,7 @@ func (s *abstractRuleSet) loadBytes(content []byte, ruleset adapter.RuleSet) err
 	default:
 		return E.New("unknown rule-set format: ", s.format)
 	}
-	plainRuleSet, err := ruleSet.Upgrade()
+	plainRuleSet, err := mmapRuleSet(s.ctx, s.logger, s.tag, ruleSet).Upgrade()
 	if err != nil {
 		return err
 	}
@@ -158,19 +168,9 @@ func (s *abstractRuleSet) reloadRules(headlessRules []option.HeadlessRule, ruleS
 }
 
 func (s *abstractRuleSet) Match(metadata *adapter.InboundContext) bool {
-	return !s.matchStates(metadata).isEmpty()
+	return matchAnyHeadlessRule(s.rules, metadata)
 }
 
-func (s *abstractRuleSet) matchStates(metadata *adapter.InboundContext) ruleMatchStateSet {
-	return s.matchStatesWithBase(metadata, 0)
-}
-
-func (s *abstractRuleSet) matchStatesWithBase(metadata *adapter.InboundContext, base ruleMatchState) ruleMatchStateSet {
-	var stateSet ruleMatchStateSet
-	for _, rule := range s.rules {
-		nestedMetadata := *metadata
-		nestedMetadata.ResetRuleMatchCache()
-		stateSet = stateSet.merge(matchHeadlessRuleStatesWithBase(rule, &nestedMetadata, base))
-	}
-	return stateSet
+func (s *abstractRuleSet) mergeableRule() *DefaultHeadlessRule {
+	return mergeableRuleIn(s.rules)
 }

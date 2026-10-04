@@ -57,6 +57,8 @@ func (c *appleClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) 
 	serverName := c.serverName
 	serverNamePtr := cStringOrNil(serverName)
 	defer cFree(serverNamePtr)
+	certificateServerNamePtr := cStringOrNil(c.certificateServerName)
+	defer cFree(certificateServerNamePtr)
 
 	alpn := strings.Join(c.nextProtos, "\n")
 	alpnPtr := cStringOrNil(alpn)
@@ -84,6 +86,7 @@ func (c *appleClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) 
 	client := C.box_apple_tls_client_create(
 		C.int(dupFD),
 		serverNamePtr,
+		certificateServerNamePtr,
 		alpnPtr,
 		C.size_t(len(alpn)),
 		C.uint16_t(c.minVersion),
@@ -130,8 +133,16 @@ func (c *appleClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) 
 		C.box_apple_tls_client_free(client)
 		return nil, err
 	}
-	if len(c.certificatePublicKeySHA256) > 0 {
-		err = VerifyPublicKeySHA256(c.certificatePublicKeySHA256, rawCerts)
+	if len(c.certificatePinSHA256) > 0 {
+		err = VerifyCertificatePinSHA256(c.certificatePinSHA256, c.verificationServerName(), c.timeFunc, connectionState.PeerCertificates)
+		if err != nil {
+			C.box_apple_tls_client_cancel(client)
+			C.box_apple_tls_client_free(client)
+			return nil, err
+		}
+	}
+	if len(c.certificateSHA256) > 0 || len(c.certificatePublicKeySHA256) > 0 {
+		err = VerifyPinnedCertificate(c.certificateSHA256, c.certificatePublicKeySHA256, rawCerts)
 		if err != nil {
 			C.box_apple_tls_client_cancel(client)
 			C.box_apple_tls_client_free(client)
@@ -520,10 +531,6 @@ func (w *appleTLSReadWaiter) WaitReadBuffer() (*buf.Buffer, error) {
 	if c.readEOF {
 		return nil, io.EOF
 	}
-	maximumLen := readWaitFreeLen(w.options)
-	if maximumLen <= 0 {
-		return nil, io.ErrShortBuffer
-	}
 	timeoutMs, err := c.prepareReadTimeout()
 	if err != nil {
 		return nil, err
@@ -533,11 +540,18 @@ func (w *appleTLSReadWaiter) WaitReadBuffer() (*buf.Buffer, error) {
 		return nil, err
 	}
 	defer c.releaseClient()
+	buffer := w.options.NewBuffer()
+	if buffer.IsFull() {
+		buffer.Release()
+		return nil, io.ErrShortBuffer
+	}
+	maximumLen := buffer.FreeLen()
 
 	handle := cgo.NewHandle(w)
 	defer handle.Delete()
 	var errorPtr *C.char
 	if !bool(C.box_apple_tls_client_read_async(client, C.size_t(maximumLen), C.uintptr_t(handle), &errorPtr)) {
+		buffer.Release()
 		return nil, c.errorFromPointer(errorPtr)
 	}
 
@@ -553,22 +567,18 @@ func (w *appleTLSReadWaiter) WaitReadBuffer() (*buf.Buffer, error) {
 			if result != nil {
 				C.box_apple_tls_read_result_free(result)
 			}
+			buffer.Release()
 			c.markReadTimedOut()
 			return nil, os.ErrDeadlineExceeded
 		}
 	} else {
 		result = <-w.results
 	}
-	return c.readWaitResultToBuffer(result, w.options)
+	return c.readWaitResultToBuffer(result, buffer, w.options)
 }
 
-func (c *appleTLSConn) readWaitResultToBuffer(result *C.box_apple_tls_read_result_t, options N.ReadWaitOptions) (*buf.Buffer, error) {
+func (c *appleTLSConn) readWaitResultToBuffer(result *C.box_apple_tls_read_result_t, buffer *buf.Buffer, options N.ReadWaitOptions) (*buf.Buffer, error) {
 	defer C.box_apple_tls_read_result_free(result)
-	buffer := options.NewBuffer()
-	if buffer.IsFull() {
-		buffer.Release()
-		return nil, io.ErrShortBuffer
-	}
 	startLen := buffer.Len()
 	var eof C.bool
 	var errorPtr *C.char
@@ -591,16 +601,6 @@ func (c *appleTLSConn) readWaitResultToBuffer(result *C.box_apple_tls_read_resul
 	buffer.Truncate(startLen + int(n))
 	options.PostReturn(buffer)
 	return buffer, nil
-}
-
-func readWaitFreeLen(options N.ReadWaitOptions) int {
-	if options.IncreaseBuffer {
-		return 65535 - options.FrontHeadroom - options.RearHeadroom
-	}
-	if options.MTU > 0 {
-		return options.MTU
-	}
-	return buf.BufferSize - options.FrontHeadroom - options.RearHeadroom
 }
 
 //export box_apple_tls_read_callback

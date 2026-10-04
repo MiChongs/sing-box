@@ -2,6 +2,7 @@
 
 package windivert
 
-func assetFiles() []assetFile { return nil }
-
-func driverSysName() string { return "" }
+const (
+	driverAssetName   = ""
+	driverAssetDigest = ""
+)

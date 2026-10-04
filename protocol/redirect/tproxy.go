@@ -13,12 +13,13 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-	"github.com/sagernet/sing/common/udpnat2"
+	"github.com/sagernet/sing/service"
 )
 
 func RegisterTProxy(registry *inbound.Registry) {
@@ -31,7 +32,7 @@ type TProxy struct {
 	router   adapter.Router
 	logger   log.ContextLogger
 	listener *listener.Listener
-	udpNat   *udpnat.Service
+	udpNat   *tun.UDPNat
 }
 
 func NewTProxy(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TProxyInboundOptions) (adapter.Inbound, error) {
@@ -47,7 +48,16 @@ func NewTProxy(ctx context.Context, router adapter.Router, logger log.ContextLog
 	} else {
 		udpTimeout = C.UDPTimeout
 	}
-	tproxy.udpNat = udpnat.New(tproxy, tproxy.preparePacketConnection, udpTimeout, false)
+	networkManager := service.FromContext[adapter.NetworkManager](ctx)
+	tproxy.udpNat = tun.NewUDPNat(tun.UDPNatOptions{
+		Handler:         tproxy,
+		Prepare:         tproxy.preparePacketConnection,
+		Timeout:         udpTimeout,
+		Mapping:         tun.NATMapping(options.UDPMapping),
+		Filtering:       tun.NATFiltering(options.UDPFiltering),
+		MaxSize:         options.UDPNATMax,
+		InterfaceFinder: networkManager.InterfaceFinder(),
+	})
 	tproxy.listener = listener.New(listener.Options{
 		Context:           ctx,
 		Logger:            logger,
@@ -64,10 +74,23 @@ func (t *TProxy) Start(stage adapter.StartStage) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
-	return t.listener.Start()
+	err := t.udpNat.Start()
+	if err != nil {
+		return err
+	}
+	err = t.listener.Start()
+	if err != nil {
+		_ = t.udpNat.Close()
+	}
+	return err
+}
+
+func (t *TProxy) InterfaceUpdated(ctx context.Context) {
+	t.udpNat.Purge()
 }
 
 func (t *TProxy) Close() error {
+	_ = t.udpNat.Close()
 	return t.listener.Close()
 }
 
@@ -123,15 +146,13 @@ type tproxyPacketWriter struct {
 
 func (w *tproxyPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	defer buffer.Release()
-	if w.listener.ListenOptions().NetNs == "" {
-		conn := w.conn
-		if w.destination == destination && conn != nil {
-			_, err := conn.WriteToUDPAddrPort(buffer.Bytes(), w.source)
-			if err != nil {
-				w.conn = nil
-			}
-			return err
+	conn := w.conn
+	if w.destination == destination && conn != nil {
+		_, err := conn.WriteToUDPAddrPort(buffer.Bytes(), w.source)
+		if err != nil {
+			w.conn = nil
 		}
+		return err
 	}
 	var listenConfig net.ListenConfig
 	listenConfig.Control = control.Append(listenConfig.Control, control.ReuseAddr())
@@ -141,7 +162,7 @@ func (w *tproxyPacketWriter) WritePacket(buffer *buf.Buffer, destination M.Socks
 		return err
 	}
 	udpConn := packetConn.(*net.UDPConn)
-	if w.listener.ListenOptions().NetNs == "" && w.destination == destination {
+	if w.destination == destination {
 		w.conn = udpConn
 	} else {
 		defer udpConn.Close()

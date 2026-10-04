@@ -3,7 +3,6 @@ package tls
 import (
 	"context"
 	"crypto/x509"
-	"os"
 	"strings"
 	"time"
 
@@ -11,17 +10,23 @@ import (
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/service/filemanager"
 )
 
 type SystemTLSValidated struct {
-	MinVersion uint16
-	MaxVersion uint16
-	UserPEM    []byte
-	Exclusive  bool
-	Store      adapter.CertificateStore
+	MinVersion           uint16
+	MaxVersion           uint16
+	UserPEM              []byte
+	Exclusive            bool
+	Store                adapter.CertificateStore
+	CertificatePinSHA256 []byte
 }
 
 func ValidateSystemTLSOptions(ctx context.Context, options option.OutboundTLSOptions, engineName string) (SystemTLSValidated, error) {
+	certificatePin, err := parseCertificatePinSHA256(options)
+	if err != nil {
+		return SystemTLSValidated{}, err
+	}
 	if options.Reality != nil && options.Reality.Enabled {
 		return SystemTLSValidated{}, E.New("reality is unsupported in ", engineName)
 	}
@@ -52,8 +57,8 @@ func ValidateSystemTLSOptions(ctx context.Context, options option.OutboundTLSOpt
 	if options.Spoof != "" || options.SpoofMethod != "" {
 		return SystemTLSValidated{}, E.New("spoof is unsupported in ", engineName)
 	}
-	if len(options.CertificatePublicKeySHA256) > 0 && (len(options.Certificate) > 0 || options.CertificatePath != "") {
-		return SystemTLSValidated{}, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
+	if (len(options.CertificateSHA256) > 0 || len(options.CertificatePublicKeySHA256) > 0) && (len(options.Certificate) > 0 || options.CertificatePath != "") {
+		return SystemTLSValidated{}, E.New("certificate_sha256 or certificate_public_key_sha256 is conflict with certificate or certificate_path")
 	}
 	var minVersion uint16
 	if options.MinVersion != "" {
@@ -76,11 +81,12 @@ func ValidateSystemTLSOptions(ctx context.Context, options option.OutboundTLSOpt
 		return SystemTLSValidated{}, err
 	}
 	return SystemTLSValidated{
-		MinVersion: minVersion,
-		MaxVersion: maxVersion,
-		UserPEM:    userPEM,
-		Exclusive:  exclusive,
-		Store:      store,
+		MinVersion:           minVersion,
+		MaxVersion:           maxVersion,
+		UserPEM:              userPEM,
+		Exclusive:            exclusive,
+		Store:                store,
+		CertificatePinSHA256: certificatePin,
 	}, nil
 }
 
@@ -89,7 +95,7 @@ func resolveSystemAnchors(ctx context.Context, options option.OutboundTLSOptions
 		return []byte(strings.Join(options.Certificate, "\n")), true, nil, nil
 	}
 	if options.CertificatePath != "" {
-		content, err := os.ReadFile(options.CertificatePath)
+		content, err := filemanager.ReadFile(ctx, options.CertificatePath)
 		if err != nil {
 			return nil, false, nil, E.Cause(err, "read certificate")
 		}

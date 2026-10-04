@@ -10,12 +10,11 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-usbip"
+	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
@@ -29,7 +28,7 @@ func (s *StartedService) ProvideUSBDevices(server grpc.BidiStreamingServer[USBPr
 	instance := s.instance
 	s.serviceAccess.RUnlock()
 	if instance == nil {
-		return E.New("service not started")
+		return nil
 	}
 	serviceManager := service.FromContext[adapter.ServiceManager](instance.ctx)
 	if serviceManager == nil {
@@ -118,112 +117,48 @@ func (s *StartedService) SubscribeUSBIPServerStatus(
 	if err != nil {
 		return err
 	}
-	s.serviceAccess.RLock()
-	instance := s.instance
-	s.serviceAccess.RUnlock()
-	if instance == nil {
-		return E.New("service not started")
-	}
-	serviceManager := service.FromContext[adapter.ServiceManager](instance.ctx)
-	if serviceManager == nil {
-		return status.Error(codes.FailedPrecondition, "service manager not available")
-	}
-
-	type usbipServer struct {
-		tag      string
-		provider adapter.USBIPDynamicServer
-	}
-	var servers []usbipServer
-	for _, serverService := range serviceManager.Services() {
-		provider, isDynamic := serverService.(adapter.USBIPDynamicServer)
-		if !isDynamic {
-			continue
+	return s.followInstance(server.Context(), func(ctx context.Context, instance *Instance) error {
+		type usbipServer struct {
+			tag      string
+			provider adapter.USBIPDynamicServer
 		}
-		servers = append(servers, usbipServer{tag: serverService.Tag(), provider: provider})
-	}
-	if len(servers) == 0 {
-		return status.Error(codes.NotFound, "no usbip-server found")
-	}
-
-	type taggedStatus struct {
-		tag     string
-		devices []usbip.ControlDeviceInfo
-	}
-	updates := make(chan taggedStatus, len(servers))
-	ctx, cancel := context.WithCancel(server.Context())
-	defer cancel()
-
-	var waitGroup sync.WaitGroup
-	for _, srv := range servers {
-		// sing-usbip invokes the SubscribeDevices listener while holding the
-		// ledger's broadcast lock, so it must never block.
-		latest := make(chan []usbip.ControlDeviceInfo, 1)
-		waitGroup.Add(1)
-		go func(provider adapter.USBIPDynamicServer) {
-			defer waitGroup.Done()
-			provider.SubscribeDevices(ctx, func(devices []usbip.ControlDeviceInfo) {
-				sendLatestUSBSnapshot(latest, devices)
-			})
-		}(srv.provider)
-		waitGroup.Add(1)
-		go func(tag string) {
-			defer waitGroup.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case devices := <-latest:
-					select {
-					case updates <- taggedStatus{tag: tag, devices: devices}:
-					case <-ctx.Done():
-						return
-					}
+		var servers []usbipServer
+		if instance != nil {
+			serviceManager := service.FromContext[adapter.ServiceManager](instance.ctx)
+			for _, serverService := range serviceManager.Services() {
+				provider, isDynamic := serverService.(adapter.USBIPDynamicServer)
+				if !isDynamic {
+					continue
 				}
+				servers = append(servers, usbipServer{tag: serverService.Tag(), provider: provider})
 			}
-		}(srv.tag)
-	}
-
-	go func() {
-		waitGroup.Wait()
-		close(updates)
-	}()
-
-	var tags []string
-	deviceStates := make(map[string][]usbip.ControlDeviceInfo, len(servers))
-	for update := range updates {
-		if _, exists := deviceStates[update.tag]; !exists {
-			tags = append(tags, update.tag)
 		}
-		deviceStates[update.tag] = update.devices
-		protoServers := make([]*USBIPServerStatus, 0, len(deviceStates))
-		for _, tag := range tags {
-			protoServers = append(protoServers, &USBIPServerStatus{
-				ServerTag: tag,
-				Devices:   usbSharedDevicesToProto(deviceStates[tag]),
-			})
-		}
-		sendErr := server.Send(&USBIPServerStatusUpdate{Servers: protoServers})
-		if sendErr != nil {
-			return sendErr
-		}
-	}
-	return nil
-}
-
-func sendLatestUSBSnapshot(slot chan []usbip.ControlDeviceInfo, devices []usbip.ControlDeviceInfo) {
-	select {
-	case slot <- devices:
-		return
-	default:
-	}
-	select {
-	case <-slot:
-	default:
-	}
-	select {
-	case slot <- devices:
-	default:
-	}
+		// sing-usbip invokes the SubscribeDevices listener with the current snapshot
+		// before registration returns, and later invocations happen while the ledger's
+		// broadcast lock is held, so the listener must never block.
+		sources := common.Map(servers, func(serverService usbipServer) taggedStatusSource[[]usbip.ControlDeviceInfo] {
+			return taggedStatusSource[[]usbip.ControlDeviceInfo]{
+				tag: serverService.tag,
+				subscribe: func(subscribeCtx context.Context, listener func([]usbip.ControlDeviceInfo)) {
+					serverService.provider.SubscribeDevices(subscribeCtx, listener)
+				},
+			}
+		})
+		return streamTaggedStatus(ctx, sources, func(deviceStates map[string][]usbip.ControlDeviceInfo) error {
+			protoServers := make([]*USBIPServerStatus, 0, len(servers))
+			for _, serverService := range servers {
+				devices, found := deviceStates[serverService.tag]
+				if !found {
+					continue
+				}
+				protoServers = append(protoServers, &USBIPServerStatus{
+					ServerTag: serverService.tag,
+					Devices:   usbSharedDevicesToProto(devices),
+				})
+			}
+			return server.Send(&USBIPServerStatusUpdate{Servers: protoServers})
+		})
+	})
 }
 
 func usbSharedDevicesToProto(devices []usbip.ControlDeviceInfo) []*USBSharedDevice {

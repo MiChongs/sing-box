@@ -1,13 +1,18 @@
 package option
 
-import "github.com/sagernet/sing/common/json/badoption"
+import (
+	"reflect"
+
+	"github.com/sagernet/sing-box/schema"
+	"github.com/sagernet/sing/common/json/badoption"
+)
 
 type RouteOptions struct {
-	GeoIP                      *GeoIPOptions                     `json:"geoip,omitempty"`
-	Geosite                    *GeositeOptions                   `json:"geosite,omitempty"`
+	GeoIP                      *GeoIPOptions                     `json:"geoip,omitempty" schema:"omit"`
+	Geosite                    *GeositeOptions                   `json:"geosite,omitempty" schema:"omit"`
 	Rules                      []Rule                            `json:"rules,omitempty"`
 	RuleSet                    []RuleSet                         `json:"rule_set,omitempty"`
-	Final                      string                            `json:"final,omitempty"`
+	Final                      string                            `json:"final,omitempty" reference:"outbound"`
 	FindProcess                bool                              `json:"find_process,omitempty"`
 	FindNeighbor               bool                              `json:"find_neighbor,omitempty"`
 	DHCPLeaseFiles             badoption.Listable[string]        `json:"dhcp_lease_files,omitempty"`
@@ -24,14 +29,26 @@ type RouteOptions struct {
 	DefaultDomainMatchStrategy DomainMatchStrategy               `json:"default_domain_match_strategy,omitempty"`
 }
 
+func (o RouteOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	return builder.Define("RouteOptions", func() (*schema.Node, error) {
+		node := schema.StrictObject()
+		err := builder.FlattenStruct(node, reflect.TypeFor[RouteOptions]())
+		if err != nil {
+			return nil, err
+		}
+		node.Properties.Put("default_domain_match_strategy", schema.StringEnum("", "as_is", "prefer_fqdn", "prefer_sniffhost"))
+		return node, nil
+	})
+}
+
 type GeoIPOptions struct {
 	Path           string `json:"path,omitempty"`
 	DownloadURL    string `json:"download_url,omitempty"`
-	DownloadDetour string `json:"download_detour,omitempty"`
+	DownloadDetour string `json:"download_detour,omitempty" reference:"outbound"`
 }
 
 type GeositeOptions struct {
 	Path           string `json:"path,omitempty"`
 	DownloadURL    string `json:"download_url,omitempty"`
-	DownloadDetour string `json:"download_detour,omitempty"`
+	DownloadDetour string `json:"download_detour,omitempty" reference:"outbound"`
 }

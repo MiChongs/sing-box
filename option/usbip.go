@@ -1,6 +1,9 @@
 package option
 
 import (
+	"reflect"
+
+	"github.com/sagernet/sing-box/schema"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badjson"
@@ -13,7 +16,7 @@ const (
 
 type _USBIPServerServiceOptions struct {
 	ListenOptions
-	Provider string `json:"provider,omitempty"`
+	Provider string `json:"provider,omitempty" enum:"default,dynamic"`
 	Options  any    `json:"-"`
 }
 
@@ -21,9 +24,9 @@ type USBIPServerServiceOptions _USBIPServerServiceOptions
 
 func (o USBIPServerServiceOptions) MarshalJSON() ([]byte, error) {
 	if o.Options == nil {
-		return json.Marshal((_USBIPServerServiceOptions)(o))
+		return json.Marshal(_USBIPServerServiceOptions(o))
 	}
-	return badjson.MarshallObjects((_USBIPServerServiceOptions)(o), o.Options)
+	return badjson.MarshallObjects(_USBIPServerServiceOptions(o), o.Options)
 }
 
 func (o *USBIPServerServiceOptions) UnmarshalJSON(content []byte) error {
@@ -47,6 +50,15 @@ func (o *USBIPServerServiceOptions) UnmarshalJSON(content []byte) error {
 	}
 	o.Options = options
 	return nil
+}
+
+func (o USBIPServerServiceOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	return schema.DiscriminatedUnion(builder, "provider", false, []schema.UnionVariant{
+		{Value: USBIPProviderDefault, StructType: reflect.TypeFor[USBIPDefaultProviderOptions](), TypeOptional: true},
+		{Value: USBIPProviderDynamic, StructType: reflect.TypeFor[USBIPDynamicProviderOptions]()},
+	}, func(variant *schema.Node) error {
+		return builder.FlattenStruct(variant, reflect.TypeFor[ListenOptions]())
+	})
 }
 
 type USBIPClientServiceOptions struct {

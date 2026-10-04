@@ -72,7 +72,7 @@ func TestBuildIoctlRecvEmbedsAddressPointer(t *testing.T) {
 func TestBuildIoctlSendEmbedsAddressPointerAndSize(t *testing.T) {
 	t.Parallel()
 	addr := &Address{}
-	buf := buildIoctlSend(addr)
+	buf := buildIoctlSend(addr, addressSize)
 	require.Equal(t, uint64(uintptr(unsafe.Pointer(addr))),
 		binary.LittleEndian.Uint64(buf[0:8]))
 	require.Equal(t, uint64(unsafe.Sizeof(Address{})),
@@ -101,9 +101,7 @@ func TestValidateOpenArgsFlags(t *testing.T) {
 	require.NoError(t, validateOpenArgs(LayerNetwork, 0, 0))
 	require.NoError(t, validateOpenArgs(LayerNetwork, 0, FlagSendOnly))
 	require.NoError(t, validateOpenArgs(LayerNetwork, 0, FlagSniff))
-	// Sniff and send-only describe contradictory handle roles.
 	require.Error(t, validateOpenArgs(LayerNetwork, 0, FlagSniff|FlagSendOnly))
-	// Unknown flag bits must be rejected to surface caller mistakes early.
 	require.Error(t, validateOpenArgs(LayerNetwork, 0, Flag(0x10)))
 	require.Error(t, validateOpenArgs(LayerNetwork, 0, FlagSendOnly|Flag(0x10)))
 }

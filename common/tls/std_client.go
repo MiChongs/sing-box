@@ -7,28 +7,30 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
-	"encoding/hex"
 	"net"
-	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	tf "github.com/sagernet/sing-box/common/tlsfragment"
+	"github.com/sagernet/sing-box/common/tlsfragment"
 	"github.com/sagernet/sing-box/common/tlsspoof"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/common/ntp"
+	"github.com/sagernet/sing/service/filemanager"
 )
 
 type STDClientConfig struct {
 	ctx                   context.Context
 	config                *tls.Config
 	serverName            string
+	certificateServerName string
 	disableSNI            bool
 	verifyServerName      bool
+	certificatePinSHA256  []byte
 	handshakeTimeout      time.Duration
 	fragment              bool
 	fragmentFallbackDelay time.Duration
@@ -43,16 +45,31 @@ func (c *STDClientConfig) ServerName() string {
 
 func (c *STDClientConfig) SetServerName(serverName string) {
 	c.serverName = serverName
-	if c.disableSNI {
-		c.config.ServerName = ""
-		if c.verifyServerName {
-			c.config.VerifyConnection = verifyConnection(c.config.RootCAs, c.config.Time, serverName)
-		} else {
-			c.config.VerifyConnection = nil
+	if len(c.certificatePinSHA256) > 0 {
+		c.config.ServerName = serverName
+		if c.disableSNI {
+			c.config.ServerName = ""
+		}
+		c.config.VerifyConnection = func(state tls.ConnectionState) error {
+			return VerifyCertificatePinSHA256(c.certificatePinSHA256, c.verificationServerName(), c.config.Time, state.PeerCertificates)
 		}
 		return
 	}
-	c.config.ServerName = serverName
+	if c.disableSNI {
+		c.config.ServerName = ""
+	} else {
+		c.config.ServerName = serverName
+	}
+	if c.verifyServerName {
+		c.config.VerifyConnection = verifyConnection(c.config.RootCAs, c.config.Time, c.verificationServerName())
+	}
+}
+
+func (c *STDClientConfig) verificationServerName() string {
+	if c.certificateServerName != "" {
+		return c.certificateServerName
+	}
+	return c.serverName
 }
 
 func (c *STDClientConfig) NextProtos() []string {
@@ -91,8 +108,10 @@ func (c *STDClientConfig) Clone() Config {
 		ctx:                   c.ctx,
 		config:                c.config.Clone(),
 		serverName:            c.serverName,
+		certificateServerName: c.certificateServerName,
 		disableSNI:            c.disableSNI,
 		verifyServerName:      c.verifyServerName,
+		certificatePinSHA256:  append([]byte(nil), c.certificatePinSHA256...),
 		handshakeTimeout:      c.handshakeTimeout,
 		fragment:              c.fragment,
 		fragmentFallbackDelay: c.fragmentFallbackDelay,
@@ -117,13 +136,21 @@ func NewSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 }
 
 func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddress string, options option.OutboundTLSOptions, allowEmptyServerName bool) (Config, error) {
+	certificatePin, err := parseCertificatePinSHA256(options)
+	if err != nil {
+		return nil, err
+	}
 	var serverName string
 	if options.ServerName != "" {
 		serverName = options.ServerName
 	} else if serverAddress != "" {
 		serverName = serverAddress
 	}
-	if serverName == "" && !options.Insecure && !allowEmptyServerName {
+	verificationServerName := options.CertificateServerName
+	if verificationServerName == "" {
+		verificationServerName = serverName
+	}
+	if verificationServerName == "" && !options.Insecure && !allowEmptyServerName {
 		return nil, errMissingServerName
 	}
 
@@ -132,57 +159,20 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 	tlsConfig.RootCAs = adapter.RootPoolFromContext(ctx)
 	if options.Insecure {
 		tlsConfig.InsecureSkipVerify = options.Insecure
-	} else if len(options.CertificatePinSHA256) > 0 {
-		if len(options.CertificatePublicKeySHA256) > 0 || len(options.Certificate) > 0 || options.CertificatePath != "" {
-			return nil, E.New("certificate_pin_sha256 is conflict with certificate_public_key_sha256 or certificate or certificate_path")
-		}
-		fingerprint := strings.TrimSpace(strings.ReplaceAll(options.CertificatePinSHA256, ":", ""))
-		fpByte, err := hex.DecodeString(fingerprint)
-		if err != nil {
-			return nil, E.Cause(err, "decode fingerprint string")
-		}
-		if len(fpByte) != 32 {
-			return nil, E.New("fingerprint string length error, need sha256 fingerprint")
-		}
+	} else if options.DisableSNI || options.CertificateServerName != "" {
 		tlsConfig.InsecureSkipVerify = true
-		tlsConfig.VerifyConnection = func(state tls.ConnectionState) error {
-			certs := state.PeerCertificates
-			for i, cert := range certs {
-				hash := sha256.Sum256(cert.Raw)
-				if bytes.Equal(fpByte, hash[:]) {
-					if i > 0 {
-						opts := x509.VerifyOptions{
-							Roots:         x509.NewCertPool(),
-							Intermediates: x509.NewCertPool(),
-							DNSName:       serverName,
-						}
-						if tlsConfig.Time != nil {
-							opts.CurrentTime = tlsConfig.Time()
-						}
-						opts.Roots.AddCert(certs[i])
-						for _, cert := range certs[1 : i+1] {
-							opts.Intermediates.AddCert(cert)
-						}
-						_, err := certs[0].Verify(opts)
-						return err
-					}
-					return nil
-				}
-			}
-			return E.New("certificate fingerprint mismatch")
-		}
-	} else if len(options.CertificatePublicKeySHA256) > 0 {
+	}
+	if len(certificatePin) > 0 {
+		tlsConfig.InsecureSkipVerify = true
+	} else if len(options.CertificateSHA256) > 0 || len(options.CertificatePublicKeySHA256) > 0 {
 		if len(options.Certificate) > 0 || options.CertificatePath != "" {
-			return nil, E.New("certificate_public_key_sha256 is conflict with certificate or certificate_path")
+			return nil, E.New("certificate_sha256 or certificate_public_key_sha256 is conflict with certificate or certificate_path")
 		}
 		tlsConfig.InsecureSkipVerify = true
 		tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-			return VerifyPublicKeySHA256(options.CertificatePublicKeySHA256, rawCerts)
+			return VerifyPinnedCertificate(options.CertificateSHA256, options.CertificatePublicKeySHA256, rawCerts)
 		}
-	} else if options.DisableSNI {
-		tlsConfig.InsecureSkipVerify = true
 	}
-
 	if len(options.ALPN) > 0 {
 		tlsConfig.NextProtos = options.ALPN
 	}
@@ -219,7 +209,7 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 	if len(options.Certificate) > 0 {
 		certificate = []byte(strings.Join(options.Certificate, "\n"))
 	} else if options.CertificatePath != "" {
-		content, err := os.ReadFile(options.CertificatePath)
+		content, err := filemanager.ReadFile(ctx, options.CertificatePath)
 		if err != nil {
 			return nil, E.Cause(err, "read certificate")
 		}
@@ -228,7 +218,7 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 	if len(certificate) > 0 {
 		certPool := x509.NewCertPool()
 		if !certPool.AppendCertsFromPEM(certificate) {
-			return nil, E.New("failed to parse certificate:\n\n", certificate)
+			return nil, E.New("failed to parse certificate:\n\n", string(certificate))
 		}
 		tlsConfig.RootCAs = certPool
 	}
@@ -236,7 +226,7 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 	if len(options.ClientCertificate) > 0 {
 		clientCertificate = []byte(strings.Join(options.ClientCertificate, "\n"))
 	} else if options.ClientCertificatePath != "" {
-		content, err := os.ReadFile(options.ClientCertificatePath)
+		content, err := filemanager.ReadFile(ctx, options.ClientCertificatePath)
 		if err != nil {
 			return nil, E.Cause(err, "read client certificate")
 		}
@@ -246,7 +236,7 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 	if len(options.ClientKey) > 0 {
 		clientKey = []byte(strings.Join(options.ClientKey, "\n"))
 	} else if options.ClientKeyPath != "" {
-		content, err := os.ReadFile(options.ClientKeyPath)
+		content, err := filemanager.ReadFile(ctx, options.ClientKeyPath)
 		if err != nil {
 			return nil, E.Cause(err, "read client key")
 		}
@@ -275,8 +265,10 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 		ctx:                   ctx,
 		config:                &tlsConfig,
 		serverName:            serverName,
+		certificateServerName: options.CertificateServerName,
 		disableSNI:            options.DisableSNI,
-		verifyServerName:      options.DisableSNI && !options.Insecure,
+		verifyServerName:      (options.DisableSNI || options.CertificateServerName != "") && !options.Insecure && len(certificatePin) == 0 && len(options.CertificateSHA256) == 0 && len(options.CertificatePublicKeySHA256) == 0,
+		certificatePinSHA256:  certificatePin,
 		handshakeTimeout:      handshakeTimeout,
 		fragment:              options.Fragment,
 		fragmentFallbackDelay: time.Duration(options.FragmentFallbackDelay),
@@ -315,21 +307,26 @@ func verifyConnection(rootCAs *x509.CertPool, timeFunc func() time.Time, serverN
 	}
 }
 
-func VerifyPublicKeySHA256(knownHashValues [][]byte, rawCerts [][]byte) error {
+func VerifyPinnedCertificate(certificateHashes [][]byte, publicKeyHashes [][]byte, rawCerts [][]byte) error {
+	if len(rawCerts) == 0 {
+		return E.New("missing peer certificate")
+	}
+	certificateHash := sha256.Sum256(rawCerts[0])
+	if slices.ContainsFunc(certificateHashes, func(value []byte) bool { return bytes.Equal(value, certificateHash[:]) }) {
+		return nil
+	}
 	leafCertificate, err := x509.ParseCertificate(rawCerts[0])
 	if err != nil {
-		return E.Cause(err, "failed to parse leaf certificate")
+		return E.Cause(err, "parse leaf certificate")
 	}
-
-	pubKeyBytes, err := x509.MarshalPKIXPublicKey(leafCertificate.PublicKey)
+	publicKeyBytes, err := x509.MarshalPKIXPublicKey(leafCertificate.PublicKey)
 	if err != nil {
-		return E.Cause(err, "failed to marshal public key")
+		return E.Cause(err, "marshal public key")
 	}
-	hashValue := sha256.Sum256(pubKeyBytes)
-	for _, value := range knownHashValues {
-		if bytes.Equal(value, hashValue[:]) {
-			return nil
-		}
+	publicKeyHash := sha256.Sum256(publicKeyBytes)
+	if slices.ContainsFunc(publicKeyHashes, func(value []byte) bool { return bytes.Equal(value, publicKeyHash[:]) }) {
+		return nil
 	}
-	return E.New("unrecognized remote public key: ", base64.StdEncoding.EncodeToString(hashValue[:]))
+	return E.New("unrecognized peer certificate: sha256 ", base64.StdEncoding.EncodeToString(certificateHash[:]),
+		", public key sha256 ", base64.StdEncoding.EncodeToString(publicKeyHash[:]))
 }

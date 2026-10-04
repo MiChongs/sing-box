@@ -8,7 +8,7 @@ import (
 )
 
 // TestGroupHiddenIcon_Defaults covers the contract guaranteed by the
-// adapter.OutboundGroup interface: zero-valued groups must report
+// adapter.OutboundGroupHint interface: zero-valued groups must report
 // hidden=false / icon="" so dashboards and Clash-API consumers can
 // rely on the fields always being safe to read.
 //
@@ -19,7 +19,7 @@ import (
 func TestGroupHiddenIcon_Defaults(t *testing.T) {
 	cases := []struct {
 		name string
-		g    adapter.OutboundGroup
+		g    adapter.OutboundGroupHint
 	}{
 		{"selector", &Selector{}},
 		{"urltest", &URLTest{}},
@@ -42,30 +42,30 @@ func TestGroupHiddenIcon_Defaults(t *testing.T) {
 // checks the getters return the assigned values. Together with the
 // constructor wiring (NewSelector / NewURLTest / etc reading
 // options.Hidden / options.Icon) this proves the value travels from
-// option.GroupCommonOption through to adapter.OutboundGroup callers
+// option.GroupCommonOption through to adapter.OutboundGroupHint callers
 // without dropping anywhere along the way.
 func TestGroupHiddenIcon_FieldPropagation(t *testing.T) {
 	const wantIcon = "https://example.com/icon.svg"
 	cases := []struct {
 		name  string
-		setup func() adapter.OutboundGroup
+		setup func() adapter.OutboundGroupHint
 	}{
-		{"selector", func() adapter.OutboundGroup {
+		{"selector", func() adapter.OutboundGroupHint {
 			s := &Selector{}
 			s.hidden, s.icon = true, wantIcon
 			return s
 		}},
-		{"urltest", func() adapter.OutboundGroup {
+		{"urltest", func() adapter.OutboundGroupHint {
 			s := &URLTest{}
 			s.hidden, s.icon = true, wantIcon
 			return s
 		}},
-		{"loadbalance", func() adapter.OutboundGroup {
+		{"loadbalance", func() adapter.OutboundGroupHint {
 			s := &LoadBalance{}
 			s.hidden, s.icon = true, wantIcon
 			return s
 		}},
-		{"smart", func() adapter.OutboundGroup {
+		{"smart", func() adapter.OutboundGroupHint {
 			s := &Smart{}
 			s.hidden, s.icon = true, wantIcon
 			return s

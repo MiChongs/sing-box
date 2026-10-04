@@ -20,6 +20,11 @@ import (
 
 var _ conn.Bind = (*ClientBind)(nil)
 
+const (
+	clientBindPausePollInterval = 100 * time.Millisecond
+	clientBindRetryInterval     = time.Second
+)
+
 type ClientBind struct {
 	ctx                 context.Context
 	logger              logger.Logger
@@ -27,6 +32,7 @@ type ClientBind struct {
 	bindCtx             context.Context
 	bindDone            context.CancelFunc
 	dialer              N.Dialer
+	reservedAccess      sync.RWMutex
 	reservedForEndpoint map[netip.AddrPort][3]uint8
 	connAccess          sync.Mutex
 	conn                *wireConn
@@ -123,7 +129,7 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 		}
 		c.logger.Error(E.Cause(err, "connect to server"))
 		err = nil
-		if !c.waitActive() || !c.waitRetry() {
+		if !c.waitAfterFailure() {
 			return
 		}
 		return
@@ -173,7 +179,7 @@ func (c *ClientBind) SetMark(mark uint32) error {
 func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 	udpConn, err := c.connect()
 	if err != nil {
-		if !c.waitActive() || !c.waitRetry() {
+		if !c.waitAfterFailure() {
 			return err
 		}
 		return err
@@ -184,7 +190,9 @@ func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
 			buf = buf[offset:]
 		}
 		if len(buf) > 3 {
+			c.reservedAccess.RLock()
 			reserved, loaded := c.reservedForEndpoint[destination]
+			c.reservedAccess.RUnlock()
 			if !loaded {
 				reserved = c.reserved
 			}
@@ -212,20 +220,29 @@ func (c *ClientBind) BatchSize() int {
 }
 
 func (c *ClientBind) SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte) {
+	c.reservedAccess.Lock()
 	c.reservedForEndpoint[destination] = reserved
+	c.reservedAccess.Unlock()
 }
 
 func (c *ClientBind) waitActive() bool {
 	for c.pauseManager != nil && c.pauseManager.IsPaused() {
-		if !c.waitRetry() {
+		if !c.waitDelay(clientBindPausePollInterval) {
 			return false
 		}
 	}
 	return !isDone(c.done)
 }
 
-func (c *ClientBind) waitRetry() bool {
-	timer := time.NewTimer(time.Second)
+func (c *ClientBind) waitAfterFailure() bool {
+	if c.pauseManager != nil && c.pauseManager.IsPaused() {
+		return c.waitActive()
+	}
+	return c.waitDelay(clientBindRetryInterval)
+}
+
+func (c *ClientBind) waitDelay(delay time.Duration) bool {
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-c.done:
@@ -285,16 +302,16 @@ func (e remoteEndpoint) SrcToString() string {
 }
 
 func (e remoteEndpoint) DstToString() string {
-	return (netip.AddrPort)(e).String()
+	return netip.AddrPort(e).String()
 }
 
 func (e remoteEndpoint) DstToBytes() []byte {
-	b, _ := (netip.AddrPort)(e).MarshalBinary()
+	b, _ := netip.AddrPort(e).MarshalBinary()
 	return b
 }
 
 func (e remoteEndpoint) DstIP() netip.Addr {
-	return (netip.AddrPort)(e).Addr()
+	return netip.AddrPort(e).Addr()
 }
 
 func (e remoteEndpoint) SrcIP() netip.Addr {

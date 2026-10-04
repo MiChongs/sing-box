@@ -14,40 +14,53 @@ type Group struct {
 }
 
 type groupConnItem struct {
-	conn       io.Closer
-	isExternal bool
-	isProvider bool
+	conn               io.Closer
+	isExternal         bool
+	isResourceDownload bool
 }
 
 func NewGroup() *Group {
 	return &Group{}
 }
 
-func (g *Group) NewConn(conn net.Conn, isExternal, isProvider bool) net.Conn {
+func (g *Group) Add(closer io.Closer, isExternal bool) (remove func()) {
 	g.access.Lock()
 	defer g.access.Unlock()
-	item := g.connections.PushBack(&groupConnItem{conn, isExternal, isProvider})
+	element := g.connections.PushBack(&groupConnItem{conn: closer, isExternal: isExternal})
+	return func() {
+		g.access.Lock()
+		defer g.access.Unlock()
+		g.connections.Remove(element)
+	}
+}
+
+func (g *Group) NewConn(conn net.Conn, isExternal, isResourceDownload bool) net.Conn {
+	g.access.Lock()
+	defer g.access.Unlock()
+	item := g.connections.PushBack(&groupConnItem{conn, isExternal, isResourceDownload})
 	return &Conn{Conn: conn, group: g, element: item}
 }
 
-func (g *Group) NewPacketConn(conn net.PacketConn, isExternal, isProvider bool) net.PacketConn {
+func (g *Group) NewPacketConn(conn net.PacketConn, isExternal, isResourceDownload bool) net.PacketConn {
 	g.access.Lock()
 	defer g.access.Unlock()
-	item := g.connections.PushBack(&groupConnItem{conn, isExternal, isProvider})
-	return &PacketConn{PacketConn: conn, group: g, element: item}
+	item := g.connections.PushBack(&groupConnItem{conn, isExternal, isResourceDownload})
+	return newPacketConn(g, conn, item)
 }
 
 func (g *Group) Interrupt(interruptExternalConnections bool) {
 	g.access.Lock()
-	defer g.access.Unlock()
-	var toDelete []*list.Element[*groupConnItem]
-	for element := g.connections.Front(); element != nil; element = element.Next() {
-		if !element.Value.isProvider && (!element.Value.isExternal || interruptExternalConnections) {
-			element.Value.conn.Close()
-			toDelete = append(toDelete, element)
+	var closers []io.Closer
+	for element := g.connections.Front(); element != nil; {
+		nextElement := element.Next()
+		if !element.Value.isResourceDownload && (!element.Value.isExternal || interruptExternalConnections) {
+			closers = append(closers, element.Value.conn)
+			g.connections.Remove(element)
 		}
+		element = nextElement
 	}
-	for _, element := range toDelete {
-		g.connections.Remove(element)
+	g.access.Unlock()
+	for _, closer := range closers {
+		closer.Close()
 	}
 }

@@ -17,6 +17,8 @@ icon: material/new-box
   "idle_session_check_interval": "30s",
   "idle_session_timeout": "30s",
   "min_idle_session": 5,
+  "client_metadata": "",
+  "disable_reuse": false,
   "tls": {},
 
   ... // 拨号字段
@@ -55,6 +57,18 @@ AnyTLS 密码。
 
 在检查中，至少前 `n` 个空闲会话保持打开状态。默认值：`n`=0
 
+#### client_metadata
+
+!!! question "自 sing-box 1.13.16 起"
+
+参阅 [AnyTLS 客户端元数据](/zh/manual/misc/anytls-client-metadata/)。
+
+未配置时，为兼容性发送 `sing-anytls/0.0.13 sing-box/<version>`。这是沿用的旧客户端标识，不代表重写后库的版本。显式配置为空字符串时发送空的 `client=` 字段，不包含客户端身份信息。
+
+#### disable_reuse
+
+禁用 TLS 连接复用。默认值：false。
+
 #### tls
 
 ==必填==
@@ -64,3 +78,5 @@ TLS 配置, 参阅 [TLS](/zh/configuration/shared/tls/#出站)。
 ### 拨号字段
 
 参阅 [拨号字段](/zh/configuration/shared/dial/)。
+
+支持 `tcp_fast_open`。

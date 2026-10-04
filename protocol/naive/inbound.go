@@ -9,6 +9,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
+	"github.com/sagernet/sing-box/common/badhttp"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/uot"
@@ -23,10 +24,9 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	aTLS "github.com/sagernet/sing/common/tls"
-	sHttp "github.com/sagernet/sing/protocol/http"
 
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"golang.org/x/net/http2/h2c" //nolint:staticcheck
 )
 
 var (
@@ -59,6 +59,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		ctx:     ctx,
 		router:  uot.NewRouter(router, logger),
 		logger:  logger,
+		options: options,
 		listener: listener.New(listener.Options{
 			Context: ctx,
 			Logger:  logger,
@@ -102,6 +103,7 @@ func (n *Inbound) Start(stage adapter.StartStage) error {
 			return err
 		}
 		n.httpServer = &http.Server{
+			//nolint:staticcheck
 			Handler: h2c.NewHandler(n, &http2.Server{}),
 			BaseContext: func(listener net.Listener) context.Context {
 				return n.ctx
@@ -158,7 +160,7 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 		n.badRequest(ctx, request, E.New("missing naive padding"))
 		return
 	}
-	userName, password, authOk := sHttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
+	userName, password, authOk := badhttp.ParseBasicAuth(request.Header.Get("Proxy-Authorization"))
 	if authOk {
 		authOk = n.authenticator.Verify(userName, password)
 	}
@@ -178,7 +180,7 @@ func (n *Inbound) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
 			hostPort = request.Host
 		}
 	}
-	source := sHttp.SourceAddress(request)
+	source := badhttp.SourceAddress(request)
 	destination := M.ParseSocksaddr(hostPort).Unwrap()
 
 	if hijacker, isHijacker := writer.(http.Hijacker); isHijacker {
@@ -221,7 +223,7 @@ func (n *Inbound) newConnection(ctx context.Context, waitForClose bool, conn net
 	} else {
 		done := make(chan struct{})
 		wrapper := v2rayhttp.NewHTTP2Wrapper(conn)
-		n.router.RouteConnectionEx(ctx, conn, metadata, N.OnceClose(func(it error) {
+		n.router.RouteConnectionEx(ctx, wrapper, metadata, N.OnceClose(func(it error) {
 			close(done)
 		}))
 		<-done

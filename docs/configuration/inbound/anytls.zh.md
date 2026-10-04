@@ -83,3 +83,6 @@ TLS 配置, 参阅 [TLS](/zh/configuration/shared/tls/#入站)。
 为 ALPN 指定回退服务器配置。
 
 如果不为空，ALPN 不在此列表中的 TLS 回退请求将被拒绝。
+
+需要启用 TLS。未协商 ALPN 时使用 `fallback`；未配置默认回退时拒绝连接。
+原始请求数据会转发给选定的回退服务器。

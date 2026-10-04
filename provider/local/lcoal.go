@@ -2,7 +2,7 @@ package provider
 
 import (
 	"context"
-	"os"
+	"io"
 	"path/filepath"
 	"sync"
 	"time"
@@ -45,6 +45,7 @@ type ProviderLocal struct {
 
 	overrideDialer *option.OverrideDialerOptions
 	overrideTLS    *option.OverrideTLSOptions
+	overrideAnyTLS *option.OverrideAnyTLSOptions
 }
 
 func NewProviderInline(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, options option.ProviderInlineOptions) (adapter.Provider, error) {
@@ -84,6 +85,7 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 
 		overrideDialer: options.OverrideDialer,
 		overrideTLS:    options.OverrideTLS,
+		overrideAnyTLS: options.OverrideAnyTLS,
 	}
 	filePath := filemanager.BasePath(ctx, options.Path)
 	provider.path, _ = filepath.Abs(filePath)
@@ -130,14 +132,25 @@ func (s *ProviderLocal) UpdatedAt() time.Time {
 func (s *ProviderLocal) reloadFile(path string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if fileInfo, err := os.Stat(path); err == nil {
-		s.lastUpdated = fileInfo.ModTime()
-	}
-	content, err := os.ReadFile(path)
+	file, err := filemanager.Open(s.ctx, path)
 	if err != nil {
 		return err
 	}
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, string(content), s.overrideDialer, s.overrideTLS, s.Tag())
+	content, err := io.ReadAll(file)
+	if err != nil {
+		file.Close()
+		return err
+	}
+	fileInfo, err := file.Stat()
+	closeErr := file.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	s.lastUpdated = fileInfo.ModTime()
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(s.ctx, string(content), s.overrideDialer, s.overrideTLS, s.overrideAnyTLS, s.Tag())
 	if err != nil {
 		return err
 	}

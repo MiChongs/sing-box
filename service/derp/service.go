@@ -1,4 +1,4 @@
-//go:build with_gvisor
+//go:build with_tailscale
 
 package derp
 
@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -48,8 +49,9 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/go-chi/render"
+	"go4.org/mem"
 	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
+	"golang.org/x/net/http2/h2c" //nolint:staticcheck
 )
 
 func Register(registry *boxService.Registry) {
@@ -67,6 +69,8 @@ type Service struct {
 	configPath           string
 	verifyClientEndpoint []string
 	verifyClientURL      []*option.DERPVerifyClientURLOptions
+	verifyClientInbound  []string
+	verifyClientKeys     []key.NodePublic
 	home                 string
 	meshKey              string
 	meshKeyPath          string
@@ -94,6 +98,15 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		if err != nil {
 			return nil, E.Cause(err, "invalid mesh_psk")
 		}
+	}
+
+	verifyClientKeys := make([]key.NodePublic, 0, len(options.VerifyClientKey))
+	for index, encodedKey := range options.VerifyClientKey {
+		publicKey, err := boxScale.DecodeTailcatKey(encodedKey)
+		if err != nil {
+			return nil, E.Cause(err, "parse verify_client_key[", index, "]")
+		}
+		verifyClientKeys = append(verifyClientKeys, key.NodePublicFromRaw32(mem.B(publicKey[:])))
 	}
 
 	var stunListener *listener.Listener
@@ -127,6 +140,8 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 		configPath:           configPath,
 		verifyClientEndpoint: options.VerifyClientEndpoint,
 		verifyClientURL:      options.VerifyClientURL,
+		verifyClientInbound:  options.VerifyClientInbound,
+		verifyClientKeys:     verifyClientKeys,
 		home:                 options.Home,
 		meshKey:              options.MeshPSK,
 		meshKeyPath:          options.MeshPSKFile,
@@ -137,7 +152,7 @@ func NewService(ctx context.Context, logger log.ContextLogger, tag string, optio
 func (d *Service) Start(stage adapter.StartStage) error {
 	switch stage {
 	case adapter.StartStateStart:
-		config, err := readDERPConfig(filemanager.BasePath(d.ctx, d.configPath))
+		config, err := readDERPConfig(d.ctx, filemanager.BasePath(d.ctx, d.configPath))
 		if err != nil {
 			return err
 		}
@@ -162,11 +177,35 @@ func (d *Service) Start(stage adapter.StartStage) error {
 			server.SetVerifyClientURL(urls)
 		}
 
+		verifyClientKeys := slices.Clone(d.verifyClientKeys)
+		if len(d.verifyClientInbound) > 0 {
+			inboundManager := service.FromContext[adapter.InboundManager](d.ctx)
+			for _, inboundTag := range d.verifyClientInbound {
+				inbound, loaded := inboundManager.Get(inboundTag)
+				if !loaded {
+					return E.New("verify_client_inbound: inbound not found: ", inboundTag)
+				}
+				tailcatInbound, isTailcat := inbound.(*boxScale.TailcatInbound)
+				if !isTailcat {
+					return E.New("verify_client_inbound: inbound is not Tailcat: ", inboundTag)
+				}
+				userKeys := tailcatInbound.UserPublicKeys()
+				if len(userKeys) == 0 {
+					return E.New("verify_client_inbound: inbound has no users: ", inboundTag)
+				}
+				verifyClientKeys = append(verifyClientKeys, tailcatInbound.PublicKey())
+				verifyClientKeys = append(verifyClientKeys, userKeys...)
+			}
+		}
+		if len(verifyClientKeys) > 0 {
+			server.SetVerifyClientKeys(verifyClientKeys)
+		}
+
 		if d.meshKey != "" {
 			server.SetMeshKey(d.meshKey)
 		} else if d.meshKeyPath != "" {
 			var meshKeyContent []byte
-			meshKeyContent, err = os.ReadFile(d.meshKeyPath)
+			meshKeyContent, err = filemanager.ReadFile(d.ctx, d.meshKeyPath)
 			if err != nil {
 				return err
 			}
@@ -217,6 +256,7 @@ func (d *Service) Start(stage adapter.StartStage) error {
 		}
 		tcpListener = aTLS.NewListener(tcpListener, d.tlsConfig)
 		httpServer := &http.Server{
+			//nolint:staticcheck
 			Handler: h2c.NewHandler(derpMux, &http2.Server{}),
 		}
 		go httpServer.Serve(tcpListener)
@@ -335,11 +375,11 @@ func (d *Service) startMeshWithHost(derpServer *derpserver.Server, server *optio
 }
 
 func (d *Service) Close() error {
-	err := common.Close(
+	return common.Close(
 		common.PtrOrNil(d.listener),
+		common.PtrOrNil(d.stunListener),
 		d.tlsConfig,
 	)
-	return err
 }
 
 var homePage = `
@@ -447,11 +487,11 @@ type derpConfig struct {
 	PrivateKey key.NodePrivate
 }
 
-func readDERPConfig(path string) (*derpConfig, error) {
-	content, err := os.ReadFile(path)
+func readDERPConfig(ctx context.Context, path string) (*derpConfig, error) {
+	content, err := filemanager.ReadFile(ctx, path)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return writeNewDERPConfig(path)
+			return writeNewDERPConfig(ctx, path)
 		}
 		return nil, err
 	}
@@ -463,9 +503,9 @@ func readDERPConfig(path string) (*derpConfig, error) {
 	return &config, nil
 }
 
-func writeNewDERPConfig(path string) (*derpConfig, error) {
+func writeNewDERPConfig(ctx context.Context, path string) (*derpConfig, error) {
 	newKey := key.NewNode()
-	err := os.MkdirAll(filepath.Dir(path), 0o777)
+	err := filemanager.MkdirAll(ctx, filepath.Dir(path), 0o777)
 	if err != nil {
 		return nil, err
 	}
@@ -476,7 +516,7 @@ func writeNewDERPConfig(path string) (*derpConfig, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = os.WriteFile(path, content, 0o644)
+	err = filemanager.WriteFile(ctx, path, content, 0o644)
 	if err != nil {
 		return nil, err
 	}
@@ -510,4 +550,10 @@ func (d *Service) loopSTUNPacket(packetConn *net.UDPConn) {
 		}
 		packetConn.WriteMsgUDPAddrPort(stun.Response(txid, addrPort), oob[:oobN], addrPort)
 	}
+}
+
+func (d *Service) References() []string {
+	return common.FilterNotDefault(common.Map(d.meshWith, func(it *option.DERPMeshOptions) string {
+		return it.Detour
+	}))
 }

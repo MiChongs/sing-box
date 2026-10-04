@@ -1,4 +1,4 @@
-package snellprotocol
+package snell
 
 import (
 	"context"
@@ -9,404 +9,668 @@ import (
 	"sync/atomic"
 	"time"
 
-	snell "github.com/reF1nd/sing-snell"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/expiringmap"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	obfs "github.com/sagernet/sing-box/transport/simple-obfs"
+	snellprotocol "github.com/sagernet/sing-snell"
+	"github.com/sagernet/sing-snell/legacy"
+	"github.com/sagernet/sing-snell/snellv4"
+	"github.com/sagernet/sing-snell/snellv6"
 	"github.com/sagernet/sing/common/buf"
+	"github.com/sagernet/sing/common/bufio"
 	E "github.com/sagernet/sing/common/exceptions"
+	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/common/pipe"
 )
 
 func RegisterOutbound(registry *outbound.Registry) {
 	outbound.Register[option.SnellOutboundOptions](registry, C.TypeSnell, NewOutbound)
 }
 
-// quicDestCacheTTL is how long a destination is remembered as a QUIC proxy
-// target. After a proxy-side connection drop (e.g. Clash API kill), the QUIC
-// client stack may send 1-RTT short-header packets (0x40-0x7f) before learning
-// of the disconnect. Those cannot be sniffed as QUIC ClientHello, so sniffQUIC
-// would be false and the flow would fall through to UoT. The cache restores the
-// QUIC proxy path without the false-positive risk of widening the byte check
-// unconditionally.
-//
-// Aligned with the default sing-box UDP NAT timeout (5 minutes): beyond that
-// window the NAT entry is gone and the cache entry is no longer useful.
-const quicDestCacheTTL = 5 * time.Minute
-
 type Outbound struct {
 	outbound.Adapter
-	logger     log.ContextLogger
-	dialer     N.Dialer
-	client     *snell.Client
-	pool       *snell.Pool
-	serverAddr M.Socksaddr
-	obfsMode   string
-	obfsHost   string
-	serverPort string
-	psk        []byte
-	version    int
-	// quicDestCache records 4-tuples that recently used the QUIC proxy path.
-	// Keyed by quicDestCacheKey{source, destination}. Values are time.Time.
-	// Using the full 4-tuple avoids misrouting when multiple source IPs reach
-	// the same destination via different protocols.
-	quicDestCache sync.Map
+	reuse         bool
+	logger        logger.ContextLogger
+	dialer        N.Dialer
+	tcpDialer     N.Dialer
+	client        snellClient
+	legacy        *legacy.Client
+	serverAddr    M.Socksaddr
+	psk           []byte
+	userKey       []byte
+	version       int
+	quicProxyMode bool
+	quicDestCache *expiringmap.Map[quicDestCacheKey, uint64]
+	quicDestSeq   atomic.Uint64
 }
 
-type quicDestCacheKey struct {
-	source      M.Socksaddr
-	destination M.Socksaddr
-}
+var (
+	_ adapter.InterfaceUpdateListener = (*Outbound)(nil)
+	_ adapter.IdleConnectionKeeper    = (*Outbound)(nil)
+	_ adapter.OutboundWithMultiplex   = (*Outbound)(nil)
+)
 
-func (h *Outbound) isRecentQUICDest(source, destination M.Socksaddr) bool {
-	key := quicDestCacheKey{source, destination}
-	v, ok := h.quicDestCache.Load(key)
-	if !ok {
-		return false
-	}
-	if time.Since(v.(time.Time)) > quicDestCacheTTL {
-		h.quicDestCache.Delete(key)
-		return false
-	}
-	return true
-}
-
-func (h *Outbound) markQUICDest(source, destination M.Socksaddr) {
-	h.quicDestCache.Store(quicDestCacheKey{source, destination}, time.Now())
+type snellClient interface {
+	snellprotocol.Method
+	DialContext(ctx context.Context, destination M.Socksaddr) (net.Conn, error)
+	Reset()
+	SetKeepIdleConnections(keep bool)
+	CloseIdleConnections()
+	Close() error
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SnellOutboundOptions) (adapter.Outbound, error) {
 	if options.PSK == "" {
 		return nil, E.New("snell: psk is required")
 	}
-
-	switch options.ObfsMode {
-	case "", "http":
-	case "tls":
-		ver := options.Version
-		if ver == 0 {
-			ver = snell.DefaultVersion
-		}
-		if ver >= snell.Version4 {
-			return nil, E.New("snell: obfs_mode TLS is insecure and not supported for v4/v5; use ShadowTLS instead")
-		}
-	default:
-		return nil, E.New("snell: unsupported obfs mode: ", options.ObfsMode)
-	}
-
-	serverAddr := options.ServerOptions.Build()
-
 	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
 		return nil, err
 	}
-
+	serverAddr := options.ServerOptions.Build()
 	version := options.Version
 	if version == 0 {
-		version = snell.DefaultVersion
+		return nil, E.New("snell: missing version")
 	}
-
-	// Build network list. If the user specified an explicit `network` field use
-	// that; otherwise apply the protocol default: v3/v4/v5 enable TCP+UDP by
-	// default, while v1/v2 default to TCP-only (no UDP support).
-	var networks []string
-	if string(options.Network) != "" {
-		networks = options.Network.Build()
-		for _, net := range networks {
-			if net == N.NetworkUDP && version < snell.Version3 {
-				return nil, E.New("snell: UDP requires version 3 or above")
-			}
-		}
-	} else if version >= snell.Version3 {
-		networks = []string{N.NetworkTCP, N.NetworkUDP}
-	} else {
-		networks = []string{N.NetworkTCP}
+	if version == 6 && (len(options.PSK) < 12 || len(options.PSK) > 255) {
+		return nil, E.New("snell: psk length must be between 12 and 255 bytes")
 	}
-
-	client, err := snell.NewClient([]byte(options.PSK), version)
+	if err = validateSnellOutboundVersionOptions(version, options.Reuse); err != nil {
+		return nil, err
+	}
+	obfsMode := options.ObfsOptions.ObfsMode
+	if err = validateSnellOutboundObfs(version, obfsMode); err != nil {
+		return nil, err
+	}
+	networks, err := buildSnellNetworks(version, options.Network)
 	if err != nil {
 		return nil, err
 	}
-
-	o := &Outbound{
-		Adapter:    outbound.NewAdapterWithDialerOptions(C.TypeSnell, tag, networks, options.DialerOptions),
-		logger:     logger,
-		dialer:     outboundDialer,
-		client:     client,
-		serverAddr: serverAddr,
-		obfsMode:   options.ObfsMode,
-		obfsHost:   options.ObfsHost,
-		serverPort: fmt.Sprintf("%d", serverAddr.Port),
-		psk:        []byte(options.PSK),
-		version:    version,
+	tcpDialer := N.Dialer(outboundDialer)
+	if obfsMode != "" && obfsMode != "none" {
+		tcpDialer = &simpleObfsDialer{
+			Dialer: outboundDialer,
+			mode:   obfsMode,
+			host:   options.ObfsOptions.ObfsHost,
+			port:   fmt.Sprint(serverAddr.Port),
+		}
 	}
-
-	// Connection reuse (v4+): build a pool whose factory dials + encrypts a
-	// fresh stream.  The pool is only active when reuse is explicitly enabled.
-	if options.Reuse && version >= snell.Version4 {
-		o.pool = snell.NewPool(func(ctx context.Context) (net.Conn, error) {
-			rawConn, err := outboundDialer.DialContext(ctx, N.NetworkTCP, serverAddr)
-			if err != nil {
-				return nil, err
-			}
-			return client.WrapStream(o.applyObfs(rawConn)), nil
+	var client snellClient
+	var legacyClient *legacy.Client
+	switch version {
+	case 1, 2, 3:
+		legacyClient, err = legacy.NewClient([]byte(options.PSK), version)
+	case 4, 5:
+		client, err = snellv4.NewClient(snellv4.ClientOptions{
+			PSK:     []byte(options.PSK),
+			UserKey: []byte(options.UserKey),
+			Reuse:   options.Reuse,
+			Dialer:  tcpDialer,
+			Server:  serverAddr,
 		})
+	case 6:
+		var mode snellv6.Mode
+		mode, err = snellv6.ParseMode(options.V6Options.Mode)
+		if err != nil {
+			return nil, err
+		}
+		client, err = snellv6.NewClient(snellv6.ClientOptions{
+			PSK:     []byte(options.PSK),
+			UserKey: []byte(options.UserKey),
+			Mode:    mode,
+			Reuse:   options.Reuse,
+			Dialer:  tcpDialer,
+			Server:  serverAddr,
+		})
+	default:
+		return nil, E.New("snell: unsupported version: ", version)
 	}
+	if err != nil {
+		return nil, err
+	}
+	outbound := &Outbound{
+		Adapter:       outbound.NewAdapterWithDialerOptions(C.TypeSnell, tag, networks, options.DialerOptions),
+		logger:        logger,
+		dialer:        outboundDialer,
+		tcpDialer:     tcpDialer,
+		client:        client,
+		legacy:        legacyClient,
+		serverAddr:    serverAddr,
+		psk:           []byte(options.PSK),
+		userKey:       []byte(options.UserKey),
+		version:       version,
+		reuse:         options.Reuse,
+		quicProxyMode: version == 5 || version == 6 && options.V6Options.QUICProxyMode,
+	}
+	if outbound.quicProxyMode {
+		outbound.quicDestCache = expiringmap.New[quicDestCacheKey, uint64](quicDestCacheTTL)
+	}
+	return outbound, nil
+}
 
-	return o, nil
+func validateSnellOutboundVersionOptions(version int, reuse bool) error {
+	if reuse && version <= 3 {
+		return E.New("snell: reuse requires version 4 or above")
+	}
+	return nil
+}
+
+func validateSnellOutboundObfs(version int, obfsMode string) error {
+	switch {
+	case version <= 3 && (obfsMode == "" || obfsMode == "none" || obfsMode == "http" || obfsMode == "tls"):
+	case version <= 5 && (obfsMode == "" || obfsMode == "none" || obfsMode == "http"):
+	case version == 6 && obfsMode == "":
+	case (version == 4 || version == 5) && obfsMode == "tls":
+		return E.New("snell: TLS obfs is unsupported for version ", version, "; use ShadowTLS instead")
+	default:
+		return E.New("snell: unsupported obfs mode for version ", version, ": ", obfsMode)
+	}
+	return nil
+}
+
+func buildSnellNetworks(version int, networkList option.NetworkList) ([]string, error) {
+	networks := []string{N.NetworkTCP}
+	if string(networkList) != "" {
+		networks = networkList.Build()
+	} else if version >= 3 {
+		networks = []string{N.NetworkTCP, N.NetworkUDP}
+	}
+	for _, network := range networks {
+		if network == N.NetworkUDP && version < 3 {
+			return nil, E.New("snell: UDP requires version 3 or above")
+		}
+	}
+	return networks, nil
 }
 
 func (h *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-
-	switch N.NetworkName(network) {
+	networkName := N.NetworkName(network)
+	switch networkName {
 	case N.NetworkTCP:
 		h.logger.InfoContext(ctx, "outbound connection to ", destination)
-		if h.pool != nil {
-			return h.client.DialContextWithPool(ctx, h.pool, destination)
+		if h.legacy != nil {
+			conn, err := h.tcpDialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+			if err != nil {
+				return nil, err
+			}
+			return h.legacy.DialContext(ctx, conn, destination), nil
 		}
-		rawConn, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
-		if err != nil {
-			return nil, err
-		}
-		conn := h.applyObfs(rawConn)
-		return h.client.DialContext(ctx, conn, destination)
+		return h.client.DialContext(ctx, destination)
 	case N.NetworkUDP:
-		h.logger.InfoContext(ctx, "outbound UDP connection to ", destination)
-		if h.version >= snell.Version5 {
-			pc := newV5LazyPacketConn(ctx, h, metadata.Source, destination, metadata.Protocol == C.ProtocolQUIC)
-			return &packetConnWrapper{PacketConn: pc, destination: destination}, nil
+		h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+		if h.quicProxyMode {
+			packetConn := newQUICProxyLazyPacketConn(ctx, h, metadata.Source, destination, metadata.Protocol == C.ProtocolQUIC || h.isRecentQUICDest(metadata.Source, destination))
+			return &packetConnWrapper{PacketConn: packetConn, destination: destination}, nil
 		}
-		rawConn, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+		packetConn, err := h.dialUDPOverTCP(ctx)
 		if err != nil {
 			return nil, err
 		}
-		conn := h.applyObfs(rawConn)
-		udpStream, err := h.client.DialUDP(ctx, conn)
-		if err != nil {
-			return nil, err
-		}
-		pc := snell.NewClientPacketConn(udpStream)
-		return &packetConnWrapper{PacketConn: pc, destination: destination}, nil
+		return &packetConnWrapper{PacketConn: packetConn, destination: destination}, nil
+	default:
+		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
-	return nil, os.ErrInvalid
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-
 	h.logger.InfoContext(ctx, "outbound packet connection to ", destination)
-
-	if h.version >= snell.Version5 {
-		sniffQUIC := metadata.Protocol == C.ProtocolQUIC || h.isRecentQUICDest(metadata.Source, destination)
-		return newV5LazyPacketConn(ctx, h, metadata.Source, destination, sniffQUIC), nil
+	if h.quicProxyMode {
+		return newQUICProxyLazyPacketConn(ctx, h, metadata.Source, destination, metadata.Protocol == C.ProtocolQUIC || h.isRecentQUICDest(metadata.Source, destination)), nil
 	}
-
-	rawConn, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
-	if err != nil {
-		return nil, err
-	}
-	conn := h.applyObfs(rawConn)
-	udpStream, err := h.client.DialUDP(ctx, conn)
-	if err != nil {
-		return nil, err
-	}
-	return snell.NewClientPacketConn(udpStream), nil
+	return h.dialUDPOverTCP(ctx)
 }
 
-// dialUDPOverTCP creates a UDP-over-TCP tunnel (v3/v4/v5 fallback for non-QUIC UDP).
+func (h *Outbound) InterfaceUpdated(ctx context.Context) {
+	if h.client != nil {
+		h.client.Reset()
+	}
+}
+
+func (h *Outbound) Close() error {
+	if h.quicDestCache != nil {
+		h.quicDestCache.Close()
+	}
+	if h.client == nil {
+		return nil
+	}
+	return h.client.Close()
+}
+
+type simpleObfsDialer struct {
+	N.Dialer
+	mode string
+	host string
+	port string
+}
+
+func (d *simpleObfsDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	conn, err := d.Dialer.DialContext(ctx, network, destination)
+	if err != nil || N.NetworkName(network) != N.NetworkTCP {
+		return conn, err
+	}
+	host := d.host
+	if host == "" {
+		host = "bing.com"
+	}
+	if d.mode == "tls" {
+		return obfs.NewTLSObfs(conn, host), nil
+	}
+	return obfs.NewHTTPObfs(conn, host, d.port), nil
+}
+
 func (h *Outbound) dialUDPOverTCP(ctx context.Context) (net.PacketConn, error) {
-	rawConn, err := h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+	conn, err := h.tcpDialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
 	if err != nil {
 		return nil, err
 	}
-	conn := h.applyObfs(rawConn)
-	udpStream, err := h.client.DialUDP(ctx, conn)
+	var packetConn net.PacketConn
+	if h.legacy != nil {
+		packetConn, err = h.legacy.DialPacketConn(conn)
+	} else {
+		packetConn, err = h.client.DialPacketConn(conn)
+	}
 	if err != nil {
+		conn.Close()
 		return nil, err
 	}
-	return snell.NewClientPacketConn(udpStream), nil
+	return packetConn, nil
 }
 
-// dialQUICProxy creates a QUIC proxy PacketConn (v5 only).
-// initPayload is the first QUIC Initial packet; it is sent as part of the init frame.
-func (h *Outbound) dialQUICProxy(ctx context.Context, destination M.Socksaddr, initPayload []byte) (net.PacketConn, error) {
-	rawConn, err := h.dialer.DialContext(ctx, N.NetworkUDP, h.serverAddr)
-	if err != nil {
-		return nil, err
-	}
-	return snell.NewQUICProxyPacketConn(rawConn, h.psk, destination, initPayload)
-}
+const quicDestCacheTTL = 5 * time.Minute
 
-// v5LazyPacketConn defers connection establishment to the first WriteTo call,
-// allowing mode selection between QUIC proxy and UDP-over-TCP.
-//
-// Mode selection priority:
-//  1. sniffQUIC == true  (router sniff identified QUIC before reaching this outbound)
-//  2. first payload byte >= 0xc0  (QUIC long-header, e.g. Initial / Handshake / 0-RTT)
-//
-// Using sniff as primary handles the 0-RTT resumption case where the first packet
-// is a short-header (0x40-0x7f) and would otherwise be misclassified.
-type v5LazyPacketConn struct {
-	outbound    *Outbound
-	ctx         context.Context
+type quicDestCacheKey struct {
 	source      M.Socksaddr
 	destination M.Socksaddr
-	// sniffQUIC is set when the router's sniff result identified this flow as QUIC.
-	// It takes priority over the first-byte heuristic.
-	sniffQUIC bool
+}
+
+func (h *Outbound) MultiplexEnabled() bool {
+	return h.reuse
+}
+
+func (h *Outbound) SetKeepIdleConnections(keep bool) {
+	if h.client != nil {
+		h.client.SetKeepIdleConnections(keep)
+	}
+}
+
+func (h *Outbound) CloseIdleConnections() {
+	if h.client != nil {
+		h.client.CloseIdleConnections()
+	}
+}
+
+func (h *Outbound) isRecentQUICDest(source M.Socksaddr, destination M.Socksaddr) bool {
+	if h.quicDestCache == nil {
+		return false
+	}
+	_, loaded := h.quicDestCache.LoadAndRefresh(quicDestCacheKey{source: source, destination: destination})
+	return loaded
+}
+
+func (h *Outbound) markQUICDest(source M.Socksaddr, destination M.Socksaddr) uint64 {
+	if h.quicDestCache == nil {
+		return 0
+	}
+	token := h.quicDestSeq.Add(1)
+	if token == 0 {
+		token = h.quicDestSeq.Add(1)
+	}
+	h.quicDestCache.Store(quicDestCacheKey{source: source, destination: destination}, token)
+	return token
+}
+
+func (h *Outbound) refreshQUICDest(source M.Socksaddr, destination M.Socksaddr, token uint64) {
+	if h.quicDestCache == nil || token == 0 {
+		return
+	}
+	h.quicDestCache.StoreIf(quicDestCacheKey{source: source, destination: destination}, token, func(current uint64, loaded bool) bool {
+		return !loaded || current == token
+	})
+}
+
+type quicProxyLazyPacketConn struct {
+	outbound    *Outbound
+	ctx         context.Context
+	cancel      context.CancelFunc
+	source      M.Socksaddr
+	destination M.Socksaddr
+	sniffQUIC   bool
 
 	once           sync.Once
-	initCh         chan struct{} // closed once conn is ready
+	initDone       chan struct{}
 	conn           net.PacketConn
 	connErr        error
-	firstWriteQUIC bool // true when dialQUICProxy consumed initPayload
-
-	// closeRequested is set to 1 by Close(). If initConn is still in progress
-	// when Close() is called, initConn will close the conn after it finishes.
+	initialSent    bool
+	quicDestToken  uint64
 	closeRequested atomic.Bool
-	closeOnce      sync.Once // ensures conn.Close is called at most once
-
-	// pendingReadDL stores a read (or combined) deadline set via
-	// SetReadDeadline / SetDeadline before initConn completes.
-	// Applied to conn inside ReadFrom after <-initCh unblocks.
-	// Zero value means no pending deadline.
-	pendingDLMu   sync.Mutex
-	pendingReadDL time.Time
+	closed         chan struct{}
+	closedOnce     sync.Once
+	closeOnce      sync.Once
+	deadlineAccess sync.Mutex
+	initializing   net.Conn
+	readDeadline   time.Time
+	writeDeadline  time.Time
+	readTimer      pipe.Deadline
+	writeTimer     pipe.Deadline
 }
 
-func newV5LazyPacketConn(ctx context.Context, ob *Outbound, src, dst M.Socksaddr, sniffQUIC bool) *v5LazyPacketConn {
-	return &v5LazyPacketConn{
-		outbound:    ob,
-		ctx:         ctx,
-		source:      src,
-		destination: dst,
-		sniffQUIC:   sniffQUIC,
-		initCh:      make(chan struct{}),
+func newQUICProxyLazyPacketConn(ctx context.Context, outbound *Outbound, source M.Socksaddr, destination M.Socksaddr, sniffQUIC bool) *quicProxyLazyPacketConn {
+	initCtx := context.WithoutCancel(ctx)
+	var cancel context.CancelFunc
+	if deadline, loaded := ctx.Deadline(); loaded {
+		initCtx, cancel = context.WithDeadline(initCtx, deadline)
+	} else {
+		initCtx, cancel = context.WithCancel(initCtx)
+	}
+	return &quicProxyLazyPacketConn{
+		outbound: outbound, ctx: initCtx, cancel: cancel,
+		source: source, destination: destination, sniffQUIC: sniffQUIC,
+		initDone: make(chan struct{}), closed: make(chan struct{}),
+		readTimer: pipe.MakeDeadline(), writeTimer: pipe.MakeDeadline(),
 	}
 }
 
-func (c *v5LazyPacketConn) initConn(p []byte, addr net.Addr) {
-	useQUIC := c.sniffQUIC || (len(p) > 0 && snell.IsQUICInitial(p[0]))
+func (c *quicProxyLazyPacketConn) initialize(payload []byte) {
+	initCtx, initCancel := context.WithCancel(c.ctx)
+	deadlineMonitorDone := make(chan struct{})
+	var writeDeadlineExceeded atomic.Bool
+	go func() {
+		select {
+		case <-c.writeTimer.Wait():
+			writeDeadlineExceeded.Store(true)
+			initCancel()
+		case <-deadlineMonitorDone:
+		}
+	}()
+	defer func() {
+		close(deadlineMonitorDone)
+		initCancel()
+		c.cancel()
+	}()
+	useQUIC := c.sniffQUIC || snellprotocol.IsQUICInitial(payload)
 	if useQUIC {
-		// Always use c.destination (resolved at ListenPacket/DialContext time, after
-		// FakeIP reverse-lookup and routing) as the QUIC proxy target.
-		// Do NOT use addr here, which carries the fake IP in TUN+FakeIP scenarios.
-		conn, err := c.outbound.dialQUICProxy(c.ctx, c.destination, p)
-		c.conn = conn
-		c.connErr = err
-		c.firstWriteQUIC = (err == nil)
-		// Record this destination so that subsequent connections (e.g. after a
-		// Clash API kill) are also routed via QUIC proxy even when the first packet
-		// is a 1-RTT short-header that cannot be sniffed as QUIC ClientHello.
-		if err == nil {
-			c.outbound.markQUICDest(c.source, c.destination)
+		c.conn, c.connErr = c.dialQUICProxy(initCtx, payload)
+		c.initialSent = c.connErr == nil
+		if c.connErr == nil && c.outbound != nil {
+			c.quicDestToken = c.outbound.markQUICDest(c.source, c.destination)
 		}
 	} else {
-		conn, err := c.outbound.dialUDPOverTCP(c.ctx)
-		c.conn = conn
-		c.connErr = err
+		c.conn, c.connErr = c.dialUDPOverTCP(initCtx)
 	}
-	close(c.initCh)
-	// If Close() arrived while we were dialling, close the conn now so that
-	// any blocked ReadFrom returns instead of hanging forever.
+	if c.connErr != nil && writeDeadlineExceeded.Load() {
+		c.connErr = os.ErrDeadlineExceeded
+	}
+	c.deadlineAccess.Lock()
+	c.initializing = nil
+	if c.conn != nil {
+		if !c.readDeadline.IsZero() {
+			_ = c.conn.SetReadDeadline(c.readDeadline)
+		}
+		if !c.writeDeadline.IsZero() {
+			_ = c.conn.SetWriteDeadline(c.writeDeadline)
+		}
+	}
+	close(c.initDone)
+	c.deadlineAccess.Unlock()
 	if c.closeRequested.Load() {
 		c.closeOnce.Do(func() {
 			if c.conn != nil {
-				c.conn.Close()
+				_ = c.conn.Close()
 			}
 		})
+		c.refreshQUICDestOnClose()
 	}
 }
 
-func (c *v5LazyPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	var firstWriteQUIC bool
+func (c *quicProxyLazyPacketConn) registerInitializingConn(conn net.Conn) error {
+	c.deadlineAccess.Lock()
+	defer c.deadlineAccess.Unlock()
+	select {
+	case <-c.closed:
+		return net.ErrClosed
+	default:
+	}
+	c.initializing = conn
+	if c.writeDeadline.IsZero() {
+		return nil
+	}
+	return conn.SetWriteDeadline(c.writeDeadline)
+}
+
+func (c *quicProxyLazyPacketConn) dialQUICProxy(ctx context.Context, initialPayload []byte) (net.PacketConn, error) {
+	conn, err := c.outbound.dialer.DialContext(ctx, N.NetworkUDP, c.outbound.serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	if err = c.registerInitializingConn(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	packetConn, err := snellprotocol.NewQUICProxyPacketConn(conn, c.outbound.psk, c.outbound.userKey, c.destination, initialPayload)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return packetConn, nil
+}
+
+func (c *quicProxyLazyPacketConn) dialUDPOverTCP(ctx context.Context) (net.PacketConn, error) {
+	conn, err := c.outbound.tcpDialer.DialContext(ctx, N.NetworkTCP, c.outbound.serverAddr)
+	if err != nil {
+		return nil, err
+	}
+	if err = c.registerInitializingConn(conn); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	var packetConn net.PacketConn
+	if c.outbound.legacy != nil {
+		packetConn, err = c.outbound.legacy.DialPacketConn(conn)
+	} else {
+		packetConn, err = c.outbound.client.DialPacketConn(conn)
+	}
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return packetConn, nil
+}
+
+func (c *quicProxyLazyPacketConn) writeError() error {
+	select {
+	case <-c.closed:
+		return net.ErrClosed
+	default:
+	}
+	select {
+	case <-c.writeTimer.Wait():
+		return os.ErrDeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (c *quicProxyLazyPacketConn) WriteTo(payload []byte, destination net.Addr) (int, error) {
+	if err := c.writeError(); err != nil {
+		return 0, err
+	}
+	if len(payload) == 0 {
+		select {
+		case <-c.initDone:
+			if c.connErr != nil {
+				return 0, c.connErr
+			}
+			return c.conn.WriteTo(payload, destination)
+		default:
+			return 0, nil
+		}
+	}
+	initialized := false
 	c.once.Do(func() {
-		c.initConn(p, addr)
-		firstWriteQUIC = c.firstWriteQUIC
+		initialized = true
+		c.initialize(payload)
 	})
-	<-c.initCh
+	<-c.initDone
+	select {
+	case <-c.closed:
+		return 0, net.ErrClosed
+	default:
+	}
 	if c.connErr != nil {
 		return 0, c.connErr
 	}
-	// For QUIC proxy first write, the payload was already sent inside dialQUICProxy.
-	if firstWriteQUIC {
-		return len(p), nil
+	if initialized && c.initialSent {
+		return len(payload), nil
 	}
-	return c.conn.WriteTo(p, addr)
+	return c.conn.WriteTo(payload, destination)
 }
 
-func (c *v5LazyPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	<-c.initCh
+func (c *quicProxyLazyPacketConn) ReadFrom(payload []byte) (int, net.Addr, error) {
+	conn, err := c.readConn()
+	if err != nil {
+		return 0, nil, err
+	}
+	return conn.ReadFrom(payload)
+}
+
+func (c *quicProxyLazyPacketConn) readConn() (net.PacketConn, error) {
+	select {
+	case <-c.closed:
+		return nil, net.ErrClosed
+	default:
+	}
+	select {
+	case <-c.initDone:
+	case <-c.closed:
+		return nil, net.ErrClosed
+	case <-c.readTimer.Wait():
+		return nil, os.ErrDeadlineExceeded
+	}
+	select {
+	case <-c.closed:
+		return nil, net.ErrClosed
+	default:
+	}
 	if c.connErr != nil {
-		return 0, nil, c.connErr
+		return nil, c.connErr
 	}
-	// Apply any read deadline that was stored before initConn completed.
-	// Without this, a SetReadDeadline call that arrived during the dial window
-	// would be silently dropped, leaving ReadFrom without a timeout.
-	c.pendingDLMu.Lock()
-	if !c.pendingReadDL.IsZero() {
-		_ = c.conn.SetReadDeadline(c.pendingReadDL)
-		c.pendingReadDL = time.Time{}
-	}
-	c.pendingDLMu.Unlock()
-	return c.conn.ReadFrom(p)
+	return c.conn, nil
 }
 
-// ReadPacket implements N.NetPacketConn, allowing bufio.NewPacketConn to use
-// this type directly instead of wrapping it in ExtendedPacketConn. This
-// preserves the FQDN source address through the relay chain.
-func (c *v5LazyPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
-	n, addr, err := c.ReadFrom(buffer.FreeBytes())
+func (c *quicProxyLazyPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	conn, err := c.readConn()
+	if err != nil {
+		return M.Socksaddr{}, err
+	}
+	if packetReader, loaded := conn.(N.PacketReader); loaded {
+		return packetReader.ReadPacket(buffer)
+	}
+	n, source, err := conn.ReadFrom(buffer.FreeBytes())
 	if err != nil {
 		return M.Socksaddr{}, err
 	}
 	buffer.Truncate(n)
-	return M.SocksaddrFromNet(addr).Unwrap(), nil
+	return M.SocksaddrFromNet(source).Unwrap(), nil
 }
 
-// WritePacket implements N.NetPacketConn. Passing destination as M.Socksaddr
-// directly (rather than converting to *net.UDPAddr first) ensures that FQDN
-// destinations are forwarded correctly when the underlying conn is a
-// ClientPacketConn (UoT fallback mode).
-func (c *v5LazyPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
+func (c *quicProxyLazyPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
 	defer buffer.Release()
 	_, err := c.WriteTo(buffer.Bytes(), destination)
 	return err
 }
 
-func (c *v5LazyPacketConn) Close() error {
-	// Signal intent before the select so initConn's post-close check is
-	// guaranteed to observe it if initCh is not yet closed.
+var _ N.PacketBatchWriter = (*quicProxyLazyPacketConn)(nil)
+
+func (c *quicProxyLazyPacketConn) WritePacketBatch(buffers []*buf.Buffer, destinations []M.Socksaddr) error {
+	if len(buffers) == 0 || len(buffers) != len(destinations) {
+		buf.ReleaseMulti(buffers)
+		return os.ErrInvalid
+	}
+	for len(buffers) > 0 {
+		if err := c.writeError(); err != nil {
+			buf.ReleaseMulti(buffers)
+			return err
+		}
+		select {
+		case <-c.initDone:
+			if c.connErr != nil {
+				buf.ReleaseMulti(buffers)
+				return c.connErr
+			}
+			packetConn := bufio.NewPacketConn(c.conn)
+			if writer, created := bufio.CreatePacketBatchWriter(packetConn); created {
+				// Buffers may have been allocated before the underlying transport was known.
+				options := N.NewReadWaitOptions(nil, packetConn)
+				for index, buffer := range buffers {
+					buffers[index] = options.Copy(buffer)
+				}
+				return writer.WritePacketBatch(buffers, destinations)
+			}
+			// Keep lazy-connection deadline and close checks on the sequential path.
+			return bufio.NewPacketBatchWriter(struct{ N.PacketWriter }{c}).WritePacketBatch(buffers, destinations)
+		default:
+			// Use the existing first-packet path for QUIC sniffing and init payload fusion.
+			// Empty packets retain WriteTo's behavior and do not consume initialization.
+			if err := c.WritePacket(buffers[0], destinations[0]); err != nil {
+				buf.ReleaseMulti(buffers[1:])
+				return err
+			}
+			buffers = buffers[1:]
+			destinations = destinations[1:]
+		}
+	}
+	return nil
+}
+
+func (c *quicProxyLazyPacketConn) Close() error {
 	c.closeRequested.Store(true)
+	c.closedOnce.Do(func() {
+		close(c.closed)
+	})
+	c.cancel()
+	c.deadlineAccess.Lock()
+	initializing := c.initializing
+	c.deadlineAccess.Unlock()
+	if initializing != nil {
+		_ = initializing.Close()
+	}
 	select {
-	case <-c.initCh:
-		// initConn has finished; close the underlying conn exactly once.
-		var err error
+	case <-c.initDone:
+		var closeErr error
 		c.closeOnce.Do(func() {
 			if c.conn != nil {
-				err = c.conn.Close()
+				closeErr = c.conn.Close()
 			}
 		})
-		return err
+		c.refreshQUICDestOnClose()
+		return closeErr
 	default:
-		// initConn is still in progress; it will call closeOnce after finishing.
 		return nil
 	}
 }
 
-func (c *v5LazyPacketConn) LocalAddr() net.Addr {
+func (c *quicProxyLazyPacketConn) refreshQUICDestOnClose() {
+	if c.outbound != nil {
+		c.outbound.refreshQUICDest(c.source, c.destination, c.quicDestToken)
+	}
+}
+
+func (c *quicProxyLazyPacketConn) LocalAddr() net.Addr {
 	select {
-	case <-c.initCh:
+	case <-c.initDone:
 		if c.conn != nil {
 			return c.conn.LocalAddr()
 		}
@@ -415,86 +679,82 @@ func (c *v5LazyPacketConn) LocalAddr() net.Addr {
 	return &net.UDPAddr{}
 }
 
-func (c *v5LazyPacketConn) SetDeadline(t time.Time) error {
+func (c *quicProxyLazyPacketConn) SetDeadline(deadline time.Time) error {
+	c.deadlineAccess.Lock()
 	select {
-	case <-c.initCh:
-		// initConn finished; clear any stale pending deadline and apply directly.
-		c.pendingDLMu.Lock()
-		c.pendingReadDL = time.Time{}
-		c.pendingDLMu.Unlock()
-		if c.conn != nil {
-			return c.conn.SetDeadline(t)
+	case <-c.initDone:
+		conn := c.conn
+		c.deadlineAccess.Unlock()
+		if conn != nil {
+			return conn.SetDeadline(deadline)
 		}
 		return nil
 	default:
-		// initConn still in progress; store for ReadFrom to apply after init.
-		c.pendingDLMu.Lock()
-		c.pendingReadDL = t
-		c.pendingDLMu.Unlock()
-		return nil
 	}
-}
-
-func (c *v5LazyPacketConn) SetReadDeadline(t time.Time) error {
-	select {
-	case <-c.initCh:
-		// initConn finished; clear any stale pending deadline and apply directly.
-		c.pendingDLMu.Lock()
-		c.pendingReadDL = time.Time{}
-		c.pendingDLMu.Unlock()
-		if c.conn != nil {
-			return c.conn.SetReadDeadline(t)
-		}
-		return nil
-	default:
-		// initConn still in progress; store for ReadFrom to apply after init.
-		c.pendingDLMu.Lock()
-		c.pendingReadDL = t
-		c.pendingDLMu.Unlock()
-		return nil
-	}
-}
-
-func (c *v5LazyPacketConn) SetWriteDeadline(t time.Time) error {
-	select {
-	case <-c.initCh:
-		if c.conn != nil {
-			return c.conn.SetWriteDeadline(t)
-		}
-	default:
+	c.readDeadline = deadline
+	c.writeDeadline = deadline
+	c.readTimer.Set(deadline)
+	c.writeTimer.Set(deadline)
+	initializing := c.initializing
+	c.deadlineAccess.Unlock()
+	if initializing != nil {
+		return initializing.SetWriteDeadline(deadline)
 	}
 	return nil
 }
 
-func (h *Outbound) applyObfs(conn net.Conn) net.Conn {
-	obfsHost := h.obfsHost
-	if obfsHost == "" {
-		obfsHost = "bing.com"
+func (c *quicProxyLazyPacketConn) SetReadDeadline(deadline time.Time) error {
+	c.deadlineAccess.Lock()
+	select {
+	case <-c.initDone:
+		conn := c.conn
+		c.deadlineAccess.Unlock()
+		if conn != nil {
+			return conn.SetReadDeadline(deadline)
+		}
+		return nil
+	default:
 	}
-	switch h.obfsMode {
-	case "http":
-		return obfs.NewHTTPObfs(conn, obfsHost, h.serverPort)
-	case "tls":
-		return obfs.NewTLSObfs(conn, obfsHost)
-	}
-	return conn
+	c.readDeadline = deadline
+	c.readTimer.Set(deadline)
+	c.deadlineAccess.Unlock()
+	return nil
 }
 
-// packetConnWrapper wraps net.PacketConn as net.Conn so it can be used in DialContext for UDP networks.
+func (c *quicProxyLazyPacketConn) SetWriteDeadline(deadline time.Time) error {
+	c.deadlineAccess.Lock()
+	select {
+	case <-c.initDone:
+		conn := c.conn
+		c.deadlineAccess.Unlock()
+		if conn != nil {
+			return conn.SetWriteDeadline(deadline)
+		}
+		return nil
+	default:
+	}
+	c.writeDeadline = deadline
+	c.writeTimer.Set(deadline)
+	initializing := c.initializing
+	c.deadlineAccess.Unlock()
+	if initializing != nil {
+		return initializing.SetWriteDeadline(deadline)
+	}
+	return nil
+}
+
 type packetConnWrapper struct {
 	net.PacketConn
 	destination M.Socksaddr
 }
 
-func (w *packetConnWrapper) Read(p []byte) (int, error) {
-	n, _, err := w.PacketConn.ReadFrom(p)
+func (c *packetConnWrapper) Read(p []byte) (int, error) {
+	n, _, err := c.ReadFrom(p)
 	return n, err
 }
 
-func (w *packetConnWrapper) Write(p []byte) (int, error) {
-	return w.PacketConn.WriteTo(p, w.destination)
+func (c *packetConnWrapper) Write(p []byte) (int, error) {
+	return c.WriteTo(p, c.destination)
 }
 
-func (w *packetConnWrapper) RemoteAddr() net.Addr {
-	return w.destination
-}
+func (c *packetConnWrapper) RemoteAddr() net.Addr { return c.destination }

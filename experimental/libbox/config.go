@@ -5,6 +5,8 @@ import (
 	"context"
 	"net/netip"
 	"os"
+	"reflect"
+	"slices"
 
 	box "github.com/sagernet/sing-box"
 	"github.com/sagernet/sing-box/adapter"
@@ -13,7 +15,7 @@ import (
 	"github.com/sagernet/sing-box/include"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/service/oomkiller"
+	"github.com/sagernet/sing-box/schema"
 	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -24,22 +26,17 @@ import (
 	"github.com/sagernet/sing/service/filemanager"
 )
 
-var sOOMReporter oomkiller.OOMReporter
-
 func baseContext(platformInterface PlatformInterface) context.Context {
 	dnsRegistry := include.DNSTransportRegistry()
 	if platformInterface != nil {
 		if localTransport := platformInterface.LocalDNSTransport(); localTransport != nil {
 			dns.RegisterTransport[option.LocalDNSServerOptions](dnsRegistry, C.DNSTypeLocal, func(ctx context.Context, logger log.ContextLogger, tag string, options option.LocalDNSServerOptions) (adapter.DNSTransport, error) {
-				return newPlatformTransport(localTransport, tag, options), nil
+				return newPlatformTransport(ctx, logger, localTransport, tag, options)
 			})
 		}
 	}
 	ctx := context.Background()
 	ctx = filemanager.WithDefault(ctx, sWorkingPath, sTempPath, sUserID, sGroupID)
-	if sOOMReporter != nil {
-		ctx = service.ContextWith[oomkiller.OOMReporter](ctx, sOOMReporter)
-	}
 	return box.Context(ctx, include.InboundRegistry(), include.ProviderRegistry(), include.OutboundRegistry(), include.EndpointRegistry(), dnsRegistry, include.ServiceRegistry(), include.CertificateProviderRegistry())
 }
 
@@ -92,6 +89,10 @@ func (s *platformInterfaceStub) OpenInterface(options *tun.Options, platformOpti
 	return nil, os.ErrInvalid
 }
 
+func (s *platformInterfaceStub) ProcessPlatformOptions(options option.TunPlatformOptions) error {
+	return nil
+}
+
 func (s *platformInterfaceStub) UsePlatformDefaultInterfaceMonitor() bool {
 	return true
 }
@@ -127,7 +128,7 @@ func (s *platformInterfaceStub) UsePlatformWIFIMonitor() bool {
 	return false
 }
 
-func (s *platformInterfaceStub) ReadWIFIState() adapter.WIFIState {
+func (s *platformInterfaceStub) ReadWIFIState(ctx context.Context) adapter.WIFIState {
 	return adapter.WIFIState{}
 }
 
@@ -144,6 +145,10 @@ func (s *platformInterfaceStub) UsePlatformNotification() bool {
 }
 
 func (s *platformInterfaceStub) SendNotification(notification *adapter.Notification) error {
+	return nil
+}
+
+func (s *platformInterfaceStub) CancelNotification(identifier string, typeID int32) error {
 	return nil
 }
 
@@ -185,6 +190,22 @@ func (s *platformInterfaceStub) ReadSystemSSHHostKey() ([]byte, error) {
 
 func (s *platformInterfaceStub) TailscaleHostname() string {
 	return ""
+}
+
+func (s *platformInterfaceStub) UsePlatformBridge() bool {
+	return false
+}
+
+func (s *platformInterfaceStub) CreateBridge(options adapter.BridgeOptions) (adapter.BridgeSession, error) {
+	return nil, os.ErrInvalid
+}
+
+func (s *platformInterfaceStub) UsePlatformAutoRedirect() bool {
+	return false
+}
+
+func (s *platformInterfaceStub) CreateAutoRedirect(options adapter.AutoRedirectOptions) (adapter.AutoRedirectSession, error) {
+	return nil, os.ErrInvalid
 }
 
 func (s *platformInterfaceStub) LookupUser(username string) (*adapter.PlatformUser, error) {
@@ -237,6 +258,14 @@ func (s *interfaceMonitorStub) MyInterfaces() []string {
 
 func (s *interfaceMonitorStub) ForceUpdate() {}
 
+func GenerateConfigSchema() (*StringBox, error) {
+	content, err := schema.Generate(baseContext(nil), reflect.TypeFor[option.Options]())
+	if err != nil {
+		return nil, err
+	}
+	return wrapString(string(content)), nil
+}
+
 func FormatConfig(configContent string) (*StringBox, error) {
 	options, err := parseConfig(baseContext(nil), configContent)
 	if err != nil {
@@ -250,4 +279,14 @@ func FormatConfig(configContent string) (*StringBox, error) {
 		return nil, err
 	}
 	return wrapString(buffer.String()), nil
+}
+
+func HasTunInbound(configContent string) (bool, error) {
+	options, err := parseConfig(baseContext(nil), configContent)
+	if err != nil {
+		return false, err
+	}
+	return slices.ContainsFunc(options.Inbounds, func(inbound option.Inbound) bool {
+		return inbound.Type == C.TypeTun
+	}), nil
 }

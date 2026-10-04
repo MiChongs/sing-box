@@ -99,12 +99,12 @@
 
 #### obfs_mode
 
-Simple-obfs 混淆模式。
+TCP 连接的 Simple-obfs 混淆模式。原生 UDP 数据包不进行混淆。
 
 可选值为 `http` `tls`，留空则禁用混淆。
 
 #### obfs_host
 
-HTTP/TLS 混淆使用的主机名。
+为兼容配置而接受此字段，但它对入站不生效。
 
-未设置时默认为 `bing.com`。
+伪装主机名由客户端设置，服务端不校验 HTTP Host 或 TLS SNI。

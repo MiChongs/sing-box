@@ -99,12 +99,12 @@ See [Multiplex](/configuration/shared/multiplex#inbound) for details.
 
 #### obfs_mode
 
-Simple-obfs obfuscation mode.
+Simple-obfs obfuscation mode for TCP connections. Native UDP packets are not obfuscated.
 
 One of `http` `tls`, or empty to disable.
 
 #### obfs_host
 
-The obfuscation hostname used for HTTP/TLS obfuscation.
+Accepted for configuration compatibility; this field has no effect on the inbound.
 
-Defaults to `bing.com` if not set.
+The camouflage hostname is set by the client. The server does not validate HTTP Host or TLS SNI.

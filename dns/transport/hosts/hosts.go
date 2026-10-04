@@ -10,6 +10,7 @@ import (
 	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 
@@ -47,7 +48,7 @@ func NewTransport(ctx context.Context, logger log.ContextLogger, tag string, opt
 		files = append(files, defaultFile)
 	} else {
 		for _, path := range options.Path {
-			files = append(files, NewFile(filemanager.BasePath(ctx, os.ExpandEnv(path))))
+			files = append(files, NewFile(ctx, filemanager.BasePath(ctx, os.ExpandEnv(path))))
 		}
 	}
 	if options.Predefined != nil {
@@ -103,68 +104,7 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 			return dns.FixedResponse(message.Id, question, addresses, C.DefaultDNSTTL), nil
 		}
 		if targetDomain, ok := t.predefinedDomain[domain]; ok {
-			dnsRouter := service.FromContext[adapter.DNSRouter](t.ctx)
-			targetMsg := &mDNS.Msg{
-				MsgHdr: mDNS.MsgHdr{
-					RecursionDesired: true,
-				},
-				Question: []mDNS.Question{{
-					Name:   targetDomain,
-					Qtype:  question.Qtype,
-					Qclass: mDNS.ClassINET,
-				}},
-			}
-			resolveCtx, loopDetected := dns.ContextWithAliasResolution(adapter.OverrideContext(ctx), domain, targetDomain)
-			if loopDetected {
-				return &mDNS.Msg{
-					MsgHdr: mDNS.MsgHdr{
-						Id:       message.Id,
-						Rcode:    mDNS.RcodeServerFailure,
-						Response: true,
-					},
-					Question: []mDNS.Question{question},
-				}, nil
-			}
-			response, err := dnsRouter.Exchange(resolveCtx, targetMsg, adapter.DNSQueryOptions{DisableOptimisticCache: true})
-			if err != nil {
-				return nil, err
-			}
-			if response.Rcode != mDNS.RcodeSuccess {
-				return &mDNS.Msg{
-					MsgHdr: mDNS.MsgHdr{
-						Id:       message.Id,
-						Rcode:    response.Rcode,
-						Response: true,
-					},
-					Question: []mDNS.Question{question},
-				}, nil
-			}
-			if len(response.Answer) == 0 {
-				return &mDNS.Msg{
-					MsgHdr: mDNS.MsgHdr{
-						Id:       message.Id,
-						Rcode:    mDNS.RcodeSuccess,
-						Response: true,
-					},
-					Question: []mDNS.Question{question},
-					Ns:       response.Ns,
-					Extra:    response.Extra,
-				}, nil
-			}
-			ttl := response.Answer[0].Header().Ttl
-			var addresses []netip.Addr
-			for _, rr := range response.Answer {
-				if rr.Header().Ttl < ttl {
-					ttl = rr.Header().Ttl
-				}
-				switch record := rr.(type) {
-				case *mDNS.A:
-					addresses = append(addresses, netip.AddrFrom4([4]byte(record.A.To4())))
-				case *mDNS.AAAA:
-					addresses = append(addresses, netip.AddrFrom16([16]byte(record.AAAA)))
-				}
-			}
-			return dns.FixedResponse(message.Id, question, addresses, ttl), nil
+			return t.exchangePredefinedDomain(ctx, message, domain, targetDomain)
 		}
 		for _, file := range t.files {
 			addresses := file.Lookup(domain)
@@ -181,4 +121,74 @@ func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg,
 		},
 		Question: []mDNS.Question{question},
 	}, nil
+}
+
+func (t *Transport) exchangePredefinedDomain(ctx context.Context, message *mDNS.Msg, domain string, targetDomain string) (*mDNS.Msg, error) {
+	question := message.Question[0]
+	targetMsg := &mDNS.Msg{
+		MsgHdr: mDNS.MsgHdr{
+			RecursionDesired: true,
+		},
+		Question: []mDNS.Question{{
+			Name:   targetDomain,
+			Qtype:  question.Qtype,
+			Qclass: mDNS.ClassINET,
+		}},
+	}
+	resolveCtx, loopDetected := dns.ContextWithAliasResolution(adapter.OverrideContext(ctx), domain, targetDomain)
+	if loopDetected {
+		return dns.FixedResponseStatus(message, mDNS.RcodeServerFailure), nil
+	}
+	var (
+		response *mDNS.Msg
+		err      error
+	)
+	if t.PreferredDomain(targetDomain) {
+		response, err = t.Exchange(resolveCtx, targetMsg)
+	} else {
+		dnsRouter := service.FromContext[adapter.DNSRouter](t.ctx)
+		if dnsRouter == nil {
+			return nil, E.New("missing DNS router")
+		}
+		response, err = dnsRouter.Exchange(resolveCtx, targetMsg, adapter.DNSQueryOptions{DisableOptimisticCache: true})
+	}
+	if err != nil {
+		return nil, err
+	}
+	if response == nil {
+		return nil, E.New("empty DNS response")
+	}
+	if response.Rcode != mDNS.RcodeSuccess {
+		return dns.FixedResponseStatus(message, response.Rcode), nil
+	}
+	if len(response.Answer) == 0 {
+		return &mDNS.Msg{
+			MsgHdr: mDNS.MsgHdr{
+				Id:       message.Id,
+				Rcode:    mDNS.RcodeSuccess,
+				Response: true,
+			},
+			Question: []mDNS.Question{question},
+			Ns:       response.Ns,
+			Extra:    response.Extra,
+		}, nil
+	}
+	ttl := response.Answer[0].Header().Ttl
+	var addresses []netip.Addr
+	for _, rr := range response.Answer {
+		if rr.Header().Ttl < ttl {
+			ttl = rr.Header().Ttl
+		}
+		switch record := rr.(type) {
+		case *mDNS.A:
+			addresses = append(addresses, netip.AddrFrom4([4]byte(record.A.To4())))
+		case *mDNS.AAAA:
+			addresses = append(addresses, netip.AddrFrom16([16]byte(record.AAAA)))
+		}
+	}
+	return dns.FixedResponse(message.Id, question, addresses, ttl), nil
+}
+
+func (t *Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
+	callback(t.Exchange(ctx, message))
 }

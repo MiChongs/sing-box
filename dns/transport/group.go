@@ -71,9 +71,25 @@ func (t *GroupTransport) Reset() {
 }
 
 func (t *GroupTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+	done := make(chan struct{})
+	var (
+		response *mDNS.Msg
+		err      error
+	)
+	t.ExchangeAsync(ctx, message, func(callbackResponse *mDNS.Msg, callbackErr error) {
+		response = callbackResponse
+		err = callbackErr
+		close(done)
+	})
+	<-done
+	return response, err
+}
+
+func (t *GroupTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
 	transportManager := service.FromContext[adapter.DNSTransportManager](t.ctx)
 	if transportManager == nil {
-		return nil, E.New("missing DNS transport manager")
+		callback(nil, E.New("missing DNS transport manager"))
+		return
 	}
 
 	type result struct {
@@ -84,7 +100,6 @@ func (t *GroupTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 
 	resultCh := make(chan result, len(t.serverTags))
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
 	for _, tag := range t.serverTags {
 		transport, loaded := transportManager.Transport(tag)
@@ -92,26 +107,40 @@ func (t *GroupTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS
 			resultCh <- result{nil, tag, E.New("DNS server not found: ", tag)}
 			continue
 		}
-		go func(transport adapter.DNSTransport, tag string) {
-			resp, err := transport.Exchange(ctx, message.Copy())
-			resultCh <- result{resp, tag, err}
-		}(transport, tag)
+		childContext := adapter.OverrideContext(ctx)
+		childMessage := message.Copy()
+		go transport.ExchangeAsync(childContext, childMessage, func(response *mDNS.Msg, err error) {
+			resultCh <- result{response, tag, err}
+		})
 	}
 
-	var firstErr error
-	for range t.serverTags {
-		r := <-resultCh
-		if r.err == nil && r.response != nil {
-			t.logger.DebugContext(ctx, "fastest response from ", r.tag)
-			return r.response, nil
+	go func() {
+		defer cancel()
+		var firstErr error
+		for range t.serverTags {
+			var r result
+			select {
+			case <-ctx.Done():
+				callback(nil, ctx.Err())
+				return
+			case r = <-resultCh:
+			}
+			if r.err == nil && r.response != nil {
+				t.logger.DebugContext(ctx, "fastest response from ", r.tag)
+				cancel()
+				callback(r.response, nil)
+				return
+			}
+			if firstErr == nil && r.err != nil {
+				firstErr = r.err
+			}
 		}
-		if firstErr == nil && r.err != nil {
-			firstErr = r.err
-		}
-	}
 
-	if firstErr != nil {
-		return nil, firstErr
-	}
-	return nil, E.New("all DNS servers failed")
+		cancel()
+		if firstErr != nil {
+			callback(nil, firstErr)
+		} else {
+			callback(nil, E.New("all DNS servers failed"))
+		}
+	}()
 }

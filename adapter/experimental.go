@@ -8,17 +8,10 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/common/hash"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/observable"
 	"github.com/sagernet/sing/common/varbin"
 )
-
-type ClashServer interface {
-	LifecycleService
-	Mode() string
-	ModeList() []string
-	SetMode(mode string)
-	AddModeUpdateHook(hook *observable.Subscriber[struct{}])
-}
 
 type URLTestHistory struct {
 	Time  time.Time `json:"time"`
@@ -87,6 +80,8 @@ type GeoXService interface {
 type CacheFile interface {
 	LifecycleService
 
+	CacheID() string
+
 	StoreFakeIP() bool
 	FakeIPStorage
 
@@ -98,6 +93,7 @@ type CacheFile interface {
 
 	SetDisableExpire(disableExpire bool)
 	SetOptimisticTimeout(timeout time.Duration)
+	Flush()
 
 	LoadMode() string
 	StoreMode(mode string) error
@@ -114,27 +110,17 @@ type CacheFile interface {
 }
 
 type SavedBinary struct {
+	// Hash is stored only by the branch-private cache envelope.
 	Hash        hash.HashType
 	Content     []byte
 	LastUpdated time.Time
 	LastEtag    string
+	URLHash     []byte
 }
 
 func (s *SavedBinary) MarshalBinary() ([]byte, error) {
 	var buffer bytes.Buffer
-	err := binary.Write(&buffer, binary.BigEndian, uint8(1))
-	if err != nil {
-		return nil, err
-	}
-	hash, err := s.Hash.MarshalBinary()
-	if err != nil {
-		return nil, err
-	}
-	_, err = varbin.WriteUvarint(&buffer, uint64(len(hash)))
-	if err != nil {
-		return nil, err
-	}
-	_, err = buffer.Write(hash)
+	err := binary.Write(&buffer, binary.BigEndian, uint8(2))
 	if err != nil {
 		return nil, err
 	}
@@ -158,32 +144,31 @@ func (s *SavedBinary) MarshalBinary() ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	_, err = varbin.WriteUvarint(&buffer, uint64(len(s.URLHash)))
+	if err != nil {
+		return nil, err
+	}
+	_, err = buffer.Write(s.URLHash)
+	if err != nil {
+		return nil, err
+	}
 	return buffer.Bytes(), nil
 }
 
 func (s *SavedBinary) UnmarshalBinary(data []byte) error {
+	*s = SavedBinary{}
 	reader := bytes.NewReader(data)
 	var version uint8
 	err := binary.Read(reader, binary.BigEndian, &version)
 	if err != nil {
 		return err
 	}
-	hashLength, err := binary.ReadUvarint(reader)
-	if err != nil {
-		return err
-	}
-	hash := make([]byte, hashLength)
-	_, err = io.ReadFull(reader, hash)
-	if err != nil {
-		return err
-	}
-	err = s.Hash.UnmarshalBinary(hash)
-	if err != nil {
-		return err
-	}
 	contentLength, err := binary.ReadUvarint(reader)
 	if err != nil {
 		return err
+	}
+	if contentLength > uint64(reader.Len()) {
+		return E.New("invalid content length: ", contentLength)
 	}
 	s.Content = make([]byte, contentLength)
 	_, err = io.ReadFull(reader, s.Content)
@@ -200,54 +185,93 @@ func (s *SavedBinary) UnmarshalBinary(data []byte) error {
 	if err != nil {
 		return err
 	}
+	if etagLength > uint64(reader.Len()) {
+		return E.New("invalid etag length: ", etagLength)
+	}
 	etagBytes := make([]byte, etagLength)
 	_, err = io.ReadFull(reader, etagBytes)
 	if err != nil {
 		return err
 	}
 	s.LastEtag = string(etagBytes)
+	if version < 2 {
+		return nil
+	}
+	urlHashLength, err := binary.ReadUvarint(reader)
+	if err != nil {
+		return err
+	}
+	if urlHashLength > uint64(reader.Len()) {
+		return E.New("invalid url hash length: ", urlHashLength)
+	}
+	s.URLHash = make([]byte, urlHashLength)
+	_, err = io.ReadFull(reader, s.URLHash)
+	if err != nil {
+		return err
+	}
 	return nil
 }
 
 type OutboundGroup interface {
 	Outbound
-	Now() string
 	All() []string
+	Selected(network string) Outbound
+	AttachConnection(closer io.Closer) (detach func())
+}
 
-	// Hidden reports the dashboard hint set in option.GroupCommonOption.
-	// Returning true tells Clash-style front-ends to keep this group out
-	// of the proxy switcher; routing rules continue to work either way.
-	// All four built-in groups (Selector / URLTest / LoadBalance /
-	// Smart) implement this — third-party group implementations should
-	// return false when no hint is configured.
+// OutboundGroupHint exposes the dashboard hints from option.GroupCommonOption.
+// It is optional: all four built-in groups (Selector / URLTest / LoadBalance /
+// Smart) implement it, and groups that don't are rendered as hidden=false,
+// icon="".
+type OutboundGroupHint interface {
+	OutboundGroup
+
+	// Hidden reports whether Clash-style front-ends should keep this group
+	// out of the proxy switcher; routing rules continue to work either way.
 	Hidden() bool
 
-	// Icon returns the opaque dashboard icon string from
-	// option.GroupCommonOption (URL / data URI / emoji). Empty means
-	// "no icon configured" and front-ends should fall back to their
-	// default rendering.
+	// Icon returns the opaque dashboard icon string (URL / data URI /
+	// emoji). Empty means "no icon configured" and front-ends should fall
+	// back to their default rendering.
 	Icon() string
+}
+
+// ConnectionOutboundGroup selects a member for a particular connection rather
+// than exposing a single globally selected member.
+type ConnectionOutboundGroup interface {
+	OutboundGroup
+	SelectConnection(metadata *InboundContext) Outbound
+}
+
+// DialingOutboundGroup is a group whose own DialContext / ListenPacket must
+// stay in the connection path. The router stops chain resolution at such a
+// group instead of dialing its Selected member directly, so the group keeps
+// observing every dial (Smart learning and breakers, URLTest failover).
+type DialingOutboundGroup interface {
+	OutboundGroup
+	DialThroughGroup()
+}
+
+// ConnectionFailureListener is notified when dialing a resolved outbound chain fails.
+type ConnectionFailureListener interface {
+	OnConnectionFailure(ctx context.Context)
+}
+
+type PreMatchOutboundGroup interface {
+	OutboundGroup
+	// selectOutbound resolves nested groups and returns nil when the selected outbound is not eligible for pre-match.
+	// Implementations must not advance consumptive selection state when selectOutbound returns nil, but may retain
+	// a stable mapping when it is required for the following L4 selection to replay the same outbound.
+	SelectPreMatchOutbound(metadata *InboundContext, selectOutbound func(Outbound) (Outbound, PreMatchAction)) (Outbound, PreMatchAction)
 }
 
 type URLTestGroup interface {
 	OutboundGroup
 	URLTest(ctx context.Context) (map[string]uint16, error)
+	PerformUpdateCheck()
 }
 
 type LoadBalanceGroup interface {
-	OutboundGroup
+	ConnectionOutboundGroup
 	URLTest(ctx context.Context) (map[string]uint16, error)
-}
-
-type SelectorGroup interface {
-	Selected() Outbound
-}
-
-func OutboundTag(detour Outbound) string {
-	if group, isGroup := detour.(OutboundGroup); isGroup {
-		if now := group.Now(); now != "" {
-			return now
-		}
-	}
-	return detour.Tag()
 }

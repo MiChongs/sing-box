@@ -1,3 +1,9 @@
+---
+icon: material/new-box
+---
+
+!!! question "自 sing-box 1.14.0 起"
+
 ### 结构
 
 ```json
@@ -7,14 +13,20 @@
 
   ... // 监听字段
 
-  "psk": "my-pre-shared-key",
-  "version": 4,
-  "obfs_mode": "",
-  "obfs_host": ""
+  "version": 5,
+  "psk": "password",
+  "multi_user_authentication": "userkey",
+  "users": [
+    {
+      "name": "sekai",
+      "userkey": "user-password"
+    }
+  ],
+  "obfs_mode": ""
 }
 ```
 
-### 多用户结构
+### 版本 6 结构
 
 ```json
 {
@@ -23,19 +35,15 @@
 
   ... // 监听字段
 
+  "version": 6,
+  "psk": "password",
   "users": [
     {
-      "name": "alice",
-      "psk": "alice-pre-shared-key"
-    },
-    {
-      "name": "bob",
-      "psk": "bob-pre-shared-key"
+      "name": "sekai",
+      "userkey": "user-password"
     }
   ],
-  "version": 4,
-  "obfs_mode": "",
-  "obfs_host": ""
+  "mode": ""
 }
 ```
 
@@ -45,42 +53,51 @@
 
 ### 字段
 
+#### version
+
+==必填==
+
+Snell 协议版本，`5` `6` 之一。
+
+版本 `5` 支持 HTTP 混淆与 QUIC Proxy Mode；版本 `6` 以流量整形（`mode`）取而代之，
+并要求 PSK 长度为 12 到 255 字节。
+
+为兼容 Surge，版本 `6` 入站也会在 Snell 端口监听 UDP，并接受旧版 v5 QUIC
+Proxy 线路格式。标准 v6 UDP 流量仍使用 UDP over TCP。
+
 #### psk
 
-==未设置 `users` 时必填==
-
-单用户模式的预共享密钥，与 `users` 互斥。
+单用户模式和 `userkey` 多用户模式下必填；`psk` 多用户模式下必须省略。
 
 #### users
 
-==未设置 `psk` 时必填==
+Snell 用户。
 
-多用户模式的用户列表，每项包含 `name` 和 `psk`，与 `psk` 互斥。
+`multi_user_authentication: userkey` 时，每个用户必须配置 `userkey` 且不能出现 `psk`；
+选择 `psk` 时，每个用户必须配置独立 `psk` 且不能出现 `userkey`。
 
-匹配到的用户名可在路由规则中通过 `auth_user` 使用。
+#### multi_user_authentication
 
-#### version
+多用户认证模式，可选值为 `userkey`、`psk`，默认 `userkey`。仅配置 `users` 时可用。
 
-Snell 协议版本，必须为 `4` 或 `5`。
-
-默认为 `4`。
-
-!!! note "QUIC 代理模式（v5）"
-    当 `version` 为 `5` 时，服务端自动在同一端口接收 QUIC 流量。
-    目标地址和首个 QUIC Initial 包经 Snell 加密传输，后续包直接转发（QUIC 本身已加密）。
-    无需额外配置。
+`psk` 模式支持 v5，以及 v6 的 `default` / `unshaped`；v6 `unsafe-raw` 不使用 PSK，
+因此该组合会直接报错。
 
 #### obfs_mode
 
-simple-obfs 混淆模式。
+==仅版本 5==
 
-可选 `http` `tls`，留空则禁用混淆。
+HTTP 混淆模式，`none` `http` 之一。
 
-!!! warning
-    v4/v5 不支持 TLS 混淆，请改用 [ShadowTLS](/zh/configuration/inbound/shadowtls/)。
+默认为 `none`。
 
-#### obfs_host
+不支持 TLS simple-obfs。如需 TLS 流量伪装，请在 Snell 前配置
+[ShadowTLS](/zh/configuration/inbound/shadowtls/) 入站。
 
-用于 HTTP/TLS 混淆的主机名。
+#### mode
 
-未设置时默认为 `bing.com`。
+==仅版本 6==
+
+流量整形模式，`default` `unshaped` `unsafe-raw` 之一。
+
+默认为 `default`。

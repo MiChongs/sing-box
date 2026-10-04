@@ -1,3 +1,9 @@
+---
+icon: material/new-box
+---
+
+!!! question "Since sing-box 1.14.0"
+
 ### Structure
 
 ```json
@@ -6,13 +12,35 @@
   "tag": "snell-out",
 
   "server": "127.0.0.1",
-  "server_port": 8388,
-  "psk": "my-pre-shared-key",
+  "server_port": 1080,
   "version": 4,
+  "psk": "password",
+  "userkey": "",
   "reuse": false,
-  "network": "",
+  "network": "tcp",
   "obfs_mode": "",
   "obfs_host": "",
+
+  ... // Dial Fields
+}
+```
+
+### Version 6 Structure
+
+```json
+{
+  "type": "snell",
+  "tag": "snell-out",
+
+  "server": "127.0.0.1",
+  "server_port": 1080,
+  "version": 6,
+  "psk": "password",
+  "userkey": "",
+  "reuse": false,
+  "network": "tcp",
+  "mode": "",
+  "quic_proxy_mode": false,
 
   ... // Dial Fields
 }
@@ -32,59 +60,88 @@ The server address.
 
 The server port.
 
+#### version
+
+==Required==
+
+The Snell protocol version, one of `1` `2` `3` `4` `5` `6`.
+
+| Version | TCP | UDP |
+|---------|-----|-----|
+| 1, 2 | Yes | No |
+| 3 | Yes | UDP over TCP |
+| 4 | Yes | UDP over TCP |
+| 5 | Yes | QUIC Proxy for QUIC; UDP over TCP otherwise |
+| 6 | Yes | UDP over TCP; optional QUIC Proxy compatibility |
+
+Versions 4 and 5 use the same TCP wire protocol. Version 5 only adds QUIC Proxy Mode.
+
 #### psk
 
 ==Required==
 
-The pre-shared key for authentication.
+The pre-shared key.
 
-#### version
+Version 6 requires a PSK between 12 and 255 bytes.
 
-Snell protocol version. One of `1` `2` `3` `4` `5`.
+#### userkey
 
-Defaults to `4`.
-
-| Version | TCP | UDP             |
-|---------|-----|-----------------|
-| 1, 2    | ✔   | ✘               |
-| 3, 4    | ✔   | ✔ (UoT)         |
-| 5       | ✔   | ✔ (QUIC proxy)  |
-
-!!! note "QUIC Proxy Mode (v5)"
-    In v5, QUIC traffic uses a dedicated proxy path: the destination address
-    and the first QUIC Initial packet are encrypted by Snell; subsequent
-    packets are forwarded as-is (QUIC provides its own encryption).
-    Other UDP traffic falls back to the standard UDP-over-TCP tunnel.
-
-#### network
-
-Enabled network, one of `tcp` `udp`.
-
-Both are enabled by default for v3/v4/v5. For v1/v2 only TCP is enabled by default (no UDP support).
-
-UDP requires version `3` or above.
+The user key, used to authenticate against a multi-user server.
 
 #### reuse
 
-Enable connection reuse (Snell v4+ only). Reuses an existing TCP connection for
-multiple sequential requests, avoiding the overhead of a new TCP and encryption
-handshake for each request.
+Enable connection reuse.
 
-Requires the server to support Snell v4 connection reuse.
+Only supported for Snell protocol version `4` or above.
 
-Defaults to `false`.
+#### network
+
+Enabled network
+
+One of `tcp` `udp`.
+
+TCP is enabled by default for v1/v2. TCP and UDP are enabled by default for
+v3-v6. UDP cannot be enabled for v1/v2.
 
 #### obfs_mode
 
-Simple-obfs obfuscation mode.
+==Version 1-5 only==
 
-One of `http` `tls`, or empty to disable.
+Simple-obfs mode. v1-v3 support `http` and `tls`; v4/v5 support `http`.
+
+`none` is used by default.
+
+TLS simple-obfs is intentionally limited to legacy v1-v3 compatibility and is
+not supported for v4/v5. Use a [ShadowTLS](/configuration/outbound/shadowtls/)
+detour when TLS camouflage is required.
 
 #### obfs_host
 
-The obfuscation hostname used for HTTP/TLS obfuscation.
+==Version 1-5 only==
 
-Defaults to `bing.com` if not set.
+The HTTP `Host` header sent when `obfs_mode` is `http`.
+
+`bing.com` is used by default.
+
+#### mode
+
+==Version 6 only==
+
+Traffic shaping mode, one of `default` `unshaped` `unsafe-raw`.
+
+`default` is used by default.
+
+#### quic_proxy_mode
+
+==Version 6 only==
+
+Enable the legacy Snell v5 QUIC Proxy Mode for QUIC traffic while keeping other
+UDP traffic on the Snell v6 UDP-over-TCP path.
+
+Disabled by default. This is a compatibility option for Surge clients that use
+QUIC Proxy Mode with a Snell v6 node, even though the standard Snell v6 protocol
+does not support that mode. The server must provide the corresponding UDP
+listener on the Snell port.
 
 ### Dial Fields
 

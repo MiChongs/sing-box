@@ -3,7 +3,9 @@ package clashapi
 import (
 	"net/http"
 
+	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/service"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
@@ -12,10 +14,16 @@ import (
 func configRouter(server *Server, logFactory log.Factory) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getConfigs(server, logFactory))
-	// r.Put("/", updateConfigs)
-	r.Put("/", reload(server))
+	// Like mihomo in embed mode, PUT is not allowed if reloading is not supported.
+	if server.configChecker() != nil {
+		r.Put("/", reload(server))
+	}
 	r.Patch("/", patchConfigs(server))
 	return r
+}
+
+func (s *Server) configChecker() adapter.ConfigChecker {
+	return service.FromContext[adapter.ConfigChecker](s.ctx)
 }
 
 type configSchema struct {
@@ -44,9 +52,9 @@ func getConfigs(server *Server, logFactory log.Factory) func(w http.ResponseWrit
 			logLevel = log.LevelError
 		}
 		render.JSON(w, r, &configSchema{
-			Mode:        server.mode,
-			ModeList:    server.modeList,
-			Modes:       server.modeList,
+			Mode:        server.clashMode.Mode(),
+			ModeList:    server.clashMode.ModeList(),
+			Modes:       server.clashMode.ModeList(),
 			AllowLan:    true,
 			BindAddress: "*",
 			LogLevel:    log.FormatLevel(logLevel),
@@ -64,7 +72,7 @@ func patchConfigs(server *Server) func(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if newConfig.Mode != "" {
-			server.SetMode(newConfig.Mode)
+			server.clashMode.SetMode(newConfig.Mode)
 		}
 		render.NoContent(w, r)
 	}

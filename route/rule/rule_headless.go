@@ -34,10 +34,6 @@ type DefaultHeadlessRule struct {
 	abstractDefaultRule
 }
 
-func (r *DefaultHeadlessRule) matchStates(metadata *adapter.InboundContext) ruleMatchStateSet {
-	return r.abstractDefaultRule.matchStates(metadata)
-}
-
 func NewDefaultHeadlessRule(ctx context.Context, options option.DefaultHeadlessRule) (*DefaultHeadlessRule, error) {
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	rule := &DefaultHeadlessRule{
@@ -233,10 +229,6 @@ type LogicalHeadlessRule struct {
 	abstractLogicalRule
 }
 
-func (r *LogicalHeadlessRule) matchStates(metadata *adapter.InboundContext) ruleMatchStateSet {
-	return r.abstractLogicalRule.matchStates(metadata)
-}
-
 func NewLogicalHeadlessRule(ctx context.Context, options option.LogicalHeadlessRule) (*LogicalHeadlessRule, error) {
 	r := &LogicalHeadlessRule{
 		abstractLogicalRule{
@@ -258,6 +250,13 @@ func NewLogicalHeadlessRule(ctx context.Context, options option.LogicalHeadlessR
 		return nil, E.New("unknown logical mode: ", options.Mode)
 	}
 	for i, subRule := range options.Rules {
+		if subRule.Type == C.RuleTypeLogical {
+			if subRule.LogicalOptions.DomainMatchStrategy == option.DomainMatchStrategy(C.DomainMatchStrategyAsIS) {
+				subRule.LogicalOptions.DomainMatchStrategy = option.DomainMatchStrategy(r.domainMatchStrategy)
+			}
+		} else if subRule.DefaultOptions.DomainMatchStrategy == option.DomainMatchStrategy(C.DomainMatchStrategyAsIS) {
+			subRule.DefaultOptions.DomainMatchStrategy = option.DomainMatchStrategy(r.domainMatchStrategy)
+		}
 		rule, err := NewHeadlessRule(ctx, subRule)
 		if err != nil {
 			return nil, E.Cause(err, "sub rule[", i, "]")

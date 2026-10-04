@@ -21,58 +21,63 @@ const (
 	filterMaxInsts  = 256
 
 	fieldZero        = 0
+	fieldInbound     = 1
 	fieldOutbound    = 2
 	fieldIP          = 5
 	fieldIPv6        = 6
+	fieldICMP        = 7
 	fieldTCP         = 8
+	fieldUDP         = 9
+	fieldICMPv6      = 10
 	fieldIPSrcAddr   = 21
 	fieldIPDstAddr   = 22
 	fieldIPv6SrcAddr = 28
 	fieldIPv6DstAddr = 29
+	fieldICMPType    = 30
+	fieldICMPv6Type  = 34
 	fieldTCPSrcPort  = 38
 	fieldTCPDstPort  = 39
+	fieldUDPSrcPort  = 53
+	fieldUDPDstPort  = 54
 
-	testEQ = 0
+	testEQ  = 0
+	testLEQ = 3
+	testGEQ = 5
 
 	resultAccept uint16 = 0x7FFE
 	resultReject uint16 = 0x7FFF
 )
 
 // Filter flags passed to IOCTL_WINDIVERT_STARTUP alongside the compiled
-// filter. These tell the driver what *kinds* of packets the filter might
-// match, used as a kernel-side fast-reject.
+// filter. The driver installs WFP callouts only for the directions and
+// address families named here (windivert_install_callouts), so a filter
+// missing its direction flag never sees a packet.
 const (
+	filterFlagInbound  uint64 = 0x0010
 	filterFlagOutbound uint64 = 0x0020
 	filterFlagIP       uint64 = 0x0040
 	filterFlagIPv6     uint64 = 0x0080
 )
 
 type filterInst struct {
-	field   uint16 // 11 bits used
-	test    uint8  //  5 bits used
+	field   uint16
+	test    uint8
 	success uint16
 	failure uint16
 	neg     bool
 	arg     [4]uint32
 }
 
-// Filter is a typed specification of packets to capture. It replaces
-// WinDivert's filter string language.
-//
-// Zero value = "reject all" (match nothing), suitable for send-only handles.
 type Filter struct {
-	insts []filterInst
-	flags uint64 // filter flags for STARTUP ioctl
+	insts    []filterInst
+	anyInsts []filterInst
+	flags    uint64
 }
 
-// reject returns a filter that matches no packet. The empty insts slice
-// is encoded as a single rejecting instruction by encode().
 func reject() *Filter {
 	return &Filter{}
 }
 
-// OutboundTCP returns a filter matching outbound TCP packets on the given
-// 5-tuple. Both addresses must share an address family (IPv4 or IPv6).
 func OutboundTCP(src, dst netip.AddrPort) (*Filter, error) {
 	if !src.IsValid() || !dst.IsValid() {
 		return nil, E.New("windivert: filter: invalid address port")
@@ -83,8 +88,6 @@ func OutboundTCP(src, dst netip.AddrPort) (*Filter, error) {
 	f := &Filter{
 		flags: filterFlagOutbound,
 	}
-	// Insts chain as AND: each test's failure = REJECT, success = next inst.
-	// The final inst's success = ACCEPT.
 	f.add(fieldOutbound, testEQ, argUint32(1))
 	if src.Addr().Is4() {
 		f.flags |= filterFlagIP
@@ -104,27 +107,114 @@ func OutboundTCP(src, dst netip.AddrPort) (*Filter, error) {
 	return f, nil
 }
 
+func inboundTo(destinations []netip.Addr) (*Filter, error) {
+	if len(destinations) == 0 {
+		return nil, E.New("windivert: filter: no destination address")
+	}
+	isV6 := destinations[0].Is6()
+	for _, destination := range destinations {
+		if !destination.IsValid() {
+			return nil, E.New("windivert: filter: invalid address")
+		}
+		if destination.Is6() != isV6 {
+			return nil, E.New("windivert: filter: mixed IPv4/IPv6")
+		}
+	}
+	f := &Filter{
+		flags: filterFlagInbound,
+	}
+	f.add(fieldInbound, testEQ, argUint32(1))
+	if !isV6 {
+		f.flags |= filterFlagIP
+		f.add(fieldIP, testEQ, argUint32(1))
+		for _, destination := range destinations {
+			f.addAny(fieldIPDstAddr, testEQ, argIPv4(destination))
+		}
+	} else {
+		f.flags |= filterFlagIPv6
+		f.add(fieldIPv6, testEQ, argUint32(1))
+		for _, destination := range destinations {
+			f.addAny(fieldIPv6DstAddr, testEQ, argIPv6(destination))
+		}
+	}
+	return f, nil
+}
+
+func InboundTCPPortRange(destinations []netip.Addr, portLow, portHigh uint16) (*Filter, error) {
+	f, err := inboundTo(destinations)
+	if err != nil {
+		return nil, err
+	}
+	f.add(fieldTCP, testEQ, argUint32(1))
+	f.add(fieldTCPDstPort, testGEQ, argUint32(uint32(portLow)))
+	f.add(fieldTCPDstPort, testLEQ, argUint32(uint32(portHigh)))
+	return f, nil
+}
+
+func InboundUDPPortRange(destinations []netip.Addr, portLow, portHigh uint16) (*Filter, error) {
+	f, err := inboundTo(destinations)
+	if err != nil {
+		return nil, err
+	}
+	f.add(fieldUDP, testEQ, argUint32(1))
+	f.add(fieldUDPDstPort, testGEQ, argUint32(uint32(portLow)))
+	f.add(fieldUDPDstPort, testLEQ, argUint32(uint32(portHigh)))
+	return f, nil
+}
+
+func InboundICMPEchoReply(destinations []netip.Addr) (*Filter, error) {
+	f, err := inboundTo(destinations)
+	if err != nil {
+		return nil, err
+	}
+	if destinations[0].Is4() {
+		f.add(fieldICMP, testEQ, argUint32(1))
+		f.add(fieldICMPType, testEQ, argUint32(0))
+	} else {
+		f.add(fieldICMPv6, testEQ, argUint32(1))
+		f.add(fieldICMPv6Type, testEQ, argUint32(129))
+	}
+	return f, nil
+}
+
+func InboundICMPError(destinations []netip.Addr) (*Filter, error) {
+	f, err := inboundTo(destinations)
+	if err != nil {
+		return nil, err
+	}
+	if destinations[0].Is4() {
+		f.add(fieldICMP, testEQ, argUint32(1))
+		f.add(fieldICMPType, testGEQ, argUint32(3))
+		f.add(fieldICMPType, testLEQ, argUint32(12))
+	} else {
+		f.add(fieldICMPv6, testEQ, argUint32(1))
+		f.add(fieldICMPv6Type, testGEQ, argUint32(1))
+		f.add(fieldICMPv6Type, testLEQ, argUint32(4))
+	}
+	return f, nil
+}
+
 func (f *Filter) add(field uint16, test uint8, arg [4]uint32) {
 	f.insts = append(f.insts, filterInst{field: field, test: test, arg: arg})
 }
 
+func (f *Filter) addAny(field uint16, test uint8, arg [4]uint32) {
+	f.anyInsts = append(f.anyInsts, filterInst{field: field, test: test, arg: arg})
+}
+
 func argUint32(v uint32) [4]uint32 { return [4]uint32{v, 0, 0, 0} }
 
-// argIPv4 encodes an IPv4 address for IP_SRCADDR/IP_DSTADDR. The driver
-// compares against an IPv4-mapped-IPv6 form: {host_order_u32, 0x0000FFFF,
-// 0, 0} (see sys/windivert.c windivert_get_ipv4_addr and the IPv4_SRCADDR
-// val-word construction). Omitting the 0x0000FFFF marker causes the EQ
-// test to fail for every packet.
+// The driver compares IP_SRCADDR/IP_DSTADDR against an IPv4-mapped-IPv6
+// form: {host_order_u32, 0x0000FFFF, 0, 0} (sys/windivert.c
+// windivert_get_ipv4_addr).
 func argIPv4(addr netip.Addr) [4]uint32 {
 	b := addr.As4()
 	return [4]uint32{binary.BigEndian.Uint32(b[:]), 0x0000FFFF, 0, 0}
 }
 
-// argIPv6 encodes an IPv6 address for IPV6_SRCADDR/IPV6_DSTADDR. The
-// driver stores the address as four host-order uint32s in REVERSED word
-// order: val[0]=low (bytes 12..15), val[3]=high (bytes 0..3). See
-// sys/windivert.c windivert_outbound_network_v6_classify val-word
-// construction.
+// The driver stores IPV6_SRCADDR/IPV6_DSTADDR as four host-order uint32s in
+// reversed word order: val[0]=low (bytes 12..15), val[3]=high (bytes 0..3)
+// (sys/windivert.c windivert_outbound_network_v6_classify).
 func argIPv6(addr netip.Addr) [4]uint32 {
 	b := addr.As16()
 	return [4]uint32{
@@ -135,12 +225,9 @@ func argIPv6(addr netip.Addr) [4]uint32 {
 	}
 }
 
-// encode serializes the Filter to the on-wire WINDIVERT_FILTER[] format
-// plus the filter_flags for STARTUP ioctl.
 func (f *Filter) encode() ([]byte, uint64, error) {
-	if len(f.insts) == 0 {
-		// "Reject all" — one instruction, ZERO == 0 is always true, but we
-		// invert by setting both success and failure to REJECT.
+	total := len(f.insts) + len(f.anyInsts)
+	if total == 0 {
 		return encodeInst(filterInst{
 			field:   fieldZero,
 			test:    testEQ,
@@ -148,17 +235,26 @@ func (f *Filter) encode() ([]byte, uint64, error) {
 			failure: resultReject,
 		}), 0, nil
 	}
-	if len(f.insts) > filterMaxInsts-1 {
+	if total > filterMaxInsts-1 {
 		return nil, 0, E.New("windivert: filter too long")
 	}
-	buf := make([]byte, 0, filterInstBytes*len(f.insts))
+	buf := make([]byte, 0, filterInstBytes*total)
 	for i, inst := range f.insts {
-		if i == len(f.insts)-1 {
+		if i == total-1 {
 			inst.success = resultAccept
 		} else {
 			inst.success = uint16(i + 1)
 		}
 		inst.failure = resultReject
+		buf = append(buf, encodeInst(inst)...)
+	}
+	for i, inst := range f.anyInsts {
+		inst.success = resultAccept
+		if len(f.insts)+i == total-1 {
+			inst.failure = resultReject
+		} else {
+			inst.failure = uint16(len(f.insts) + i + 1)
+		}
 		buf = append(buf, encodeInst(inst)...)
 	}
 	return buf, f.flags, nil

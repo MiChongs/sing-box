@@ -1,10 +1,9 @@
-//go:build with_gvisor
+//go:build with_tailscale
 
 package tailscale
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/http"
 	"net/netip"
@@ -28,6 +27,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 	nDNS "github.com/sagernet/tailscale/net/dns"
+	nDNSResolver "github.com/sagernet/tailscale/net/dns/resolver"
 	"github.com/sagernet/tailscale/types/dnstype"
 	"github.com/sagernet/tailscale/util/dnsname"
 	"github.com/sagernet/tailscale/wgengine/router"
@@ -56,7 +56,9 @@ type DNSTransport struct {
 	routePrefixes          []netip.Prefix
 	routes                 map[string][]adapter.DNSTransport
 	hosts                  map[string][]netip.Addr
+	magicHosts             nDNSResolver.MagicDNSHosts
 	searchDomains          []string
+	serverAddresses        []netip.Addr
 	defaultResolvers       []adapter.DNSTransport
 }
 
@@ -119,6 +121,7 @@ func (t *DNSTransport) updateDNSServers(routeConfig *router.Config, dnsConfig *n
 		return &DNSDialer{transport: t, fallbackDialer: directDialer}
 	})
 	routes := make(map[string][]adapter.DNSTransport)
+	var serverAddresses []netip.Addr
 	for domain, resolvers := range dnsConfig.Routes {
 		var myResolvers []adapter.DNSTransport
 		for _, resolver := range resolvers {
@@ -127,8 +130,12 @@ func (t *DNSTransport) updateDNSServers(routeConfig *router.Config, dnsConfig *n
 				return err
 			}
 			myResolvers = append(myResolvers, myResolver)
+			serverAddrPort, isIPResolver := resolver.IPPort()
+			if isIPResolver {
+				serverAddresses = append(serverAddresses, serverAddrPort.Addr())
+			}
 		}
-		routes[domain.WithTrailingDot()] = myResolvers
+		routes[mDNS.CanonicalName(domain.WithTrailingDot())] = myResolvers
 	}
 	hosts := make(map[string][]netip.Addr)
 	for domain, addresses := range dnsConfig.Hosts {
@@ -144,6 +151,10 @@ func (t *DNSTransport) updateDNSServers(routeConfig *router.Config, dnsConfig *n
 			return err
 		}
 		defaultResolvers = append(defaultResolvers, myResolver)
+		serverAddrPort, isIPResolver := resolver.IPPort()
+		if isIPResolver {
+			serverAddresses = append(serverAddresses, serverAddrPort.Addr())
+		}
 	}
 
 	t.access.Lock()
@@ -151,7 +162,9 @@ func (t *DNSTransport) updateDNSServers(routeConfig *router.Config, dnsConfig *n
 	t.routePrefixes = routePrefixes
 	t.routes = routes
 	t.hosts = hosts
+	t.magicHosts = t.endpoint.server.ExportLocalBackend().ExportMagicDNSHosts()
 	t.searchDomains = searchDomains
+	t.serverAddresses = common.Uniq(serverAddresses)
 	t.defaultResolvers = defaultResolvers
 	t.access.Unlock()
 
@@ -242,6 +255,8 @@ func (t *DNSTransport) Close() error {
 	t.routePrefixes = nil
 	t.routes = nil
 	t.hosts = nil
+	t.magicHosts = nil
+	t.serverAddresses = nil
 	t.defaultResolvers = nil
 	t.access.Unlock()
 
@@ -259,65 +274,109 @@ func (t *DNSTransport) Raw() bool {
 	return true
 }
 
+func (t *DNSTransport) ServerAddresses() []netip.Addr {
+	t.access.RLock()
+	defer t.access.RUnlock()
+	return t.serverAddresses
+}
+
+func (t *DNSTransport) SearchDomains() []string {
+	t.access.RLock()
+	defer t.access.RUnlock()
+	return t.searchDomains
+}
+
 func (t *DNSTransport) PreferredDomain(domain string) bool {
 	t.access.RLock()
 	hosts := t.hosts
+	magicHosts := t.magicHosts
 	routes := t.routes
+	searchDomains := t.searchDomains
 	t.access.RUnlock()
-	if _, loaded := hosts[domain]; loaded {
+	if _, loaded := lookupHosts(hosts, magicHosts, domain); loaded {
 		return true
 	}
+	if t.acceptSearchDomain && len(searchDomains) > 0 && mDNS.CountLabel(domain) == 1 {
+		return true
+	}
+	canonicalDomain := mDNS.CanonicalName(domain)
 	for suffix := range routes {
-		if strings.HasSuffix(domain, suffix) {
+		if matchDomainSuffix(canonicalDomain, suffix) {
 			return true
 		}
 	}
 	return false
 }
 
+func matchDomainSuffix(domain string, suffix string) bool {
+	if suffix == "." || suffix == "" {
+		return true
+	}
+	if !strings.HasSuffix(domain, suffix) {
+		return false
+	}
+	return len(domain) == len(suffix) || domain[len(domain)-len(suffix)-1] == '.'
+}
+
 func (t *DNSTransport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+	done := make(chan struct{})
+	var (
+		response *mDNS.Msg
+		err      error
+	)
+	t.ExchangeAsync(ctx, message, func(callbackResponse *mDNS.Msg, callbackErr error) {
+		response = callbackResponse
+		err = callbackErr
+		close(done)
+	})
+	<-done
+	return response, err
+}
+
+func (t *DNSTransport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
 	if len(message.Question) != 1 {
-		return nil, os.ErrInvalid
+		callback(nil, os.ErrInvalid)
+		return
 	}
 	if t.acceptSearchDomain && mDNS.CountLabel(message.Question[0].Name) == 1 {
-		return t.exchangeWithSearchDomains(ctx, message)
+		t.exchangeWithSearchDomains(ctx, message, callback)
+		return
 	}
 	t.access.RLock()
 	acceptDefaultResolvers := t.acceptDefaultResolvers
 	t.access.RUnlock()
-	return t.exchangeOnce(ctx, message, acceptDefaultResolvers)
+	t.exchangeOnce(ctx, message, acceptDefaultResolvers, callback)
 }
 
-func (t *DNSTransport) exchangeWithSearchDomains(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+func (t *DNSTransport) exchangeWithSearchDomains(ctx context.Context, message *mDNS.Msg, callback func(response *mDNS.Msg, err error)) {
 	t.access.RLock()
 	searchDomains := t.searchDomains
 	t.access.RUnlock()
+	if len(searchDomains) == 0 {
+		callback(nil, dns.RcodeNameError)
+		return
+	}
 	originalQuestion := message.Question[0]
 	singleLabel := strings.TrimSuffix(originalQuestion.Name, ".")
-	var lastErr error
+	domainExchangers := make([]transport.AsyncExchanger, 0, len(searchDomains))
 	for _, searchDomain := range searchDomains {
 		expandedName := singleLabel + "." + searchDomain
-		question := originalQuestion
-		question.Name = expandedName
-		rewritten := *message
-		rewritten.Question = []mDNS.Question{question}
-		response, err := t.exchangeOnce(ctx, &rewritten, false)
-		if err == nil {
-			if response.Rcode == mDNS.RcodeNameError {
-				continue
-			}
-			restoreOriginalQuestion(response, expandedName, originalQuestion)
-			return response, nil
-		}
-		if errors.Is(err, dns.RcodeNameError) {
-			continue
-		}
-		lastErr = err
+		domainExchangers = append(domainExchangers, func(exchangeCtx context.Context, exchangeCallback func(response *mDNS.Msg, err error)) {
+			question := originalQuestion
+			question.Name = expandedName
+			rewritten := *message
+			rewritten.Question = []mDNS.Question{question}
+			t.exchangeOnce(exchangeCtx, &rewritten, false, func(response *mDNS.Msg, err error) {
+				if err == nil {
+					restoreOriginalQuestion(response, expandedName, originalQuestion)
+				}
+				exchangeCallback(response, err)
+			})
+		})
 	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, dns.RcodeNameError
+	transport.ExchangeSequential(ctx, domainExchangers, func(response *mDNS.Msg, err error) bool {
+		return err == nil && response.Rcode != mDNS.RcodeNameError
+	}, callback)
 }
 
 // RFC 1035 §4.1.1 requires the response Question to match the request byte-for-byte,
@@ -331,75 +390,85 @@ func restoreOriginalQuestion(response *mDNS.Msg, expandedName string, originalQu
 	}
 }
 
-func (t *DNSTransport) exchangeOnce(ctx context.Context, message *mDNS.Msg, allowDefaultResolvers bool) (*mDNS.Msg, error) {
+func (t *DNSTransport) exchangeOnce(ctx context.Context, message *mDNS.Msg, allowDefaultResolvers bool, callback func(response *mDNS.Msg, err error)) {
 	question := message.Question[0]
 
 	t.access.RLock()
 	hosts := t.hosts
+	magicHosts := t.magicHosts
 	routes := t.routes
 	defaultResolvers := t.defaultResolvers
 	t.access.RUnlock()
 
-	addresses, hostsLoaded := hosts[question.Name]
+	addresses, hostsLoaded := lookupHosts(hosts, magicHosts, question.Name)
 	if hostsLoaded {
 		switch question.Qtype {
-		case mDNS.TypeA:
-			addresses4 := common.Filter(addresses, func(addr netip.Addr) bool {
-				return addr.Is4()
-			})
-			if len(addresses4) > 0 {
-				return dns.FixedResponse(message.Id, question, addresses4, C.DefaultDNSTTL), nil
-			}
-		case mDNS.TypeAAAA:
-			addresses6 := common.Filter(addresses, func(addr netip.Addr) bool {
-				return addr.Is6()
-			})
-			if len(addresses6) > 0 {
-				return dns.FixedResponse(message.Id, question, addresses6, C.DefaultDNSTTL), nil
-			}
+		case mDNS.TypeA, mDNS.TypeAAAA:
+			callback(dns.FixedResponse(message.Id, question, addresses, C.DefaultDNSTTL), nil)
+		default:
+			callback(dns.FixedResponseStatus(message, mDNS.RcodeSuccess), nil)
 		}
+		return
 	}
+	canonicalName := mDNS.CanonicalName(question.Name)
 	for domainSuffix, transports := range routes {
-		if strings.HasSuffix(question.Name, domainSuffix) {
+		if matchDomainSuffix(canonicalName, domainSuffix) {
 			if len(transports) == 0 {
-				return &mDNS.Msg{
+				callback(&mDNS.Msg{
 					MsgHdr: mDNS.MsgHdr{
 						Id:       message.Id,
 						Rcode:    mDNS.RcodeNameError,
 						Response: true,
 					},
 					Question: []mDNS.Question{question},
-				}, nil
+				}, nil)
+				return
 			}
-			var lastErr error
-			for _, dnsTransport := range transports {
-				response, err := dnsTransport.Exchange(ctx, message)
-				if err != nil {
-					lastErr = err
-					continue
-				}
-				return response, nil
-			}
-			return nil, lastErr
+			transport.ExchangeSequential(ctx, resolverExchangers(transports, message), nil, callback)
+			return
 		}
 	}
 	if allowDefaultResolvers {
 		if len(defaultResolvers) > 0 {
-			var lastErr error
-			for _, resolver := range defaultResolvers {
-				response, err := resolver.Exchange(ctx, message)
-				if err != nil {
-					lastErr = err
-					continue
-				}
-				return response, nil
-			}
-			return nil, lastErr
+			transport.ExchangeSequential(ctx, resolverExchangers(defaultResolvers, message), nil, callback)
 		} else {
-			return nil, E.New("missing default resolvers")
+			callback(nil, E.New("missing default resolvers"))
+		}
+		return
+	}
+	callback(nil, dns.RcodeNameError)
+}
+
+func lookupHosts(hosts map[string][]netip.Addr, magicHosts nDNSResolver.MagicDNSHosts, name string) ([]netip.Addr, bool) {
+	addresses, loaded := hosts[name]
+	if loaded {
+		return addresses, true
+	}
+	if magicHosts == nil {
+		return nil, false
+	}
+	fqdn, err := dnsname.ToFQDN(name)
+	if err != nil {
+		return nil, false
+	}
+	addresses, loaded = magicHosts.LookupHost(fqdn)
+	if loaded {
+		return addresses, true
+	}
+	for parent := fqdn.Parent(); parent != ""; parent = parent.Parent() {
+		if magicHosts.SubdomainHost(parent) {
+			return magicHosts.LookupHost(parent)
 		}
 	}
-	return nil, dns.RcodeNameError
+	return nil, false
+}
+
+func resolverExchangers(resolvers []adapter.DNSTransport, message *mDNS.Msg) []transport.AsyncExchanger {
+	return common.Map(resolvers, func(resolver adapter.DNSTransport) transport.AsyncExchanger {
+		return func(ctx context.Context, callback func(response *mDNS.Msg, err error)) {
+			resolver.ExchangeAsync(ctx, message, callback)
+		}
+	})
 }
 
 func (t *DNSTransport) collectResolversLocked() []adapter.DNSTransport {
@@ -447,3 +516,8 @@ func (t *DNSTransport) routePrefixesSnapshot() []netip.Prefix {
 	defer t.access.RUnlock()
 	return append([]netip.Prefix(nil), t.routePrefixes...)
 }
+
+var (
+	_ adapter.DNSTransportWithPreferredDomain = (*DNSTransport)(nil)
+	_ adapter.DNSTransportWithConfiguration   = (*DNSTransport)(nil)
+)

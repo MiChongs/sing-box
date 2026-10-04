@@ -55,26 +55,40 @@ go build -tags "tag_a tag_b" ./cmd/sing-box
 | `with_acme`                        | :material-check:     | Build with ACME TLS certificate issuer support, see [TLS](/configuration/shared/tls/).                                                                                                                                                                                                                                         |
 | `with_clash_api`                   | :material-check:     | Build with Clash API support, see [Experimental](/configuration/experimental#clash-api-fields).                                                                                                                                                                                                                                |
 | `with_v2ray_api`                   | :material-close:️    | Build with V2Ray API support, see [Experimental](/configuration/experimental#v2ray-api-fields).                                                                                                                                                                                                                                |
-| `with_gvisor`                      | :material-check:     | Build with gVisor support, see [Tun inbound](/configuration/inbound/tun#stack) and [WireGuard outbound](/configuration/outbound/wireguard#system_interface).                                                                                                                                                                   |
+| `with_gvisor`                      | :material-close:     | Build with gVisor support, required by the deprecated `gvisor` / `mixed` [Tun stacks](/configuration/inbound/tun#stack).                                                                                                                                                                   |
+| `with_ebpf`                        | :material-close:     | Build the pure-Go runtime for the experimental eBPF inbound on Linux or Android. See [eBPF inbound](/configuration/inbound/ebpf/).                                                                                                                                                                                             |
 | `with_embedded_tor` (CGO required) | :material-close:️    | Build with embedded Tor support, see [Tor outbound](/configuration/outbound/tor/).                                                                                                                                                                                                                                             |
 | `with_tailscale`                   | :material-check:     | Build with Tailscale support, see [Tailscale endpoint](/configuration/endpoint/tailscale).                                                                                                                                                                                                                                     |
 | `with_ccm`                         | :material-check:     | Build with Claude Code Multiplexer service support.                                                                                                                                                                                                                                                                            |
 | `with_ocm`                         | :material-check:     | Build with OpenAI Codex Multiplexer service support.                                                                                                                                                                                                                                                                           |
 | `with_naive_outbound`              | :material-check:     | Build with NaiveProxy outbound support, see [NaiveProxy outbound](/configuration/outbound/naive/).                                                                                                                                                                                                                             |
 | `with_cloudflared`                 | :material-check:     | Build with Cloudflare Tunnel inbound support, see [Cloudflared inbound](/configuration/inbound/cloudflared/).                                                                                                                                                                                                                  |
-| `badlinkname`                      | :material-check:     | Enable `go:linkname` access to internal standard library functions. Required because the Go standard library does not expose many low-level APIs needed by this project, and reimplementing them externally is impractical. Used for kTLS (kernel TLS offload) and raw TLS record manipulation.                                 |
-| `tfogo_checklinkname0`             | :material-check:     | Companion to `badlinkname`. Go 1.23+ enforces `go:linkname` restrictions via the linker; this tag signals the build uses `-checklinkname=0` to bypass that enforcement.                                                                                                                                                       |
+| `badlinkname`                      | :material-check:     | Enable `go:linkname` access to internal standard library functions.                                                                                                                                                                                                                                                            |
+| `tfogo_checklinkname0`             | :material-check:     | Indicates the build uses the `-checklinkname=0` linker flag. Required together with `badlinkname`.                                                                                                                                                                                                                            |
 
 It is not recommended to change the default build tag list unless you really know what you are adding.
 
+### eBPF object generation
+
+The `with_ebpf` runtime is pure Go. Building sing-box with this tag does not
+require cgo or an Android NDK. Maintainers who change the native BPF sources
+must regenerate the embedded objects with Android NDK r29 Clang 21:
+
+```sh
+ANDROID_NDK_HOME=/usr/share/android-ndk-r29 make ebpf_generate
+make ebpf_check
+```
+
+The generation Makefile runs the `bpf2go` Go tool on the build host, so a final
+`GOOS`/`GOARCH` cross-build does not change the generator's executable format.
+
 ## :material-wrench: Linker Flags
 
-The following `-ldflags` are used in official builds:
+The required linker flags for official builds are maintained in `release/LDFLAGS`. Downstream builds should use that file unchanged.
 
 | Flag                                                        | Description                                                                                                                                                                                                             |
 |-------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `-X 'internal/godebug.defaultGODEBUG=multipathtcp=0'`      | Go 1.24 enabled Multipath TCP for listeners by default (`multipathtcp=2`). This may cause errors on low-level sockets, and sing-box has its own MPTCP control (`tcp_multi_path` option). This flag disables the Go default. |
-| `-checklinkname=0`                                          | Go 1.23+ linker rejects unauthorized `go:linkname` usage. This flag disables the check, required together with the `badlinkname` build tag.                                                                            |
+| `-checklinkname=0`                                          | Required together with the `badlinkname` build tag.                                                                                                                                                                     |
 
 ## :material-package-variant: For Downstream Packagers
 

@@ -11,94 +11,59 @@ import (
 	"time"
 )
 
-// HTTPObfsServer is the server-side simple-obfs HTTP implementation.
-// It strips the client's HTTP upgrade request and replies with HTTP 101.
 type HTTPObfsServer struct {
 	net.Conn
-	buf           []byte
-	bio           *bufio.Reader
-	offset        int
+	buffer        []byte
+	reader        *bufio.Reader
 	firstRequest  bool
 	firstResponse bool
 }
 
-func (hos *HTTPObfsServer) Read(b []byte) (int, error) {
-	if hos.buf != nil {
-		n := copy(b, hos.buf[hos.offset:])
-		hos.offset += n
-		if hos.offset == len(hos.buf) {
-			hos.offset = 0
-			hos.buf = nil
-		}
+func (c *HTTPObfsServer) Read(p []byte) (int, error) {
+	if len(c.buffer) > 0 {
+		n := copy(p, c.buffer)
+		c.buffer = c.buffer[n:]
 		return n, nil
 	}
-
-	if hos.firstRequest {
-		bio := bufio.NewReader(hos.Conn)
-		req, err := http.ReadRequest(bio)
+	if c.firstRequest {
+		reader := bufio.NewReader(c.Conn)
+		request, err := http.ReadRequest(reader)
 		if err != nil {
 			return 0, err
 		}
-		if req.Method != "GET" || req.Header.Get("Connection") != "Upgrade" {
+		if request.Method != http.MethodGet || request.Header.Get("Connection") != "Upgrade" {
+			request.Body.Close()
 			return 0, io.EOF
 		}
-
-		body, err := io.ReadAll(req.Body)
-		req.Body.Close()
+		body, err := io.ReadAll(request.Body)
+		request.Body.Close()
 		if err != nil {
 			return 0, err
 		}
-		n := copy(b, body)
-		if n < len(body) {
-			hos.buf = body
-			hos.offset = n
-		}
-		hos.bio = bio
-		hos.firstRequest = false
+		c.reader = reader
+		c.firstRequest = false
+		n := copy(p, body)
+		c.buffer = body[n:]
 		return n, nil
 	}
-
-	return hos.bio.Read(b)
+	return c.reader.Read(p)
 }
 
-const httpResponseTemplate = "HTTP/1.1 101 Switching Protocols\r\n" +
-	"Server: nginx/1.%d.%d\r\n" +
-	"Date: %s\r\n" +
-	"Upgrade: websocket\r\n" +
-	"Connection: Upgrade\r\n" +
-	"Sec-WebSocket-Accept: %s\r\n" +
-	"\r\n"
-
-func (hos *HTTPObfsServer) Write(b []byte) (int, error) {
-	if hos.firstResponse {
-		randBytes := make([]byte, 16)
-		rand.Read(randBytes)
-		date := time.Now().Format(time.RFC1123)
-		resp := fmt.Sprintf(httpResponseTemplate, randInt()%11, randInt()%12, date, base64.URLEncoding.EncodeToString(randBytes))
-		if _, err := hos.Conn.Write([]byte(resp)); err != nil {
+func (c *HTTPObfsServer) Write(p []byte) (int, error) {
+	if c.firstResponse {
+		var random [16]byte
+		_, _ = rand.Read(random[:])
+		response := fmt.Sprintf("HTTP/1.1 101 Switching Protocols\r\nServer: nginx\r\nDate: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: %s\r\n\r\n", time.Now().Format(time.RFC1123), base64.URLEncoding.EncodeToString(random[:]))
+		if _, err := c.Conn.Write([]byte(response)); err != nil {
 			return 0, err
 		}
-		hos.firstResponse = false
+		c.firstResponse = false
 	}
-	return hos.Conn.Write(b)
+	return c.Conn.Write(p)
 }
 
-func (hos *HTTPObfsServer) Upstream() any {
-	return hos.Conn
-}
+func (c *HTTPObfsServer) Upstream() any { return c.Conn }
 
-// NewHTTPObfsServer wraps conn with server-side HTTP obfs.
 func NewHTTPObfsServer(conn net.Conn) net.Conn {
-	return &HTTPObfsServer{
-		Conn:          conn,
-		firstRequest:  true,
-		firstResponse: true,
-	}
-}
-
-// randInt returns a pseudo-random non-negative integer.
-func randInt() int {
-	b := make([]byte, 1)
-	rand.Read(b)
-	return int(b[0])
+	return &HTTPObfsServer{Conn: conn, firstRequest: true, firstResponse: true}
 }

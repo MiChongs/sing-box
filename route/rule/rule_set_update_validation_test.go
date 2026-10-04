@@ -2,6 +2,7 @@ package rule
 
 import (
 	"context"
+	"os"
 	"sync/atomic"
 	"testing"
 
@@ -10,7 +11,9 @@ import (
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json/badoption"
+	"github.com/sagernet/sing/common/logger"
 	"github.com/sagernet/sing/service"
+	"github.com/sagernet/sing/service/filemanager"
 
 	"github.com/stretchr/testify/require"
 )
@@ -44,6 +47,7 @@ func TestLocalRuleSetReloadRulesRejectsInvalidUpdateBeforeCommit(t *testing.T) {
 			ctx:    ctx,
 			tag:    "dynamic-set",
 			format: C.RuleSetFormatSource,
+			logger: logger.NOP(),
 		},
 	}
 	_ = ruleSet.callbacks.PushBack(func(adapter.RuleSet) {
@@ -86,6 +90,7 @@ func TestRemoteRuleSetLoadBytesRejectsInvalidUpdateBeforeCommit(t *testing.T) {
 			return nil
 		},
 	})
+	ctx = filemanager.WithDefault(ctx, "", t.TempDir(), os.Getuid(), os.Getgid())
 	ruleSet := &RemoteRuleSet{
 		abstractRuleSet: abstractRuleSet{
 			ctx:    ctx,

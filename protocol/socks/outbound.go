@@ -59,7 +59,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		resolve:   version == socks.Version4,
 	}
 	if version == socks.Version4 && options.InnerDomainResolver != nil {
-		innerDNSOpts, err := adapter.DNSQueryOptionsFrom(ctx, options.InnerDomainResolver)
+		innerDNSOpts, err := dialer.NewInnerDNSQueryOptions(ctx, options.InnerDomainResolver)
 		if err != nil {
 			return nil, E.Cause(err, "inner domain resolver")
 		}

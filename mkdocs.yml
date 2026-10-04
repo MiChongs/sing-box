@@ -62,6 +62,9 @@ nav:
       - Apple platforms:
           - clients/apple/index.md
           - Features: clients/apple/features.md
+      - Desktop:
+          - clients/desktop/index.md
+          - Features: clients/desktop/features.md
       - General: clients/general.md
       - Privacy policy: clients/privacy.md
   - Manual:
@@ -75,8 +78,13 @@ nav:
           - Hysteria 2: manual/proxy-protocol/hysteria2.md
       - Misc:
           - TunnelVision: manual/misc/tunnelvision.md
+          - AnyTLS client metadata: manual/misc/anytls-client-metadata.md
+          - eBPF troubleshooting: manual/misc/ebpf-troubleshooting.md
+          - eBPF kernel requirements: manual/misc/ebpf-kernel-requirements.md
+          - eBPF checksum/offload verification: manual/misc/ebpf-checksum-offload-verification.md
   - Configuration:
       - configuration/index.md
+      - JSON Schema: configuration/schema.md
       - Log:
           - configuration/log/index.md
       - DNS:
@@ -96,6 +104,8 @@ nav:
               - mDNS: configuration/dns/server/mdns.md
               - FakeIP: configuration/dns/server/fakeip.md
               - Tailscale: configuration/dns/server/tailscale.md
+              - OpenConnect: configuration/dns/server/openconnect.md
+              - OpenVPN: configuration/dns/server/openvpn.md
               - Resolved: configuration/dns/server/resolved.md
               - Group: configuration/dns/server/group.md
           - DNS Rule: configuration/dns/rule.md
@@ -119,6 +129,7 @@ nav:
           - configuration/experimental/index.md
           - Cache File: configuration/experimental/cache-file.md
           - Clash API: configuration/experimental/clash-api.md
+          - Observability: configuration/experimental/observability.md
           - V2Ray API: configuration/experimental/v2ray-api.md
       - Shared:
           - Listen Fields: configuration/shared/listen.md
@@ -137,13 +148,23 @@ nav:
           - Multiplex: configuration/shared/multiplex.md
           - V2Ray Transport: configuration/shared/v2ray-transport.md
           - UDP over TCP: configuration/shared/udp-over-tcp.md
+          - UDP NAT Fields: configuration/shared/udp-nat.md
           - TCP Brutal: configuration/shared/tcp-brutal.md
           - Wi-Fi State: configuration/shared/wifi-state.md
           - Neighbor Resolution: configuration/shared/neighbor.md
+      - Network Namespace:
+          - configuration/network-namespace/index.md
+          - Default: configuration/network-namespace/default.md
+          - Unshare: configuration/network-namespace/unshare.md
       - Endpoint:
           - configuration/endpoint/index.md
           - WireGuard: configuration/endpoint/wireguard.md
           - Tailscale: configuration/endpoint/tailscale.md
+          - OpenConnect Client: configuration/endpoint/openconnect.md
+          - OpenVPN Client: configuration/endpoint/openvpn-client.md
+          - OpenVPN Server: configuration/endpoint/openvpn-server.md
+          - MASQUE Client: configuration/endpoint/masque-client.md
+          - MASQUE Server: configuration/endpoint/masque-server.md
       - Inbound:
           - configuration/inbound/index.md
           - Direct: configuration/inbound/direct.md
@@ -151,7 +172,6 @@ nav:
           - SOCKS: configuration/inbound/socks.md
           - HTTP: configuration/inbound/http.md
           - Shadowsocks: configuration/inbound/shadowsocks.md
-          - Snell: configuration/inbound/snell.md
           - VMess: configuration/inbound/vmess.md
           - Trojan: configuration/inbound/trojan.md
           - Naive: configuration/inbound/naive.md
@@ -161,18 +181,21 @@ nav:
           - TUIC: configuration/inbound/tuic.md
           - Hysteria2: configuration/inbound/hysteria2.md
           - AnyTLS: configuration/inbound/anytls.md
+          - Snell: configuration/inbound/snell.md
           - Tun: configuration/inbound/tun.md
+          - eBPF: configuration/inbound/ebpf.md
           - Redirect: configuration/inbound/redirect.md
           - TProxy: configuration/inbound/tproxy.md
           - Cloudflared: configuration/inbound/cloudflared.md
+          - Tailcat: configuration/inbound/tailcat.md
       - Outbound:
           - configuration/outbound/index.md
           - Direct: configuration/outbound/direct.md
+          - Bridge: configuration/outbound/bridge.md
           - Block: configuration/outbound/block.md
           - SOCKS: configuration/outbound/socks.md
           - HTTP: configuration/outbound/http.md
           - Shadowsocks: configuration/outbound/shadowsocks.md
-          - Snell: configuration/outbound/snell.md
           - VMess: configuration/outbound/vmess.md
           - Trojan: configuration/outbound/trojan.md
           - Naive: configuration/outbound/naive.md
@@ -183,6 +206,8 @@ nav:
           - TUIC: configuration/outbound/tuic.md
           - Hysteria2: configuration/outbound/hysteria2.md
           - AnyTLS: configuration/outbound/anytls.md
+          - Snell: configuration/outbound/snell.md
+          - Tailcat: configuration/outbound/tailcat.md
           - Tor: configuration/outbound/tor.md
           - SSH: configuration/outbound/ssh.md
           - DNS: configuration/outbound/dns.md
@@ -192,6 +217,7 @@ nav:
           - configuration/provider/index.md
           - Dialer Fields Override: configuration/provider/override_dialer.md
           - TLS Fields Override: configuration/provider/override_tls.md
+          - AnyTLS Fields Override: configuration/provider/override_anytls.md
       - Service:
           - configuration/service/index.md
           - sing-box API: configuration/service/api.md
@@ -299,7 +325,9 @@ plugins:
             Multiplex: 多路复用
             V2Ray Transport: V2Ray 传输层
             Wi-Fi State: Wi-Fi 状态
+            UDP NAT Fields: UDP NAT 字段
 
+            Network Namespace: 网络命名空间
             Endpoint: 端点
             Inbound: 入站
             Outbound: 出站
@@ -307,7 +335,12 @@ plugins:
             Certificate Provider: 证书提供者
             Dialer Fields Override: 拨号字段覆写
             TLS Fields Override: TLS 字段覆写
+            AnyTLS Fields Override: AnyTLS 字段覆写
 
             Manual: 手册
+            Misc: 其他
+            eBPF troubleshooting: eBPF 问题排查
+            eBPF kernel requirements: eBPF 内核要求
+            eBPF checksum/offload verification: eBPF 校验和/卸载验证
       reconfigure_material: true
       reconfigure_search: true

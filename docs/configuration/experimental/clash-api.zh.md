@@ -1,6 +1,10 @@
+!!! quote "sing-box 1.15.0 中的更改"
+
+    :material-plus: [external_ui_update_interval](#external_ui_update_interval)
+
 !!! quote "sing-box 1.14.0 中的更改"
 
-    :material-plus: [external_ui_http_client](#external_ui_http_client)  
+    :material-plus: [external_ui_http_client](#external_ui_http_client)
     :material-delete-clock: [external_ui_download_detour](#external_ui_download_detour)
 
 !!! quote "sing-box 1.10.0 中的更改"
@@ -26,6 +30,7 @@
       "external_ui": "",
       "external_ui_download_url": "",
       "external_ui_http_client": "", // or {}
+      "external_ui_update_interval": "",
       "secret": "",
       "default_mode": "",
       "access_control_allow_origin": [],
@@ -73,6 +78,11 @@
 
     当内容只有一项时，可以忽略 JSON 数组 [] 标签
 
+!!! info "可观测性 API"
+
+    启用[实验性可观测性](observability.md)后，专用的 `/observability/v1`
+    HTTP API 会挂载到该 Controller，并使用相同的 `secret` 保护。
+
 ### Fields
 
 #### external_controller
@@ -106,6 +116,16 @@ RESTful web API 监听地址。如果为空，则禁用 Clash API。
     `external_ui_download_detour` 已在 sing-box 1.14.0 废弃且将在 sing-box 1.16.0 中被移除，请使用 `external_ui_http_client` 代替。
 
 用于下载静态网页资源的出站的标签。
+
+#### external_ui_update_interval
+
+!!! question "自 sing-box 1.15.0 起"
+
+外部用户界面的更新间隔。留空时禁用自动更新。
+
+最小间隔为一小时。
+
+启用 `cache_file.enabled` 时，更改 `external_ui_download_url` 会使外部用户界面重新下载。
 
 #### secret
 

@@ -1,16 +1,32 @@
-//go:build windows
+//go:build windows && !with_external_windivert
 
 package windivert
 
 import (
 	"errors"
+	"log"
 	"net/netip"
+	"os"
 	"testing"
 	"time"
+
+	"github.com/sagernet/sing-box/common/winmutex"
+	E "github.com/sagernet/sing/common/exceptions"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/windows"
 )
+
+func TestMain(m *testing.M) {
+	exitCode, err := winmutex.WithLock("SingBoxWinDivertIntegrationTests", 3*time.Minute, func() (int, error) {
+		return m.Run(), nil
+	})
+	if err != nil {
+		log.Print(E.Cause(err, "run in exclusive WinDivert integration test environment"))
+		os.Exit(1)
+	}
+	os.Exit(exitCode)
+}
 
 func openHandle(t *testing.T, filter *Filter, flags Flag) *Handle {
 	t.Helper()
@@ -19,26 +35,18 @@ func openHandle(t *testing.T, filter *Filter, flags Flag) *Handle {
 	return h
 }
 
-// A send-only handle installs+opens the driver but does not attach a
-// receive filter, so it exercises the full driver-install path without
-// diverting any live traffic on the host.
 func TestIntegrationOpenSendOnly(t *testing.T) {
 	h := openHandle(t, nil, FlagSendOnly)
 	require.NoError(t, h.Close())
 }
 
-// Close is idempotent per the doc contract.
 func TestIntegrationCloseTwice(t *testing.T) {
 	h := openHandle(t, nil, FlagSendOnly)
 	require.NoError(t, h.Close())
 	require.NoError(t, h.Close())
 }
 
-// Recv must unblock when the handle is closed concurrently. Without this,
-// the spoofer's run goroutine could deadlock on shutdown.
 func TestIntegrationRecvAbortsOnClose(t *testing.T) {
-	// A filter no live traffic will match, so Recv blocks indefinitely
-	// until Close aborts the overlapped I/O.
 	filter, err := OutboundTCP(
 		netip.MustParseAddrPort("10.255.255.254:1"),
 		netip.MustParseAddrPort("10.255.255.253:2"),
@@ -53,7 +61,6 @@ func TestIntegrationRecvAbortsOnClose(t *testing.T) {
 		errCh <- recvErr
 	}()
 
-	// Let Recv reach the blocking DeviceIoControl before Close races in.
 	time.Sleep(200 * time.Millisecond)
 	require.NoError(t, h.Close())
 
@@ -67,18 +74,60 @@ func TestIntegrationRecvAbortsOnClose(t *testing.T) {
 	}
 }
 
-// Two concurrent Open calls must both succeed: the first wins the driver
-// install race, the second reuses the already-running service.
+// The driver does not unload when the last handle closes: it stays running
+// until explicitly stopped, like `sc stop WinDivert`.
+func stopDriver(t *testing.T) {
+	t.Helper()
+	manager, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
+	require.NoError(t, err)
+	defer windows.CloseServiceHandle(manager)
+	serviceNameW, err := windows.UTF16PtrFromString(driverServiceName)
+	require.NoError(t, err)
+	service, err := windows.OpenService(manager, serviceNameW, windows.SERVICE_STOP|windows.SERVICE_QUERY_STATUS)
+	if err == nil {
+		defer windows.CloseServiceHandle(service)
+		var status windows.SERVICE_STATUS
+		err = windows.ControlService(service, windows.SERVICE_CONTROL_STOP, &status)
+		if err != nil &&
+			!errors.Is(err, windows.ERROR_SERVICE_NOT_ACTIVE) &&
+			!errors.Is(err, windows.ERROR_SERVICE_CANNOT_ACCEPT_CTRL) {
+			require.NoError(t, err)
+		}
+		require.Eventually(t, func() bool {
+			queryErr := windows.QueryServiceStatus(service, &status)
+			return queryErr == nil && status.CurrentState == windows.SERVICE_STOPPED
+		}, 60*time.Second, 200*time.Millisecond, "driver did not reach SERVICE_STOPPED")
+	} else {
+		require.True(t, errors.Is(err, windows.ERROR_SERVICE_DOES_NOT_EXIST), "open driver service: %v", err)
+	}
+	// SCM can report SERVICE_STOPPED before the driver finishes deleting its
+	// device object.
+	require.Eventually(t, func() bool {
+		device, openErr := openDevice()
+		if openErr == nil {
+			_ = windows.CloseHandle(device)
+			return false
+		}
+		return errors.Is(openErr, windows.ERROR_FILE_NOT_FOUND) ||
+			errors.Is(openErr, windows.ERROR_PATH_NOT_FOUND) ||
+			errors.Is(openErr, windows.ERROR_NO_SUCH_DEVICE)
+	}, 60*time.Second, 200*time.Millisecond, "driver device remained openable after stop")
+}
+
 func TestIntegrationConcurrentOpen(t *testing.T) {
+	stopDriver(t)
+	start := make(chan struct{})
 	errCh := make(chan error, 2)
 	handles := make(chan *Handle, 2)
 	for range 2 {
 		go func() {
+			<-start
 			h, err := Open(nil, LayerNetwork, 0, FlagSendOnly)
 			handles <- h
 			errCh <- err
 		}()
 	}
+	close(start)
 	for range 2 {
 		err := <-errCh
 		h := <-handles

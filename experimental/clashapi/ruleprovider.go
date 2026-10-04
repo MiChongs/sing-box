@@ -56,13 +56,7 @@ func getRuleProviders(router adapter.Router) func(w http.ResponseWriter, r *http
 
 func getRuleProvider(w http.ResponseWriter, r *http.Request) {
 	ruleSet := r.Context().Value(CtxKeyProvider).(adapter.RuleSet)
-	response, err := ruleSetInfo(ruleSet).MarshalJSON()
-	if err != nil {
-		render.Status(r, http.StatusInternalServerError)
-		render.JSON(w, r, newError(err.Error()))
-		return
-	}
-	w.Write(response)
+	render.JSON(w, r, ruleSetInfo(ruleSet))
 }
 
 func updateRuleProvider(w http.ResponseWriter, r *http.Request) {

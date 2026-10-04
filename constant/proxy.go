@@ -2,9 +2,11 @@ package constant
 
 const (
 	TypeTun                = "tun"
+	TypeEBPF               = "ebpf"
 	TypeRedirect           = "redirect"
 	TypeTProxy             = "tproxy"
 	TypeDirect             = "direct"
+	TypeBridge             = "bridge"
 	TypeBlock              = "block"
 	TypePass               = "pass"
 	TypeDNS                = "dns"
@@ -12,6 +14,7 @@ const (
 	TypeHTTP               = "http"
 	TypeMixed              = "mixed"
 	TypeShadowsocks        = "shadowsocks"
+	TypeSnell              = "snell"
 	TypeVMess              = "vmess"
 	TypeTrojan             = "trojan"
 	TypeNaive              = "naive"
@@ -21,12 +24,17 @@ const (
 	TypeSSH                = "ssh"
 	TypeShadowTLS          = "shadowtls"
 	TypeAnyTLS             = "anytls"
-	TypeSnell              = "snell"
 	TypeShadowsocksR       = "shadowsocksr"
 	TypeVLESS              = "vless"
 	TypeTUIC               = "tuic"
 	TypeHysteria2          = "hysteria2"
+	TypeOpenConnect        = "openconnect"
+	TypeOpenVPNClient      = "openvpn-client"
+	TypeOpenVPNServer      = "openvpn-server"
+	TypeMASQUEClient       = "masque-client"
+	TypeMASQUEServer       = "masque-server"
 	TypeTailscale          = "tailscale"
+	TypeTailcat            = "tailcat"
 	TypeCloudflared        = "cloudflared"
 	TypeDERP               = "derp"
 	TypeResolved           = "resolved"
@@ -53,12 +61,16 @@ func ProxyDisplayName(proxyType string) string {
 	switch proxyType {
 	case TypeTun:
 		return "TUN"
+	case TypeEBPF:
+		return "eBPF"
 	case TypeRedirect:
 		return "Redirect"
 	case TypeTProxy:
 		return "TProxy"
 	case TypeDirect:
 		return "Direct"
+	case TypeBridge:
+		return "Bridge"
 	case TypeBlock:
 		return "Block"
 	case TypePass:
@@ -73,6 +85,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Mixed"
 	case TypeShadowsocks:
 		return "Shadowsocks"
+	case TypeSnell:
+		return "Snell"
 	case TypeVMess:
 		return "VMess"
 	case TypeTrojan:
@@ -99,10 +113,20 @@ func ProxyDisplayName(proxyType string) string {
 		return "Hysteria2"
 	case TypeAnyTLS:
 		return "AnyTLS"
-	case TypeSnell:
-		return "Snell"
+	case TypeOpenConnect:
+		return "OpenConnect"
+	case TypeOpenVPNClient:
+		return "OpenVPN Client"
+	case TypeOpenVPNServer:
+		return "OpenVPN Server"
+	case TypeMASQUEClient:
+		return "MASQUE Client"
+	case TypeMASQUEServer:
+		return "MASQUE Server"
 	case TypeTailscale:
 		return "Tailscale"
+	case TypeTailcat:
+		return "Tailcat"
 	case TypeCloudflared:
 		return "Cloudflared"
 	case TypeSelector:

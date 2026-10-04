@@ -236,6 +236,7 @@ func (c *RealityServerConfig) Clone() Config {
 	return &RealityServerConfig{
 		config:           c.config.Clone(),
 		handshakeTimeout: c.handshakeTimeout,
+		rejectUnknownSNI: c.rejectUnknownSNI,
 	}
 }
 
@@ -279,5 +280,5 @@ func (c *realityConnWrapper) ReaderReplaceable() bool {
 }
 
 func (c *realityConnWrapper) WriterReplaceable() bool {
-	return true
+	return false
 }

@@ -15,12 +15,12 @@ import (
 	"go4.org/netipx"
 )
 
-func NewRuleSet(ctx context.Context, logger logger.ContextLogger, options option.RuleSet) (adapter.RuleSet, error) {
+func NewRuleSet(ctx context.Context, logger logger.ContextLogger, tag string, options option.RuleSet) (adapter.RuleSet, error) {
 	switch options.Type {
 	case C.RuleSetTypeInline, C.RuleSetTypeLocal, "":
-		return NewLocalRuleSet(ctx, logger, options)
+		return NewLocalRuleSet(ctx, logger, tag, options)
 	case C.RuleSetTypeRemote:
-		return NewRemoteRuleSet(ctx, logger, options)
+		return NewRemoteRuleSet(ctx, logger, tag, options)
 	default:
 		return nil, E.New("unknown rule-set type: ", options.Type)
 	}
@@ -32,7 +32,7 @@ func extractIPSetFromRule(rawRule adapter.HeadlessRule) []*netipx.IPSet {
 		return common.FlatMap(rule.destinationIPCIDRItems, func(rawItem RuleItem) []*netipx.IPSet {
 			switch item := rawItem.(type) {
 			case *IPCIDRItem:
-				return []*netipx.IPSet{item.ipSet}
+				return []*netipx.IPSet{item.ipSet.IPSet()}
 			default:
 				return nil
 			}
@@ -65,7 +65,16 @@ func isProcessHeadlessRule(rule option.DefaultHeadlessRule) bool {
 }
 
 func isWIFIHeadlessRule(rule option.DefaultHeadlessRule) bool {
-	return len(rule.WIFISSID) > 0 || len(rule.WIFIBSSID) > 0
+	return len(rule.WIFISSID) > 0 || len(rule.WIFIBSSID) > 0 || C.IsAndroid && isWIFINetworkType(rule.NetworkType)
+}
+
+func isWIFINetworkType(networkType []option.InterfaceType) bool {
+	for _, interfaceType := range networkType {
+		if interfaceType.Build() == C.InterfaceTypeWIFI {
+			return true
+		}
+	}
+	return false
 }
 
 func isIPCIDRHeadlessRule(rule option.DefaultHeadlessRule) bool {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/sagernet/sing-anytls"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	"github.com/sagernet/sing-box/common/listener"
@@ -20,9 +21,6 @@ import (
 	"github.com/sagernet/sing/common/logger"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
-
-	anytls "github.com/anytls/sing-anytls"
-	"github.com/anytls/sing-anytls/padding"
 )
 
 func RegisterInbound(registry *inbound.Registry) {
@@ -35,7 +33,7 @@ type Inbound struct {
 	router                   adapter.ConnectionRouterEx
 	logger                   logger.ContextLogger
 	listener                 *listener.Listener
-	service                  *anytls.Service
+	service                  *anytls.MultiService[string]
 	fallbackAddr             M.Socksaddr
 	fallbackAddrTLSNextProto map[string]M.Socksaddr
 }
@@ -55,7 +53,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		inbound.tlsConfig = tlsConfig
 	}
 
-	paddingScheme := padding.DefaultPaddingScheme
+	var paddingScheme []byte
 	if len(options.PaddingScheme) > 0 {
 		paddingScheme = []byte(strings.Join(options.PaddingScheme, "\n"))
 	}
@@ -72,28 +70,30 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			if inbound.tlsConfig == nil {
 				return nil, E.New("fallback for ALPN is not supported without TLS")
 			}
-			fallbackAddrNextProto := make(map[string]M.Socksaddr)
+			inbound.fallbackAddrTLSNextProto = make(map[string]M.Socksaddr)
 			for nextProto, destination := range options.FallbackForALPN {
-				fallbackAddr := destination.Build()
-				if !fallbackAddr.IsValid() {
-					return nil, E.New("invalid fallback address for ALPN ", nextProto, ": ", fallbackAddr)
+				if destination == nil || !destination.Build().IsValid() {
+					return nil, E.New("invalid fallback address for ALPN ", nextProto)
 				}
-				fallbackAddrNextProto[nextProto] = fallbackAddr
+				inbound.fallbackAddrTLSNextProto[nextProto] = destination.Build()
 			}
-			inbound.fallbackAddrTLSNextProto = fallbackAddrNextProto
 		}
 		fallbackHandler = adapter.NewUpstreamContextHandler(inbound.fallbackConnection, nil)
 	}
 
-	service, err := anytls.NewService(anytls.ServiceConfig{
-		Users: common.Map(options.Users, func(it option.AnyTLSUser) anytls.User {
-			return (anytls.User)(it)
-		}),
+	service, err := anytls.NewMultiService[string](anytls.ServiceOptions{
 		PaddingScheme:   paddingScheme,
 		Handler:         (*inboundHandler)(inbound),
 		FallbackHandler: fallbackHandler,
 		Logger:          logger,
 	})
+	if err != nil {
+		return nil, err
+	}
+	err = service.UpdateUsers(
+		common.Map(options.Users, func(it option.AnyTLSUser) string { return it.Name }),
+		common.Map(options.Users, func(it option.AnyTLSUser) string { return it.Password }),
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -146,10 +146,10 @@ func (h *Inbound) fallbackConnection(ctx context.Context, conn net.Conn, metadat
 	var fallbackAddr M.Socksaddr
 	if len(h.fallbackAddrTLSNextProto) > 0 {
 		if tlsConn, loaded := common.Cast[tls.Conn](conn); loaded {
-			connectionState := tlsConn.ConnectionState()
-			if connectionState.NegotiatedProtocol != "" {
-				if fallbackAddr, loaded = h.fallbackAddrTLSNextProto[connectionState.NegotiatedProtocol]; !loaded {
-					h.logger.DebugContext(ctx, "process connection from ", metadata.Source, ": fallback disabled for ALPN: ", connectionState.NegotiatedProtocol)
+			nextProto := tlsConn.ConnectionState().NegotiatedProtocol
+			if nextProto != "" {
+				if fallbackAddr, loaded = h.fallbackAddrTLSNextProto[nextProto]; !loaded {
+					h.logger.DebugContext(ctx, "process connection from ", metadata.Source, ": fallback disabled for ALPN: ", nextProto)
 					N.CloseOnHandshakeFailure(conn, onClose, os.ErrInvalid)
 					return
 				}

@@ -27,6 +27,10 @@ type DNSRule interface {
 	LegacyPreMatch(metadata *InboundContext) bool
 	WithAddressLimit() bool
 	MatchAddressLimit(metadata *InboundContext, response *dns.Msg) bool
+	MatchResponseTag() string
+	MatchResponseTags() []string
+	MatchResponseAnonymous() bool
+	Race() bool
 }
 
 type RuleAction interface {
@@ -36,7 +40,7 @@ type RuleAction interface {
 
 func IsFinalAction(action RuleAction) bool {
 	switch action.Type() {
-	case C.RuleActionTypeSniff, C.RuleActionTypeResolve, C.RuleActionTypeEvaluate:
+	case C.RuleActionTypeSniff, C.RuleActionTypeSniffOverrideDestination, C.RuleActionTypeResolve, C.RuleActionTypeEvaluate:
 		return false
 	default:
 		return true

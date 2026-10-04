@@ -1,3 +1,6 @@
+当此组被引用时，所有候选出站（包括 provider 成员）都会在空闲连接管理中被视为已引用，
+不受健康检查结果影响，以保持它们依赖的按需端点可供选择。
+
 ### 结构
 
 ```json
@@ -21,8 +24,7 @@
   "interval": "",
   "idle_timeout": "",
   "ttl": "10m",
-  "use_all_providers": false,
-  "interrupt_exist_connections": false
+  "use_all_providers": false
 }
 ```
 
@@ -80,9 +82,3 @@
 #### use_all_providers
 
 是否使用所有提供者。默认使用 `false`。
-
-#### interrupt_exist_connections
-
-当选定的出站发生更改时，中断现有连接。
-
-仅入站连接受此设置影响，内部连接将始终被中断。

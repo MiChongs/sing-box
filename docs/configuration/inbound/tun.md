@@ -2,12 +2,23 @@
 icon: material/new-box
 ---
 
+!!! quote "Changes in sing-box 1.15.0"
+
+    :material-plus: [auto_redirect_disable_mark_mode](#auto_redirect_disable_mark_mode)
+    :material-plus: [auto_redirect_tproxy_mark](#auto_redirect_tproxy_mark)  
+    :material-plus: [multi_queue](#multi_queue)  
+    :material-delete-clock: [stack](#stack)
+
 !!! quote "Changes in sing-box 1.14.0"
 
     :material-plus: [include_mac_address](#include_mac_address)  
     :material-plus: [exclude_mac_address](#exclude_mac_address)  
     :material-plus: [dns_mode](#dns_mode)  
-    :material-plus: [dns_address](#dns_address)
+    :material-plus: [dns_address](#dns_address)  
+    :material-plus: [netns](#netns)  
+    :material-plus: [udp_mapping](/configuration/shared/udp-nat/#udp_mapping)  
+    :material-plus: [udp_filtering](/configuration/shared/udp-nat/#udp_filtering)  
+    :material-plus: [udp_nat_max](/configuration/shared/udp-nat/#udp_nat_max)
 
 !!! quote "Changes in sing-box 1.13.3"
 
@@ -84,9 +95,11 @@ icon: material/new-box
   "iproute2_table_index": 2022,
   "iproute2_rule_index": 9000,
   "auto_redirect": true,
+  "auto_redirect_disable_mark_mode": false,
   "auto_redirect_input_mark": "0x2023",
   "auto_redirect_output_mark": "0x2024",
   "auto_redirect_reset_mark": "0x2025",
+  "auto_redirect_tproxy_mark": "0x2026",
   "auto_redirect_nfqueue": 100,
   "auto_redirect_iproute2_fallback_rule_index": 32768,
   "exclude_mptcp": false,
@@ -111,8 +124,10 @@ icon: material/new-box
     "geoip-cn"
   ],
   "endpoint_independent_nat": false,
-  "udp_timeout": "5m",
-  "stack": "system",
+
+  ... // UDP NAT Fields
+
+  "multi_queue": false,
   "include_interface": [
     "lan0"
   ],
@@ -157,6 +172,7 @@ icon: material/new-box
     }
   },
   // Deprecated
+  "stack": "system",
   "gso": false,
   "inet4_address": [
     "172.19.0.1/30"
@@ -196,6 +212,22 @@ icon: material/new-box
 #### interface_name
 
 Virtual device name, automatically selected if empty.
+
+#### netns
+
+!!! question "Since sing-box 1.14.0"
+
+!!! quote ""
+
+    Only supported on Linux.
+
+Create the tun interface in the specified network namespace, name, path, or the tag of a
+[network namespace](/configuration/network-namespace/).
+
+When set, `auto_route` and `auto_redirect` operate inside the namespace, and no root privilege is
+required if the namespace is owned by the current user.
+
+Conflict with `platform`.
 
 #### address
 
@@ -237,21 +269,16 @@ How DNS is handled on the TUN interface.
 
 `hijack` adds the following on top of `native`:
 
-*On Linux*: only DNS sent to non-local destinations can be intercepted.
-Traffic destined to addresses on the host's own interfaces (such as
-`127.0.0.53` or the host's LAN-side IP) is delivered through the kernel
-`local` routing table before any user rule applies, and `OUTPUT` NAT cannot
-redirect packets going through `lo`.
+*On Linux*: DNS sent to addresses on the host's own interfaces (such as
+`127.0.0.53` or the host's LAN-side IP) is not hijacked.
 
-- Without `auto_redirect`, an `iproute2` rule makes port 53 skip the `main`
-  table's specific-route lookup, forcing DNS that would otherwise be
-  delivered through a directly-attached subnet through the TUN. Destination
-  addresses are not rewritten.
-- With `auto_redirect`, an nftables rule DNATs port 53 traffic directly to
+- Without `auto_redirect`, port 53 traffic to directly-attached subnets is
+  also routed through the TUN.
+- With `auto_redirect`, port 53 traffic is redirected to
   [`dns_address`](#dns_address).
 
-*On Windows with [`strict_route`](#strict_route)*: a WFP filter blocks port
-53 traffic going through interfaces other than the TUN.
+*On Windows with [`strict_route`](#strict_route)*: port 53 traffic going
+through interfaces other than the TUN is blocked.
 
 #### dns_address
 
@@ -259,15 +286,12 @@ redirect packets going through `lo`.
 
 List of DNS server addresses used by [`dns_mode`](#dns_mode).
 
-When unset, sing-box derives one address per family by taking the next IP after
-the first IPv4/IPv6 entry in [`address`](#address). Connections toward those
-derived addresses are additionally hijacked into the sing-box DNS module,
-equivalent to a [`hijack-dns`](/configuration/route/rule_action/#hijack-dns)
-route action; this preserves the behaviour from before this option was added.
+When unset, the next address after the first IPv4 and IPv6 entry in
+[`address`](#address) is used, and connections to it are handled as a
+[`hijack-dns`](/configuration/route/rule_action/#hijack-dns) route action.
 
-When set, this auto-hijack is not applied; configure an explicit
-[`hijack-dns`](/configuration/route/rule_action/#hijack-dns) route rule if the
-behaviour is still required.
+When set, configure a [`hijack-dns`](/configuration/route/rule_action/#hijack-dns)
+route rule to handle DNS traffic to these addresses.
 
 #### gso
 
@@ -329,11 +353,10 @@ Improve TUN routing and performance using nftables.
 higher performance (better than tproxy),
 and avoids conflicts between TUN and Docker bridge networks.
 
-Note that `auto_redirect` also works on Android, 
-but due to the lack of `nftables` and `ip6tables`,
-only simple IPv4 TCP forwarding is performed.
-To share your VPN connection over hotspot or repeater on Android,
-use [VPNHotspot](https://github.com/Mygod/VPNHotspot).
+Pre-matching requires nfqueue support in the kernel (`nfnetlink_queue`).
+
+`auto_redirect` is fully supported on Android through the root service of the graphical client
+or a root shell, including forwarded traffic (hotspot, repeater).
 
 `auto_redirect` also automatically inserts compatibility rules
 into the OpenWrt fw4 table, i.e. 
@@ -341,13 +364,25 @@ it will work on routers without any extra configuration.
 
 Conflict with `route.default_mark` and `[dialOptions].routing_mark`.
 
+#### auto_redirect_disable_mark_mode
+
+!!! question "Since sing-box 1.15.0"
+
+!!! quote ""
+
+    Only supported on Linux with `auto_route` and `auto_redirect` enabled.
+
+Disable connection mark based routing for `auto_redirect`.
+
+Conflict with `route_address_set` and `route_exclude_address_set`.
+
 #### auto_redirect_input_mark
 
 !!! question "Since sing-box 1.10.0"
 
 Connection input mark used by `auto_redirect`.
 
-`0x2023` is used by default.
+`0x2023` is used by default (`0x400000` on Android).
 
 #### auto_redirect_output_mark
 
@@ -355,7 +390,7 @@ Connection input mark used by `auto_redirect`.
 
 Connection output mark used by `auto_redirect`.
 
-`0x2024` is used by default.
+`0x2024` is used by default (`0x200000` on Android).
 
 #### auto_redirect_reset_mark
 
@@ -363,7 +398,15 @@ Connection output mark used by `auto_redirect`.
 
 Connection reset mark used by `auto_redirect` pre-matching.
 
-`0x2025` is used by default.
+`0x2025` is used by default (`0x600000` on Android).
+
+#### auto_redirect_tproxy_mark
+
+!!! question "Since sing-box 1.15.0"
+
+Connection TPROXY mark used by the `auto_redirect` iptables backend for IPv6 TCP.
+
+`0x2026` is used by default (`0x800000` on Android).
 
 #### auto_redirect_nfqueue
 
@@ -484,9 +527,9 @@ Exclude custom routes when `auto_route` is enabled.
 
     !!! quote ""
     
-        Only supported on Linux with nftables and requires `auto_route` and `auto_redirect` enabled.
+        Only supported on Linux and requires `auto_route` and `auto_redirect` enabled.
     
-    Add the destination IP CIDR rules in the specified rule-sets to the firewall.
+    Match the destination IP CIDR rules in the specified rule-sets during pre-matching.
     Unmatched traffic will bypass the sing-box routes.
     
     Conflict with `route.default_mark` and `[dialOptions].routing_mark`.
@@ -510,9 +553,9 @@ Exclude custom routes when `auto_route` is enabled.
 
     !!! quote ""
 
-    Only supported on Linux with nftables and requires `auto_route` and `auto_redirect` enabled.
+        Only supported on Linux and requires `auto_route` and `auto_redirect` enabled.
 
-    Add the destination IP CIDR rules in the specified rule-sets to the firewall.
+    Match the destination IP CIDR rules in the specified rule-sets during pre-matching.
     Matched traffic will bypass the sing-box routes.
 
 === "Without `auto_redirect` enabled"
@@ -528,21 +571,23 @@ Exclude custom routes when `auto_route` is enabled.
 
 #### endpoint_independent_nat
 
-!!! info ""
+This option has had no effect since sing-box 1.11.0 and can be removed from the configuration.
 
-    This item is only available on the gvisor stack, other stacks are endpoint-independent NAT by default.
-
-Enable endpoint-independent NAT.
-
-Performance may degrade slightly, so it is not recommended to enable on when it is not needed.
-
-#### udp_timeout
-
-UDP NAT expiration time.
-
-`5m` will be used by default.
+Since sing-box 1.14.0, use [UDP NAT fields](/configuration/shared/udp-nat/)
+to customize the mapping and filtering behavior.
 
 #### stack
+
+!!! failure "Deprecated in sing-box 1.15.0"
+
+    `stack` is deprecated and will be removed in sing-box 1.17.0.
+    Remove the `stack` option to use sing-tun's own TCP/IP stack.
+    See [Migration](/migration/#migrate-tun-stack).
+
+!!! quote "Changes in sing-box 1.15.0"
+
+    Since 1.15.0, sing-tun uses its own TCP/IP stack, with substantial improvements over all previous
+    implementations in peak performance, energy efficiency, and memory usage.
 
 !!! quote "Changes in sing-box 1.8.0"
 
@@ -556,7 +601,13 @@ TCP/IP stack.
 | `gvisor` | Perform L3 to L4 translation using [gVisor](https://github.com/google/gvisor)'s virtual network stack |
 | `mixed`  | Mixed `system` TCP stack and `gvisor` UDP stack                                                       |
 
-Defaults to the `mixed` stack if the gVisor build tag is enabled, otherwise defaults to the `system` stack.
+#### multi_queue
+
+!!! quote ""
+
+    Only supported on Linux, and requires sing-tun's own TCP/IP stack.
+
+Enable multi-queue support based on `IFF_MULTI_QUEUE`, allowing throughput to scale with the number of CPU cores.
 
 #### include_interface
 
@@ -682,6 +733,10 @@ Hostnames that bypass the HTTP proxy.
     Only supported in graphical clients on Apple platforms.
 
 Hostnames that use the HTTP proxy.
+
+### UDP NAT Fields
+
+See [UDP NAT Fields](/configuration/shared/udp-nat/) for details.
 
 ### Listen Fields
 

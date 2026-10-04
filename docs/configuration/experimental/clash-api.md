@@ -1,6 +1,10 @@
+!!! quote "Changes in sing-box 1.15.0"
+
+    :material-plus: [external_ui_update_interval](#external_ui_update_interval)
+
 !!! quote "Changes in sing-box 1.14.0"
 
-    :material-plus: [external_ui_http_client](#external_ui_http_client)  
+    :material-plus: [external_ui_http_client](#external_ui_http_client)
     :material-delete-clock: [external_ui_download_detour](#external_ui_download_detour)
 
 !!! quote "Changes in sing-box 1.10.0"
@@ -26,6 +30,7 @@
       "external_ui": "",
       "external_ui_download_url": "",
       "external_ui_http_client": "", // or {}
+      "external_ui_update_interval": "",
       "secret": "",
       "default_mode": "",
       "access_control_allow_origin": [],
@@ -73,6 +78,12 @@
 
     You can ignore the JSON Array [] tag when the content is only one item
 
+!!! info "Observability API"
+
+    When [experimental observability](observability.md) is enabled, its dedicated
+    `/observability/v1` HTTP API is mounted on this controller and protected by
+    the same `secret`.
+
 ### Fields
 
 #### external_controller
@@ -108,6 +119,16 @@ Default transport will be used if empty.
     `external_ui_download_detour` is deprecated in sing-box 1.14.0 and will be removed in sing-box 1.16.0, use `external_ui_http_client` instead.
 
 The tag of the outbound to download the external UI.
+
+#### external_ui_update_interval
+
+!!! question "Since sing-box 1.15.0"
+
+Update interval for the external UI. Automatic updates are disabled if empty.
+
+The minimum interval is one hour.
+
+When `cache_file.enabled` is enabled, changing `external_ui_download_url` causes the external UI to be downloaded again.
 
 #### secret
 

@@ -4,10 +4,11 @@ import (
 	"context"
 	"os"
 	"runtime"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/expiringmap"
 	"github.com/sagernet/sing-box/common/process"
 	"github.com/sagernet/sing-box/common/taskmonitor"
 	C "github.com/sagernet/sing-box/constant"
@@ -45,15 +46,17 @@ type Router struct {
 	ruleSetMap        map[string]adapter.RuleSet
 	ruleSetUpdater    *R.RuleSetUpdater
 	processSearcher   process.Searcher
-	processCache      freelru.Cache[processCacheKey, processCacheEntry]
+	processCache      *freelru.Cache[processCacheKey, processCacheEntry]
 	neighborResolver  adapter.NeighborResolver
 	pauseManager      pause.Manager
 	trackers          []adapter.ConnectionTracker
 	platformInterface adapter.PlatformInterface
 	started           bool
 
-	quicSniffCache sync.Map
+	processLookupMode      process.LookupMode
+	processCacheGeneration atomic.Uint64
 
+	quicSniffCache             *expiringmap.Map[quicSniffCacheKey, string]
 	defaultDomainMatchStrategy C.DomainMatchStrategy
 	reloadChan                 chan<- struct{}
 }
@@ -78,6 +81,7 @@ func NewRouter(ctx context.Context, logFactory log.Factory, options option.Route
 		pauseManager:      service.FromContext[pause.Manager](ctx),
 		platformInterface: service.FromContext[adapter.PlatformInterface](ctx),
 
+		quicSniffCache:             expiringmap.New[quicSniffCacheKey, string](quicSniffCacheTTL),
 		defaultDomainMatchStrategy: C.DomainMatchStrategy(options.DefaultDomainMatchStrategy),
 		reloadChan:                 reloadChan,
 	}
@@ -101,15 +105,17 @@ func (r *Router) Initialize(rules []option.Rule, ruleSets []option.RuleSet) erro
 		r.ruleByUUID[uuid] = rule
 	}
 	for i, options := range ruleSets {
-		if _, exists := r.ruleSetMap[options.Tag]; exists {
-			return E.New("duplicate rule-set tag: ", options.Tag)
+		for _, tag := range options.Tag {
+			if _, exists := r.ruleSetMap[tag]; exists {
+				return E.New("duplicate rule-set tag: ", tag)
+			}
+			ruleSet, err := R.NewRuleSet(r.ctx, r.logger, tag, options)
+			if err != nil {
+				return E.Cause(err, "parse rule-set[", i, "]")
+			}
+			r.ruleSets = append(r.ruleSets, ruleSet)
+			r.ruleSetMap[tag] = ruleSet
 		}
-		ruleSet, err := R.NewRuleSet(r.ctx, r.logger, options)
-		if err != nil {
-			return E.Cause(err, "parse rule-set[", i, "]")
-		}
-		r.ruleSets = append(r.ruleSets, ruleSet)
-		r.ruleSetMap[options.Tag] = ruleSet
 	}
 	return nil
 }
@@ -204,11 +210,14 @@ func (r *Router) Start(stage adapter.StartStage) error {
 					}
 				} else {
 					r.processSearcher = searcher
+					if C.IsAndroid {
+						r.processLookupMode = process.LookupOwner
+					}
 				}
 			}
 		}
 		if r.processSearcher != nil {
-			processCache := common.Must1(freelru.NewSharded[processCacheKey, processCacheEntry](256, maphash.NewHasher[processCacheKey]().Hash32))
+			processCache := common.Must1(freelru.New[processCacheKey, processCacheEntry](256, maphash.NewHasher[processCacheKey]().Hash32, true))
 			processCache.SetLifetime(200 * time.Millisecond)
 			r.processCache = processCache
 		}
@@ -274,6 +283,7 @@ func (r *Router) Start(stage adapter.StartStage) error {
 }
 
 func (r *Router) Close() error {
+	r.quicSniffCache.Close()
 	monitor := taskmonitor.New(r.logger, C.StopTimeout)
 	var err error
 	if r.neighborResolver != nil {
@@ -344,41 +354,49 @@ func (r *Router) NeighborResolver() adapter.NeighborResolver {
 }
 
 func (r *Router) ResetNetwork() {
+	r.processCacheGeneration.Add(1)
 	r.httpClientManager.ResetNetwork()
 	r.dns.ResetNetwork()
+	if r.processCache != nil {
+		r.processCache.Purge()
+	}
+	if r.processSearcher != nil {
+		r.processSearcher.ResetCache()
+	}
 }
 
 const quicSniffCacheTTL = 5 * time.Minute
+
+func (r *Router) processQUICSniff(ctx context.Context, metadata *adapter.InboundContext) {
+	if metadata.Protocol != C.ProtocolQUIC {
+		return
+	}
+	metadata.SniffDestination = metadata.Destination
+	if metadata.SniffHost != "" {
+		r.cacheQUICSniff(metadata.Source, metadata.SniffDestination, metadata.SniffHost)
+	} else if sniffHost, loaded := r.lookupQUICSniff(metadata.Source, metadata.SniffDestination); loaded {
+		metadata.SniffHost = sniffHost
+		r.logger.DebugContext(ctx, "restored QUIC SNI from cache: ", sniffHost)
+	}
+}
 
 type quicSniffCacheKey struct {
 	source      M.Socksaddr
 	destination M.Socksaddr
 }
 
-type quicSniffCacheEntry struct {
-	sniffHost string
-	expiry    time.Time
-}
-
 func (r *Router) cacheQUICSniff(source, destination M.Socksaddr, sniffHost string) {
-	r.quicSniffCache.Store(quicSniffCacheKey{source, destination}, quicSniffCacheEntry{
-		sniffHost: sniffHost,
-		expiry:    time.Now().Add(quicSniffCacheTTL),
-	})
+	r.quicSniffCache.Store(quicSniffCacheKey{source, destination}, sniffHost)
 }
 
 func (r *Router) lookupQUICSniff(source, destination M.Socksaddr) (string, bool) {
-	key := quicSniffCacheKey{source, destination}
-	v, ok := r.quicSniffCache.Load(key)
-	if !ok {
-		return "", false
-	}
-	entry := v.(quicSniffCacheEntry)
-	if time.Now().After(entry.expiry) {
-		r.quicSniffCache.Delete(key)
-		return "", false
-	}
-	return entry.sniffHost, true
+	return r.quicSniffCache.LoadAndRefresh(quicSniffCacheKey{source, destination})
+}
+
+func (r *Router) refreshQUICSniff(source, destination M.Socksaddr, sniffHost string) {
+	r.quicSniffCache.StoreIf(quicSniffCacheKey{source, destination}, sniffHost, func(current string, loaded bool) bool {
+		return !loaded || current == sniffHost
+	})
 }
 
 func (r *Router) DefaultDomainMatchStrategy() C.DomainMatchStrategy {

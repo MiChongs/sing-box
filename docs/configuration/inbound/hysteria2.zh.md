@@ -48,6 +48,12 @@ icon: material/alert-decagram
     "realm_id": "",
     "stun_servers": [],
     "stun_domain_resolver": "", // 或 {}
+    "ip_version": 0,
+    "port_mapping": {
+      "enabled": false,
+      "timeout": "",
+      "lifetime": ""
+    },
     "http_client": {}
   }
 }
@@ -194,8 +200,6 @@ BBR 拥塞控制算法配置，可选 `conservative` `standard` `aggressive`。
 
 将此入站注册到 Hysteria Realm 会合服务，以启用 NAT 穿透。
 
-入站通过 STUN 发现自己的公网地址并注册到 realm，借助 UDP 打洞接受客户端连接，无需可公网直达的监听地址。
-
 会合服务参阅 [Hysteria Realm](/zh/configuration/service/hysteria-realm/)。
 
 #### realm.server_url
@@ -233,6 +237,38 @@ Realm 上的槽位标识符。
 若直接将此选项设置为字符串，则等同于设置该选项的 `server` 字段。
 
 如果为空，则使用默认域名解析器。
+
+#### realm.ip_version
+
+将 realm 连接（STUN、打洞与最终的 QUIC 路径）限制为单一 IP 版本。
+
+`4` 或 `6`。默认使用两者。
+
+`listen` 地址必须与所选版本兼容。
+
+#### realm.port_mapping
+
+通过 UPnP 或 NAT-PMP 在本地网关上维护 UDP 端口映射。
+
+可在支持的网关后提升打洞成功率。
+
+需要 IPv4：与 `"ip_version": 6` 冲突。
+
+#### realm.port_mapping.enabled
+
+启用端口映射。
+
+#### realm.port_mapping.timeout
+
+网关发现与映射操作的超时。
+
+默认使用 `10s`。
+
+#### realm.port_mapping.lifetime
+
+映射的租约时长。
+
+默认使用 `10m`。
 
 #### realm.http_client
 

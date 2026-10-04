@@ -27,7 +27,7 @@ import (
 func connectionRouter(ctx context.Context, network adapter.NetworkManager, trafficManager *trafficcontrol.Manager) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getConnections(ctx, trafficManager))
-	r.Delete("/", closeAllConnections(network, trafficManager))
+	r.Delete("/", closeAllConnections(ctx, network, trafficManager))
 	r.Delete("/{id}", closeConnection(trafficManager))
 	// Smart-block: close the connection AND mark its upstream Smart-selected
 	// node as blocked so the group stops selecting it for a cooldown window.
@@ -74,10 +74,10 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 	}
 	var processPath string
 	if c.Metadata.ProcessInfo != nil {
-		if c.Metadata.ProcessInfo.ProcessPath != "" {
-			processPath = c.Metadata.ProcessInfo.ProcessPath
-		} else if len(c.Metadata.ProcessInfo.AndroidPackageNames) > 0 {
-			processPath = c.Metadata.ProcessInfo.AndroidPackageNames[0]
+		if len(c.Metadata.ProcessInfo.PackageNames) > 0 {
+			processPath = c.Metadata.ProcessInfo.PackageNames[0]
+		} else if len(c.Metadata.ProcessInfo.ProcessPaths) > 0 {
+			processPath = c.Metadata.ProcessInfo.ProcessPaths[0]
 		}
 		if processPath == "" {
 			if c.Metadata.ProcessInfo.UserId != -1 {
@@ -95,7 +95,6 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 	} else {
 		rule = "final"
 	}
-	chains := trafficcontrol.TrackerMetadata(c).Chains()
 	return json.Marshal(map[string]any{
 		"id": c.ID,
 		"metadata": map[string]any{
@@ -113,7 +112,7 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 		"upload":      c.Upload.Load(),
 		"download":    c.Download.Load(),
 		"start":       c.CreatedAt,
-		"chains":      chains,
+		"chains":      c.Chain,
 		"rule":        rule,
 		"rulePayload": "",
 	})
@@ -185,10 +184,10 @@ func closeConnection(trafficManager *trafficcontrol.Manager) func(w http.Respons
 	}
 }
 
-func closeAllConnections(network adapter.NetworkManager, trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
+func closeAllConnections(ctx context.Context, network adapter.NetworkManager, trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		trafficManager.CloseAllConnections()
-		network.ResetNetwork()
+		network.ResetNetwork(ctx)
 		render.NoContent(w, r)
 	}
 }
@@ -220,8 +219,9 @@ func smartBlockConnection(ctx context.Context, trafficManager *trafficcontrol.Ma
 		}
 
 		// Walk the chain looking for a Smart group. The slot immediately after
-		// the Smart tag in the chain is the actual node it selected.
-		chain := target.Metadata.GetRealOutboundChain()
+		// the Smart tag in the chain is the actual node it selected; Smart
+		// dials through itself, so it is normally terminal and Now() fills in.
+		chain := common.Map(target.Metadata.OutboundChain, adapter.Outbound.Tag)
 		outboundMgr := service.FromContext[adapter.OutboundManager](ctx)
 		if outboundMgr == nil {
 			render.NoContent(w, r)

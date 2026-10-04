@@ -35,14 +35,14 @@ func TestInterfaceUpdatedDebounce(t *testing.T) {
 	s := newSmartForNetChangeTest(t)
 
 	// First call: advances lastFireNS.
-	s.InterfaceUpdated()
+	s.InterfaceUpdated(context.Background())
 	firstFire := s.netChange.lastFireNS.Load()
 	if firstFire == 0 {
 		t.Fatal("first call did not set lastFireNS")
 	}
 
 	// Second call within window: must NOT advance.
-	s.InterfaceUpdated()
+	s.InterfaceUpdated(context.Background())
 	if s.netChange.lastFireNS.Load() != firstFire {
 		t.Fatalf("debounce failed: lastFireNS advanced within window (%d → %d)",
 			firstFire, s.netChange.lastFireNS.Load())
@@ -52,7 +52,7 @@ func TestInterfaceUpdatedDebounce(t *testing.T) {
 	past := time.Now().UnixNano() - int64(netChangeDebounce) - int64(time.Millisecond)
 	s.netChange.lastFireNS.Store(past)
 
-	s.InterfaceUpdated()
+	s.InterfaceUpdated(context.Background())
 	if s.netChange.lastFireNS.Load() == past {
 		t.Fatal("post-window fire did not advance lastFireNS")
 	}
@@ -70,7 +70,7 @@ func TestInterfaceUpdatedInFlight(t *testing.T) {
 	}
 
 	// Call should observe inFlight=true and bail fast.
-	s.InterfaceUpdated()
+	s.InterfaceUpdated(context.Background())
 
 	// lastFireNS must remain zero because the inFlight guard fired.
 	if s.netChange.lastFireNS.Load() != 0 {
@@ -89,7 +89,7 @@ func TestInterfaceUpdatedNotStarted(t *testing.T) {
 	}
 	// started is false by default.
 
-	s.InterfaceUpdated()
+	s.InterfaceUpdated(context.Background())
 
 	if s.netChange.lastFireNS.Load() != 0 {
 		t.Fatal("started=false did not short-circuit")
