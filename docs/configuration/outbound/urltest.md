@@ -55,6 +55,10 @@ The URL to test. `https://www.gstatic.com/generate_204` will be used if empty.
 
 The test interval. `3m` will be used if empty.
 
+Every interval, the current selection and the fastest members are tested, along with members never tested before.
+Other members are refreshed in turns, least recently tested first: groups of up to 64 members are fully refreshed every interval, larger groups at most every 8 intervals.
+A member whose tests keep failing is retried after 1, 2, 4 and up to 8 intervals; a network change resets this.
+
 #### tolerance
 
 The test tolerance in milliseconds. `50` will be used if empty.

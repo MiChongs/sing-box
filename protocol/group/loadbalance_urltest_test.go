@@ -82,10 +82,7 @@ func TestLoadBalanceURLTestRecursesAndForcesRefresh(t *testing.T) {
 		outbound: manager,
 		history:  history,
 	}
-	urlTestGroup.state.Store(&groupState{
-		outbounds: []adapter.Outbound{nested, fallback},
-		tags:      []string{nested.Tag(), fallback.Tag()},
-	})
+	urlTestGroup.storeOutbounds([]adapter.Outbound{nested, fallback})
 	selected, available := urlTestGroup.Select(N.NetworkTCP)
 	require.True(t, available)
 	require.Same(t, nested, selected)

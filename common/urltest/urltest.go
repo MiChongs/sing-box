@@ -52,7 +52,16 @@ type HistoryStorage struct {
 	delayHistory sync.Map
 	updateHooks  []*observable.Subscriber[struct{}]
 	hookAccess   sync.Mutex
+
+	notifyAccess  sync.Mutex
+	notifyPending bool
+	lastNotify    time.Time
 }
+
+// historyNotifyInterval coalesces store/delete notifications: a health
+// check stores one result per member, and every notification makes the
+// subscribers (reference tracking, dashboard pushes) walk all outbounds.
+const historyNotifyInterval = 200 * time.Millisecond
 
 func NewHistoryStorage() *HistoryStorage { return &HistoryStorage{} }
 
@@ -92,13 +101,30 @@ func (s *HistoryStorage) StoreURLTestHistory(tag string, h *adapter.URLTestHisto
 	s.notifyUpdated()
 }
 
+// notifyUpdated emits right away when the last emission is older than
+// historyNotifyInterval, and otherwise schedules a single trailing emission.
 func (s *HistoryStorage) notifyUpdated() {
-	s.hookAccess.Lock()
-	hooks := s.updateHooks
-	s.hookAccess.Unlock()
-	for _, h := range hooks {
-		h.Emit(struct{}{})
+	s.notifyAccess.Lock()
+	if s.notifyPending {
+		s.notifyAccess.Unlock()
+		return
 	}
+	wait := historyNotifyInterval - time.Since(s.lastNotify)
+	if wait <= 0 {
+		s.lastNotify = time.Now()
+		s.notifyAccess.Unlock()
+		s.NotifyUpdated()
+		return
+	}
+	s.notifyPending = true
+	s.notifyAccess.Unlock()
+	time.AfterFunc(wait, func() {
+		s.notifyAccess.Lock()
+		s.notifyPending = false
+		s.lastNotify = time.Now()
+		s.notifyAccess.Unlock()
+		s.NotifyUpdated()
+	})
 }
 
 func (s *HistoryStorage) Close() error {

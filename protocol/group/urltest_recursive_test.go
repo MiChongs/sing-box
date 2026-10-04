@@ -163,16 +163,12 @@ func newURLTestForRecursiveTest(tag string, link string, manager adapter.Outboun
 		memberTags = append(memberTags, member.Tag())
 	}
 	group := &URLTestGroup{
-		ctx:              context.Background(),
-		outbound:         manager,
-		logger:           log.NewNOPFactory().Logger(),
-		link:             link,
-		interval:         time.Hour,
-		history:          history,
-		failureCount:     make(map[string]int32),
-		dialFailureCount: make(map[string]int32),
-		reusableChecked:  make(map[string]bool),
-		reusableResult:   make(map[string]uint16),
+		ctx:      context.Background(),
+		outbound: manager,
+		logger:   log.NewNOPFactory().Logger(),
+		link:     link,
+		interval: time.Hour,
+		history:  history,
 	}
 	group.storeOutbounds(outbounds)
 	return &URLTest{
