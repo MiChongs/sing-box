@@ -28,6 +28,7 @@
 | `openvpn-server` | [OpenVPN 服务器](./openvpn-server/)         |
 | `masque-client`  | [MASQUE 客户端](./masque-client/)           |
 | `masque-server`  | [MASQUE 服务器](./masque-server/)           |
+| `easytier`       | [EasyTier](./easytier/)                 |
 
 #### tag
 

@@ -3983,8 +3983,412 @@
       },
       "additionalProperties": false
     },
+    "EasyTierPortForwardOptions": {
+      "type": "object",
+      "properties": {
+        "network": {
+          "anyOf": [
+            {
+              "type": "string",
+              "enum": [
+                "tcp",
+                "udp"
+              ]
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "tcp",
+                  "udp"
+                ]
+              }
+            }
+          ]
+        },
+        "listen": {
+          "type": "string"
+        },
+        "destination": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "EasyTierProxyNetworkOptions": {
+      "type": "object",
+      "properties": {
+        "cidr": {
+          "$ref": "#/$defs/IPPrefix"
+        },
+        "mapped_cidr": {
+          "$ref": "#/$defs/IPPrefix"
+        }
+      },
+      "additionalProperties": false
+    },
+    "EasyTierSecureModeOptions": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "private_key": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "EasyTierWebOptions": {
+      "type": "object",
+      "properties": {
+        "server": {
+          "type": "string"
+        },
+        "machine_id": {
+          "type": "string"
+        },
+        "hostname": {
+          "type": "string"
+        },
+        "secure_mode": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
     "Endpoint": {
       "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "const": "easytier"
+            },
+            "tag": {
+              "type": "string"
+            },
+            "detour": {
+              "type": "string",
+              "x-tag-reference": "outbound"
+            },
+            "bind_interface": {
+              "type": "string"
+            },
+            "inet4_bind_address": {
+              "$ref": "#/$defs/IPAddress"
+            },
+            "inet6_bind_address": {
+              "$ref": "#/$defs/IPAddress"
+            },
+            "bind_address_no_port": {
+              "type": "boolean"
+            },
+            "protect_path": {
+              "type": "string"
+            },
+            "routing_mark": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295
+                },
+                {
+                  "type": "string"
+                }
+              ]
+            },
+            "reuse_addr": {
+              "type": "boolean"
+            },
+            "netns": {
+              "type": "string",
+              "x-tag-reference": "network_namespace"
+            },
+            "connect_timeout": {
+              "$ref": "#/$defs/Duration"
+            },
+            "tcp_fast_open": {
+              "type": "boolean"
+            },
+            "tcp_multi_path": {
+              "type": "boolean"
+            },
+            "disable_tcp_keep_alive": {
+              "type": "boolean"
+            },
+            "tcp_keep_alive": {
+              "$ref": "#/$defs/Duration"
+            },
+            "tcp_keep_alive_interval": {
+              "$ref": "#/$defs/Duration"
+            },
+            "tcp_keep_alive_count": {
+              "type": "integer"
+            },
+            "udp_gso": {
+              "type": "boolean"
+            },
+            "udp_fragment": {
+              "type": "boolean"
+            },
+            "domain_resolver": {
+              "$ref": "#/$defs/DomainResolver"
+            },
+            "network_strategy": {
+              "type": "string",
+              "enum": [
+                "default",
+                "fallback",
+                "hybrid"
+              ]
+            },
+            "network_type": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InterfaceType"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/InterfaceType"
+                  }
+                }
+              ]
+            },
+            "fallback_network_type": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/InterfaceType"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/InterfaceType"
+                  }
+                }
+              ]
+            },
+            "fallback_delay": {
+              "$ref": "#/$defs/Duration"
+            },
+            "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "inner_domain_resolver": {
+              "$ref": "#/$defs/DomainResolver"
+            },
+            "system": {
+              "type": "boolean"
+            },
+            "gso": {
+              "type": "boolean"
+            },
+            "name": {
+              "type": "string"
+            },
+            "mtu": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "udp_timeout": {
+              "$ref": "#/$defs/Duration"
+            },
+            "udp_mapping": {
+              "type": "string",
+              "enum": [
+                "",
+                "endpoint_independent",
+                "address_dependent",
+                "address_and_port_dependent"
+              ]
+            },
+            "udp_filtering": {
+              "type": "string",
+              "enum": [
+                "",
+                "endpoint_independent",
+                "address_dependent",
+                "address_and_port_dependent"
+              ]
+            },
+            "udp_nat_max": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 4294967295
+            },
+            "network_name": {
+              "type": "string"
+            },
+            "network_secret": {
+              "type": "string"
+            },
+            "hostname": {
+              "type": "string"
+            },
+            "address": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/IPPrefix"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/IPPrefix"
+                  }
+                }
+              ]
+            },
+            "peers": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "listeners": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "proxy_networks": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EasyTierProxyNetworkOptions"
+              }
+            },
+            "enable_exit_node": {
+              "type": "boolean"
+            },
+            "exit_nodes": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/IPAddress"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/$defs/IPAddress"
+                  }
+                }
+              ]
+            },
+            "port_forwards": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/EasyTierPortForwardOptions"
+              }
+            },
+            "stun_servers": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "stun_servers_v6": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "disable_encryption": {
+              "type": "boolean"
+            },
+            "encryption_algorithm": {
+              "type": "string",
+              "enum": [
+                "aes-gcm",
+                "aes-256-gcm",
+                "chacha20",
+                "xor"
+              ]
+            },
+            "secure_mode": {
+              "$ref": "#/$defs/EasyTierSecureModeOptions"
+            },
+            "disable_p2p": {
+              "type": "boolean"
+            },
+            "lazy_p2p": {
+              "type": "boolean"
+            },
+            "need_p2p": {
+              "type": "boolean"
+            },
+            "p2p_only": {
+              "type": "boolean"
+            },
+            "disable_tcp_hole_punching": {
+              "type": "boolean"
+            },
+            "disable_udp_hole_punching": {
+              "type": "boolean"
+            },
+            "disable_sym_hole_punching": {
+              "type": "boolean"
+            },
+            "latency_first": {
+              "type": "boolean"
+            },
+            "private_mode": {
+              "type": "boolean"
+            },
+            "relay_network_whitelist": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "relay_all_peer_rpc": {
+              "type": "boolean"
+            },
+            "web": {
+              "$ref": "#/$defs/EasyTierWebOptions"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
         {
           "type": "object",
           "properties": {

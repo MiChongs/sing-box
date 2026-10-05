@@ -51,7 +51,11 @@ type Options struct {
 	PacketFrontHeadroom int
 	PacketRearHeadroom  int
 	Route               func(packet []byte) *tun.OutboundQueue
-	Configuration       Configuration
+	// SourceAddress optionally selects the local address used by the internal
+	// stack for a destination. An invalid or wrong-family result falls back to
+	// the first configured address of that family.
+	SourceAddress func(destination netip.Addr) netip.Addr
+	Configuration Configuration
 }
 
 type Configuration struct {
