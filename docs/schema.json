@@ -2130,6 +2130,27 @@
           "type": "object",
           "properties": {
             "type": {
+              "const": "easytier"
+            },
+            "tag": {
+              "type": "string"
+            },
+            "endpoint": {
+              "type": "string"
+            },
+            "accept_search_domain": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
               "const": "fakeip"
             },
             "tag": {
@@ -4227,6 +4248,9 @@
               "type": "string"
             },
             "hostname": {
+              "type": "string"
+            },
+            "tld_dns_zone": {
               "type": "string"
             },
             "address": {

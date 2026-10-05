@@ -20,6 +20,7 @@ type EasyTierEndpointOptions struct {
 	NetworkName            string                           `json:"network_name,omitempty"`
 	NetworkSecret          string                           `json:"network_secret,omitempty"`
 	Hostname               string                           `json:"hostname,omitempty"`
+	TLDDNSZone             string                           `json:"tld_dns_zone,omitempty"`
 	Address                badoption.Listable[netip.Prefix] `json:"address,omitempty"`
 	Peers                  badoption.Listable[string]       `json:"peers,omitempty"`
 	Listeners              badoption.Listable[string]       `json:"listeners,omitempty"`
@@ -48,6 +49,11 @@ type EasyTierEndpointOptions struct {
 
 func (o *EasyTierEndpointOptions) TakeInnerDomainResolverOptions() *DomainResolveOptions {
 	return o.InnerDomainResolver
+}
+
+type EasyTierDNSServerOptions struct {
+	Endpoint           string `json:"endpoint,omitempty"`
+	AcceptSearchDomain bool   `json:"accept_search_domain,omitempty"`
 }
 
 type EasyTierSecureModeOptions struct {

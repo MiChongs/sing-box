@@ -20,6 +20,7 @@ The EasyTier core is embedded as WebAssembly and runs inside sing-box, so no ext
   "network_name": "",
   "network_secret": "",
   "hostname": "",
+  "tld_dns_zone": "",
   "address": [],
   "peers": [],
   "listeners": [],
@@ -98,6 +99,14 @@ EasyTier network secret.
 Hostname advertised to other peers, at most 32 characters.
 
 The system hostname is used by default.
+
+Peers resolve this node as `<hostname>.<tld_dns_zone>` through [Magic DNS](#magic-dns).
+
+### tld_dns_zone
+
+Zone of the [Magic DNS](#magic-dns) names of this network.
+
+`et.net` is used by default.
 
 ### address
 
@@ -354,6 +363,30 @@ Use the [`preferred_by`](/configuration/route/rule/#preferred_by) rule item to r
       {
         "preferred_by": "easytier-ep",
         "outbound": "easytier-ep"
+      }
+    ]
+  }
+}
+```
+
+## Magic DNS
+
+With an [EasyTier DNS server](/configuration/dns/server/easytier/), every node of the networks is resolvable as `<hostname>.<zone>`, and connections to these names routed to this endpoint are resolved by the endpoint itself:
+
+```json
+{
+  "dns": {
+    "servers": [
+      {
+        "type": "easytier",
+        "tag": "easytier-dns",
+        "endpoint": "easytier-ep"
+      }
+    ],
+    "rules": [
+      {
+        "preferred_by": "easytier-dns",
+        "server": "easytier-dns"
       }
     ]
   }

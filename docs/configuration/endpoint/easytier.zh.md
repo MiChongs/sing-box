@@ -20,6 +20,7 @@ EasyTier 内核以 WebAssembly 形式内嵌并运行在 sing-box 中，不需要
   "network_name": "",
   "network_secret": "",
   "hostname": "",
+  "tld_dns_zone": "",
   "address": [],
   "peers": [],
   "listeners": [],
@@ -98,6 +99,14 @@ EasyTier 网络密钥。
 向其他节点通告的主机名，最多 32 个字符。
 
 默认使用系统主机名。
+
+其他节点通过 [Magic DNS](#magic-dns) 以 `<hostname>.<tld_dns_zone>` 解析本节点。
+
+### tld_dns_zone
+
+此网络 [Magic DNS](#magic-dns) 名称所在的区域。
+
+默认使用 `et.net`。
 
 ### address
 
@@ -354,6 +363,30 @@ UDP NAT 过期时间。
       {
         "preferred_by": "easytier-ep",
         "outbound": "easytier-ep"
+      }
+    ]
+  }
+}
+```
+
+## Magic DNS
+
+配置 [EasyTier DNS 服务器](/zh/configuration/dns/server/easytier/) 后，网络中的每个节点都可以通过 `<hostname>.<zone>` 解析；路由到此端点的、目标为这些名称的连接由端点自行解析：
+
+```json
+{
+  "dns": {
+    "servers": [
+      {
+        "type": "easytier",
+        "tag": "easytier-dns",
+        "endpoint": "easytier-ep"
+      }
+    ],
+    "rules": [
+      {
+        "preferred_by": "easytier-dns",
+        "server": "easytier-dns"
       }
     ]
   }

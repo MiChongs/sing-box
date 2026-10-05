@@ -104,6 +104,7 @@ nav:
               - mDNS: configuration/dns/server/mdns.md
               - FakeIP: configuration/dns/server/fakeip.md
               - Tailscale: configuration/dns/server/tailscale.md
+              - EasyTier: configuration/dns/server/easytier.md
               - OpenConnect: configuration/dns/server/openconnect.md
               - OpenVPN: configuration/dns/server/openvpn.md
               - Resolved: configuration/dns/server/resolved.md

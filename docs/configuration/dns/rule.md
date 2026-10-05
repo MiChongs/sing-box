@@ -549,6 +549,7 @@ Match specified DNS servers' preferred domains.
 | `local`       | Match hosts entries, neighbor-resolved hosts, and mDNS local domains         |
 | `mdns`        | Match mDNS local domains (`*.local.` and IPv4/IPv6 link-local reverse zones) |
 | `tailscale`   | Match MagicDNS hosts and DNS route suffixes                                  |
+| `easytier`    | Match Magic DNS zones, and with `accept_search_domain`, single-label names of existing nodes |
 | `openconnect` | Match split DNS and search domains pushed by the VPN server                  |
 | `resolved`    | Match split DNS and search domains from systemd-resolved links               |
 
@@ -579,6 +580,7 @@ Match specified DNS servers' search domains.
 | `dhcp`        | Match search domains from DHCP                   |
 | `resolved`    | Match search domains from systemd-resolved links |
 | `tailscale`   | Match search domains of the tailnet              |
+| `easytier`    | Match Magic DNS zones of the networks            |
 | `openvpn`     | Match search domains pushed by the VPN server    |
 | `openconnect` | Match search domains pushed by the VPN server    |
 

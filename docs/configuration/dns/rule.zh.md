@@ -543,6 +543,7 @@ Available values: `wifi`, `cellular`, `ethernet` and `other`.
 | `local`       | 匹配 hosts 中的条目、邻居解析得到的主机名以及 mDNS 本地域名                         |
 | `mdns`        | 匹配 mDNS 本地域名（`*.local.` 以及 IPv4/IPv6 链路本地反向区域）              |
 | `tailscale`   | 匹配 MagicDNS 主机和 DNS 路由后缀                                    |
+| `easytier`    | 匹配 Magic DNS 区域；启用 `accept_search_domain` 时还匹配已存在节点的单标签名称 |
 | `openconnect` | 匹配 VPN 服务器推送的分流 DNS 和搜索域                                  |
 | `resolved`    | 匹配 systemd-resolved 链路中的分流域名和搜索域                            |
 
@@ -573,6 +574,7 @@ Available values: `wifi`, `cellular`, `ethernet` and `other`.
 | `dhcp`        | 匹配通过 DHCP 获取的搜索域              |
 | `resolved`    | 匹配 systemd-resolved 链路中的搜索域    |
 | `tailscale`   | 匹配 tailnet 的搜索域                |
+| `easytier`    | 匹配各网络的 Magic DNS 区域                  |
 | `openvpn`     | 匹配 VPN 服务器推送的搜索域              |
 | `openconnect` | 匹配 VPN 服务器推送的搜索域              |
 

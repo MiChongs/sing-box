@@ -4,9 +4,14 @@ package include
 
 import (
 	"github.com/sagernet/sing-box/adapter/endpoint"
+	"github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/protocol/easytier"
 )
 
 func registerEasyTierEndpoint(registry *endpoint.Registry) {
 	easytier.RegisterEndpoint(registry)
+}
+
+func registerEasyTierTransport(registry *dns.TransportRegistry) {
+	easytier.RegisterTransport(registry)
 }

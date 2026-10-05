@@ -484,6 +484,7 @@ icon: material/new-box
 |-------------|--------------------------------|
 | `tailscale` | 匹配 MagicDNS 域名和对端的 allowed IPs |
 | `wireguard` | 匹配对端的 allowed IPs              |
+| `easytier`  | 匹配虚拟子网、节点地址与节点通告的网段；配置 [EasyTier DNS 服务器](/zh/configuration/dns/server/easytier/) 时还匹配 Magic DNS 域名 |
 | `bridge`    | 匹配除本机本地地址外的所有地址，仅在[预匹配](/zh/configuration/shared/pre-match/)中 |
 
 #### dns_server_address
@@ -513,6 +514,7 @@ icon: material/new-box
 | `dhcp`        | 匹配通过 DHCP 获取的搜索域              |
 | `resolved`    | 匹配 systemd-resolved 链路中的搜索域    |
 | `tailscale`   | 匹配 tailnet 的搜索域                |
+| `easytier`    | 匹配各网络的 Magic DNS 区域                  |
 | `openvpn`     | 匹配 VPN 服务器推送的搜索域              |
 | `openconnect` | 匹配 VPN 服务器推送的搜索域              |
 

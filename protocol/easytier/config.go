@@ -281,6 +281,13 @@ func buildConfig(options option.EasyTierEndpointOptions, address addressConfig, 
 
 	builder.table("flags")
 	builder.intField("mtu", uint64(mtu))
+	if options.TLDDNSZone != "" {
+		zone, err := parseDNSZone(options.TLDDNSZone)
+		if err != nil {
+			return "", E.Cause(err, "tld_dns_zone")
+		}
+		builder.stringField("tld_dns_zone", zone)
+	}
 	builder.boolField("proxy_forward_by_system", true)
 	builder.boolField("enable_exit_node", options.EnableExitNode)
 	builder.boolField("enable_encryption", !options.DisableEncryption)

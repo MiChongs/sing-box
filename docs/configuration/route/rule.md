@@ -486,6 +486,7 @@ Match specified outbounds' preferred routes.
 |-------------|----------------------------------------------------|
 | `tailscale` | Match MagicDNS domains and peers' allowed IPs      |
 | `wireguard` | Match peers's allowed IPs                          |
+| `easytier`  | Match virtual subnets, peer addresses and networks advertised by peers, and Magic DNS domains with an [EasyTier DNS server](/configuration/dns/server/easytier/) |
 | `bridge`    | Match all addresses except local addresses of the machine, only in [pre-match](/configuration/shared/pre-match/) |
 
 #### dns_server_address
@@ -515,6 +516,7 @@ Match specified DNS servers' search domains.
 | `dhcp`        | Match search domains from DHCP                   |
 | `resolved`    | Match search domains from systemd-resolved links |
 | `tailscale`   | Match search domains of the tailnet              |
+| `easytier`    | Match Magic DNS zones of the networks            |
 | `openvpn`     | Match search domains pushed by the VPN server    |
 | `openconnect` | Match search domains pushed by the VPN server    |
 

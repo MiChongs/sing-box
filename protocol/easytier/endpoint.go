@@ -67,6 +67,7 @@ type Endpoint struct {
 	localConfig          string
 	localAddress         addressConfig
 	localMappings        []proxyMapping
+	localDNSZone         string
 	webOptions           *corehost.WebClientOptions
 	mtu                  uint32
 	deviceOptions        *device.Options
@@ -76,6 +77,8 @@ type Endpoint struct {
 	deviceAddresses      []netip.Prefix
 	instances            []*attachedInstance
 	snapshot             atomic.Pointer[routingSnapshot]
+	dnsTable             atomic.Pointer[magicDNSTable]
+	dnsTransport         atomic.Pointer[DNSTransport]
 	ingress              chan ingressPacket
 	ready                chan struct{}
 	readyOnce            sync.Once
@@ -115,8 +118,12 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		if err != nil {
 			return nil, err
 		}
-	} else if len(options.ProxyNetworks) > 0 || len(options.PortForwards) > 0 || len(options.Peers) > 0 || len(options.Listeners) > 0 || len(options.Address) > 0 {
+	} else if len(options.ProxyNetworks) > 0 || len(options.PortForwards) > 0 || len(options.Peers) > 0 || len(options.Listeners) > 0 || len(options.Address) > 0 || options.TLDDNSZone != "" {
 		return nil, E.New("network options require network_name")
+	}
+	localDNSZone, err := parseDNSZone(options.TLDDNSZone)
+	if err != nil {
+		return nil, E.Cause(err, "tld_dns_zone")
 	}
 	webOptions, err := newWebClientOptions(options, tag)
 	if err != nil {
@@ -153,6 +160,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		localConfig:          localConfig,
 		localAddress:         address,
 		localMappings:        localMappings,
+		localDNSZone:         localDNSZone,
 		webOptions:           webOptions,
 		mtu:                  mtu,
 		ingress:              make(chan ingressPacket, packetIngressWorkers*4),
@@ -177,6 +185,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		Environment: sockets,
 	}
 	ep.snapshot.Store(newRoutingSnapshot(nil))
+	ep.dnsTable.Store(ep.newDNSTable(nil))
 	udpTimeout := time.Duration(options.UDPTimeout)
 	if udpTimeout == 0 {
 		udpTimeout = C.UDPTimeout
@@ -353,6 +362,7 @@ func (e *Endpoint) detachInstance(instance *attachedInstance) {
 func (e *Endpoint) updateDeviceLocked() error {
 	snapshot := newRoutingSnapshot(e.instances)
 	e.snapshot.Store(snapshot)
+	e.dnsTable.Store(e.newDNSTable(e.instances))
 	if len(snapshot.instances) > 0 {
 		e.setReady(nil)
 	}
@@ -612,7 +622,7 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 		return nil, err
 	}
 	if destination.IsDomain() {
-		destinationAddresses, lookupErr := e.dnsRouter.Lookup(ctx, destination.Fqdn, e.innerDNSQueryOptions)
+		destinationAddresses, lookupErr := e.lookupDomain(ctx, destination.Fqdn)
 		if lookupErr != nil {
 			return nil, lookupErr
 		}
@@ -631,7 +641,7 @@ func (e *Endpoint) ListenPacketWithDestination(ctx context.Context, destination 
 		return nil, netip.Addr{}, err
 	}
 	if destination.IsDomain() {
-		destinationAddresses, lookupErr := e.dnsRouter.Lookup(ctx, destination.Fqdn, e.innerDNSQueryOptions)
+		destinationAddresses, lookupErr := e.lookupDomain(ctx, destination.Fqdn)
 		if lookupErr != nil {
 			return nil, netip.Addr{}, lookupErr
 		}
@@ -662,8 +672,51 @@ func (e *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (n
 	return packetConn, nil
 }
 
+// PreferredDomain reports Magic DNS names when an EasyTier DNS server is
+// attached to the endpoint.
 func (e *Endpoint) PreferredDomain(metadata *adapter.InboundContext, domain string) bool {
-	return false
+	transport := e.dnsTransport.Load()
+	if transport == nil {
+		return false
+	}
+	return e.dnsTable.Load().preferred(domain, transport.acceptSearchDomain)
+}
+
+// lookupDomain resolves a destination domain. Magic DNS names are answered
+// from the endpoint's own records when an EasyTier DNS server is attached;
+// other names go through the DNS router.
+func (e *Endpoint) lookupDomain(ctx context.Context, domain string) ([]netip.Addr, error) {
+	if transport := e.dnsTransport.Load(); transport != nil {
+		addresses, handled, err := e.dnsTable.Load().lookup(domain, transport.acceptSearchDomain)
+		if handled {
+			if err != nil {
+				return nil, err
+			}
+			addresses = filterAddresses(addresses, e.innerDNSQueryOptions.Strategy)
+			if len(addresses) == 0 {
+				return nil, E.New("EasyTier Magic DNS: no address for ", domain, " with strategy ", e.innerDNSQueryOptions.Strategy)
+			}
+			return addresses, nil
+		}
+	}
+	return e.dnsRouter.Lookup(ctx, domain, e.innerDNSQueryOptions)
+}
+
+// newDNSTable collects the Magic DNS zones and records of the instances. The
+// zone of the local network is claimed before its instance is up, so early
+// queries are answered instead of leaking to other servers.
+func (e *Endpoint) newDNSTable(instances []*attachedInstance) *magicDNSTable {
+	var zones []string
+	if e.localConfig != "" {
+		zones = append(zones, e.localDNSZone)
+	}
+	hostLists := make([][]magicDNSHost, 0, len(instances))
+	for _, instance := range instances {
+		state := instance.state.Load()
+		zones = append(zones, state.dnsZone)
+		hostLists = append(hostLists, state.dnsHosts)
+	}
+	return newMagicDNSTable(zones, hostLists...)
 }
 
 // PreferredAddress reports destinations inside the EasyTier networks: virtual

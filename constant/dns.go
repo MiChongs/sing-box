@@ -28,6 +28,7 @@ const (
 	DNSTypeDHCP        = "dhcp"
 	DNSTypeMDNS        = "mdns"
 	DNSTypeTailscale   = "tailscale"
+	DNSTypeEasyTier    = "easytier"
 	DNSTypeOpenConnect = "openconnect"
 	DNSTypeOpenVPN     = "openvpn"
 	DNSTypeGroup       = "group"

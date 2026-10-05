@@ -44,13 +44,17 @@ type instanceState struct {
 	addresses  []netip.Prefix
 	routes     []netip.Prefix
 	mappings   []proxyMapping
+	dnsZone    string
+	dnsHosts   []magicDNSHost
 }
 
 func (s *instanceState) equal(other *instanceState) bool {
 	return s.configured == other.configured &&
 		slices.Equal(s.addresses, other.addresses) &&
 		slices.Equal(s.routes, other.routes) &&
-		slices.Equal(s.mappings, other.mappings)
+		slices.Equal(s.mappings, other.mappings) &&
+		s.dnsZone == other.dnsZone &&
+		slices.EqualFunc(s.dnsHosts, other.dnsHosts, magicDNSHost.equal)
 }
 
 func (e *Endpoint) attachInstance(instance *corehost.Instance, name string, web bool, static addressConfig, mappings []proxyMapping) *attachedInstance {
@@ -66,7 +70,10 @@ func (e *Endpoint) attachInstance(instance *corehost.Instance, name string, web 
 		done:         make(chan struct{}),
 		statusUpdate: make(chan struct{}, 1),
 	}
-	state := &instanceState{mappings: mappings}
+	state := &instanceState{mappings: mappings, dnsZone: defaultDNSZone}
+	if !web {
+		state.dnsZone = e.localDNSZone
+	}
 	if static.inet4.IsValid() {
 		state.configured = true
 		state.addresses = static.prefixes()
@@ -226,6 +233,7 @@ func (a *attachedInstance) refreshStatus() {
 	previous := a.state.Load()
 	state := &instanceState{
 		mappings: parseNodeProxyCIDRs(nodeInfo.GetProxyCidrs()),
+		dnsZone:  a.dnsZone(nodeInfo),
 	}
 	if a.static.inet4.IsValid() {
 		state.addresses = a.static.prefixes()
@@ -243,11 +251,13 @@ func (a *attachedInstance) refreshStatus() {
 	routes, err := a.instance.ListRoute(queryCtx)
 	if err == nil {
 		state.routes = routePrefixes(state.addresses, routes)
+		state.dnsHosts = magicDNSHosts(state.dnsZone, nodeInfo.GetHostname(), state.addresses, routes)
 	} else {
 		if a.ctx.Err() == nil {
 			logger.Debug(E.Cause(err, a.logPrefix(), "query routes"))
 		}
 		state.routes = previous.routes
+		state.dnsHosts = previous.dnsHosts
 	}
 	if previous.equal(state) {
 		return
@@ -258,6 +268,11 @@ func (a *attachedInstance) refreshStatus() {
 	if !slices.Equal(previous.routes, state.routes) {
 		logger.Debug(a.logPrefix(), "routes: ", strings.Join(common.Map(state.routes, netip.Prefix.String), " "))
 	}
+	if !slices.EqualFunc(previous.dnsHosts, state.dnsHosts, magicDNSHost.equal) {
+		logger.Debug(a.logPrefix(), "magic DNS: ", strings.Join(common.Map(state.dnsHosts, func(host magicDNSHost) string {
+			return strings.TrimSuffix(host.name, ".")
+		}), " "))
+	}
 	a.state.Store(state)
 	a.endpoint.stateAccess.Lock()
 	err = a.endpoint.updateDeviceLocked()
@@ -265,6 +280,20 @@ func (a *attachedInstance) refreshStatus() {
 	if err != nil {
 		logger.Error(err)
 	}
+}
+
+// dnsZone returns the Magic DNS zone of the instance: the endpoint option for
+// the local network and the tld_dns_zone flag of a Web instance's config.
+func (a *attachedInstance) dnsZone(nodeInfo *corehost.NodeInfo) string {
+	if !a.web {
+		return a.endpoint.localDNSZone
+	}
+	zone, err := parseDNSZone(tomlString(nodeInfo.GetConfig(), "flags", "tld_dns_zone"))
+	if err != nil {
+		a.endpoint.logger.Warn(E.Cause(err, a.logPrefix(), "magic DNS"))
+		return defaultDNSZone
+	}
+	return zone
 }
 
 func parseNodeAddress(address string) (netip.Prefix, bool) {
