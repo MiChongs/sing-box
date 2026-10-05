@@ -20,6 +20,11 @@ on:
         required: false
         type: boolean
         default: false
+      skip_gui:
+        description: '跳过 SFA / SFW / SFL 图形客户端构建'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -38,6 +43,11 @@ env:
   GO_VERSION: '1.27.1'
   # 预装 NDK 没有 r28+ 时才下载这个版本。
   NDK_VERSION: r28c
+  # 图形客户端源码：reF1nd 客户端的 MiChongs fork，已合入上游同版本的客户端改动。
+  SFA_REPOSITORY: MiChongs/sing-box-for-android
+  SFA_REF: xiaobaf14g-testing
+  SFD_REPOSITORY: MiChongs/sing-box-for-desktop
+  SFD_REF: xiaobaf14g-dev
 
 # 缓存布局（全部由 actions/cache 显式管理，setup-go 自带缓存关闭）:
 # - Go 模块 (~/go/pkg/mod): prepare 按每个 target 的 tag 组合 `go list -deps`
@@ -50,6 +60,9 @@ env:
 #   同一 target 普通版的缓存。
 # - Go toolchain / Zig: setup-go、setup-zig 自带 runner tool cache。
 # - NDK: 优先用 runner 预装的 r28+，没有才下载。
+# - 图形客户端: Linux job 只恢复上面的模块缓存；Windows runner 不能恢复 Linux
+#   的缓存，SFW 单独维护一份 Windows 模块缓存。Gradle / pnpm / cargo 缓存由
+#   各自的 setup action 管理。
 
 jobs:
   # ───────────────────────────────────────────────────────────────────
@@ -64,16 +77,18 @@ jobs:
       tag:          ${{ steps.meta.outputs.tag }}
       prerelease:   ${{ steps.meta.outputs.prerelease }}
       skip_android: ${{ steps.meta.outputs.skip_android }}
+      skip_gui:     ${{ steps.meta.outputs.skip_gui }}
       gomod_key:    ${{ steps.gomod_key.outputs.key }}
     steps:
       - name: Parse trigger
         id: meta
         env:
-          EVENT:         ${{ github.event_name }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_PRE:     ${{ inputs.prerelease }}
-          INPUT_SKIP:    ${{ inputs.skip_android }}
-          REF_NAME:      ${{ github.ref_name }}
+          EVENT:          ${{ github.event_name }}
+          INPUT_VERSION:  ${{ inputs.version }}
+          INPUT_PRE:      ${{ inputs.prerelease }}
+          INPUT_SKIP:     ${{ inputs.skip_android }}
+          INPUT_SKIP_GUI: ${{ inputs.skip_gui }}
+          REF_NAME:       ${{ github.ref_name }}
         run: |
           set -euo pipefail
           if [[ "$EVENT" == "workflow_dispatch" ]]; then
@@ -81,6 +96,7 @@ jobs:
             TAG="v${VERSION}"
             PRE="$INPUT_PRE"
             SKIP_ANDROID="$INPUT_SKIP"
+            SKIP_GUI="$INPUT_SKIP_GUI"
           else
             TAG="$REF_NAME"
             VERSION="${TAG#v}"
@@ -92,12 +108,14 @@ jobs:
               PRE=false
             fi
             SKIP_ANDROID=false
+            SKIP_GUI=false
           fi
           {
             echo "version=$VERSION"
             echo "tag=$TAG"
             echo "prerelease=$PRE"
             echo "skip_android=$SKIP_ANDROID"
+            echo "skip_gui=$SKIP_GUI"
           } | tee -a "$GITHUB_OUTPUT"
 
       - name: Checkout
@@ -595,8 +613,589 @@ jobs:
           compression-level: 0
 
   # ───────────────────────────────────────────────────────────────────
-  # 5) 收集所有 artifact + 生成 changelog + 创建 / 更新 Release
-  #    android、实验性构建失败或被跳过时只要 desktop 成功就发布。
+  # 5) 图形客户端 SFA (Android) / SFW (Windows) / SFL (Linux)
+  #    客户端源码取自 env 中的 reF1nd 客户端 fork，内核取本仓库当前提交：
+  #    libbox.aar 与 sing-box-daemon 都从这里编译，版本号与 CLI 产物一致。
+  #    签名材料存放在仓库 secrets（缺失时对应 job 直接失败）：
+  #    - SFA: RELEASE_KEYSTORE_FILE / RELEASE_KEYSTORE_PASSWORD /
+  #           RELEASE_KEY_ALIAS / RELEASE_KEY_PASSWORD
+  #    - SFW: WINDOWS_CERTIFICATES_P12 / WINDOWS_P12_PASSWORD（自签名代码签名
+  #           证书，daemon 校验更新包签名者与当前安装一致）
+  #    - SFL: GPG_KEY / GPG_KEY_ID / GPG_PASSPHRASE（deb / rpm 签名）
+  #    continue-on-error 让客户端失败不阻塞发布，结果按产物是否齐全写入
+  #    Release 说明。
+  # ───────────────────────────────────────────────────────────────────
+  sfa_library:
+    name: SFA libbox (${{ matrix.go_arch }})
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: needs.prepare.outputs.skip_gui != 'true'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        go_arch: ['386', amd64, arm, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      # build_libbox 用 git describe 读取版本号。
+      - name: Set build tag
+        run: git tag -f "${{ needs.prepare.outputs.tag }}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Restore Go modules
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ needs.prepare.outputs.gomod_key }}
+
+      - name: Setup OpenJDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Locate preinstalled NDK (r28+)
+        id: ndk_local
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          NDK=""
+          for dir in $(ls -d "$SDK"/ndk/*/ 2>/dev/null | sort -V -r); do
+            dir="${dir%/}"
+            major=$(basename "$dir" | cut -d. -f1)
+            if [[ "$major" =~ ^[0-9]+$ ]] && [ "$major" -ge 28 ] && \
+               [ -x "$dir/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" ]; then
+              NDK="$dir"
+              break
+            fi
+          done
+          echo "path=$NDK" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Setup NDK (download fallback)
+        id: ndk_download
+        if: steps.ndk_local.outputs.path == ''
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+
+      - name: Build libbox
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk_local.outputs.path || steps.ndk_download.outputs.ndk-path }}
+          GO_ARCH: ${{ matrix.go_arch }}
+        run: |
+          set -euo pipefail
+          make lib_install
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          go run ./cmd/internal/build_libbox -target android -platform "android/${GO_ARCH}"
+          mkdir -p "dist/${GO_ARCH}"
+          mv libbox.aar libbox-legacy.aar "dist/${GO_ARCH}"
+          ls -lh "dist/${GO_ARCH}"
+
+      - name: Upload library
+        uses: actions/upload-artifact@v5
+        with:
+          name: libbox-android-${{ matrix.go_arch }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  sfa:
+    name: SFA (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    needs:
+      - prepare
+      - sfa_library
+    if: needs.prepare.outputs.skip_gui != 'true'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { variant: other,        task: ':app:assembleOtherRelease',       output: 'app/build/outputs/apk/other/release/*.apk' }
+          - { variant: other-legacy, task: ':app:assembleOtherLegacyRelease', output: 'app/build/outputs/apk/otherLegacy/release/*.apk' }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Checkout SFA
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SFA_REPOSITORY }}
+          ref: ${{ env.SFA_REF }}
+          path: clients/android
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Restore Go modules
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ needs.prepare.outputs.gomod_key }}
+
+      - name: Setup OpenJDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # app/build.gradle.kts 固定 ndkVersion，ANDROID_NDK_HOME 必须是同一版本。
+      - name: Locate preinstalled NDK (app ndkVersion)
+        id: ndk_local
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          WANT=$(sed -n 's/^ *ndkVersion *= *"\(.*\)".*/\1/p' clients/android/app/build.gradle.kts)
+          NDK=""
+          if [ -n "$WANT" ] && [ -x "$SDK/ndk/$WANT/toolchains/llvm/prebuilt/linux-x86_64/bin/clang" ]; then
+            NDK="$SDK/ndk/$WANT"
+          fi
+          echo "want=$WANT" | tee -a "$GITHUB_OUTPUT"
+          echo "path=$NDK" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Setup NDK (download fallback)
+        id: ndk_download
+        if: steps.ndk_local.outputs.path == ''
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r28
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@3f131e8634966bd73d06cc69884922b02e6faf92 # v6.2.0
+        with:
+          cache-provider: basic
+
+      - name: Download libraries
+        uses: actions/download-artifact@v5
+        with:
+          pattern: libbox-android-*
+          path: libbox-inputs
+          merge-multiple: true
+
+      # 四个架构缺一个都不能出包，否则 APK 会缺对应 ABI。
+      - name: Merge libraries
+        run: |
+          set -euo pipefail
+          for NAME in libbox libbox-legacy; do
+            INPUTS=(libbox-inputs/*/"${NAME}.aar")
+            if [ "${#INPUTS[@]}" -ne 4 ] || [ ! -f "${INPUTS[0]}" ]; then
+              echo "::error::expected 4 ${NAME}.aar inputs, found: ${INPUTS[*]}"
+              exit 1
+            fi
+            go run ./cmd/internal/merge_aar -output "${NAME}.aar" "${INPUTS[@]}"
+          done
+          mkdir -p clients/android/app/libs
+          cp libbox.aar libbox-legacy.aar clients/android/app/libs/
+          ls -lh clients/android/app/libs
+
+      # VERSION_CODE 取客户端仓库中的基数加上本 workflow 的运行序号，保证
+      # 每次发布单调递增（应用内更新按 version_code 判断新旧）。
+      - name: Update version
+        id: version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -euo pipefail
+          FILE=clients/android/version.properties
+          BASE_CODE=$(sed -n 's/^VERSION_CODE=//p' "$FILE")
+          VERSION_CODE=$((BASE_CODE + RUN_NUMBER))
+          sed -i \
+            -e "s/^VERSION_CODE=.*/VERSION_CODE=${VERSION_CODE}/" \
+            -e "s/^VERSION_NAME=.*/VERSION_NAME=${VERSION}/" \
+            -e "s/^GO_VERSION=.*/GO_VERSION=$(go env GOVERSION)/" \
+            "$FILE"
+          cat "$FILE"
+          echo "code=${VERSION_CODE}" >> "$GITHUB_OUTPUT"
+
+      - name: Build APK
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk_local.outputs.path || steps.ndk_download.outputs.ndk-path }}
+          RELEASE_KEYSTORE_FILE:     ${{ secrets.RELEASE_KEYSTORE_FILE }}
+          RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          RELEASE_KEY_ALIAS:         ${{ secrets.RELEASE_KEY_ALIAS }}
+          RELEASE_KEY_PASSWORD:      ${{ secrets.RELEASE_KEY_PASSWORD }}
+          TASK: ${{ matrix.task }}
+        run: |
+          set -euo pipefail
+          for NAME in RELEASE_KEYSTORE_FILE RELEASE_KEYSTORE_PASSWORD RELEASE_KEY_ALIAS RELEASE_KEY_PASSWORD; do
+            [ -n "${!NAME}" ] || { echo "::error::secret ${NAME} is not configured"; exit 1; }
+          done
+          KEYSTORE="$RUNNER_TEMP/release.keystore"
+          printf '%s' "$RELEASE_KEYSTORE_FILE" | base64 -d > "$KEYSTORE"
+          cd clients/android
+          chmod +x gradlew
+          ./gradlew --build-cache --parallel "$TASK" \
+            -Pandroid.injected.signing.store.file="$KEYSTORE" \
+            -Pandroid.injected.signing.store.password="$RELEASE_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$RELEASE_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$RELEASE_KEY_PASSWORD"
+
+      # SFA-version-metadata.json 供应用内更新检查读取。
+      - name: Prepare upload
+        env:
+          VARIANT: ${{ matrix.variant }}
+          OUTPUT: ${{ matrix.output }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION_CODE: ${{ steps.version.outputs.code }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp clients/android/$OUTPUT dist/
+          if [ "$VARIANT" = "other" ]; then
+            printf '{\n  "version_code": %s,\n  "version_name": "%s"\n}\n' \
+              "$VERSION_CODE" "$VERSION" > dist/SFA-version-metadata.json
+            cat dist/SFA-version-metadata.json
+          fi
+          ls -lh dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: sfa-${{ matrix.variant }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  sfw:
+    name: SFW (${{ matrix.desktop_arch }})
+    runs-on: windows-latest
+    needs: prepare
+    if: needs.prepare.outputs.skip_gui != 'true'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { desktop_arch: x64,   rust_target: x86_64-pc-windows-msvc }
+          - { desktop_arch: x86,   rust_target: i686-pc-windows-msvc }
+          - { desktop_arch: arm64, rust_target: aarch64-pc-windows-msvc }
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      # 客户端在 ../.. 找 sing-box 源码，放进 clients/desktop 正好指向本仓库。
+      - name: Checkout SFW
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SFD_REPOSITORY }}
+          ref: ${{ env.SFD_REF }}
+          path: clients/desktop
+          submodules: recursive
+
+      - name: Set build tag
+        run: git tag -f "${{ needs.prepare.outputs.tag }}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: ~/go/pkg/mod
+          key: gomod-windows-${{ hashFiles('go.sum') }}
+          restore-keys: gomod-windows-
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache Windows sharing module
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/git
+            ~/.cargo/registry
+            clients/desktop/bin/windows-share-toolchain/cargo-target
+          key: windows-share-${{ matrix.rust_target }}-${{ hashFiles('clients/desktop/native/windows-share/Cargo.lock') }}
+          restore-keys: windows-share-${{ matrix.rust_target }}-
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: clients/desktop/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: clients/desktop/package.json
+          cache: pnpm
+          cache-dependency-path: |
+            clients/desktop/pnpm-lock.yaml
+            clients/desktop/dashboard/pnpm-lock.yaml
+
+      # 打包脚本要求 go_version 与当前 Go 一致（经 GOTOOLCHAIN 校验）。
+      - name: Update version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          $versionPath = 'clients/desktop/version.json'
+          $metadata = Get-Content -Raw $versionPath | ConvertFrom-Json
+          $metadata.version = $env:VERSION
+          $metadata.go_version = (go env GOVERSION)
+          $metadata | ConvertTo-Json -Depth 100 | Set-Content -Encoding utf8NoBOM $versionPath
+          Get-Content $versionPath
+
+      - name: Setup signing
+        env:
+          WINDOWS_CERTIFICATES_P12: ${{ secrets.WINDOWS_CERTIFICATES_P12 }}
+          WINDOWS_P12_PASSWORD:     ${{ secrets.WINDOWS_P12_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATES_P12)) {
+            throw 'secret WINDOWS_CERTIFICATES_P12 is not configured'
+          }
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_P12_PASSWORD)) {
+            throw 'secret WINDOWS_P12_PASSWORD is not configured'
+          }
+          $certificatePath = Join-Path $env:RUNNER_TEMP 'windows-signing.p12'
+          [IO.File]::WriteAllBytes($certificatePath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATES_P12))
+          @{
+            windows = @{
+              certificateFile = $certificatePath
+              certificatePassword = $env:WINDOWS_P12_PASSWORD
+            }
+          } | ConvertTo-Json -Depth 3 | Set-Content -Encoding utf8NoBOM clients/desktop/signing.local.json
+
+      - name: Install dependencies
+        run: pnpm -C clients/desktop install --frozen-lockfile
+
+      - name: Build
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm -C clients/desktop package:win -- ${{ matrix.desktop_arch }}
+
+      - name: Prepare upload
+        run: |
+          $artifacts = @(Get-ChildItem clients/desktop/release/SFW-*.exe -File)
+          if ($artifacts.Count -ne 1) {
+            throw "expected 1 Windows installer for ${{ matrix.desktop_arch }}, found $($artifacts.Count)"
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item $artifacts.FullName dist
+          Get-ChildItem dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: sfw-${{ matrix.desktop_arch }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  sfl:
+    name: SFL (${{ matrix.desktop_arch }})
+    runs-on: ubuntu-26.04
+    needs: prepare
+    if: needs.prepare.outputs.skip_gui != 'true'
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { desktop_arch: x64,    go_arch: amd64 }
+          - { desktop_arch: arm64,  go_arch: arm64 }
+          - { desktop_arch: armv7l, go_arch: arm,  go_arm: '7' }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Checkout SFL
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ env.SFD_REPOSITORY }}
+          ref: ${{ env.SFD_REF }}
+          path: clients/desktop
+          submodules: recursive
+
+      - name: Set build tag
+        run: git tag -f "${{ needs.prepare.outputs.tag }}"
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Restore Go modules
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ needs.prepare.outputs.gomod_key }}
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          package_json_file: clients/desktop/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: clients/desktop/package.json
+          cache: pnpm
+          cache-dependency-path: |
+            clients/desktop/pnpm-lock.yaml
+            clients/desktop/dashboard/pnpm-lock.yaml
+
+      - name: Update version
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          jq --arg version "$VERSION" --arg go "$(go env GOVERSION)" \
+            '.version = $version | .go_version = $go' \
+            clients/desktop/version.json > "$RUNNER_TEMP/version.json"
+          mv "$RUNNER_TEMP/version.json" clients/desktop/version.json
+          cat clients/desktop/version.json
+
+      # Linux daemon 带 naive（cronet 静态链接），需要 Chromium 工具链与 sysroot。
+      - name: Clone cronet-go
+        run: |
+          set -xeuo pipefail
+          CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
+          git init ~/cronet-go
+          git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
+          git -C ~/cronet-go fetch --depth=1 origin "$CRONET_GO_VERSION"
+          git -C ~/cronet-go checkout FETCH_HEAD
+          git -C ~/cronet-go submodule update --init --recursive --depth=1
+
+      - name: Regenerate Debian keyring
+        run: |
+          set -xeuo pipefail
+          rm -f ~/cronet-go/naiveproxy/src/build/linux/sysroot_scripts/keyring.gpg
+          cd ~/cronet-go
+          GPG_TTY=/dev/null ./naiveproxy/src/build/linux/sysroot_scripts/generate_keyring.sh
+
+      - name: Download Chromium toolchain
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/${{ matrix.go_arch }} download-toolchain
+
+      - name: Set Chromium toolchain environment
+        run: |
+          set -xeuo pipefail
+          cd ~/cronet-go
+          go run ./cmd/build-naive --target=linux/${{ matrix.go_arch }} env >> "$GITHUB_ENV"
+
+      - name: Install package tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update || true
+          sudo apt-get install -y debsigs libarchive-tools rpm zstd
+          echo '%_rpmformat 4' > "$HOME/.rpmmacros"
+
+      - name: Install dependencies
+        run: pnpm -C clients/desktop install --frozen-lockfile
+
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+          GOARM: ${{ matrix.go_arm }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: pnpm -C clients/desktop package:linux -- deb rpm pacman ${{ matrix.desktop_arch }}
+
+      - name: Setup package signing
+        env:
+          GPG_KEY:        ${{ secrets.GPG_KEY }}
+          GPG_KEY_ID:     ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          for NAME in GPG_KEY GPG_KEY_ID GPG_PASSPHRASE; do
+            [ -n "${!NAME}" ] || { echo "::error::secret ${NAME} is not configured"; exit 1; }
+          done
+          SIGNING_GNUPG_HOME="$RUNNER_TEMP/package-signing-gnupg"
+          SIGNING_PASSPHRASE_FILE="$RUNNER_TEMP/package-signing-passphrase"
+          mkdir -m 700 "$SIGNING_GNUPG_HOME"
+          printf '%s' "$GPG_PASSPHRASE" > "$SIGNING_PASSPHRASE_FILE"
+          chmod 600 "$SIGNING_PASSPHRASE_FILE"
+          {
+            echo "GNUPGHOME=$SIGNING_GNUPG_HOME"
+            echo "SIGNING_PASSPHRASE_FILE=$SIGNING_PASSPHRASE_FILE"
+          } >> "$GITHUB_ENV"
+          printf '%s' "$GPG_KEY" | gpg \
+            --homedir "$SIGNING_GNUPG_HOME" \
+            --batch \
+            --pinentry-mode loopback \
+            --passphrase-file "$SIGNING_PASSPHRASE_FILE" \
+            --import
+          gpg --homedir "$SIGNING_GNUPG_HOME" --batch --list-secret-keys "$GPG_KEY_ID" >/dev/null
+          cat > "$HOME/.rpmmacros" <<EOF
+          %_rpmformat 4
+          %_gpg_name $GPG_KEY_ID
+          %_gpg_sign_cmd_extra_args --pinentry-mode loopback --passphrase-file $SIGNING_PASSPHRASE_FILE
+          EOF
+
+      - name: Sign Linux packages
+        env:
+          GPG_KEY_ID: ${{ secrets.GPG_KEY_ID }}
+        run: |
+          set -euo pipefail
+          debsigs \
+            --sign=origin \
+            -k "$GPG_KEY_ID" \
+            --gpgopts "--batch --pinentry-mode loopback --passphrase-file $SIGNING_PASSPHRASE_FILE" \
+            clients/desktop/release/SFL-*.deb
+          rpmsign --addsign clients/desktop/release/SFL-*.rpm
+
+      - name: Prepare upload
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          artifacts=(
+            clients/desktop/release/SFL-*.deb
+            clients/desktop/release/SFL-*.rpm
+            clients/desktop/release/SFL-*.pkg.tar.zst
+          )
+          if (( ${#artifacts[@]} != 3 )); then
+            echo "::error::expected 3 Linux packages, found ${#artifacts[@]}: ${artifacts[*]}"
+            exit 1
+          fi
+          mkdir -p dist
+          cp "${artifacts[@]}" dist
+          ls -lh dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: sfl-${{ matrix.desktop_arch }}
+          path: dist
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  # ───────────────────────────────────────────────────────────────────
+  # 6) 收集所有 artifact + 生成 changelog + 创建 / 更新 Release
+  #    android、实验性构建、图形客户端失败或被跳过时只要 desktop 成功就发布。
   # ───────────────────────────────────────────────────────────────────
   publish:
     name: publish GitHub Release
@@ -606,6 +1205,9 @@ jobs:
       - desktop
       - experimental
       - android
+      - sfa
+      - sfw
+      - sfl
     if: always() && needs.desktop.result == 'success'
     steps:
       - name: Checkout (全量历史用于 changelog)
@@ -613,11 +1215,34 @@ jobs:
         with:
           fetch-depth: 0
 
+      # libbox-android-* 只是 SFA 的中间产物，不随 Release 发布。
       - name: Download all artifacts
         uses: actions/download-artifact@v5
         with:
           path: builds/
+          pattern: '!libbox-android-*'
           merge-multiple: true
+
+      # SFL 的 deb / rpm 用这把 GPG 公钥校验（rpm --import / debsig-verify）。
+      - name: Export SFL signing public key
+        env:
+          GPG_KEY:        ${{ secrets.GPG_KEY }}
+          GPG_KEY_ID:     ${{ secrets.GPG_KEY_ID }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GPG_KEY" ] || [ -z "$(find builds -maxdepth 1 -name 'SFL-*' -print -quit)" ]; then
+            echo "no SFL packages or signing key, skipped"
+            exit 0
+          fi
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          printf '%s' "$GPG_PASSPHRASE" > "$RUNNER_TEMP/gpg-passphrase"
+          printf '%s' "$GPG_KEY" | gpg --batch --pinentry-mode loopback \
+            --passphrase-file "$RUNNER_TEMP/gpg-passphrase" --import
+          gpg --batch --armor --export "$GPG_KEY_ID" > builds/SFL-signing-key.asc
+          rm -f "$RUNNER_TEMP/gpg-passphrase"
+          gpg --batch --show-keys builds/SFL-signing-key.asc
 
       - name: Inspect artifacts + 生成 SHA256 清单
         run: |
@@ -627,7 +1252,8 @@ jobs:
           echo "---"
           echo "total: $(ls | wc -l) artifact(s)"
           # SHA256SUMS 供用户校验；写在 builds/ 里随 Release 一起发布。
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum -- * > ../SHA256SUMS
+          mv ../SHA256SUMS SHA256SUMS
           cat SHA256SUMS
 
       # 引入 mikepenz/release-changelog-builder-action 做 commit 分类 + 美化；
@@ -668,6 +1294,7 @@ jobs:
           TAG:          ${{ needs.prepare.outputs.tag }}
           PREV:         ${{ steps.prevtag.outputs.prev }}
           SKIP_ANDROID: ${{ needs.prepare.outputs.skip_android }}
+          SKIP_GUI:     ${{ needs.prepare.outputs.skip_gui }}
           ANDROID_RES:  ${{ needs.android.result }}
           EXPERIMENTAL_RES: ${{ needs.experimental.result }}
           ANDROID_EXPERIMENTAL: ${{ needs.android.outputs.experimental }}
@@ -693,6 +1320,34 @@ jobs:
           else
             CHANNEL_CELL="stable"
           fi
+
+          count() { find builds -maxdepth 1 -type f "$@" | wc -l; }
+          # 图形客户端按产物是否齐全判断结果：SFA 需要普通版、Android 5 版
+          # APK 与 version metadata；SFW 每个架构一个安装包；SFL 每个架构
+          # deb / rpm / pacman 各一个。
+          gui_status() {
+            local actual="$1" complete="$2"
+            if [ "$SKIP_GUI" = 'true' ]; then
+              echo "Skipped — disabled via workflow input."
+            elif [ "$complete" = 'true' ]; then
+              echo "Built successfully and attached above."
+            elif [ "$actual" -gt 0 ]; then
+              echo "Partially built (${actual} file(s)) — inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID})."
+            else
+              echo "Build failed — inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID})."
+            fi
+          }
+          SFA_MAIN=$(count -name 'SFA-*.apk' ! -name '*legacy-android-5*')
+          SFA_LEGACY=$(count -name 'SFA-*legacy-android-5*.apk')
+          SFA_META=$(count -name 'SFA-version-metadata.json')
+          SFA_COMPLETE=false
+          if [ "$SFA_MAIN" -gt 0 ] && [ "$SFA_LEGACY" -gt 0 ] && [ "$SFA_META" -eq 1 ]; then SFA_COMPLETE=true; fi
+          SFW_COUNT=$(count -name 'SFW-*.exe')
+          SFW_COMPLETE=false
+          if [ "$SFW_COUNT" -eq 3 ]; then SFW_COMPLETE=true; fi
+          SFL_COUNT=$(count \( -name 'SFL-*.deb' -o -name 'SFL-*.rpm' -o -name 'SFL-*.pkg.tar.zst' \))
+          SFL_COMPLETE=false
+          if [ "$SFL_COUNT" -eq 9 ]; then SFL_COMPLETE=true; fi
 
           {
             echo "# sing-box xiaobaf14g &mdash; \`$TAG\`"
@@ -739,6 +1394,18 @@ jobs:
               echo "_No artifacts produced._"
             fi
             echo ""
+            GUI_FILES=$(find builds -maxdepth 1 -type f \( -name 'SFA-*' -o -name 'SFW-*' -o -name 'SFL-*' \) | sort)
+            if [ -n "$GUI_FILES" ]; then
+              echo "### GUI Clients"
+              echo ""
+              echo "| File | Size |"
+              echo "|---|---:|"
+              while IFS= read -r f; do
+                SIZE=$(du -h "$f" | cut -f1 | tr -d ' ')
+                printf '| `%s` | %s |\n' "$(basename "$f")" "$SIZE"
+              done <<< "$GUI_FILES"
+              echo ""
+            fi
             echo "<details><summary><b>SHA256SUMS</b></summary>"
             echo ""
             echo '```'
@@ -758,6 +1425,22 @@ jobs:
             else
               echo "> Build failed. Inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) for logs."
             fi
+            echo ""
+            echo "---"
+            echo ""
+            echo "## GUI Clients"
+            echo ""
+            echo "> 基于 reF1nd 的图形客户端（[\`${SFA_REPOSITORY}@${SFA_REF}\`](${SERVER_URL}/${SFA_REPOSITORY}/tree/${SFA_REF}) / [\`${SFD_REPOSITORY}@${SFD_REF}\`](${SERVER_URL}/${SFD_REPOSITORY}/tree/${SFD_REF})），内核为本次构建的提交。"
+            echo ">"
+            echo "> - **SFA**：包名 \`io.reF1nd.sfa\`，使用本仓库的签名密钥，不能覆盖安装其他签名的同包名应用；\`legacy-android-5\` 为 Android 5.0+ 版本。"
+            echo "> - **SFW**：自签名代码签名证书，SmartScreen 会提示未知发布者；应用内更新要求新旧版本签名证书一致。"
+            echo "> - **SFL**：deb / rpm 已用 \`SFL-signing-key.asc\` 中的 GPG 密钥签名。"
+            echo ""
+            echo "| Client | Status |"
+            echo "|---|---|"
+            echo "| SFA (Android) | $(gui_status $((SFA_MAIN + SFA_LEGACY)) "$SFA_COMPLETE") |"
+            echo "| SFW (Windows) | $(gui_status "$SFW_COUNT" "$SFW_COMPLETE") |"
+            echo "| SFL (Linux) | $(gui_status "$SFL_COUNT" "$SFL_COMPLETE") |"
             echo ""
             echo "---"
             echo ""
@@ -827,7 +1510,5 @@ jobs:
           prerelease: ${{ needs.prepare.outputs.prerelease == 'true' }}
           draft:      false
           body_path:  CHANGELOG_RELEASE.md
-          files: |
-            builds/*.tar.gz
-            builds/SHA256SUMS
+          files: builds/*
           fail_on_unmatched_files: true
