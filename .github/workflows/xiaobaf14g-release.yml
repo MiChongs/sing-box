@@ -161,6 +161,8 @@ jobs:
           done
           TAGS="${OTHERS},with_naive_outbound,with_xhttp,netgo,with_ebpf"
           list GOOS=android GOARCH=arm64 CGO_ENABLED=1
+          TAGS="${OTHERS},with_naive_outbound,with_xhttp,netgo,with_easytier"
+          list GOOS=android GOARCH=arm64 CGO_ENABLED=1
           go list -deps ./cmd/internal/build_libbox > /dev/null
           du -sh ~/go/pkg/mod
 
@@ -334,7 +336,8 @@ jobs:
   #    与正式产物并列发布。continue-on-error 让实验性构建失败不阻塞发布。
   #    - easytier: with_easytier（EasyTier endpoint，内嵌 WASM 内核约 +11MB）。
   #      wazero 只在 amd64 / arm64 上编译执行，其他架构走解释器，因此只提供
-  #      amd64 / arm64。
+  #      amd64 / arm64。Android 的实验性构建在 android job 中，复用其 NDK 与
+  #      构建缓存。
   # ───────────────────────────────────────────────────────────────────
   experimental:
     name: experimental ${{ matrix.feature }} ${{ matrix.goos }}/${{ matrix.goarch }}
@@ -431,13 +434,17 @@ jobs:
   # 4) Android arm64-v8a (CGO + NDK + naive，走 cmd/internal/build_libbox
   #    android-bin 入口)，普通版与 -ebpf 版在同一 job 先后编译共享构建缓存。
   #    continue-on-error 让 Android 失败不阻塞 desktop 的发布。
+  #    实验性 -easytier 版在单独的 continue-on-error 步骤中编译，失败不影响
+  #    普通版与 -ebpf 版，结果经 job output 写入 Release 说明。
   # ───────────────────────────────────────────────────────────────────
   android:
-    name: android/arm64-v8a (+ebpf)
+    name: android/arm64-v8a (+ebpf, +experimental)
     runs-on: ubuntu-latest
     needs: prepare
     if: needs.prepare.outputs.skip_android != 'true'
     continue-on-error: true
+    outputs:
+      experimental: ${{ steps.experimental.outcome }}
     steps:
       - name: Checkout
         uses: actions/checkout@v5
@@ -535,6 +542,30 @@ jobs:
           done
           ls -lh dist
 
+      - name: Build experimental variants via build_libbox
+        id: experimental
+        continue-on-error: true
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          command -v pigz >/dev/null || sudo apt-get install -y --no-install-recommends pigz >/dev/null
+          STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          for EXPERIMENT in "easytier:with_easytier"; do
+            FEATURE="${EXPERIMENT%%:*}"
+            FEATURE_TAG="${EXPERIMENT#*:}"
+            echo "::group::build_libbox android/arm64-${FEATURE}"
+            go run ./cmd/internal/build_libbox -target android-bin -platform android/arm64 \
+              -version "${VERSION}" -tags "${FEATURE_TAG}"
+            echo "::endgroup::"
+            "$STRIP" --strip-all sing-box-android-arm64-v8a
+            ls -lh sing-box-android-arm64-v8a
+            mv sing-box-android-arm64-v8a sing-box
+            tar cf - sing-box | pigz -9 > "dist/sing-box-${VERSION}-android-arm64-v8a-${FEATURE}.tar.gz"
+            rm -f sing-box
+          done
+          ls -lh dist
+
       - name: Upload artifact
         uses: actions/upload-artifact@v5
         with:
@@ -620,6 +651,7 @@ jobs:
           SKIP_ANDROID: ${{ needs.prepare.outputs.skip_android }}
           ANDROID_RES:  ${{ needs.android.result }}
           EXPERIMENTAL_RES: ${{ needs.experimental.result }}
+          ANDROID_EXPERIMENTAL: ${{ needs.android.outputs.experimental }}
           REPO:         ${{ github.repository }}
           SERVER_URL:   ${{ github.server_url }}
           RUN_ID:       ${{ github.run_id }}
@@ -675,7 +707,7 @@ jobs:
             echo ""
             echo "> 带 \`-ebpf\` 后缀的是启用 eBPF 入站 (\`with_ebpf\`) 的构建，其余功能与同平台普通版一致。"
             echo ">"
-            echo "> 带 \`-easytier\` 后缀的是启用 EasyTier endpoint (\`with_easytier\`) 的**实验性**构建，仅提供 amd64 / arm64，其余功能与同平台普通版一致。"
+            echo "> 带 \`-easytier\` 后缀的是启用 EasyTier endpoint (\`with_easytier\`) 的**实验性**构建，仅提供 amd64 / arm64（含 Android arm64-v8a），其余功能与同平台普通版一致。"
             echo ""
             if ls builds/*.tar.gz >/dev/null 2>&1; then
               echo "| File | Size |"
@@ -713,9 +745,20 @@ jobs:
             echo "## Experimental Builds"
             echo ""
             if [ "$EXPERIMENTAL_RES" = 'success' ]; then
-              echo "> Built successfully and attached above."
+              echo "- Desktop: built successfully and attached above."
             else
-              echo "> Some experimental builds failed and are not attached. Inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) for logs."
+              echo "- Desktop: some builds failed and are not attached."
+            fi
+            if [ "$SKIP_ANDROID" = 'true' ]; then
+              echo "- Android: skipped — disabled via workflow input."
+            elif [ "$ANDROID_EXPERIMENTAL" = 'success' ]; then
+              echo "- Android: built successfully and attached above."
+            else
+              echo "- Android: build failed and is not attached."
+            fi
+            if [ "$EXPERIMENTAL_RES" != 'success' ] || { [ "$SKIP_ANDROID" != 'true' ] && [ "$ANDROID_EXPERIMENTAL" != 'success' ]; }; then
+              echo ""
+              echo "> Inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) for logs."
             fi
             echo ""
             echo "---"
