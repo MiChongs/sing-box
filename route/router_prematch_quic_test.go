@@ -155,6 +155,10 @@ type preMatchQUICRule struct {
 
 func (r *preMatchQUICRule) Disabled() bool { return r.disabled }
 
+func (*preMatchQUICRule) Hit() {}
+
+func (*preMatchQUICRule) Miss() {}
+
 func (r *preMatchQUICRule) Action() adapter.RuleAction { return r.action }
 
 func (*preMatchQUICRule) String() string { return "" }

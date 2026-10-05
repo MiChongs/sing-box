@@ -1,6 +1,8 @@
 package adapter
 
 import (
+	"time"
+
 	C "github.com/sagernet/sing-box/constant"
 
 	"github.com/miekg/dns"
@@ -15,11 +17,24 @@ type HeadlessRule interface {
 type Rule interface {
 	HeadlessRule
 	SimpleLifecycle
+	RuleStatistics
 	Disabled() bool
+	SetDisabled(disabled bool)
 	UUID() string
 	ChangeStatus()
 	Type() string
 	Action() RuleAction
+}
+
+// RuleStatistics 对齐 mihomo RuleWrapper 的命中统计：路由器每次对顶层规则求值
+// 计一次 Hit 或 Miss（被禁用的规则跳过不计），子规则不单独计数。
+type RuleStatistics interface {
+	Hit()
+	Miss()
+	HitCount() uint64
+	HitAt() time.Time
+	MissCount() uint64
+	MissAt() time.Time
 }
 
 type DNSRule interface {

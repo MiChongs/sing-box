@@ -244,6 +244,10 @@ func (r *testL3Rule) Disabled() bool {
 	return false
 }
 
+func (r *testL3Rule) Hit() {}
+
+func (r *testL3Rule) Miss() {}
+
 func (r *testL3Rule) String() string {
 	return ""
 }

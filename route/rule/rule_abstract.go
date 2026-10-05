@@ -4,6 +4,7 @@ import (
 	"io"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
@@ -13,13 +14,63 @@ import (
 )
 
 type abstractRule struct {
-	disabled atomic.Bool
-	uuid     string
-	history  *urltest.HistoryStorage
+	disabled  atomic.Bool
+	uuid      string
+	history   *urltest.HistoryStorage
+	hitCount  atomic.Uint64
+	hitAt     atomicTime
+	missCount atomic.Uint64
+	missAt    atomicTime
 }
 
 func (r *abstractRule) Disabled() bool {
 	return r.disabled.Load()
+}
+
+func (r *abstractRule) SetDisabled(disabled bool) {
+	if r.disabled.Swap(disabled) != disabled && r.history != nil {
+		r.history.NotifyUpdated()
+	}
+}
+
+func (r *abstractRule) Hit() {
+	r.hitCount.Add(1)
+	r.hitAt.Store(time.Now())
+}
+
+func (r *abstractRule) Miss() {
+	r.missCount.Add(1)
+	r.missAt.Store(time.Now())
+}
+
+func (r *abstractRule) HitCount() uint64 {
+	return r.hitCount.Load()
+}
+
+func (r *abstractRule) HitAt() time.Time {
+	return r.hitAt.Load()
+}
+
+func (r *abstractRule) MissCount() uint64 {
+	return r.missCount.Load()
+}
+
+func (r *abstractRule) MissAt() time.Time {
+	return r.missAt.Load()
+}
+
+// atomicTime 同 mihomo rules/wrapper：只存 UnixNano，避免高频写入时
+// atomic.Value[time.Time] 每次逃逸到堆；未写入时读出 Unix 纪元，与 mihomo 一致。
+type atomicTime struct {
+	nanos atomic.Int64
+}
+
+func (t *atomicTime) Load() time.Time {
+	return time.Unix(0, t.nanos.Load())
+}
+
+func (t *atomicTime) Store(value time.Time) {
+	t.nanos.Store(value.UnixNano())
 }
 
 func (r *abstractRule) UUID() string {

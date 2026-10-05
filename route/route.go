@@ -400,7 +400,57 @@ func (r *Router) wrapQUICSniffIdleCache(metadata adapter.InboundContext, onClose
 	}
 }
 
+// preMatchRuleEvaluations 记录 PreMatch 中顶层规则的求值结果（规则下标与是否命中）。
+// 常见规则数下只用内联数组，不在每个 flow 上分配。
+type preMatchRuleEvaluations struct {
+	inline   [64]preMatchRuleEvaluation
+	overflow []preMatchRuleEvaluation
+	length   int
+}
+
+type preMatchRuleEvaluation struct {
+	index   int
+	matched bool
+}
+
+func (e *preMatchRuleEvaluations) add(index int, matched bool) {
+	evaluation := preMatchRuleEvaluation{index: index, matched: matched}
+	if e.length < len(e.inline) {
+		e.inline[e.length] = evaluation
+	} else {
+		e.overflow = append(e.overflow, evaluation)
+	}
+	e.length++
+}
+
+func (e *preMatchRuleEvaluations) commit(rules []adapter.Rule) {
+	for i := 0; i < e.length; i++ {
+		var evaluation preMatchRuleEvaluation
+		if i < len(e.inline) {
+			evaluation = e.inline[i]
+		} else {
+			evaluation = e.overflow[i-len(e.inline)]
+		}
+		if evaluation.matched {
+			rules[evaluation.index].Hit()
+		} else {
+			rules[evaluation.index].Miss()
+		}
+	}
+}
+
 func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) adapter.PreMatchResult {
+	var evaluations preMatchRuleEvaluations
+	result := r.preMatch(metadata, firstPacket, &evaluations)
+	// PreMatchContinue 时连接随后会走 matchRule 重新求值并在那里计数，
+	// 只有 PreMatch 直接给出最终裁决（flow / bypass / reject / drop / hijack-dns）时才计入命中统计。
+	if result.Action != adapter.PreMatchContinue {
+		evaluations.commit(r.rules)
+	}
+	return result
+}
+
+func (r *Router) preMatch(metadata adapter.InboundContext, firstPacket []byte, evaluations *preMatchRuleEvaluations) adapter.PreMatchResult {
 	ctx := log.ContextWithNewID(r.ctx)
 	metadata.PreMatch = true
 	continueResult := adapter.PreMatchResult{Action: adapter.PreMatchContinue}
@@ -414,7 +464,9 @@ func (r *Router) PreMatch(metadata adapter.InboundContext, firstPacket []byte) a
 			continue
 		}
 		metadata.ResetRuleCache()
-		if !currentRule.Match(&metadata) {
+		matched := currentRule.Match(&metadata)
+		evaluations.add(currentRuleIndex, matched)
+		if !matched {
 			continue
 		}
 		ruleDescription := currentRule.String()
@@ -753,8 +805,10 @@ match:
 		}
 		metadata.ResetRuleCache()
 		if !currentRule.Match(metadata) {
+			currentRule.Miss()
 			continue
 		}
+		currentRule.Hit()
 		ruleDescription := currentRule.String()
 		if ruleDescription != "" {
 			r.logger.DebugContext(ctx, "match[", currentRuleIndex, "] ", currentRule, " => ", currentRule.Action())

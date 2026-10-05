@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -49,6 +50,31 @@ func (r *legacyAliasRule) UUID() string {
 }
 
 func (r *legacyAliasRule) ChangeStatus() {
+}
+
+func (r *legacyAliasRule) SetDisabled(bool) {
+}
+
+func (r *legacyAliasRule) Hit() {
+}
+
+func (r *legacyAliasRule) Miss() {
+}
+
+func (r *legacyAliasRule) HitCount() uint64 {
+	return 0
+}
+
+func (r *legacyAliasRule) HitAt() time.Time {
+	return time.Time{}
+}
+
+func (r *legacyAliasRule) MissCount() uint64 {
+	return 0
+}
+
+func (r *legacyAliasRule) MissAt() time.Time {
+	return time.Time{}
 }
 
 func (r *legacyAliasRule) Type() string {

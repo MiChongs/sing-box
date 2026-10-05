@@ -83,6 +83,16 @@
     启用[实验性可观测性](observability.md)后，专用的 `/observability/v1`
     HTTP API 会挂载到该 Controller，并使用相同的 `secret` 保护。
 
+!!! info "规则命中统计"
+
+    `GET /rules` 依次列出 DNS 规则与路由规则。与 mihomo 一致，每条规则返回
+    `index`、`size` 与 `extra`（`disabled`、`hitCount`、`hitAt`、`missCount`、
+    `missAt`）：顶层规则每参与一次匹配计一次命中或未命中，被禁用的规则跳过不计。
+    统计保存在内存中，重启或重载配置后清零。
+
+    `PATCH /rules/disable` 接受 `{"<index>": true|false}`，按 `index` 禁用或启用规则；
+    `PUT /rules/{uuid}` 仍可按 `uuid` 切换规则状态。
+
 ### Fields
 
 #### external_controller

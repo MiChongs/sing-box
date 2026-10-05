@@ -84,6 +84,17 @@
     `/observability/v1` HTTP API is mounted on this controller and protected by
     the same `secret`.
 
+!!! info "Rule statistics"
+
+    `GET /rules` lists DNS rules followed by route rules. Like mihomo, each rule
+    reports `index`, `size` and `extra` (`disabled`, `hitCount`, `hitAt`,
+    `missCount`, `missAt`): every time a top-level rule is evaluated it counts one
+    hit or miss, disabled rules are skipped and not counted. Statistics are kept
+    in memory and reset when sing-box restarts or reloads the configuration.
+
+    `PATCH /rules/disable` takes `{"<index>": true|false}` to disable or enable
+    rules by `index`; `PUT /rules/{uuid}` still toggles a rule by `uuid`.
+
 ### Fields
 
 #### external_controller
