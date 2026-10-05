@@ -295,15 +295,20 @@ type xrayXmux struct {
 
 // xrayStreamSettings is the subset of Xray streamSettings that
 // downloadSettings uses.
+//
+// ALPN is not an Xray field: some subscription generators write mihomo's
+// download-settings.alpn there instead of in tlsSettings (e.g. "alpn": ["h3"]
+// for an HTTP/3 download). It is used when tlsSettings sets no ALPN.
 type xrayStreamSettings struct {
-	Address           string               `json:"address"`
-	Port              uint16               `json:"port"`
-	Network           string               `json:"network"`
-	Security          string               `json:"security"`
-	TLSSettings       *xrayTLSSettings     `json:"tlsSettings"`
-	REALITYSettings   *xrayRealitySettings `json:"realitySettings"`
-	XHTTPSettings     *xrayXHTTPSettings   `json:"xhttpSettings"`
-	SplitHTTPSettings *xrayXHTTPSettings   `json:"splithttpSettings"`
+	Address           string                     `json:"address"`
+	Port              uint16                     `json:"port"`
+	Network           string                     `json:"network"`
+	Security          string                     `json:"security"`
+	ALPN              badoption.Listable[string] `json:"alpn"`
+	TLSSettings       *xrayTLSSettings           `json:"tlsSettings"`
+	REALITYSettings   *xrayRealitySettings       `json:"realitySettings"`
+	XHTTPSettings     *xrayXHTTPSettings         `json:"xhttpSettings"`
+	SplitHTTPSettings *xrayXHTTPSettings         `json:"splithttpSettings"`
 }
 
 type xrayTLSSettings struct {
@@ -402,6 +407,9 @@ func (s *xrayStreamSettings) build() *option.V2RayXHTTPDownloadOptions {
 			if s.TLSSettings.Fingerprint != "" {
 				tlsOptions.UTLS = &option.OutboundUTLSOptions{Enabled: true, Fingerprint: s.TLSSettings.Fingerprint}
 			}
+		}
+		if len(tlsOptions.ALPN) == 0 {
+			tlsOptions.ALPN = s.ALPN
 		}
 		downloadOptions.TLS = tlsOptions
 	case "reality":

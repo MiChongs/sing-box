@@ -138,6 +138,47 @@ func TestParseVLESSLinkXHTTPExtra(t *testing.T) {
 	require.Equal(t, "firefox", download.TLS.UTLS.Fingerprint)
 }
 
+// XHTTP over HTTP/3: alpn=h3 with a uTLS fingerprint, and a downloadSettings
+// that carries its ALPN at the top level (mihomo style) rather than in
+// tlsSettings.
+func TestParseVLESSLinkXHTTPHTTP3DownloadALPN(t *testing.T) {
+	extra := `{
+		"downloadSettings": {
+			"alpn": ["h3"],
+			"address": "down.example.com",
+			"port": 443,
+			"network": "xhttp",
+			"security": "tls",
+			"tlsSettings": {"serverName": "down-sni.example.com", "fingerprint": "chrome"},
+			"xhttpSettings": {"host": null, "mode": "auto", "path": "/zones"}
+		}
+	}`
+	outbound, err := ParseSubscriptionLink("vless://11111111-1111-1111-1111-111111111111@example.com:443?" +
+		"type=xhttp&security=tls&fp=chrome&alpn=h3&sni=up-sni.example.com&path=%2Fzones&mode=auto&extra=" + url.QueryEscape(extra) + "#tag")
+	require.NoError(t, err)
+	vlessOptions := outbound.Options.(*option.VLESSOutboundOptions)
+	require.Equal(t, []string{"h3"}, []string(vlessOptions.TLS.ALPN))
+	require.True(t, vlessOptions.TLS.UTLS.Enabled)
+	require.Equal(t, "chrome", vlessOptions.TLS.UTLS.Fingerprint)
+
+	download := xhttpTransport(t, vlessOptions.Transport).DownloadSettings
+	require.NotNil(t, download)
+	require.Equal(t, "down.example.com", download.Server)
+	require.Equal(t, "/zones", download.Path)
+	require.NotNil(t, download.TLS)
+	require.Equal(t, "down-sni.example.com", download.TLS.ServerName)
+	require.Equal(t, []string{"h3"}, []string(download.TLS.ALPN))
+	require.Equal(t, "chrome", download.TLS.UTLS.Fingerprint)
+
+	// tlsSettings.alpn, the Xray field, wins over the top-level one.
+	extra = `{"downloadSettings": {"alpn": ["h3"], "security": "tls", "tlsSettings": {"alpn": ["h2"]}}}`
+	outbound, err = ParseSubscriptionLink("vless://11111111-1111-1111-1111-111111111111@example.com:443?" +
+		"type=xhttp&security=tls&alpn=h3&extra=" + url.QueryEscape(extra) + "#tag")
+	require.NoError(t, err)
+	download = xhttpTransport(t, outbound.Options.(*option.VLESSOutboundOptions).Transport).DownloadSettings
+	require.Equal(t, []string{"h2"}, []string(download.TLS.ALPN))
+}
+
 func TestParseVLESSLinkXHTTPInvalidExtraIgnored(t *testing.T) {
 	outbound, err := ParseSubscriptionLink("vless://11111111-1111-1111-1111-111111111111@example.com:443?" +
 		"security=tls&type=xhttp&path=%2Fxyz&extra=%7Bnot-json#tag")

@@ -70,6 +70,12 @@ func newEndpoint(cfg *config, dialer N.Dialer, serverAddr M.Socksaddr, tlsConfig
 		if err := checkH3Available(); err != nil {
 			return nil, err
 		}
+		// QUIC 握手只能用标准库 TLS：与 Xray 一致，忽略 uTLS 指纹。
+		quicTLSConfig, err := boxtls.QUICClientConfig(tlsConfig)
+		if err != nil {
+			return nil, E.Cause(err, "xhttp h3")
+		}
+		e.tlsConfig = quicTLSConfig
 	}
 	if tlsConfig != nil {
 		e.scheme = "https"

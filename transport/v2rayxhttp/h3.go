@@ -50,11 +50,15 @@ func buildH3Transport(dialer N.Dialer, serverAddr M.Socksaddr, tlsConfig boxtls.
 	return &http3.Transport{
 		QUICConfig: quicConfig,
 		Dial: func(ctx context.Context, addr string, _ *tls.Config, quicConfig *quic.Config) (*quic.Conn, error) {
+			dialTLSConfig, err := boxtls.QUICDialConfig(ctx, tlsConfig)
+			if err != nil {
+				return nil, err
+			}
 			udpConn, err := dialer.DialContext(ctx, N.NetworkUDP, serverAddr)
 			if err != nil {
 				return nil, err
 			}
-			quicConn, err := qtls.Dial(ctx, udpConn, tlsConfig, quicConfig)
+			quicConn, err := qtls.Dial(ctx, udpConn, dialTLSConfig, quicConfig)
 			if err != nil {
 				_ = udpConn.Close()
 				return nil, err

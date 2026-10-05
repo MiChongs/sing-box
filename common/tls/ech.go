@@ -130,6 +130,15 @@ func (s *ECHClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) (a
 func (s *ECHClientConfig) fetchAndHandshake(ctx context.Context, conn net.Conn) (aTLS.Conn, error) {
 	s.access.Lock()
 	defer s.access.Unlock()
+	err := s.fetchECHConfigList(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return s.Client(conn)
+}
+
+// fetchECHConfigList 在 ECH 配置缺失或 TTL 过期时通过 DNS HTTPS 记录刷新，调用方需持有 access。
+func (s *ECHClientConfig) fetchECHConfigList(ctx context.Context) error {
 	if len(s.ECHConfigList()) == 0 || s.lastTTL == 0 || time.Since(s.lastUpdate) > s.lastTTL {
 		queryServerName := s.queryServerName
 		if queryServerName == "" {
@@ -149,10 +158,10 @@ func (s *ECHClientConfig) fetchAndHandshake(ctx context.Context, conn net.Conn) 
 		}
 		response, err := s.dnsRouter.Exchange(ctx, message, adapter.DNSQueryOptions{})
 		if err != nil {
-			return nil, E.Cause(err, "fetch ECH config list")
+			return E.Cause(err, "fetch ECH config list")
 		}
 		if response.Rcode != mDNS.RcodeSuccess {
-			return nil, E.Cause(dns.RcodeError(response.Rcode), "fetch ECH config list")
+			return E.Cause(dns.RcodeError(response.Rcode), "fetch ECH config list")
 		}
 	match:
 		for _, rr := range response.Answer {
@@ -162,7 +171,7 @@ func (s *ECHClientConfig) fetchAndHandshake(ctx context.Context, conn net.Conn) 
 					if value.Key().String() == "ech" {
 						echConfigList, err := base64.StdEncoding.DecodeString(value.String())
 						if err != nil {
-							return nil, E.Cause(err, "decode ECH config")
+							return E.Cause(err, "decode ECH config")
 						}
 						s.lastTTL = time.Duration(rr.Header().Ttl) * time.Second
 						s.lastUpdate = time.Now()
@@ -173,10 +182,10 @@ func (s *ECHClientConfig) fetchAndHandshake(ctx context.Context, conn net.Conn) 
 			}
 		}
 		if len(s.ECHConfigList()) == 0 {
-			return nil, E.New("no ECH config found in DNS records")
+			return E.New("no ECH config found in DNS records")
 		}
 	}
-	return s.Client(conn)
+	return nil
 }
 
 func (s *ECHClientConfig) Clone() Config {

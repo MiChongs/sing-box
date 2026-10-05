@@ -81,6 +81,11 @@ func NewClient(ctx context.Context, dialer N.Dialer, serverAddr M.Socksaddr, opt
 	quicConfig := qtls.ConfigWithGSO(&quic.Config{
 		DisablePathMTUDiscovery: !C.IsLinux && !C.IsWindows,
 	}, dialer)
+	// QUIC 握手只能用标准库 TLS：与 Xray 一致，忽略 uTLS 指纹。
+	tlsConfig, err := tls.QUICClientConfig(tlsConfig)
+	if err != nil {
+		return nil, err
+	}
 	if len(tlsConfig.NextProtos()) == 0 {
 		tlsConfig.SetNextProtos([]string{http3.NextProtoH3})
 	}
@@ -112,11 +117,15 @@ func (c *Client) offer() (*clientConnection, error) {
 }
 
 func (c *Client) offerNew() (*clientConnection, error) {
+	tlsConfig, err := tls.QUICDialConfig(c.ctx, c.tlsConfig)
+	if err != nil {
+		return nil, err
+	}
 	udpConn, err := c.dialer.DialContext(c.ctx, "udp", c.serverAddr)
 	if err != nil {
 		return nil, err
 	}
-	quicConn, err := qtls.Dial(c.ctx, udpConn, c.tlsConfig, c.quicConfig)
+	quicConn, err := qtls.Dial(c.ctx, udpConn, tlsConfig, c.quicConfig)
 	if err != nil {
 		udpConn.Close()
 		return nil, err

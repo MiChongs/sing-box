@@ -129,7 +129,7 @@
 | `packet-up` | GET 请求承载下行，上行数据分批以独立请求发送，由服务端按序号重排；兼容性最好 |
 | `auto` | 客户端：使用 REALITY 时为 `stream-one`（配置 `download_settings` 时为 `stream-up`），其余情况为 `packet-up`。服务端：接受全部模式 |
 
-客户端按以下规则选择 HTTP 版本：使用 REALITY 时为 HTTP/2；未启用 TLS 或 ALPN 仅为 `http/1.1` 时为 HTTP/1.1；ALPN 仅为 `h3` 时为 HTTP/3；其余情况为 HTTP/2。服务端在 ALPN 仅为 `h3` 时监听 UDP 并提供 HTTP/3 服务（需要 `with_quic`）。
+客户端按以下规则选择 HTTP 版本：使用 REALITY 时为 HTTP/2；未启用 TLS 或 ALPN 仅为 `http/1.1` 时为 HTTP/1.1；ALPN 仅为 `h3` 时为 HTTP/3；其余情况为 HTTP/2。服务端在 ALPN 仅为 `h3` 时监听 UDP 并提供 HTTP/3 服务（需要 `with_quic`）。HTTP/3 由 QUIC 完成 TLS 握手，uTLS 指纹无法应用；与 Xray 一致，此时忽略 `utls` 设置（如分享链接中的 `fp=chrome`），改用标准库 TLS，证书校验、SNI、ALPN 与 ECH 设置保持不变。
 
 ### 功能
 
