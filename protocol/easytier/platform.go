@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"syscall"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/dialer"
@@ -34,15 +35,21 @@ var (
 //     routing_mark and auto_detect_interface apply; those that must own a
 //     local address are created with the default dialer's socket controls.
 //   - Listener sockets (UDP tunnel listeners, port forwards, port leases)
-//     accept local or remote clients and are bound without outbound controls.
+//     accept local or remote clients and are bound without outbound controls;
+//     they are only registered for eBPF self-bypass, so that local eBPF
+//     interception does not redirect their replies back into sing-box.
 //   - Egress sockets carry overlay traffic out to real destinations (the
 //     core's own subnet proxy, its SOCKS5 portal and direct fallbacks of the
 //     gateway data plane). They are routed by sing-box as connections
 //     arriving at the endpoint.
 type socketFactory struct {
-	endpoint      *Endpoint
-	dialer        N.Dialer
-	defaultDialer *dialer.DefaultDialer
+	endpoint       *Endpoint
+	dialer         N.Dialer
+	defaultDialer  *dialer.DefaultDialer
+	networkManager adapter.NetworkManager
+	// listenerControl only registers listener sockets for eBPF self-bypass;
+	// it carries no bind_interface, routing_mark or auto_detect_interface.
+	listenerControl control.Func
 }
 
 func (f *socketFactory) ConnectTCP(ctx context.Context, options platform.TCPConnectOptions) (net.Conn, error) {
@@ -98,7 +105,7 @@ func (f *socketFactory) BindUDP(ctx context.Context, options platform.UDPBindOpt
 	case platform.UDPBindProxyNAT, platform.UDPBindSocks5:
 		return f.endpoint.newEgressPacketConn(), nil
 	case platform.UDPBindPortBoundListener, platform.UDPBindPortForward, platform.UDPBindPortLease:
-		return listenUDP(ctx, nil, options)
+		return f.listenUDP(ctx, f.listenerControl, options)
 	}
 	if f.defaultDialer == nil && !udpNeedsBind(options) {
 		packetConn, err := f.dialer.ListenPacket(ctx, M.Socksaddr{Addr: netip.IPv4Unspecified()})
@@ -111,10 +118,13 @@ func (f *socketFactory) BindUDP(ctx context.Context, options platform.UDPBindOpt
 	if f.defaultDialer != nil {
 		listenControl, _ = f.defaultDialer.UDPListenerControl()
 	}
-	return listenUDP(ctx, listenControl, options)
+	return f.listenUDP(ctx, listenControl, options)
 }
 
-func listenUDP(ctx context.Context, listenControl control.Func, options platform.UDPBindOptions) (net.PacketConn, error) {
+// listenUDP binds a host UDP socket with listenControl, which registers it for
+// eBPF self-bypass when eBPF is enabled; the registration is released on Close
+// when the kernel has no socket release hook.
+func (f *socketFactory) listenUDP(ctx context.Context, listenControl control.Func, options platform.UDPBindOptions) (net.PacketConn, error) {
 	listenConfig := net.ListenConfig{
 		Control: control.Append(listenControl, reuseControl(options.ReuseAddr, options.ReusePort)),
 	}
@@ -126,7 +136,13 @@ func listenUDP(ctx context.Context, listenControl control.Func, options platform
 	if err != nil {
 		return nil, err
 	}
-	return newDatagramConn(packetConn), nil
+	conn := newDatagramConn(packetConn)
+	if syscallConn, isSyscallConn := packetConn.(syscall.Conn); isSyscallConn {
+		if rawConn, rawConnErr := syscallConn.SyscallConn(); rawConnErr == nil {
+			conn.cleanup = dialer.EBPFSelfBypassCleanup(f.networkManager, rawConn)
+		}
+	}
+	return conn, nil
 }
 
 func (f *socketFactory) ListenTCP(ctx context.Context, options platform.TCPListenOptions) (net.Listener, error) {
@@ -230,6 +246,9 @@ func (c *streamConn) Upstream() any {
 type datagramConn struct {
 	net.PacketConn
 	localAddr *net.UDPAddr
+	// cleanup releases the socket's eBPF self-bypass registration; nil when
+	// the socket is not registered or the kernel releases it on close.
+	cleanup func()
 }
 
 func newDatagramConn(packetConn net.PacketConn) *datagramConn {
@@ -255,6 +274,13 @@ func (c *datagramConn) ReadFrom(p []byte) (int, net.Addr, error) {
 
 func (c *datagramConn) LocalAddr() net.Addr {
 	return c.localAddr
+}
+
+func (c *datagramConn) Close() error {
+	if c.cleanup != nil {
+		c.cleanup()
+	}
+	return c.PacketConn.Close()
 }
 
 func (c *datagramConn) Upstream() any {

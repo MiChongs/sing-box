@@ -160,10 +160,13 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		done:                 make(chan struct{}),
 		proxyNATListeners:    make(map[uint16]*proxyNATListener),
 	}
+	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	sockets := &socketFactory{
-		endpoint:      ep,
-		dialer:        outboundDialer,
-		defaultDialer: defaultDialer,
+		endpoint:        ep,
+		dialer:          outboundDialer,
+		defaultDialer:   defaultDialer,
+		networkManager:  networkManager,
+		listenerControl: dialer.AppendEBPFSelfBypass(networkManager, nil),
 	}
 	ep.services = platform.Services{
 		Sockets: sockets,
