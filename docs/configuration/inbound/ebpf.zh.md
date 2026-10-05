@@ -293,7 +293,7 @@ fake-ip 范围重叠的前缀会在启动时报错。
 - `sing-box tools ebpf status` 对所选数据面执行不挂载的内核能力和对象加载预检。
 - `sing-box api ebpf` 从运行实例读取 attachment、恢复状态、活动程序、map 占用、资源、
   UDP/会话统计、分片/放行计数和失败信息。local cgroup 还会报告回退后实际使用的挂载、
-  UDP 清理、socket storage 和时间源模式；需要启用
+  UDP 清理、socket storage 和时间源模式，以及 UDP socket-release 路径；需要启用
   [sing-box API 服务](/zh/configuration/service/api/)。
 
 local TC 和 shared `socket_assign` 还会报告实际的 TCX/clsact 挂载机制、SOCKMAP/direct

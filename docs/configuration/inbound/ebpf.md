@@ -318,8 +318,8 @@ any matching exclude selector takes precedence.
 - `sing-box api ebpf` reads attachments, recovery state, active programs, map
   occupancy, resource use, UDP/session statistics, fragment/pass counters, and
   failures from a running instance. For local cgroup it also reports the
-  effective attach, UDP cleanup, socket-storage, and time-source modes after
-  fallback. It requires the
+  effective attach, UDP cleanup, socket-storage, and time-source modes and the
+  UDP socket-release path after fallback. It requires the
   [sing-box API service](/configuration/service/api/).
 
 For local TC and shared `socket_assign`, the response also reports the effective

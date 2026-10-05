@@ -10,8 +10,8 @@ filippo.io/edwards25519 v1.2.0/go.mod h1:xzAOLCNug/yB62zG1bQ8uziwrIqIuxhctzJT18Q
 filippo.io/hpke v0.4.0 h1:p575VVQ6ted4pL+it6M00V/f2qTZITO0zgmdKCkd5+A=
 filippo.io/hpke v0.4.0/go.mod h1:EmAN849/P3qdeK+PCMkDpDm83vRHM5cDipBJ8xbQLVY=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
-github.com/MiChongs/sing-ebpf v0.1.0-alpha.16 h1:jY432K2CD7ryXEf+GpZClVCcGfEewtPzqTKI44UTC2k=
-github.com/MiChongs/sing-ebpf v0.1.0-alpha.16/go.mod h1:swwBAcOfGFH5R8n7yHwIrNRsaiE/didsG3gN9bqDLZM=
+github.com/MiChongs/sing-ebpf v0.1.0-alpha.17 h1:AGqnXcH78+LeJD6SNf1I49SW4+lYjT9egvbXJVa26Cg=
+github.com/MiChongs/sing-ebpf v0.1.0-alpha.17/go.mod h1:swwBAcOfGFH5R8n7yHwIrNRsaiE/didsG3gN9bqDLZM=
 github.com/RussellLuo/timingwheel v0.0.0-20220218152713-54845bda3108 h1:iPugyBI7oFtbDZXC4dnY093M1kZx6k/95sen92gafbY=
 github.com/RussellLuo/timingwheel v0.0.0-20220218152713-54845bda3108/go.mod h1:WAMLHwunr1hi3u7OjGV6/VWG9QbdMhGpEKjROiSFd10=
 github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=

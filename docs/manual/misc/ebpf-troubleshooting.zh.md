@@ -122,6 +122,16 @@ local cgroup 还应记录 API 返回的实际运行字段：`local_cgroup_attach
 `local_udp_storage_mode` 和 `local_udp_time_mode`。这些字段表示厂商内核或安全策略
 触发回退后真正选中的路径，不是能力猜测。
 
+UDP socket-release 路径单独报告：
+
+- `local_udp_release_program` 是实际使用的 socket-release 程序：
+  `sb_ebpf_rel_notify` 会把每次释放通知到用户态，`sb_ebpf_rel` 只清理内核状态。
+  内核没有 socket-release hook 时不返回该字段。
+- `local_udp_release_observer` 为 true 表示释放通知能到达用户态。
+- `local_udp_release_fallback_reason` 说明通知不可用的原因：
+  `socket_release_unsupported`、`ringbuf_unsupported`、`ringbuf_map_load_failed`、
+  `ringbuf_reader_unavailable` 或 `release_notification_program_load_failed`。
+
 local TC 或 shared `socket_assign` 启用时，API 还会返回 `tc_*` 运行态字段：实际
 `tcx`/`clsact`/`mixed` 挂载机制、TCP listener 的 `sockmap`/`direct` 查找方式、delivery
 接口及其 ifindex、策略路由 mark/table/priority、活动和待回收资源数量、健康状态、最近
@@ -140,7 +150,9 @@ health check/reconcile 时间以及网络代数。它们来自运行中的资源
 - UDP `capacity_evictions`、`queue_drops`、pending-release 拒绝和 release 通知丢失是
   不同压力信号，并不都代表 BPF assignment map 缺项；
 - map occupancy 只在显式请求诊断时采集。`UNKNOWN` 表示该 map 类型无法安全遍历或
-  检查被拒绝，不表示占用为零。
+  检查被拒绝，不表示占用为零。类型无法遍历的 map 报告 pressure `not_applicable`。
+  整体状态只反映实际测得的占用（`warning` 或 `degraded`），无法测量的 map 不影响
+  整体状态。
 
 program/map 枚举按 `sb_` 命名约定筛选，同一内核中其他可见的 sing-ebpf 进程也可能
 出现；每个入站自身的 attachment、策略状态、用户态会话和计数才是实例级证据。

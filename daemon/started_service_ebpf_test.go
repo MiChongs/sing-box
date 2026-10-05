@@ -102,6 +102,8 @@ func TestGetEBPFDiagnosticsUsesSingBoxAPI(t *testing.T) {
 			LocalUDPRecoveryMode:      "reverse_index",
 			LocalUDPMapPressure:       "healthy",
 			LocalUDPNetworkGeneration: 17,
+			LocalUDPReleaseObserver:   true,
+			LocalUDPReleaseProgram:    "sb_ebpf_rel_notify",
 			PolicyEpoch: adapter.EBPFPolicyEpochDiagnostics{
 				LocalConfirmed:  11,
 				LocalExpected:   12,
@@ -167,7 +169,9 @@ func TestGetEBPFDiagnosticsUsesSingBoxAPI(t *testing.T) {
 		t.Fatalf("UDP NAT diagnostics = %+v", diagnostics.UdpNAT)
 	}
 	if diagnostics.LocalUdpState != "release_notification" || diagnostics.LocalUdpRecoveryMode != "reverse_index" ||
-		diagnostics.LocalUdpMapPressure != "healthy" || diagnostics.LocalUdpNetworkGeneration != 17 {
+		diagnostics.LocalUdpMapPressure != "healthy" || diagnostics.LocalUdpNetworkGeneration != 17 ||
+		!diagnostics.LocalUdpReleaseObserver || diagnostics.LocalUdpReleaseProgram != "sb_ebpf_rel_notify" ||
+		diagnostics.LocalUdpReleaseFallbackReason != "" {
 		t.Fatalf("local UDP diagnostics = %+v", diagnostics)
 	}
 	if diagnostics.PolicyEpoch == nil || diagnostics.PolicyEpoch.LocalConfirmed != 11 ||

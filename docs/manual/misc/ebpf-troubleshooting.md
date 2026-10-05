@@ -136,6 +136,19 @@ For local cgroup, also record the effective runtime fields returned by the API:
 `local_udp_time_mode`. These describe the path actually selected after vendor
 kernel and security-policy fallbacks; they are not capability guesses.
 
+The UDP socket-release path is reported separately:
+
+- `local_udp_release_program` is the socket-release program in use:
+  `sb_ebpf_rel_notify` notifies userspace of each release, `sb_ebpf_rel` only
+  cleans kernel state. It is absent when the kernel offers no socket-release
+  hook.
+- `local_udp_release_observer` is true when release notifications reach
+  userspace.
+- `local_udp_release_fallback_reason` names why they do not:
+  `socket_release_unsupported`, `ringbuf_unsupported`,
+  `ringbuf_map_load_failed`, `ringbuf_reader_unavailable`, or
+  `release_notification_program_load_failed`.
+
 When local TC or shared `socket_assign` is enabled, the API also reports `tc_*`
 runtime fields: the effective `tcx`/`clsact`/`mixed` attachment mechanism,
 `sockmap`/`direct` TCP listener lookup, delivery interface and ifindex, policy
@@ -162,7 +175,9 @@ interpreting a single large number:
   mean that the BPF assignment map is missing;
 - map occupancy is collected only on an explicit diagnostic request. `UNKNOWN`
   means the map type cannot be safely iterated or inspection was denied; it is
-  not zero occupancy.
+  not zero occupancy. A map whose type cannot be iterated reports pressure
+  `not_applicable`. The overall status reflects only measured occupancy
+  (`warning` or `degraded`); maps that could not be measured do not change it.
 
 Program/map enumeration uses the `sb_` naming convention and can see another
 visible sing-ebpf process in the same kernel. Per-inbound attachments, policy

@@ -82,17 +82,23 @@ func TestEBPFDiagnosticsUsesShortRequestDrivenCache(t *testing.T) {
 
 func TestEBPFDiagnosticsIncludesEffectiveCgroupPaths(t *testing.T) {
 	diagnostics := diagnosticsForAPI(EBPFDiagnostics{
-		LocalCgroupAttachMode:        "legacy_exclusive",
-		LocalUDPCleanupMode:          "lru_fallback",
-		LocalUDPUserspaceCleanupMode: "deadline",
-		LocalUDPStorageMode:          "socket_storage",
-		LocalUDPTimeMode:             "coarse",
+		LocalCgroupAttachMode:         "legacy_exclusive",
+		LocalUDPCleanupMode:           "lru_fallback",
+		LocalUDPUserspaceCleanupMode:  "deadline",
+		LocalUDPStorageMode:           "socket_storage",
+		LocalUDPTimeMode:              "coarse",
+		LocalUDPReleaseObserver:       false,
+		LocalUDPReleaseFallbackReason: "ringbuf_unsupported",
+		LocalUDPReleaseProgram:        "sb_ebpf_rel",
 	})
 	if diagnostics.LocalCgroupAttachMode != "legacy_exclusive" ||
 		diagnostics.LocalUDPCleanupMode != "lru_fallback" ||
 		diagnostics.LocalUDPUserspaceCleanupMode != "deadline" ||
 		diagnostics.LocalUDPStorageMode != "socket_storage" ||
-		diagnostics.LocalUDPTimeMode != "coarse" {
+		diagnostics.LocalUDPTimeMode != "coarse" ||
+		diagnostics.LocalUDPReleaseObserver ||
+		diagnostics.LocalUDPReleaseFallbackReason != "ringbuf_unsupported" ||
+		diagnostics.LocalUDPReleaseProgram != "sb_ebpf_rel" {
 		t.Fatalf("effective cgroup paths were not propagated: %+v", diagnostics)
 	}
 }
@@ -130,12 +136,12 @@ func TestEBPFDiagnosticsIncludesEffectiveTCState(t *testing.T) {
 }
 
 func TestEBPFDiagnosticsSchemaVersionIncludesEffectiveRuntimeFields(t *testing.T) {
-	if adapter.EBPFDiagnosticsSchemaVersion != 12 {
-		t.Fatalf("schema version = %d, want 12 after adding self-bypass diagnostics", adapter.EBPFDiagnosticsSchemaVersion)
+	if adapter.EBPFDiagnosticsSchemaVersion != 13 {
+		t.Fatalf("schema version = %d, want 13 after adding UDP release path diagnostics", adapter.EBPFDiagnosticsSchemaVersion)
 	}
 	diagnostics := diagnosticsForAPI(EBPFDiagnostics{SchemaVersion: adapter.EBPFDiagnosticsSchemaVersion, LocalCgroupAttachMode: "link_create"})
-	if diagnostics.SchemaVersion != 12 {
-		t.Fatalf("diagnostics schema version = %d, want 12", diagnostics.SchemaVersion)
+	if diagnostics.SchemaVersion != 13 {
+		t.Fatalf("diagnostics schema version = %d, want 13", diagnostics.SchemaVersion)
 	}
 }
 
