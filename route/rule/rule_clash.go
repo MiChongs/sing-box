@@ -16,8 +16,8 @@ import (
 )
 
 // Clash API 按 mihomo 的形式展示规则：类型对应 mihomo C.RuleType.String()，
-// 载荷对应 Rule.Payload()，多个条件按 mihomo rules/logic 的 AND / OR / NOT
-// 载荷格式组合，目标对应 Rule.Adapter()。sing-box 特有的条件沿用同样的驼峰命名。
+// 载荷对应 Rule.Payload()，目标对应 Rule.Adapter()；sing-box 特有的条件沿用同样的
+// 驼峰命名。多个条件组合时类型为 AND / OR / NOT，载荷写作易读的条件表达式。
 const (
 	clashRuleTypeDomain                  = "Domain"
 	clashRuleTypeDomainSuffix            = "DomainSuffix"
@@ -74,20 +74,26 @@ const (
 	clashRuleTypeUnknown                 = "Unknown"
 )
 
+// clashRule 是规则的 mihomo 形式：条件为类型加值（多个值之间为“或”），
+// AND / OR / NOT 持有子规则；先组合成树再输出载荷，便于展平与合并。
 type clashRule struct {
 	ruleType string
-	payload  string
+	values   []string
+	rules    []clashRule
 }
 
 type clashRuleDescriber interface {
-	clashRule() clashRule
+	clashRule() (described clashRule, payload string)
 }
 
 // ClashRule 返回规则在 Clash API 中的类型与载荷，对应 mihomo C.Rule 的
 // RuleType().String() 与 Payload()。结果在首次调用时生成并缓存。
 func ClashRule(rule adapter.HeadlessRule) (ruleType string, payload string) {
-	described := clashRuleOf(rule)
-	return described.ruleType, described.payload
+	if describer, isDescriber := rule.(clashRuleDescriber); isDescriber {
+		described, payload := describer.clashRule()
+		return described.ruleType, payload
+	}
+	return clashRuleTypeUnknown, rule.String()
 }
 
 // ClashProxy 返回规则动作在 Clash API 中的目标，对应 mihomo Rule.Adapter()：
@@ -115,16 +121,22 @@ func ClashProxy(action adapter.RuleAction) string {
 
 func clashRuleOf(rule adapter.HeadlessRule) clashRule {
 	if describer, isDescriber := rule.(clashRuleDescriber); isDescriber {
-		return describer.clashRule()
+		described, _ := describer.clashRule()
+		return described
 	}
-	return clashRule{clashRuleTypeUnknown, rule.String()}
+	return clashRule{ruleType: clashRuleTypeUnknown, values: []string{rule.String()}}
 }
 
-func (r *abstractDefaultRule) clashRule() clashRule {
+func (r *abstractRule) describeClash(build func() clashRule) (clashRule, string) {
 	r.clashOnce.Do(func() {
-		r.clash = r.buildClashRule()
+		r.clash = build()
+		r.clashPayload = r.clash.payload()
 	})
-	return r.clash
+	return r.clash, r.clashPayload
+}
+
+func (r *abstractDefaultRule) clashRule() (clashRule, string) {
+	return r.describeClash(r.buildClashRule)
 }
 
 // buildClashRule 按 sing-box 的匹配逻辑组合条件：源地址、源端口、目标地址
@@ -153,19 +165,7 @@ func (r *abstractDefaultRule) buildClashRule() clashRule {
 			components = append(components, clashAny(rules))
 		}
 	}
-	var described clashRule
-	switch len(components) {
-	case 0:
-		described = clashRule{clashRuleTypeMatch, ""}
-	case 1:
-		described = components[0]
-	default:
-		described = clashLogic(clashRuleTypeAnd, components)
-	}
-	if r.invert {
-		return clashNot(described)
-	}
-	return described
+	return clashInvert(clashAll(components), r.invert)
 }
 
 func (r *abstractDefaultRule) clashGroupOf(item RuleItem) ruleMatchState {
@@ -183,35 +183,33 @@ func (r *abstractDefaultRule) clashGroupOf(item RuleItem) ruleMatchState {
 	}
 }
 
-func (r *abstractLogicalRule) clashRule() clashRule {
-	r.clashOnce.Do(func() {
-		rules := make([]clashRule, 0, len(r.rules))
-		for _, rule := range r.rules {
-			rules = append(rules, clashRuleOf(rule))
-		}
-		ruleType := clashRuleTypeAnd
-		if r.mode == C.LogicalTypeOr {
-			ruleType = clashRuleTypeOr
-		}
-		r.clash = clashLogic(ruleType, rules)
-		if r.invert {
-			r.clash = clashNot(r.clash)
-		}
-	})
-	return r.clash
+func (r *abstractLogicalRule) clashRule() (clashRule, string) {
+	return r.describeClash(r.buildClashRule)
 }
 
-// clashAny 组合同一组内的条件 (OR)：mihomo 原生以 "/" 分隔多值的类型合并为
-// 一条，只剩一条时直接返回该条件。
+func (r *abstractLogicalRule) buildClashRule() clashRule {
+	rules := make([]clashRule, 0, len(r.rules))
+	for _, rule := range r.rules {
+		rules = append(rules, clashRuleOf(rule))
+	}
+	if r.mode == C.LogicalTypeOr {
+		return clashInvert(clashAny(rules), r.invert)
+	}
+	return clashInvert(clashAll(rules), r.invert)
+}
+
+// clashAny 以 OR 组合：子 OR 展开到同一层，同类型条件的值合并为一条，
+// 只剩一条时直接返回，因此只有不同类型的条件才以 OR 并列。
 func clashAny(rules []clashRule) clashRule {
-	merged := make([]clashRule, 0, len(rules))
-	for _, rule := range rules {
-		if clashJoinable(rule.ruleType) {
+	var merged []clashRule
+	for _, rule := range clashFlatten(clashRuleTypeOr, rules) {
+		if rule.rules == nil {
 			index := slices.IndexFunc(merged, func(it clashRule) bool {
-				return it.ruleType == rule.ruleType
+				return it.rules == nil && it.ruleType == rule.ruleType
 			})
 			if index >= 0 {
-				merged[index].payload += "/" + rule.payload
+				// values 可能与配置共用底层数组，Clip 后追加以免写入原数组
+				merged[index].values = append(slices.Clip(merged[index].values), rule.values...)
 				continue
 			}
 		}
@@ -220,71 +218,119 @@ func clashAny(rules []clashRule) clashRule {
 	if len(merged) == 1 {
 		return merged[0]
 	}
-	return clashLogic(clashRuleTypeOr, merged)
+	return clashRule{ruleType: clashRuleTypeOr, rules: merged}
 }
 
-// clashJoinable 报告该类型的多个值能否以 "/" 合并：mihomo 的 IN-NAME、IN-USER、
-// DST-PORT、SRC-PORT、UID 原生支持，sing-box 特有的枚举型条件沿用该写法；
-// 其余类型的值可能含 "/"（CIDR、路径、正则）或 mihomo 只接受单值，展开为 OR。
-func clashJoinable(ruleType string) bool {
-	switch ruleType {
-	case clashRuleTypeInName, clashRuleTypeInUser, clashRuleTypeDstPort, clashRuleTypeSrcPort, clashRuleTypeUid,
-		clashRuleTypeProtocol, clashRuleTypeClient, clashRuleTypeClashMode, clashRuleTypeNetworkType, clashRuleTypeQueryType:
-		return true
+// clashAll 以 AND 组合：子 AND 展开到同一层，没有条件时为 Match。
+func clashAll(rules []clashRule) clashRule {
+	flattened := clashFlatten(clashRuleTypeAnd, rules)
+	switch len(flattened) {
+	case 0:
+		return clashRule{ruleType: clashRuleTypeMatch}
+	case 1:
+		return flattened[0]
 	default:
-		return false
+		return clashRule{ruleType: clashRuleTypeAnd, rules: flattened}
 	}
 }
 
-// clashLogic 同 mihomo Logic.Payload：AND 为 "((T1,P1) && (T2,P2))"，OR 以 " || " 连接。
-func clashLogic(ruleType string, rules []clashRule) clashRule {
-	separator := " && "
-	if ruleType == clashRuleTypeOr {
-		separator = " || "
-	}
-	var payload strings.Builder
-	payload.WriteByte('(')
-	for index, rule := range rules {
-		if index > 0 {
-			payload.WriteString(separator)
+func clashFlatten(ruleType string, rules []clashRule) []clashRule {
+	flattened := make([]clashRule, 0, len(rules))
+	for _, rule := range rules {
+		if rule.ruleType == ruleType && rule.rules != nil {
+			flattened = append(flattened, rule.rules...)
+		} else {
+			flattened = append(flattened, rule)
 		}
-		rule.writeSubRule(&payload)
 	}
-	payload.WriteByte(')')
-	return clashRule{ruleType, payload.String()}
+	return flattened
 }
 
-// clashNot 同 mihomo Logic.Payload 的 NOT 形式 "(!(T,P))"。
-func clashNot(rule clashRule) clashRule {
-	var payload strings.Builder
-	payload.WriteString("(!")
-	rule.writeSubRule(&payload)
-	payload.WriteByte(')')
-	return clashRule{clashRuleTypeNot, payload.String()}
+func clashInvert(rule clashRule, invert bool) clashRule {
+	if !invert {
+		return rule
+	}
+	return clashRule{ruleType: clashRuleTypeNot, rules: []clashRule{rule}}
 }
 
-func (r clashRule) writeSubRule(builder *strings.Builder) {
-	builder.WriteByte('(')
-	builder.WriteString(r.ruleType)
-	builder.WriteByte(',')
-	builder.WriteString(r.payload)
-	builder.WriteByte(')')
+// payload 返回规则的载荷，运算符已由类型给出：条件为其值，以 ", " 分隔；
+// AND / OR 为以 " & " / " | " 连接的子条件；NOT 为被取反的条件。
+// 子条件写作 Type(值)，复合子条件加括号，如 "Network(tcp) & (DomainSuffix(a.com) | IPCIDR(1.1.1.1/32))"。
+func (r clashRule) payload() string {
+	var builder strings.Builder
+	switch r.ruleType {
+	case clashRuleTypeAnd, clashRuleTypeOr:
+		r.writeOperands(&builder)
+	case clashRuleTypeNot:
+		r.rules[0].writeExpression(&builder)
+	default:
+		r.writeValues(&builder)
+	}
+	return builder.String()
+}
+
+func (r clashRule) writeExpression(builder *strings.Builder) {
+	switch r.ruleType {
+	case clashRuleTypeAnd, clashRuleTypeOr:
+		builder.WriteByte('(')
+		r.writeOperands(builder)
+		builder.WriteByte(')')
+	case clashRuleTypeNot:
+		builder.WriteByte('!')
+		r.rules[0].writeExpression(builder)
+	default:
+		builder.WriteString(r.ruleType)
+		if len(r.values) > 0 {
+			builder.WriteByte('(')
+			r.writeValues(builder)
+			builder.WriteByte(')')
+		}
+	}
+}
+
+func (r clashRule) writeOperands(builder *strings.Builder) {
+	operator := " & "
+	if r.ruleType == clashRuleTypeOr {
+		operator = " | "
+	}
+	for index, rule := range r.rules {
+		if index > 0 {
+			builder.WriteString(operator)
+		}
+		rule.writeExpression(builder)
+	}
+}
+
+func (r clashRule) writeValues(builder *strings.Builder) {
+	for index, value := range r.values {
+		if index > 0 {
+			builder.WriteString(", ")
+		}
+		builder.WriteString(value)
+	}
 }
 
 func clashRules[T any](ruleType string, values []T, format func(T) string) []clashRule {
-	rules := make([]clashRule, 0, len(values))
+	formatted := make([]string, 0, len(values))
 	for _, value := range values {
-		rules = append(rules, clashRule{ruleType, format(value)})
+		formatted = append(formatted, format(value))
 	}
-	return rules
+	return clashStrings(ruleType, formatted)
 }
 
 func clashStrings(ruleType string, values []string) []clashRule {
-	return clashRules(ruleType, values, func(it string) string { return it })
+	if len(values) == 0 {
+		return nil
+	}
+	return []clashRule{{ruleType: ruleType, values: values}}
+}
+
+func clashValue(ruleType string, value string) []clashRule {
+	return []clashRule{{ruleType: ruleType, values: []string{value}}}
 }
 
 func clashFlag(ruleType string) []clashRule {
-	return []clashRule{{ruleType, ""}}
+	return []clashRule{{ruleType: ruleType}}
 }
 
 func clashItemRules(item RuleItem) []clashRule {
@@ -315,16 +361,16 @@ func clashItemRules(item RuleItem) []clashRule {
 	case *IPIsPrivateItem:
 		// mihomo 以伪 GeoIP 代码 lan 匹配私有地址
 		if item.isSource {
-			return []clashRule{{clashRuleTypeSrcGeoIP, "lan"}}
+			return clashValue(clashRuleTypeSrcGeoIP, "lan")
 		}
-		return []clashRule{{clashRuleTypeGeoIP, "lan"}}
+		return clashValue(clashRuleTypeGeoIP, "lan")
 	case *IPAcceptAnyItem:
 		return clashFlag(clashRuleTypeIPAcceptAny)
 	case *IPVersionItem:
 		if item.isIPv6 {
-			return []clashRule{{clashRuleTypeIPVersion, "6"}}
+			return clashValue(clashRuleTypeIPVersion, "6")
 		}
-		return []clashRule{{clashRuleTypeIPVersion, "4"}}
+		return clashValue(clashRuleTypeIPVersion, "4")
 	case *PortItem:
 		return clashRules(clashPortType(item.isSource), item.ports, F.ToString0[uint16])
 	case *PortRangeItem:
@@ -387,21 +433,21 @@ func clashItemRules(item RuleItem) []clashRule {
 	case *PreferredByDNSItem:
 		return clashStrings(clashRuleTypePreferredBy, item.transportTags)
 	case *DNSServerAddressItem:
-		var rules []clashRule
+		var values []string
 		for index, tag := range item.transportTags {
 			for _, prefix := range item.serverAddresses[index] {
-				rules = append(rules, clashRule{clashRuleTypeDNSServerAddress, tag + "=" + prefix.String()})
+				values = append(values, tag+"="+prefix.String())
 			}
 		}
-		return rules
+		return clashStrings(clashRuleTypeDNSServerAddress, values)
 	case *DNSSearchDomainItem:
-		var rules []clashRule
+		var values []string
 		for index, tag := range item.transportTags {
 			for _, searchDomain := range item.searchDomains[index] {
-				rules = append(rules, clashRule{clashRuleTypeDNSSearchDomain, tag + "=" + strings.TrimSuffix(searchDomain, ".")})
+				values = append(values, tag+"="+strings.TrimSuffix(searchDomain, "."))
 			}
 		}
-		return rules
+		return clashStrings(clashRuleTypeDNSSearchDomain, values)
 	case *QueryTypeItem:
 		return clashRules(clashRuleTypeQueryType, item.typeList, option.DNSQueryTypeToString)
 	case *QueryClientSubnetItem:
@@ -409,7 +455,7 @@ func clashItemRules(item RuleItem) []clashRule {
 	case *QueryDNSSECItem:
 		return clashFlag(clashRuleTypeQueryDNSSEC)
 	case *DNSResponseRCodeItem:
-		return []clashRule{{clashRuleTypeResponseRcode, dns.RcodeToString[item.rcode]}}
+		return clashValue(clashRuleTypeResponseRcode, dns.RcodeToString[item.rcode])
 	case *DNSResponseRecordItem:
 		var ruleType string
 		switch item.field {
@@ -420,18 +466,18 @@ func clashItemRules(item RuleItem) []clashRule {
 		default:
 			ruleType = clashRuleTypeResponseExtra
 		}
-		var rules []clashRule
+		var values []string
 		for _, record := range item.records {
 			if record.RR != nil {
 				// dns.RR.String 以制表符分隔字段
-				rules = append(rules, clashRule{ruleType, strings.Join(strings.Fields(record.RR.String()), " ")})
+				values = append(values, strings.Join(strings.Fields(record.RR.String()), " "))
 			}
 		}
-		return rules
+		return clashStrings(ruleType, values)
 	case *RuleSetItem:
 		return clashStrings(clashRuleTypeRuleSet, item.tagList)
 	default:
-		return []clashRule{{clashRuleTypeUnknown, item.String()}}
+		return clashValue(clashRuleTypeUnknown, item.String())
 	}
 }
 
@@ -451,11 +497,11 @@ func clashKeyedPrefixes[K comparable](ruleType string, prefixMap map[K][]netip.P
 	slices.SortFunc(keys, func(a, b K) int {
 		return strings.Compare(keyString(a), keyString(b))
 	})
-	var rules []clashRule
+	var values []string
 	for _, key := range keys {
 		for _, prefix := range prefixMap[key] {
-			rules = append(rules, clashRule{ruleType, keyString(key) + "=" + prefix.String()})
+			values = append(values, keyString(key)+"="+prefix.String())
 		}
 	}
-	return rules
+	return clashStrings(ruleType, values)
 }

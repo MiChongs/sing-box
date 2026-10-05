@@ -86,18 +86,25 @@
 
 !!! info "Rule statistics"
 
-    `GET /rules` lists route rules followed by DNS rules, in the same format as
-    mihomo: `type` and `payload` use mihomo rule types (`DomainSuffix`,
-    `IPCIDR`, `RuleSet`, `InName`, `DstPort`, ...; `ip_is_private` is shown as
-    `GeoIP,lan`, conditions without a mihomo equivalent use the camel-cased
-    field name such as `ClashMode`). A rule with several conditions is shown as
-    an `AND` / `OR` / `NOT` payload like `((Network,udp) && (DstPort,443))`,
-    values that mihomo separates with `/` (ports, inbounds, users, uid) are
-    merged, and a rule without conditions is `Match`. `proxy` is the target
-    outbound or DNS server tag, or the upper-cased action name for other actions
-    (`REJECT`, `REJECT-DROP`, `SNIFF`, `HIJACK-DNS`, ...). The `rule` and
-    `rulePayload` of `/connections` use the same format, and `Match` when the
-    connection went to `route.final`.
+    `GET /rules` lists route rules followed by DNS rules. `type` uses mihomo
+    rule types (`DomainSuffix`, `IPCIDR`, `RuleSet`, `InName`, `DstPort`, ...;
+    `ip_is_private` is shown as `GeoIP` `lan`, conditions without a mihomo
+    equivalent use the camel-cased field name such as `ClashMode`), and
+    `payload` lists the values separated by `, `, e.g. `DomainSuffix`
+    `google.com, youtube.com`.
+
+    A rule with several conditions has the type `AND`, `OR` or `NOT`, and its
+    payload is an expression of `Type(values)` joined by `&` (and) or `|` (or),
+    with parentheses around nested groups, e.g. `AND`
+    `Network(tcp) & (DomainSuffix(a.com) | IPCIDR(1.1.1.1/32))`. Nested
+    `AND` / `OR` (including logical rules) are flattened and the values of the
+    same condition type within an `OR` are merged, so `OR` only lists different
+    condition types. A rule without conditions is `Match`.
+
+    `proxy` is the target outbound or DNS server tag, or the upper-cased action
+    name for other actions (`REJECT`, `REJECT-DROP`, `SNIFF`, `HIJACK-DNS`,
+    ...). The `rule` and `rulePayload` of `/connections` use the same format,
+    and `Match` when the connection went to `route.final`.
 
     Like mihomo, each rule reports `index`, `size` and `extra` (`disabled`,
     `hitCount`, `hitAt`, `missCount`, `missAt`): every time a top-level rule is

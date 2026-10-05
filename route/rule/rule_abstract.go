@@ -15,15 +15,16 @@ import (
 )
 
 type abstractRule struct {
-	disabled  atomic.Bool
-	uuid      string
-	history   *urltest.HistoryStorage
-	hitCount  atomic.Uint64
-	hitAt     atomicTime
-	missCount atomic.Uint64
-	missAt    atomicTime
-	clashOnce sync.Once
-	clash     clashRule
+	disabled     atomic.Bool
+	uuid         string
+	history      *urltest.HistoryStorage
+	hitCount     atomic.Uint64
+	hitAt        atomicTime
+	missCount    atomic.Uint64
+	missAt       atomicTime
+	clashOnce    sync.Once
+	clash        clashRule
+	clashPayload string
 }
 
 func (r *abstractRule) Disabled() bool {
