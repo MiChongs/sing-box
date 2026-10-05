@@ -8,10 +8,16 @@
   "certificate_server_name": "example.com",
   "insecure": false,
   "kernel_tx": false,
-  "kernel_rx": false
+  "kernel_rx": false,
+  "ech": {
+    "enabled": true,
+    "config": [],
+    "config_path": "",
+    "query_server_name": "encryptedsni.com"
+  }
 }
 ```
 
 ### Fields
 
-`enabled` `disable_sni` `server_name` `certificate_server_name` `insecure` `kernel_tx` `kernel_rx` see [TLS Fields](/configuration/shared/tls/#outbound).
+`enabled` `disable_sni` `server_name` `certificate_server_name` `insecure` `kernel_tx` `kernel_rx` `ech` see [TLS Fields](/configuration/shared/tls/#outbound).

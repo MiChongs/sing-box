@@ -528,6 +528,8 @@ func parseVLESSLink(link string) (option.Outbound, error) {
 			if value == "xtls-rprx-vision" {
 				options.Flow = "xtls-rprx-vision"
 			}
+		case "ech":
+			TLSOptions.ECH = linkECHOptions(value)
 		case "pbk":
 			TLSOptions.Reality.PublicKey = value
 		case "sid":
@@ -597,6 +599,8 @@ func parseTrojanLink(link string) (option.Outbound, error) {
 		case "fp":
 			TLSOptions.UTLS.Enabled = true
 			TLSOptions.UTLS.Fingerprint = value
+		case "ech":
+			TLSOptions.ECH = linkECHOptions(value)
 		case "type":
 			Transport := option.V2RayTransportOptions{
 				Type: "",
@@ -805,4 +809,25 @@ func parseAnyTLSLink(link string) (option.Outbound, error) {
 	options.TLS = &TLSOptions
 	outbound.Options = &options
 	return outbound, nil
+}
+
+// linkECHOptions parses the Xray share link "ech" parameter: either a base64
+// ECHConfigList, or a DNS server URL optionally prefixed with the name whose
+// HTTPS record carries the config ("cloudflare-ech.com+https://1.1.1.1/dns-query").
+// sing-box resolves the record through its own DNS router, so the server URL is ignored.
+func linkECHOptions(value string) *option.OutboundECHOptions {
+	// url.Query decodes an unescaped "+" (base64 or name separator) into a space.
+	value = strings.ReplaceAll(strings.TrimSpace(value), " ", "+")
+	if value == "" {
+		return &option.OutboundECHOptions{}
+	}
+	options := &option.OutboundECHOptions{Enabled: true}
+	if strings.Contains(value, "://") {
+		if queryServerName, _, found := strings.Cut(value, "+"); found && !strings.Contains(queryServerName, "://") {
+			options.QueryServerName = queryServerName
+		}
+		return options
+	}
+	options.Config = echConfigPEM(value)
+	return options
 }

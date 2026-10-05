@@ -256,5 +256,32 @@ func overrideTLSOption(options *option.OutboundTLSOptions, overrideTLSOptions *o
 	if overrideTLSOptions.KernelRx != nil {
 		options.KernelRx = *overrideTLSOptions.KernelRx
 	}
+	if overrideTLSOptions.ECH != nil {
+		options.ECH = overrideECHOption(options.ECH, overrideTLSOptions.ECH)
+	}
 	return options
+}
+
+func overrideECHOption(options *option.OutboundECHOptions, overrideECHOptions *option.OverrideECHOptions) *option.OutboundECHOptions {
+	var newOptions option.OutboundECHOptions
+	if options != nil {
+		newOptions = *options
+	}
+	if overrideECHOptions.Enabled != nil {
+		newOptions.Enabled = *overrideECHOptions.Enabled
+	}
+	if overrideECHOptions.Config != nil {
+		newOptions.Config = *overrideECHOptions.Config
+	}
+	if overrideECHOptions.ConfigPath != nil {
+		newOptions.ConfigPath = *overrideECHOptions.ConfigPath
+		// inline config takes precedence over config_path, drop the node's own one
+		if overrideECHOptions.Config == nil {
+			newOptions.Config = nil
+		}
+	}
+	if overrideECHOptions.QueryServerName != nil {
+		newOptions.QueryServerName = *overrideECHOptions.QueryServerName
+	}
+	return &newOptions
 }

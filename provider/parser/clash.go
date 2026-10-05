@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"encoding/base64"
+	"encoding/pem"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -762,22 +763,38 @@ func (r *RealityOptions) Build() *option.OutboundRealityOptions {
 }
 
 type ECHOptions struct {
-	Enable bool   `yaml:"enable,omitempty"`
-	Config string `yaml:"config,omitempty"`
+	Enable          bool   `yaml:"enable,omitempty"`
+	Config          string `yaml:"config,omitempty"`
+	QueryServerName string `yaml:"query-server-name,omitempty"`
 }
 
 func (e *ECHOptions) Build() *option.OutboundECHOptions {
-	if e == nil {
-		return nil
-	}
-	list, err := base64.StdEncoding.DecodeString(e.Config)
-	if err != nil {
+	if e == nil || !e.Enable {
 		return nil
 	}
 	return &option.OutboundECHOptions{
-		Enabled: e.Enable,
-		Config:  trimStringArray(strings.Split(string(list), "\n")),
+		Enabled:         true,
+		Config:          echConfigPEM(e.Config),
+		QueryServerName: e.QueryServerName,
 	}
+}
+
+// echConfigPEM converts a mihomo/Xray style base64 ECHConfigList into the
+// "ECH CONFIGS" PEM lines sing-box expects. An empty or undecodable value
+// returns nil, which falls back to fetching the config from DNS HTTPS records.
+func echConfigPEM(config string) []string {
+	config = strings.TrimSpace(config)
+	if config == "" {
+		return nil
+	}
+	if strings.Contains(config, "-----BEGIN") {
+		return trimStringArray(strings.Split(config, "\n"))
+	}
+	list, err := base64.StdEncoding.DecodeString(config)
+	if err != nil || len(list) == 0 {
+		return nil
+	}
+	return trimStringArray(strings.Split(string(pem.EncodeToMemory(&pem.Block{Type: "ECH CONFIGS", Bytes: list})), "\n"))
 }
 
 type TLSOptions struct {

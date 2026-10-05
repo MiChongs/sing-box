@@ -17913,6 +17913,9 @@
         "config_path": {
           "type": "string"
         },
+        "query_server_name": {
+          "type": "string"
+        },
         "pq_signature_schemes_enabled": {
           "type": "boolean"
         },
