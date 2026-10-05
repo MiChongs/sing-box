@@ -12,6 +12,7 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/vless/encryption"
 	"github.com/sagernet/sing-box/transport/v2ray"
 	"github.com/sagernet/sing-vmess/packetaddr"
 	"github.com/sagernet/sing-vmess/vless"
@@ -38,6 +39,7 @@ type Outbound struct {
 	logger          logger.ContextLogger
 	dialer          N.Dialer
 	client          *vless.Client
+	encryption      *encryption.ClientInstance
 	serverAddr      M.Socksaddr
 	multiplexDialer *mux.Client
 	tlsConfig       tls.Config
@@ -93,6 +95,10 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		}
 	}
 	outbound.client, err = vless.NewClient(options.UUID, options.Flow, logger)
+	if err != nil {
+		return nil, err
+	}
+	outbound.encryption, err = encryption.NewClient(options.Encryption)
 	if err != nil {
 		return nil, err
 	}
@@ -189,15 +195,7 @@ func (h *vlessDialer) DialContext(ctx context.Context, network string, destinati
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-	var conn net.Conn
-	var err error
-	if h.transport != nil {
-		conn, err = h.transport.DialContext(ctx)
-	} else if h.tlsDialer != nil {
-		conn, err = h.tlsDialer.DialTLSContext(ctx, h.serverAddr)
-	} else {
-		conn, err = h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
-	}
+	conn, err := h.dialServer(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -231,17 +229,8 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	ctx, metadata := adapter.ExtendContext(ctx)
 	metadata.Outbound = h.Tag()
 	metadata.Destination = destination
-	var conn net.Conn
-	var err error
-	if h.transport != nil {
-		conn, err = h.transport.DialContext(ctx)
-	} else if h.tlsDialer != nil {
-		conn, err = h.tlsDialer.DialTLSContext(ctx, h.serverAddr)
-	} else {
-		conn, err = h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
-	}
+	conn, err := h.dialServer(ctx)
 	if err != nil {
-		common.Close(conn)
 		return nil, err
 	}
 	if h.xudp {
@@ -258,4 +247,35 @@ func (h *vlessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	} else {
 		return h.client.DialEarlyPacketConn(conn, destination)
 	}
+}
+
+func (h *vlessDialer) dialServer(ctx context.Context) (net.Conn, error) {
+	var conn net.Conn
+	var err error
+	if h.transport != nil {
+		conn, err = h.transport.DialContext(ctx)
+	} else if h.tlsDialer != nil {
+		conn, err = h.tlsDialer.DialTLSContext(ctx, h.serverAddr)
+	} else {
+		conn, err = h.dialer.DialContext(ctx, N.NetworkTCP, h.serverAddr)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if h.encryption == nil {
+		return conn, nil
+	}
+	stop := context.AfterFunc(ctx, func() {
+		conn.Close()
+	})
+	encryptedConn, err := h.encryption.Handshake(conn)
+	if !stop() {
+		conn.Close()
+		return nil, E.Cause(ctx.Err(), "VLESS encryption handshake")
+	}
+	if err != nil {
+		conn.Close()
+		return nil, E.Cause(err, "VLESS encryption handshake")
+	}
+	return encryptedConn, nil
 }

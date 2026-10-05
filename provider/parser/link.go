@@ -528,6 +528,10 @@ func parseVLESSLink(link string) (option.Outbound, error) {
 			if value == "xtls-rprx-vision" {
 				options.Flow = "xtls-rprx-vision"
 			}
+		case "encryption":
+			if value != "none" {
+				options.Encryption = value
+			}
 		case "ech":
 			TLSOptions.ECH = linkECHOptions(value)
 		case "pbk":

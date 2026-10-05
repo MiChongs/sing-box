@@ -2,8 +2,10 @@ package parser
 
 import (
 	"encoding/base64"
+	"strings"
 	"testing"
 
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 
 	"github.com/stretchr/testify/require"
@@ -141,4 +143,18 @@ func TestParseHysteria2LinkOptions(t *testing.T) {
 	require.Equal(t, []string{"40000:50000"}, []string(options.ServerPorts))
 	require.Equal(t, "example.com", options.TLS.ServerName)
 	require.Equal(t, "AA:BB", options.TLS.CertificatePinSHA256)
+}
+
+func TestParseVLESSLinkEncryption(t *testing.T) {
+	encryption := "mlkem768x25519plus.native.0rtt.100-111-1111.75-0-111.50-0-3333." + strings.Repeat("A", 43)
+	outbound, err := ParseSubscriptionLink("vless://11111111-1111-1111-1111-111111111111@192.0.2.1:443?type=xhttp&encryption=" + encryption + "&flow=xtls-rprx-vision&security=tls&sni=example.com&path=%2Fzones&mode=auto")
+	require.NoError(t, err)
+	options := outbound.Options.(*option.VLESSOutboundOptions)
+	require.Equal(t, encryption, options.Encryption)
+	require.Equal(t, "xtls-rprx-vision", options.Flow)
+	require.Equal(t, C.V2RayTransportTypeXHTTP, options.Transport.Type)
+
+	outbound, err = ParseSubscriptionLink("vless://11111111-1111-1111-1111-111111111111@192.0.2.1:443?encryption=none&security=tls")
+	require.NoError(t, err)
+	require.Empty(t, outbound.Options.(*option.VLESSOutboundOptions).Encryption)
 }

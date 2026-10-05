@@ -10161,6 +10161,9 @@
                 "$ref": "#/$defs/VLESSUser"
               }
             },
+            "decryption": {
+              "type": "string"
+            },
             "tls": {
               "$ref": "#/$defs/InboundTLSOptions"
             },
@@ -17207,6 +17210,9 @@
               "type": "string"
             },
             "flow": {
+              "type": "string"
+            },
+            "encryption": {
               "type": "string"
             },
             "network": {

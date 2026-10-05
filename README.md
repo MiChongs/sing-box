@@ -7,13 +7,14 @@
 [![Last Commit](https://img.shields.io/github/last-commit/MiChongs/sing-box/xiaobaf14g-testing)](https://github.com/MiChongs/sing-box/commits/xiaobaf14g-testing)
 [![Code Size](https://img.shields.io/github/languages/code-size/MiChongs/sing-box)](https://github.com/MiChongs/sing-box)
 
-本项目是 [sing-box](https://github.com/SagerNet/sing-box) 的衍生版本，基于 [reF1nd/sing-box](https://github.com/reF1nd/sing-box) 维护。在兼容上游配置格式的前提下，本分支新增 Smart 出站组、XHTTP 传输与 EasyTier 端点，扩展了 Clash API，并为 Windows、Linux、macOS、FreeBSD 与 Android 提供命令行程序及 SFA、SFW、SFL 图形客户端的发布构建。
+本项目是 [sing-box](https://github.com/SagerNet/sing-box) 的衍生版本，基于 [reF1nd/sing-box](https://github.com/reF1nd/sing-box) 维护。在兼容上游配置格式的前提下，本分支新增 Smart 出站组、XHTTP 传输、VLESS Encryption 与 EasyTier 端点，扩展了 Clash API，并为 Windows、Linux、macOS、FreeBSD 与 Android 提供命令行程序及 SFA、SFW、SFL 图形客户端的发布构建。
 
 ## 目录
 
 - [分支关系与功能来源](#分支关系与功能来源)
 - [Smart 出站组](#smart-出站组)
 - [XHTTP 传输](#xhttp-传输)
+- [VLESS Encryption](#vless-encryption)
 - [EasyTier 端点](#easytier-端点)
 - [eBPF 入站](#ebpf-入站)
 - [Clash API 扩展](#clash-api-扩展)
@@ -33,6 +34,7 @@
 |---|---|---|
 | Smart 出站组 | 本分支 | 无需 |
 | XHTTP 传输 | 本分支 | `with_xhttp`（默认启用） |
+| VLESS Encryption（`mlkem768x25519plus`）及其上的 XTLS Vision | 本分支 | 无需 |
 | EasyTier 端点与 Magic DNS | 本分支 | `with_easytier`（实验性，默认不启用） |
 | Clash API 扩展：规则命中统计、Smart 管理接口 | 本分支 | `with_clash_api`（默认启用） |
 | eBPF 入站 | reF1nd；本分支改用 [MiChongs/sing-ebpf](https://github.com/MiChongs/sing-ebpf) | `with_ebpf`（默认不启用） |
@@ -349,6 +351,45 @@ XHTTP 字段直接写在 `transport` 对象中，与 `type` 同级。
 
 `xmux` 全部字段均未设置时，采用 Xray 默认值：`max_connections` 为 `3`，`h_max_request_times` 为 `600-900`，`h_max_reusable_secs` 为 `1800-3000`。
 
+## VLESS Encryption
+
+VLESS 入站的 `decryption` 与出站的 `encryption` 字段实现 Xray-core 的 VLESS Encryption（`mlkem768x25519plus`），与 Xray-core 互通。该加密层位于传输层与 VLESS 头部之间：通过 ML-KEM-768 与 X25519 混合密钥交换建立具备前向安全的会话，以 X25519 或 ML-KEM-768（抗量子）密钥认证服务端，支持 0-RTT 会话复用及重放检测。
+
+启用加密后，`xtls-rprx-vision` 流控以加密层代替外层 TLS 工作，因此可用于 XHTTP、WebSocket、gRPC 等任意传输层，也可在不启用 TLS 的情况下使用；内层 TLS 1.3 流量切换为直接转发时绕过加密层，与 Xray-core 行为一致。未启用加密时，Vision 仍仅支持直接基于 TLS 或 REALITY 的连接。
+
+订阅解析支持分享链接中的 `encryption` 参数与 Clash 配置中的 `encryption` 字段。
+
+取值格式与 Xray-core 相同：
+
+| 字段 | 格式 |
+|---|---|
+| 入站 `decryption` | `mlkem768x25519plus.<外观>.<票据有效期>.[填充.]<服务端密钥>` |
+| 出站 `encryption` | `mlkem768x25519plus.<外观>.<0rtt 或 1rtt>.[填充.]<客户端密钥>` |
+
+- **外观**：`native` 为 TLS 记录形态；`xorpub` 额外混淆公钥；`random` 使全部流量呈现为随机字节。双方取值必须一致。
+- **票据有效期**：服务端签发的 0-RTT 票据有效期，如 `600s` 或范围 `300-600s`；`0s` 表示禁用 0-RTT。
+- **填充**：可选，如 `100-111-1111.75-0-111.50-0-3333`，依次为长度与间隔参数，未设置时采用 Xray 默认值。
+- **密钥**：执行 `sing-box generate vless-encryption` 生成成对的 `decryption` 与 `encryption`；X25519 与 ML-KEM-768 认证任选其一。
+
+```json
+{
+  "type": "vless",
+  "server": "example.com",
+  "server_port": 443,
+  "uuid": "bf000d23-0752-40b4-affe-68f7707a9661",
+  "flow": "xtls-rprx-vision",
+  "encryption": "mlkem768x25519plus.native.0rtt.<client key>",
+  "tls": {
+    "enabled": true,
+    "server_name": "example.com"
+  },
+  "transport": {
+    "type": "xhttp",
+    "path": "/xhttp"
+  }
+}
+```
+
 ## EasyTier 端点
 
 `easytier` 端点将 sing-box 接入 [EasyTier](https://github.com/EasyTier/EasyTier) 虚拟网络。EasyTier 内核以 WebAssembly 形式内嵌并由 wazero 执行，无需另行部署 `easytier-core`。该功能为实验性功能，需使用 `with_easytier` 构建标记，二进制文件体积约增加 11 MB。
@@ -470,7 +511,7 @@ wazero 仅在 amd64 与 arm64 架构上以编译方式执行，其他架构使�
 
 - **URLTest 健康检查**：每个检查周期优先探测热点节点（手动指定的节点、当前选择的节点及延迟最低的 4 个节点）与尚未探测的节点，其余节点按探测时间先后轮流检查。持续失败的节点按 1、2、4、8 个周期退避，网络变化时重置。当前选择的节点在连续 2 次探测失败或 5 次拨号失败后才会更换。
 - **缓存一致性**：规则集与订阅 Provider 的缓存记录与磁盘文件不一致时，直接加载磁盘文件，不再重新下载。远程规则集的下载体积上限为 50 MiB。
-- **订阅解析**：支持 XHTTP 配置；正确解析 ECH 配置中的 `query-server-name`；修复 VMess `cipher: auto` 在 TLS 下被转换为 `zero` 的问题。
+- **订阅解析**：支持 XHTTP 配置与 VLESS Encryption；正确解析 ECH 配置中的 `query-server-name`；修复 VMess `cipher: auto` 在 TLS 下被转换为 `zero` 的问题。
 - **网络切换**：尚未获取默认网卡时由内核选择路由；网络切换期间的不可达错误降为 Debug 级别，且每秒至多记录一次。
 - **日志**：没有日志订阅者时，不再格式化超出日志级别的条目。
 - **配置语法预校验**：命令行程序在解析配置前进行轻量语法检查，可识别 `//`、`#` 与 `/* */` 注释。未闭合的字符串、未闭合的块注释以及多余的 `}` 或 `]` 将报告行号与列号，文件末尾未闭合的括号将报告缺失数量。此项检查用于避免上游 JSON 注释解析器在遇到格式错误的配置时持续占用内存直至进程被终止。

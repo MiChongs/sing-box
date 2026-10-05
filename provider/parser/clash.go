@@ -277,6 +277,7 @@ type VlessOption struct {
 	*TLSOptions    `yaml:",inline"`
 	UUID           string       `yaml:"uuid"`
 	Flow           string       `yaml:"flow,omitempty"`
+	Encryption     string       `yaml:"encryption,omitempty"`
 	UDP            bool         `yaml:"udp,omitempty"`
 	PacketAddr     bool         `yaml:"packet-addr,omitempty"`
 	XUDP           bool         `yaml:"xudp,omitempty"`
@@ -306,11 +307,15 @@ func (v *VlessOption) Build() any {
 	case "packet":
 		v.PacketEncoding = "packetaddr"
 	}
+	if v.Encryption == "none" {
+		v.Encryption = ""
+	}
 	return &option.VLESSOutboundOptions{
 		DialerOptions:               v.DialerOptions.Build(),
 		ServerOptions:               v.ServerOptions.Build(),
 		UUID:                        v.UUID,
 		Flow:                        v.Flow,
+		Encryption:                  v.Encryption,
 		Network:                     clashNetworks(v.UDP),
 		OutboundTLSOptionsContainer: clashTLSOptions(v.Server, v.TLSOptions),
 		Multiplex:                   v.MuxOpts.Build(),
