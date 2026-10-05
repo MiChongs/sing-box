@@ -161,7 +161,7 @@ jobs:
           done
           TAGS="${OTHERS},with_naive_outbound,with_xhttp,netgo,with_ebpf"
           list GOOS=android GOARCH=arm64 CGO_ENABLED=1
-          TAGS="${OTHERS},with_naive_outbound,with_xhttp,netgo,with_easytier"
+          TAGS="${OTHERS},with_naive_outbound,with_xhttp,netgo,with_ebpf,with_easytier"
           list GOOS=android GOARCH=arm64 CGO_ENABLED=1
           go list -deps ./cmd/internal/build_libbox > /dev/null
           du -sh ~/go/pkg/mod
@@ -434,8 +434,9 @@ jobs:
   # 4) Android arm64-v8a (CGO + NDK + naive，走 cmd/internal/build_libbox
   #    android-bin 入口)，普通版与 -ebpf 版在同一 job 先后编译共享构建缓存。
   #    continue-on-error 让 Android 失败不阻塞 desktop 的发布。
-  #    实验性 -easytier 版在单独的 continue-on-error 步骤中编译，失败不影响
-  #    普通版与 -ebpf 版，结果经 job output 写入 Release 说明。
+  #    实验性 -easytier 与 -ebpf-easytier 版在单独的 continue-on-error 步骤中
+  #    逐个编译，任一失败不影响普通版、-ebpf 版与其他实验版，结果经 job
+  #    output 写入 Release 说明。
   # ───────────────────────────────────────────────────────────────────
   android:
     name: android/arm64-v8a (+ebpf, +experimental)
@@ -551,20 +552,38 @@ jobs:
           set -euo pipefail
           command -v pigz >/dev/null || sudo apt-get install -y --no-install-recommends pigz >/dev/null
           STRIP="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          for EXPERIMENT in "easytier:with_easytier"; do
-            FEATURE="${EXPERIMENT%%:*}"
-            FEATURE_TAG="${EXPERIMENT#*:}"
-            echo "::group::build_libbox android/arm64-${FEATURE}"
+          build_variant() {
+            local variant="$1" tags="$2"
             go run ./cmd/internal/build_libbox -target android-bin -platform android/arm64 \
-              -version "${VERSION}" -tags "${FEATURE_TAG}"
-            echo "::endgroup::"
+              -version "${VERSION}" -tags "${tags}"
             "$STRIP" --strip-all sing-box-android-arm64-v8a
             ls -lh sing-box-android-arm64-v8a
             mv sing-box-android-arm64-v8a sing-box
-            tar cf - sing-box | pigz -9 > "dist/sing-box-${VERSION}-android-arm64-v8a-${FEATURE}.tar.gz"
+            tar cf - sing-box | pigz -9 > "dist/sing-box-${VERSION}-android-arm64-v8a${variant}.tar.gz"
             rm -f sing-box
+          }
+          # 每个实验版独立编译：一个失败时继续编译其余的，最后让步骤失败。
+          FAILED=()
+          for EXPERIMENT in "-easytier:with_easytier" "-ebpf-easytier:with_ebpf,with_easytier"; do
+            VARIANT="${EXPERIMENT%%:*}"
+            echo "::group::build_libbox android/arm64${VARIANT}"
+            # 子 shell 不能放在 if 条件里，否则其中的 set -e 不生效。
+            set +e
+            (set -euo pipefail; build_variant "$VARIANT" "${EXPERIMENT#*:}")
+            STATUS=$?
+            set -e
+            if [ "$STATUS" -ne 0 ]; then
+              FAILED+=("$VARIANT")
+              echo "::error::android/arm64${VARIANT} experimental build failed"
+              rm -f sing-box sing-box-android-arm64-v8a "dist/sing-box-${VERSION}-android-arm64-v8a${VARIANT}.tar.gz"
+            fi
+            echo "::endgroup::"
           done
           ls -lh dist
+          if [ "${#FAILED[@]}" -gt 0 ]; then
+            echo "failed: ${FAILED[*]}"
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v5
@@ -707,7 +726,7 @@ jobs:
             echo ""
             echo "> 带 \`-ebpf\` 后缀的是启用 eBPF 入站 (\`with_ebpf\`) 的构建，其余功能与同平台普通版一致。"
             echo ">"
-            echo "> 带 \`-easytier\` 后缀的是启用 EasyTier endpoint (\`with_easytier\`) 的**实验性**构建，仅提供 amd64 / arm64（含 Android arm64-v8a），其余功能与同平台普通版一致。"
+            echo "> 带 \`-easytier\` 后缀的是启用 EasyTier endpoint (\`with_easytier\`) 的**实验性**构建，仅提供 amd64 / arm64（含 Android arm64-v8a），其余功能与同平台普通版一致；Android 另有同时启用 eBPF 与 EasyTier 的 \`-ebpf-easytier\` 版。"
             echo ""
             if ls builds/*.tar.gz >/dev/null 2>&1; then
               echo "| File | Size |"
