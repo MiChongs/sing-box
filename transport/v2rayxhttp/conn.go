@@ -36,6 +36,9 @@ type xhttpConn struct {
 
 	closeOnce sync.Once
 	closeErr  error
+	// closed 在本端 Close 后置位：pending Read 拿到的 "http2: response body closed"
+	// 等底层错误统一改报 net.ErrClosed，上层据此按正常关闭处理而非报错。
+	closed atomic.Bool
 	// onClose 在 Close 时调用一次，用于归还 XMUX 计数、取消请求 context。
 	onClose func()
 
@@ -65,6 +68,9 @@ func (c *xhttpConn) Read(p []byte) (int, error) {
 	if err != nil && c.deadlineFired.Load() {
 		return n, xhttpDeadlineError{}
 	}
+	if err != nil && err != io.EOF && c.closed.Load() {
+		return n, net.ErrClosed
+	}
 	return n, err
 }
 
@@ -81,6 +87,7 @@ func (c *xhttpConn) Write(p []byte) (int, error) {
 
 func (c *xhttpConn) Close() error {
 	c.closeOnce.Do(func() {
+		c.closed.Store(true)
 		c.deadlineAccess.Lock()
 		if c.readDeadlineTimer != nil {
 			c.readDeadlineTimer.Stop()
