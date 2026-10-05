@@ -46,7 +46,8 @@ env:
 # - Go 构建缓存 (~/.cache/go-build): 每个 target 一份，key 带 commit sha，
 #   restore-keys 前缀回退到上一次发布的缓存，每次发布都增量编译并写回。
 #   同一 target 的普通版与 -ebpf 版在同一 job 里先后编译，-ebpf 版复用
-#   普通版编译出的几乎全部包。
+#   普通版编译出的几乎全部包。实验性构建有自己的 key，没有命中时回退到
+#   同一 target 普通版的缓存。
 # - Go toolchain / Zig: setup-go、setup-zig 自带 runner tool cache。
 # - NDK: 优先用 runner 预装的 r28+，没有才下载。
 
@@ -148,6 +149,14 @@ jobs:
           done
           TAGS="$WINDOWS"
           for target in windows/amd64 windows/arm64 windows/386; do
+            list GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0
+          done
+          TAGS="${OTHERS},with_easytier"
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            list GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0
+          done
+          TAGS="${WINDOWS},with_easytier"
+          for target in windows/amd64 windows/arm64; do
             list GOOS="${target%/*}" GOARCH="${target#*/}" CGO_ENABLED=0
           done
           TAGS="${OTHERS},with_naive_outbound,with_xhttp,netgo,with_ebpf"
@@ -321,7 +330,105 @@ jobs:
           compression-level: 0
 
   # ───────────────────────────────────────────────────────────────────
-  # 3) Android arm64-v8a (CGO + NDK + naive，走 cmd/internal/build_libbox
+  # 3) 实验性构建：在普通版 tag 集合上加实验性功能 tag，产物带对应后缀，
+  #    与正式产物并列发布。continue-on-error 让实验性构建失败不阻塞发布。
+  #    - easytier: with_easytier（EasyTier endpoint，内嵌 WASM 内核约 +11MB）。
+  #      wazero 只在 amd64 / arm64 上编译执行，其他架构走解释器，因此只提供
+  #      amd64 / arm64。
+  # ───────────────────────────────────────────────────────────────────
+  experimental:
+    name: experimental ${{ matrix.feature }} ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    needs: prepare
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { feature: easytier, tag: with_easytier, goos: windows, goarch: amd64, ext: .exe, tags_src: windows }
+          - { feature: easytier, tag: with_easytier, goos: windows, goarch: arm64, ext: .exe, tags_src: windows }
+          - { feature: easytier, tag: with_easytier, goos: linux,   goarch: amd64, ext: '',   tags_src: others }
+          - { feature: easytier, tag: with_easytier, goos: linux,   goarch: arm64, ext: '',   tags_src: others }
+          - { feature: easytier, tag: with_easytier, goos: darwin,  goarch: amd64, ext: '',   tags_src: others }
+          - { feature: easytier, tag: with_easytier, goos: darwin,  goarch: arm64, ext: '',   tags_src: others }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Restore Go modules
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ needs.prepare.outputs.gomod_key }}
+
+      - name: Cache Go build
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/go-build
+          key: gobuild-${{ matrix.feature }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ env.GO_VERSION }}-${{ github.sha }}
+          restore-keys: |
+            gobuild-${{ matrix.feature }}-${{ matrix.goos }}-${{ matrix.goarch }}-${{ env.GO_VERSION }}-
+            gobuild-${{ matrix.goos }}-${{ matrix.goarch }}-${{ env.GO_VERSION }}-
+
+      - name: Build binary
+        env:
+          CGO_ENABLED: '0'
+          GOOS:        ${{ matrix.goos }}
+          GOARCH:      ${{ matrix.goarch }}
+          TAGS_SRC:    ${{ matrix.tags_src }}
+          FEATURE:     ${{ matrix.feature }}
+          FEATURE_TAG: ${{ matrix.tag }}
+          EXT:         ${{ matrix.ext }}
+          VERSION:     ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          case "$TAGS_SRC" in
+            windows) BASE_TAGS=$(cat release/DEFAULT_BUILD_TAGS_WINDOWS) ;;
+            *)       BASE_TAGS=$(cat release/DEFAULT_BUILD_TAGS_OTHERS) ;;
+          esac
+          BASE_TAGS=$(echo "$BASE_TAGS" | tr ',' '\n' | grep -vx 'with_naive_outbound' | paste -sd, -)
+          TAGS="${BASE_TAGS},${FEATURE_TAG}"
+          LDFLAGS="-s -w -buildid= $(cat release/LDFLAGS) -X github.com/sagernet/sing-box/constant.Version=${VERSION}"
+          NAME="sing-box-${VERSION}-${GOOS}-${GOARCH}-${FEATURE}"
+          BIN="${NAME}${EXT}"
+          mkdir -p dist
+          echo "::group::Build $BIN"
+          echo "tags=${TAGS}"
+          echo "ldflags=${LDFLAGS}"
+          go build -trimpath -buildvcs=false -tags "$TAGS" -ldflags "$LDFLAGS" -o "dist/$BIN" ./cmd/sing-box
+          echo "::endgroup::"
+          ls -lh "dist/$BIN"
+
+      - name: Pack with tar.gz
+        run: |
+          set -euo pipefail
+          command -v pigz >/dev/null || sudo apt-get install -y --no-install-recommends pigz >/dev/null
+          cd dist
+          for BIN in sing-box-*; do
+            tar cf - "$BIN" | pigz -9 > "${BIN%.exe}.tar.gz"
+            rm -f "$BIN"
+          done
+          ls -lh
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: experimental-${{ matrix.feature }}-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  # ───────────────────────────────────────────────────────────────────
+  # 4) Android arm64-v8a (CGO + NDK + naive，走 cmd/internal/build_libbox
   #    android-bin 入口)，普通版与 -ebpf 版在同一 job 先后编译共享构建缓存。
   #    continue-on-error 让 Android 失败不阻塞 desktop 的发布。
   # ───────────────────────────────────────────────────────────────────
@@ -438,8 +545,8 @@ jobs:
           compression-level: 0
 
   # ───────────────────────────────────────────────────────────────────
-  # 4) 收集所有 artifact + 生成 changelog + 创建 / 更新 Release
-  #    android 失败或被跳过时只要 desktop 成功就发布。
+  # 5) 收集所有 artifact + 生成 changelog + 创建 / 更新 Release
+  #    android、实验性构建失败或被跳过时只要 desktop 成功就发布。
   # ───────────────────────────────────────────────────────────────────
   publish:
     name: publish GitHub Release
@@ -447,6 +554,7 @@ jobs:
     needs:
       - prepare
       - desktop
+      - experimental
       - android
     if: always() && needs.desktop.result == 'success'
     steps:
@@ -511,6 +619,7 @@ jobs:
           PREV:         ${{ steps.prevtag.outputs.prev }}
           SKIP_ANDROID: ${{ needs.prepare.outputs.skip_android }}
           ANDROID_RES:  ${{ needs.android.result }}
+          EXPERIMENTAL_RES: ${{ needs.experimental.result }}
           REPO:         ${{ github.repository }}
           SERVER_URL:   ${{ github.server_url }}
           RUN_ID:       ${{ github.run_id }}
@@ -565,6 +674,8 @@ jobs:
             echo "## Artifacts"
             echo ""
             echo "> 带 \`-ebpf\` 后缀的是启用 eBPF 入站 (\`with_ebpf\`) 的构建，其余功能与同平台普通版一致。"
+            echo ">"
+            echo "> 带 \`-easytier\` 后缀的是启用 EasyTier endpoint (\`with_easytier\`) 的**实验性**构建，仅提供 amd64 / arm64，其余功能与同平台普通版一致。"
             echo ""
             if ls builds/*.tar.gz >/dev/null 2>&1; then
               echo "| File | Size |"
@@ -595,6 +706,16 @@ jobs:
               echo "> Built successfully and attached above."
             else
               echo "> Build failed. Inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) for logs."
+            fi
+            echo ""
+            echo "---"
+            echo ""
+            echo "## Experimental Builds"
+            echo ""
+            if [ "$EXPERIMENTAL_RES" = 'success' ]; then
+              echo "> Built successfully and attached above."
+            else
+              echo "> Some experimental builds failed and are not attached. Inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) for logs."
             fi
             echo ""
             echo "---"
