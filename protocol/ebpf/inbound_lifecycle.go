@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -182,8 +183,12 @@ func (i *Inbound) startInbound() error {
 	}
 	if cgroupBackend := i.cgroupBackendInstance(); cgroupBackend != nil {
 		if err = cgroupBackend.Attach(); err != nil {
+			if errors.Is(err, commonEBPF.ErrCgroupHookOccupied) {
+				return E.Cause(err, "cgroup hook is held exclusively by another program, use local.data_plane=tc instead")
+			}
 			return err
 		}
+		i.logCgroupHookTakeover(cgroupBackend)
 		i.startCgroupRecoveryScheduler(cgroupBackend)
 		i.startCgroupUDPReleaseReader(cgroupBackend)
 	}
@@ -373,6 +378,25 @@ func (i *Inbound) processTrackingMode() string {
 		return "cgroup_socket_lru"
 	}
 	return "userspace"
+}
+
+// cgroupAttachModeNetdReplace is the attach mode sing-ebpf reports for a hook
+// whose Android netd pass-through placeholder it replaced. The placeholder is
+// restored when the backend detaches.
+const cgroupAttachModeNetdReplace = "legacy_netd_replace"
+
+func (i *Inbound) logCgroupHookTakeover(backend *commonEBPF.CgroupBackend) {
+	var programs []string
+	for program, mode := range backend.AttachModes() {
+		if mode == cgroupAttachModeNetdReplace {
+			programs = append(programs, program)
+		}
+	}
+	if len(programs) == 0 {
+		return
+	}
+	slices.Sort(programs)
+	i.logger.Info("took over Android netd pass-through cgroup hooks for [", strings.Join(programs, ", "), "], netd programs are restored when the inbound stops")
 }
 
 func (i *Inbound) startCgroupUDPReleaseReader(backend *commonEBPF.CgroupBackend) {

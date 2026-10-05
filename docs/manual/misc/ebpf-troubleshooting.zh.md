@@ -116,7 +116,8 @@ attachment 列表是实际运行机制的准确信息。已配置路径没有对
 等待接口；cgroup attachment 本来就不存在网络接口 filter。
 
 local cgroup 还应记录 API 返回的实际运行字段：`local_cgroup_attach_mode`
-（`link_create`、`legacy_multi`、`legacy_exclusive` 或 `mixed`）、
+（`link_create`、`legacy_multi`、`legacy_exclusive`、`legacy_netd_replace` 或
+`mixed`）、
 `local_udp_cleanup_mode`、`local_udp_userspace_cleanup_mode`、
 `local_udp_storage_mode` 和 `local_udp_time_mode`。这些字段表示厂商内核或安全策略
 触发回退后真正选中的路径，不是能力猜测。
@@ -154,6 +155,10 @@ program/map 枚举按 `sb_` 命名约定筛选，同一内核中其他可见的 
 - 对象已成功加载，但 cgroup 程序挂载时报 `operation not permitted`，应检查所选层级、
   delegation、multi/独占挂载支持和 Android netd 等现有 hook，并记录启动时最终选择的
   cgroup 挂载方式。
+- `refusing to replace existing cgroup program owner` 表示有其他程序以单程序模式
+  持有该 hook，错误中会列出这些程序以及保留它们的原因。sing-box 只会替换 Android
+  15+ netd 直接放行的占位程序，此时挂载方式报告为 `legacy_netd_replace`。对于其他
+  程序，应释放该 hook 或使用 `local.data_plane=tc`。
 - 探测成功后 TC 挂载仍失败，需要实际链路类型、qdisc/filter 清单、接口锁结果和
   netlink 错误；探测命令按设计不会修改 qdisc。
 - SOCKMAP 失败后可以正常选择 legacy TC 对象；只有回退对象也失败或入站未激活时，
@@ -260,6 +265,11 @@ qdisc/filter 位于同一接口就删除它们。
 
 清理报错时，保留准确对象/接口标识；在人工删除前，优先尝试使用同一构建重新启动并
 正常停止。人工清理只能针对已明确确认由 sing-box 创建的状态。
+
+在入站接管过 netd hook 的设备上，正常停止会把 netd 的占位程序放回去。如果进程被
+强制结束，这些 hook 会保持被接管状态，直到下次启动时先还原 netd 的程序再重新挂载。
+这些 hook 上的 `sb_hook_allow` 程序是 netd 固定程序不可用时用来代替其占位程序的
+直接放行程序，不要卸载它：hook 被清空会导致重启的 netd 中止。
 
 ## 隐私
 

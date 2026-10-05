@@ -131,7 +131,7 @@ waiting for an interface; a cgroup attachment has no network-interface filter.
 
 For local cgroup, also record the effective runtime fields returned by the API:
 `local_cgroup_attach_mode` (`link_create`, `legacy_multi`,
-`legacy_exclusive`, or `mixed`), `local_udp_cleanup_mode`,
+`legacy_exclusive`, `legacy_netd_replace`, or `mixed`), `local_udp_cleanup_mode`,
 `local_udp_userspace_cleanup_mode`, `local_udp_storage_mode`, and
 `local_udp_time_mode`. These describe the path actually selected after vendor
 kernel and security-policy fallbacks; they are not capability guesses.
@@ -182,6 +182,11 @@ produce a different result from the service manager.
   program points to the selected hierarchy, delegation, multi/exclusive attach
   support, or an existing hook such as Android netd. The cgroup fallback mode
   selected at startup matters.
+- `refusing to replace existing cgroup program owner` means another program
+  holds the hook in single-program mode; the error names the owners and why
+  they were kept. The only owner sing-box replaces is the Android 15+ netd
+  pass-through placeholder, reported as `legacy_netd_replace`. For any other
+  owner, free the hook or use `local.data_plane=tc`.
 - TC attach failure after a successful probe requires the actual link type,
   qdisc/filter inventory, interface lock result, and netlink error. The probe
   intentionally does not modify qdiscs.
@@ -308,6 +313,13 @@ If cleanup reports an error, preserve the exact object/interface identifiers
 and retry by starting then gracefully stopping the same build before manual
 removal. Manual cleanup should be the last step and must target only positively
 identified sing-box-owned state.
+
+On a device where the inbound took over netd hooks, a graceful stop puts netd's
+placeholder back. If the process is killed, the hooks stay taken over until the
+next start, which restores netd's program before attaching again. An
+`sb_hook_allow` program on those hooks is a pass-through stand-in for netd's
+placeholder, used when netd's pinned program is unavailable. Leave it attached:
+an emptied hook makes a restarting netd abort.
 
 ## Privacy
 

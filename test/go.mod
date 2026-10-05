@@ -40,7 +40,7 @@ require (
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1 // indirect
-	github.com/MiChongs/sing-ebpf v0.1.0-alpha.15 // indirect
+	github.com/MiChongs/sing-ebpf v0.1.0-alpha.16 // indirect
 	github.com/Microsoft/go-winio v0.6.1 // indirect
 	github.com/RussellLuo/timingwheel v0.0.0-20220218152713-54845bda3108 // indirect
 	github.com/RyuaNerin/go-krypto v1.3.0 // indirect

@@ -103,8 +103,18 @@ cgroup v2 子树。
 `cgroup` 数据面使用的绝对 cgroup v2 子树。省略时接管当前可见的 cgroup v2 根层级
 及其子层级。
 
-Android 厂商的 netd hook 可能造成挂载冲突。sing-box 优先尝试多程序挂载，只在兼容
-错误下回退旧式独占挂载；设备无法安全共享根 cgroup hook 时应使用 local `tc`。
+sing-box 优先尝试多程序挂载，只在兼容错误下回退旧式独占挂载。
+
+Android 15 及以上的 netd 会以单程序模式在 cgroup v2 根层级的 connect、sendmsg 和
+recvmsg hook 上挂载一个直接放行的占位程序，导致所有 cgroup 的这些 hook 都无法进行
+多程序挂载。sing-box 会在入站运行期间替换该占位程序，并在入站停止时将其还原；API
+将此报告为挂载方式 `legacy_netd_replace`。入站占用这些 hook 期间，eBPF 进程追踪和
+另一个使用 cgroup 数据面的入站都无法挂载到这些 hook 上，因此进程查找会回退到用户态
+搜索。netd 的 socket-release 程序永远不会被替换，因此这类设备上的 UDP 清理使用有界
+LRU 回退。
+
+其他以独占方式持有 hook 的程序都会被保留，启动将失败，并在错误中指明该程序。这种
+情况下应使用 local `tc`。
 
 ### local.dns_mode
 

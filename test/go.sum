@@ -6,8 +6,8 @@ filippo.io/edwards25519 v1.2.0/go.mod h1:xzAOLCNug/yB62zG1bQ8uziwrIqIuxhctzJT18Q
 github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1 h1:UQHMgLO+TxOElx5B5HZ4hJQsoJ/PvUvKRhJHDQXO8P8=
 github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
-github.com/MiChongs/sing-ebpf v0.1.0-alpha.15 h1:rn2qfxiWQB5wQUGkIo/BCXXVlPie3uMRhG8H03Yxkwc=
-github.com/MiChongs/sing-ebpf v0.1.0-alpha.15/go.mod h1:swwBAcOfGFH5R8n7yHwIrNRsaiE/didsG3gN9bqDLZM=
+github.com/MiChongs/sing-ebpf v0.1.0-alpha.16 h1:jY432K2CD7ryXEf+GpZClVCcGfEewtPzqTKI44UTC2k=
+github.com/MiChongs/sing-ebpf v0.1.0-alpha.16/go.mod h1:swwBAcOfGFH5R8n7yHwIrNRsaiE/didsG3gN9bqDLZM=
 github.com/Microsoft/go-winio v0.6.1 h1:9/kr64B9VUZrLm5YYwbGtUJnMgqWVOdUAXu6Migciow=
 github.com/Microsoft/go-winio v0.6.1/go.mod h1:LRdKpFKfdobln8UmuiYcKPot9D2v6svN5+sAH+4kjUM=
 github.com/RussellLuo/timingwheel v0.0.0-20220218152713-54845bda3108 h1:iPugyBI7oFtbDZXC4dnY093M1kZx6k/95sen92gafbY=
