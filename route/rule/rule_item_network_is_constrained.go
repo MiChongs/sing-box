@@ -25,5 +25,5 @@ func (r *NetworkIsConstrainedItem) Match(metadata *adapter.InboundContext) bool 
 }
 
 func (r *NetworkIsConstrainedItem) String() string {
-	return "network_is_expensive=true"
+	return "network_is_constrained=true"
 }

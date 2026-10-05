@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	R "github.com/sagernet/sing-box/route/rule"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/render"
@@ -44,15 +45,17 @@ type RuleExtra struct {
 	MissAt    time.Time `json:"missAt"`
 }
 
-// allRules 返回 /rules 列出的规则：先 DNS 规则后路由规则，下标即 Rule.Index。
+// allRules 返回 /rules 列出的规则，下标即 Rule.Index：与 mihomo 一致先列出路由规则，
+// DNS 规则接在其后。
 func allRules(router adapter.Router, dnsRouter adapter.DNSRouter) []adapter.Rule {
-	dnsRules := dnsRouter.Rules()
 	routeRules := router.Rules()
-	rules := make([]adapter.Rule, 0, len(dnsRules)+len(routeRules))
+	dnsRules := dnsRouter.Rules()
+	rules := make([]adapter.Rule, 0, len(routeRules)+len(dnsRules))
+	rules = append(rules, routeRules...)
 	for _, rule := range dnsRules {
 		rules = append(rules, rule)
 	}
-	return append(rules, routeRules...)
+	return rules
 }
 
 func getRules(router adapter.Router, dnsRouter adapter.DNSRouter) func(w http.ResponseWriter, r *http.Request) {
@@ -61,11 +64,12 @@ func getRules(router adapter.Router, dnsRouter adapter.DNSRouter) func(w http.Re
 		rules := make([]Rule, 0, len(rawRules))
 		for index, rule := range rawRules {
 			disabled := rule.Disabled()
+			ruleType, payload := R.ClashRule(rule)
 			rules = append(rules, Rule{
 				Index:   index,
-				Type:    rule.Type(),
-				Payload: rule.String(),
-				Proxy:   rule.Action().String(),
+				Type:    ruleType,
+				Payload: payload,
+				Proxy:   R.ClashProxy(rule.Action()),
 				Size:    -1,
 				Extra: &RuleExtra{
 					Disabled:  disabled,

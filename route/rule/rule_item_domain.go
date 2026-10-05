@@ -16,6 +16,9 @@ type DomainItem struct {
 	matcher             *domain.Matcher
 	description         string
 	domainMatchStrategy C.DomainMatchStrategy
+	// 仅顶层规则保留配置原值，供 Clash API 按配置展示；规则集条目不保留，避免大列表常驻内存
+	domains        []string
+	domainSuffixes []string
 }
 
 func NewDomainItem(domains []string, domainSuffixes []string, domainMatchStrategy C.DomainMatchStrategy) (*DomainItem, error) {
@@ -48,17 +51,17 @@ func NewDomainItem(domains []string, domainSuffixes []string, domainMatchStrateg
 		}
 	}
 	return &DomainItem{
-		domain.NewMatcher(domains, domainSuffixes, false),
-		description,
-		domainMatchStrategy,
+		matcher:             domain.NewMatcher(domains, domainSuffixes, false),
+		description:         description,
+		domainMatchStrategy: domainMatchStrategy,
 	}, nil
 }
 
 func NewRawDomainItem(matcher *domain.Matcher, domainMatchStrategy C.DomainMatchStrategy) *DomainItem {
 	return &DomainItem{
-		matcher,
-		"domain/domain_suffix=<binary>",
-		domainMatchStrategy,
+		matcher:             matcher,
+		description:         "domain/domain_suffix=<binary>",
+		domainMatchStrategy: domainMatchStrategy,
 	}
 }
 

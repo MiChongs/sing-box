@@ -12,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/common/trafficcontrol"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/protocol/group"
+	R "github.com/sagernet/sing-box/route/rule"
 	"github.com/sagernet/sing/common"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json"
@@ -89,11 +90,10 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 			processPath = F.ToString(processPath, " (", c.Metadata.ProcessInfo.UserId, ")")
 		}
 	}
-	var rule string
+	// 同 mihomo 连接的 rule / rulePayload；未命中任何规则时落到 final 出站，相当于 mihomo 的 MATCH
+	rule, rulePayload := "Match", ""
 	if c.Rule != nil {
-		rule = F.ToString(c.Rule, " => ", c.Rule.Action())
-	} else {
-		rule = "final"
+		rule, rulePayload = R.ClashRule(c.Rule)
 	}
 	return json.Marshal(map[string]any{
 		"id": c.ID,
@@ -114,7 +114,7 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 		"start":       c.CreatedAt,
 		"chains":      c.Chain,
 		"rule":        rule,
-		"rulePayload": "",
+		"rulePayload": rulePayload,
 	})
 }
 

@@ -85,10 +85,19 @@
 
 !!! info "规则命中统计"
 
-    `GET /rules` 依次列出 DNS 规则与路由规则。与 mihomo 一致，每条规则返回
-    `index`、`size` 与 `extra`（`disabled`、`hitCount`、`hitAt`、`missCount`、
-    `missAt`）：顶层规则每参与一次匹配计一次命中或未命中，被禁用的规则跳过不计。
-    统计保存在内存中，重启或重载配置后清零。
+    `GET /rules` 依次列出路由规则与 DNS 规则，格式与 mihomo 一致：`type` 与
+    `payload` 使用 mihomo 规则类型（`DomainSuffix`、`IPCIDR`、`RuleSet`、`InName`、
+    `DstPort` 等；`ip_is_private` 显示为 `GeoIP,lan`，mihomo 中没有对应类型的条件
+    使用字段名的驼峰形式，如 `ClashMode`）。含多个条件的规则以 `AND` / `OR` / `NOT`
+    载荷表示，如 `((Network,udp) && (DstPort,443))`；mihomo 以 `/` 分隔的多值
+    （端口、入站、用户、uid）合并为一条；没有条件的规则为 `Match`。`proxy` 为目标
+    出站或 DNS 服务器的标签，其余动作为大写的动作名（`REJECT`、`REJECT-DROP`、
+    `SNIFF`、`HIJACK-DNS` 等）。`/connections` 的 `rule` 与 `rulePayload` 使用同样的
+    格式，连接落到 `route.final` 时为 `Match`。
+
+    与 mihomo 一致，每条规则返回 `index`、`size` 与 `extra`（`disabled`、`hitCount`、
+    `hitAt`、`missCount`、`missAt`）：顶层规则每参与一次匹配计一次命中或未命中，
+    被禁用的规则跳过不计。统计保存在内存中，重启或重载配置后清零。
 
     `PATCH /rules/disable` 接受 `{"<index>": true|false}`，按 `index` 禁用或启用规则；
     `PUT /rules/{uuid}` 仍可按 `uuid` 切换规则状态。

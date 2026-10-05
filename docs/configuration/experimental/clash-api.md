@@ -86,11 +86,24 @@
 
 !!! info "Rule statistics"
 
-    `GET /rules` lists DNS rules followed by route rules. Like mihomo, each rule
-    reports `index`, `size` and `extra` (`disabled`, `hitCount`, `hitAt`,
-    `missCount`, `missAt`): every time a top-level rule is evaluated it counts one
-    hit or miss, disabled rules are skipped and not counted. Statistics are kept
-    in memory and reset when sing-box restarts or reloads the configuration.
+    `GET /rules` lists route rules followed by DNS rules, in the same format as
+    mihomo: `type` and `payload` use mihomo rule types (`DomainSuffix`,
+    `IPCIDR`, `RuleSet`, `InName`, `DstPort`, ...; `ip_is_private` is shown as
+    `GeoIP,lan`, conditions without a mihomo equivalent use the camel-cased
+    field name such as `ClashMode`). A rule with several conditions is shown as
+    an `AND` / `OR` / `NOT` payload like `((Network,udp) && (DstPort,443))`,
+    values that mihomo separates with `/` (ports, inbounds, users, uid) are
+    merged, and a rule without conditions is `Match`. `proxy` is the target
+    outbound or DNS server tag, or the upper-cased action name for other actions
+    (`REJECT`, `REJECT-DROP`, `SNIFF`, `HIJACK-DNS`, ...). The `rule` and
+    `rulePayload` of `/connections` use the same format, and `Match` when the
+    connection went to `route.final`.
+
+    Like mihomo, each rule reports `index`, `size` and `extra` (`disabled`,
+    `hitCount`, `hitAt`, `missCount`, `missAt`): every time a top-level rule is
+    evaluated it counts one hit or miss, disabled rules are skipped and not
+    counted. Statistics are kept in memory and reset when sing-box restarts or
+    reloads the configuration.
 
     `PATCH /rules/disable` takes `{"<index>": true|false}` to disable or enable
     rules by `index`; `PUT /rules/{uuid}` still toggles a rule by `uuid`.

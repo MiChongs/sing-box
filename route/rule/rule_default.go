@@ -117,6 +117,7 @@ func NewDefaultRule(ctx context.Context, logger log.ContextLogger, options optio
 		if err != nil {
 			return nil, err
 		}
+		item.domains, item.domainSuffixes = options.Domain, options.DomainSuffix
 		rule.destinationAddressItems = append(rule.destinationAddressItems, item)
 		rule.allItems = append(rule.allItems, item)
 	}
@@ -147,6 +148,7 @@ func NewDefaultRule(ctx context.Context, logger log.ContextLogger, options optio
 		if err != nil {
 			return nil, E.Cause(err, "source_ip_cidr")
 		}
+		item.prefixes = options.SourceIPCIDR
 		rule.sourceAddressItems = append(rule.sourceAddressItems, item)
 		rule.allItems = append(rule.allItems, item)
 	}
@@ -160,6 +162,7 @@ func NewDefaultRule(ctx context.Context, logger log.ContextLogger, options optio
 		if err != nil {
 			return nil, E.Cause(err, "ipcidr")
 		}
+		item.prefixes = options.IPCIDR
 		rule.destinationIPCIDRItems = append(rule.destinationIPCIDRItems, item)
 		rule.allItems = append(rule.allItems, item)
 	}

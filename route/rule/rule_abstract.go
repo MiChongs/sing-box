@@ -3,6 +3,7 @@ package rule
 import (
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -21,6 +22,8 @@ type abstractRule struct {
 	hitAt     atomicTime
 	missCount atomic.Uint64
 	missAt    atomicTime
+	clashOnce sync.Once
+	clash     clashRule
 }
 
 func (r *abstractRule) Disabled() bool {

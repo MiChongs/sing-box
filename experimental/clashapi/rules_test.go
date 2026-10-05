@@ -124,8 +124,10 @@ func TestGetRulesStatistics(t *testing.T) {
 		// 与 mihomo 一致：未命中过时为 Unix 纪元
 		require.True(t, rule.Extra.HitAt.Equal(time.Unix(0, 0)))
 	}
-	require.Equal(t, dnsRouter.rules[0].UUID(), rules[0].UUID)
-	require.Equal(t, router.rules[1].UUID(), rules[2].UUID)
+	// 与 mihomo 一致先列路由规则，DNS 规则接在其后
+	require.Equal(t, router.rules[0].UUID(), rules[0].UUID)
+	require.Equal(t, router.rules[1].UUID(), rules[1].UUID)
+	require.Equal(t, dnsRouter.rules[0].UUID(), rules[2].UUID)
 
 	before := time.Now().Round(0).Truncate(time.Second)
 	router.rules[0].Hit()
@@ -133,13 +135,29 @@ func TestGetRulesStatistics(t *testing.T) {
 	router.rules[0].Miss()
 	dnsRouter.rules[0].Miss()
 	rules = fetchTestRules(t, handler)
-	require.Equal(t, uint64(0), rules[0].Extra.HitCount)
+	require.Equal(t, uint64(2), rules[0].Extra.HitCount)
 	require.Equal(t, uint64(1), rules[0].Extra.MissCount)
-	require.Equal(t, uint64(2), rules[1].Extra.HitCount)
-	require.Equal(t, uint64(1), rules[1].Extra.MissCount)
-	require.False(t, rules[1].Extra.HitAt.Before(before))
-	require.False(t, rules[1].Extra.MissAt.Before(before))
+	require.False(t, rules[0].Extra.HitAt.Before(before))
+	require.False(t, rules[0].Extra.MissAt.Before(before))
+	require.Equal(t, uint64(0), rules[1].Extra.HitCount)
 	require.Equal(t, uint64(0), rules[2].Extra.HitCount)
+	require.Equal(t, uint64(1), rules[2].Extra.MissCount)
+}
+
+func TestGetRulesMihomoFormat(t *testing.T) {
+	t.Parallel()
+	router, dnsRouter := newTestRuleRouters(t)
+	rules := fetchTestRules(t, ruleRouter(router, dnsRouter))
+	require.Len(t, rules, 3)
+	for index, expected := range []struct{ ruleType, payload, proxy string }{
+		{"Domain", "direct.example.com", "direct"},
+		{"Domain", "proxy.example.com", "proxy"},
+		{"Domain", "example.com", "local"},
+	} {
+		require.Equal(t, expected.ruleType, rules[index].Type)
+		require.Equal(t, expected.payload, rules[index].Payload)
+		require.Equal(t, expected.proxy, rules[index].Proxy)
+	}
 }
 
 func TestDisableRulesByIndex(t *testing.T) {
@@ -152,18 +170,18 @@ func TestDisableRulesByIndex(t *testing.T) {
 		handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodPatch, "/disable", strings.NewReader(body)))
 		return recorder.Code
 	}
-	require.Equal(t, http.StatusNoContent, patch(`{"0": true, "2": true, "9": true, "-1": true}`))
-	require.True(t, dnsRouter.rules[0].Disabled())
+	require.Equal(t, http.StatusNoContent, patch(`{"1": true, "2": true, "9": true, "-1": true}`))
 	require.False(t, router.rules[0].Disabled())
 	require.True(t, router.rules[1].Disabled())
+	require.True(t, dnsRouter.rules[0].Disabled())
 	rules := fetchTestRules(t, handler)
-	require.True(t, rules[0].Extra.Disabled)
-	require.True(t, rules[0].Disabled)
-	require.False(t, rules[1].Extra.Disabled)
+	require.False(t, rules[0].Extra.Disabled)
+	require.True(t, rules[1].Extra.Disabled)
+	require.True(t, rules[1].Disabled)
 	require.True(t, rules[2].Extra.Disabled)
 
 	require.Equal(t, http.StatusNoContent, patch(`{"2": false}`))
-	require.False(t, router.rules[1].Disabled())
+	require.False(t, dnsRouter.rules[0].Disabled())
 	require.Equal(t, http.StatusNoContent, patch(`{}`))
 	require.Equal(t, http.StatusBadRequest, patch(`not json`))
 
