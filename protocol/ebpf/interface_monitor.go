@@ -685,6 +685,13 @@ func (i *Inbound) updateTCInterfaces(ctx context.Context) (outcome tcUpdateOutco
 		i.interfaceWarnings.infrastructure.warn(i.logger, "repair TC eBPF network state: ", err)
 		outcome.general = tcSharedRewriteRecoverable
 	}
+	redirectRoutesChanged, err := i.reconcileRedirectInterfaceRoutes()
+	if err != nil {
+		i.interfaceWarnings.redirectRoutes.warn(i.logger, "refresh eBPF redirect routes for bound sockets: ", err)
+		outcome.general = tcSharedRewriteRecoverable
+	} else if redirectRoutesChanged {
+		i.logger.Debug("eBPF redirect routes for bound sockets updated")
+	}
 	changed, err := i.tcAttachmentStateChanged(localInterface, tcSharedInterfaces)
 	if err != nil {
 		i.interfaceWarnings.topology.warn(i.logger, "inspect TC eBPF interfaces: ", err)

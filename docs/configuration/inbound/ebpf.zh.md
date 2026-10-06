@@ -103,6 +103,11 @@ cgroup v2 子树。
 `cgroup` 数据面使用的绝对 cgroup v2 子树。省略时接管当前可见的 cgroup v2 根层级
 及其子层级。
 
+绑定了网络接口的 socket（例如 systemd-resolved 用于其 DNS 服务器的 socket）同样会被
+接管。这类 socket 的路由查找限定在所绑定的接口上，因此 sing-box 会在每个已启用且带有
+对应地址族地址的接口上，把重定向前缀安装为本地路由（`local` 表中 protocol 为 83），
+并随接口与地址的变化更新。
+
 sing-box 优先尝试多程序挂载，只在兼容错误下回退旧式独占挂载。
 
 Android 15 及以上的 netd 会以单程序模式在 cgroup v2 根层级的 connect、sendmsg 和

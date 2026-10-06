@@ -109,6 +109,12 @@ the cgroup path follows the selected cgroup v2 subtree.
 Absolute cgroup v2 subtree used by the `cgroup` data plane. When omitted, the
 visible cgroup v2 root and its descendants are intercepted.
 
+Sockets bound to an interface, such as the ones systemd-resolved uses for its
+DNS servers, are intercepted as well. Their route lookups require the bound
+interface, so sing-box installs the redirect prefixes as local routes
+(protocol 83 in table `local`) on every interface that is up and has an address
+of the matching family, and updates them as interfaces and addresses change.
+
 sing-box prefers multi-program attachment and falls back to legacy exclusive
 attachment only for compatible errors.
 

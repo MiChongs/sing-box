@@ -109,6 +109,7 @@ type interfaceWarningLimiters struct {
 	defaultInterface warningLimiter
 	topology         warningLimiter
 	infrastructure   warningLimiter
+	redirectRoutes   warningLimiter
 	hostPolicy       warningLimiter
 	reconcile        warningLimiter
 	fakeIPICMPRoute  warningLimiter

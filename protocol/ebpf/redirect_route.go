@@ -49,7 +49,25 @@ func (i *Inbound) setupLocalRoutes() error {
 		return err
 	}
 	i.localRoutes = routes
+	// A failure here only affects sockets bound to an interface; the interface
+	// update that follows the monitor's start retries it.
+	if _, err = i.reconcileRedirectInterfaceRoutes(); err != nil {
+		i.interfaceWarnings.redirectRoutes.warn(i.logger, "configure eBPF redirect routes for bound sockets: ", err)
+	}
 	return nil
+}
+
+// reconcileRedirectInterfaceRoutes keeps the cgroup data plane's redirect
+// prefixes reachable from sockets bound to an interface, such as the ones
+// systemd-resolved uses for its DNS servers. Their route lookups skip the
+// prefixes' loopback routes, so a connection the cgroup programs redirected
+// would otherwise leave through the bound interface instead of reaching the
+// listeners.
+func (i *Inbound) reconcileRedirectInterfaceRoutes() (bool, error) {
+	if i.localRoutes == nil || !i.localCgroupEnabled() {
+		return false, nil
+	}
+	return i.localRoutes.ReconcileInterfaceRoutes()
 }
 
 func (i *Inbound) removeLocalRoutes() error {
