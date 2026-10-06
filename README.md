@@ -7,7 +7,7 @@
 [![Last Commit](https://img.shields.io/github/last-commit/MiChongs/sing-box/xiaobaf14g-testing)](https://github.com/MiChongs/sing-box/commits/xiaobaf14g-testing)
 [![Code Size](https://img.shields.io/github/languages/code-size/MiChongs/sing-box)](https://github.com/MiChongs/sing-box)
 
-本项目是 [sing-box](https://github.com/SagerNet/sing-box) 的衍生版本，基于 [reF1nd/sing-box](https://github.com/reF1nd/sing-box) 维护。在兼容上游配置格式的前提下，本分支新增 Smart 出站组、XHTTP 传输、VLESS Encryption 与 EasyTier 端点，扩展了 Clash API，并为 Windows、Linux、macOS、FreeBSD 与 Android 提供命令行程序及 SFA、SFW、SFL 图形客户端的发布构建。
+本项目是 [sing-box](https://github.com/SagerNet/sing-box) 的衍生版本，基于 [reF1nd/sing-box](https://github.com/reF1nd/sing-box) 维护。在兼容上游配置格式的前提下，本分支新增 Smart 出站组、XHTTP 传输、VLESS Encryption、QUICX 与 Nowhere 协议以及 EasyTier 端点，扩展了 Clash API，并为 Windows、Linux、macOS、FreeBSD 与 Android 提供命令行程序及 SFA、SFW、SFL 图形客户端的发布构建。
 
 ## 目录
 
@@ -15,6 +15,8 @@
 - [Smart 出站组](#smart-出站组)
 - [XHTTP 传输](#xhttp-传输)
 - [VLESS Encryption](#vless-encryption)
+- [QUICX 协议](#quicx-协议)
+- [Nowhere 协议](#nowhere-协议)
 - [EasyTier 端点](#easytier-端点)
 - [eBPF 入站](#ebpf-入站)
 - [Clash API 扩展](#clash-api-扩展)
@@ -35,6 +37,8 @@
 | Smart 出站组 | 本分支 | 无需 |
 | XHTTP 传输 | 本分支 | `with_xhttp`（默认启用） |
 | VLESS Encryption（`mlkem768x25519plus`）及其上的 XTLS Vision | 本分支 | 无需 |
+| QUICX 入站与出站；QUIC 丢包检测自适应乱序 | [BanYeHanFeng/sing-box](https://github.com/BanYeHanFeng/sing-box)、[BanYeHanFeng/quic-go](https://github.com/BanYeHanFeng/quic-go) | `with_quic`（默认启用） |
+| Nowhere 2.1 入站与出站（含 Morph、Portal 链式转发） | [ohmycggk/sing-box](https://github.com/ohmycggk/sing-box) | 无需；QUIC carrier 需 `with_quic`（默认启用） |
 | EasyTier 端点与 Magic DNS | 本分支 | `with_easytier`（实验性，默认不启用） |
 | Clash API 扩展：规则命中统计、Smart 管理接口 | 本分支 | `with_clash_api`（默认启用） |
 | eBPF 入站 | reF1nd；本分支改用 [MiChongs/sing-ebpf](https://github.com/MiChongs/sing-ebpf) | `with_ebpf`（默认不启用） |
@@ -390,6 +394,62 @@ VLESS 入站的 `decryption` 与出站的 `encryption` 字段实现 Xray-core �
 }
 ```
 
+## QUICX 协议
+
+`quicx` 入站与出站实现 QUICX 代理协议。传输层与标准 HTTP/3 服务器不可分辨（ALPN `h3`）：TCP 经 QUIC 双向流转发，UDP 经 QUIC DATAGRAM 转发并在超出路径上限时分片，所有分片均携带目标地址。
+
+- **0-RTT**：客户端复用上一次连接的会话票据，认证、CONNECT 请求与首段数据随第一个航班发出；0-RTT 被拒绝时在握手完成后重发，不会中断连接。
+- **抗重放**：每个连接的认证请求携带随机 nonce，服务端拒绝其他会话重复使用同一 nonce（最近 65536 个会话、最长 24 小时），重放的 0-RTT 航班无法建立代理连接。
+- **鉴权失败策略**：`auth_failure_policy` 为 `h3_close` 时以 `H3_NO_ERROR` 正常关闭，为 `silent_drop` 时静默丢弃并在 30 秒宽限期后本地回收；非 QUICX 的 HTTP/3 请求按同一策略处理。
+- **拥塞控制与诊断**：`bbr_profile` 选择 BBR 配置（默认 `conservative`）；`qlog_directory` 为每个连接写入 qlog 日志，`qlog_max_size` 限制目录总大小（默认 300 MB）。
+- 支持多用户（入站 `users`，可用于 `auth_user` 路由规则）、`udp_gso`、订阅 Provider 的拨号与 TLS 覆写；出站启用 uTLS 时 QUIC 握手忽略指纹。
+- **QUIC 传输层**：`quic-go` 与 `sing-quic` 依赖替换为 QUICX 作者基于 reF1nd 同一基线维护的分支（[BanYeHanFeng/quic-go](https://github.com/BanYeHanFeng/quic-go)、[BanYeHanFeng/sing-quic](https://github.com/BanYeHanFeng/sing-quic)）。丢包检测的 packet threshold 按链路实际乱序程度自适应（上限 64，无新证据时逐步回落），time threshold 计入对端 `max_ack_delay`；UDP 分片按连接当前的 DATAGRAM 载荷上限起步；qlog 额外记录全部丢包、伪丢包归因与 BBR 状态。这些改动作用于所有基于 QUIC 的协议。
+
+```json
+{
+  "type": "quicx",
+  "tag": "quicx-out",
+  "server": "example.com",
+  "server_port": 443,
+  "password": "hello",
+  "tls": {
+    "enabled": true,
+    "server_name": "example.com"
+  }
+}
+```
+
+完整字段说明参见 [QUICX 入站](./docs/configuration/inbound/quicx.zh.md)与 [QUICX 出站](./docs/configuration/outbound/quicx.zh.md)。
+
+## Nowhere 协议
+
+`nowhere` 入站（Portal）与出站实现 Nowhere 2.1（ALPN `nw2`）。认证使用绑定 TLS exporter 的 AuthFrame，强制 TLS 1.3。
+
+- **载体矩阵**：出站的 `up` 与 `down` 分别选择上行与下行载体（`tcp` 为 TLS/TCP，`udp` 为 QUIC），可组合为对称或非对称矩阵；`mix` 按 flow 在 `tcp/tcp` 与 `udp/udp` 等组合间选择，主路由准备超时后切换。
+- **TLS 连接复用**：`mux=1` 启用基于信用窗口的 TLS Mux 分片；`mux=0` 时可通过 `pool` 维持预热连接池，`prewarm_on_start` 在启动后立即填充。
+- **Morph**：`morph` 为全部载体启用密钥变换，TLS 之下附加 64 字节随机前导，TLS 与 QUIC 之下使用由共享密钥派生的方向性 ChaCha20 密钥。两端必须同时启用。
+- **Portal 链式转发**：入站 `next` 将全部 flow 转发至下一个 Portal，最多 7 跳；`pin` 与 `next.pin` 支持叶子证书 SHA-256 固定。
+- 入站支持未认证连接数限制（全局与按来源），并可作为 TCP 注入目标；QUIC 拥塞控制器通过 `quic_congestion_control` 选择。
+
+```json
+{
+  "type": "nowhere",
+  "tag": "nowhere-out",
+  "server": "example.com",
+  "server_port": 2077,
+  "password": "secret",
+  "up": "udp",
+  "down": "tcp",
+  "morph": true,
+  "tls": {
+    "enabled": true,
+    "server_name": "example.com"
+  }
+}
+```
+
+完整字段说明参见 [Nowhere 入站](./docs/configuration/inbound/nowhere.zh.md)与 [Nowhere 出站](./docs/configuration/outbound/nowhere.zh.md)。
+
 ## EasyTier 端点
 
 `easytier` 端点将 sing-box 接入 [EasyTier](https://github.com/EasyTier/EasyTier) 虚拟网络。EasyTier 内核以 WebAssembly 形式内嵌并由 wazero 执行，无需另行部署 `easytier-core`。该功能为实验性功能，需使用 `with_easytier` 构建标记，二进制文件体积约增加 11 MB。
@@ -606,6 +666,8 @@ go build -trimpath \
 - Smart 出站组文档站：<https://michongs.github.io/sing-box/>
 - 本仓库扩展功能文档：
   - [订阅 Provider](./docs/configuration/provider/index.zh.md)（[English](./docs/configuration/provider/index.md)）
+  - [QUICX 入站](./docs/configuration/inbound/quicx.zh.md)（[English](./docs/configuration/inbound/quicx.md)）与[出站](./docs/configuration/outbound/quicx.zh.md)（[English](./docs/configuration/outbound/quicx.md)）
+  - [Nowhere 入站](./docs/configuration/inbound/nowhere.zh.md)（[English](./docs/configuration/inbound/nowhere.md)）与[出站](./docs/configuration/outbound/nowhere.zh.md)（[English](./docs/configuration/outbound/nowhere.md)）
   - [EasyTier 端点](./docs/configuration/endpoint/easytier.zh.md)（[English](./docs/configuration/endpoint/easytier.md)）
   - [EasyTier DNS 服务器](./docs/configuration/dns/server/easytier.zh.md)（[English](./docs/configuration/dns/server/easytier.md)）
   - [eBPF 入站](./docs/configuration/inbound/ebpf.zh.md)（[English](./docs/configuration/inbound/ebpf.md)）

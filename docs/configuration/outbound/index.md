@@ -32,6 +32,8 @@
 | `tuic`         | [TUIC](./tuic/)                 |
 | `hysteria2`    | [Hysteria2](./hysteria2/)       |
 | `anytls`       | [AnyTLS](./anytls/)             |
+| `quicx`        | [QUICX](./quicx/)               |
+| `nowhere`      | [Nowhere](./nowhere/)           |
 | `snell`        | [Snell](./snell/)               |
 | `tailcat`      | [Tailcat](./tailcat/)           |
 | `tor`          | [Tor](./tor/)                   |

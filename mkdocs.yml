@@ -183,6 +183,8 @@ nav:
           - TUIC: configuration/inbound/tuic.md
           - Hysteria2: configuration/inbound/hysteria2.md
           - AnyTLS: configuration/inbound/anytls.md
+          - QUICX: configuration/inbound/quicx.md
+          - Nowhere: configuration/inbound/nowhere.md
           - Snell: configuration/inbound/snell.md
           - Tun: configuration/inbound/tun.md
           - eBPF: configuration/inbound/ebpf.md
@@ -208,6 +210,8 @@ nav:
           - TUIC: configuration/outbound/tuic.md
           - Hysteria2: configuration/outbound/hysteria2.md
           - AnyTLS: configuration/outbound/anytls.md
+          - QUICX: configuration/outbound/quicx.md
+          - Nowhere: configuration/outbound/nowhere.md
           - Snell: configuration/outbound/snell.md
           - Tailcat: configuration/outbound/tailcat.md
           - Tor: configuration/outbound/tor.md

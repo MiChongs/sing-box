@@ -31,6 +31,8 @@
 | `hysteria2`   | [Hysteria2](./hysteria2/)     | :material-close: |
 | `vless`       | [VLESS](./vless/)             | TCP              |
 | `anytls`      | [AnyTLS](./anytls/)           | TCP              |
+| `quicx`       | [QUICX](./quicx/)             | :material-close: |
+| `nowhere`     | [Nowhere](./nowhere/)         | TCP              |
 | `snell`       | [Snell](./snell/)             | TCP / UDP（v5）  |
 | `tun`         | [Tun](./tun/)                 | :material-close: |
 | `redirect`    | [Redirect](./redirect/)       | :material-close: |
