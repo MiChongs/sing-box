@@ -21,6 +21,12 @@ type (
 	CurveID         = tls.CurveID
 )
 
+// ClientSessionCacheSetter is implemented by client configs which expose their
+// TLS session cache, used by protocols such as QUICX to enable 0-RTT.
+type ClientSessionCacheSetter interface {
+	SetClientSessionCache(cache tls.ClientSessionCache)
+}
+
 func ParseTLSVersion(version string) (uint16, error) {
 	switch version {
 	case "1.0":

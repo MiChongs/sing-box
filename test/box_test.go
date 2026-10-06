@@ -36,16 +36,22 @@ func init() {
 }
 
 func startInstance(t *testing.T, options option.Options) *box.Box {
-	if debug.Enabled {
-		options.Log = &option.LogOptions{
-			Level: "trace",
-		}
-	} else {
-		options.Log = &option.LogOptions{
-			Level: "warning",
+	return startInstanceWithContext(t, globalCtx, options)
+}
+
+func startInstanceWithContext(t *testing.T, parent context.Context, options option.Options) *box.Box {
+	if options.Log == nil {
+		if debug.Enabled {
+			options.Log = &option.LogOptions{
+				Level: "trace",
+			}
+		} else {
+			options.Log = &option.LogOptions{
+				Level: "warning",
+			}
 		}
 	}
-	ctx, cancel := context.WithCancel(globalCtx)
+	ctx, cancel := context.WithCancel(parent)
 	var instance *box.Box
 	var err error
 	for retry := 0; retry < 3; retry++ {

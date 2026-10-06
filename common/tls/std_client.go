@@ -92,6 +92,13 @@ func (c *STDClientConfig) STDConfig() (*STDConfig, error) {
 	return c.config, nil
 }
 
+// SetClientSessionCache enables TLS session resumption for this config. It is
+// required by 0-RTT QUIC handshakes, which always resume a session established
+// by a ticket received on a previous connection.
+func (c *STDClientConfig) SetClientSessionCache(cache tls.ClientSessionCache) {
+	c.config.ClientSessionCache = cache
+}
+
 func (c *STDClientConfig) Client(conn net.Conn) (Conn, error) {
 	if c.fragment || c.recordFragment {
 		conn = tf.NewConn(conn, c.ctx, c.fragment, c.recordFragment, c.fragmentFallbackDelay)
