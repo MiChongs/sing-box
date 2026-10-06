@@ -1,6 +1,8 @@
 package trafficcontrol
 
 import (
+	"context"
+	"sync/atomic"
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -52,4 +54,40 @@ func TestTrackerMetadataConnectionDomain(t *testing.T) {
 			require.Equal(t, testCase.expected, metadata.ConnectionDomain())
 		})
 	}
+}
+
+type resolvedChainTestOutbound struct {
+	adapter.Outbound
+	tag          string
+	outboundType string
+}
+
+func (o *resolvedChainTestOutbound) Tag() string  { return o.tag }
+func (o *resolvedChainTestOutbound) Type() string { return o.outboundType }
+
+func TestTrackerMetadataResolvedChain(t *testing.T) {
+	proxy := &resolvedChainTestOutbound{tag: "Proxy", outboundType: "selector"}
+	smart := &resolvedChainTestOutbound{tag: "Smart", outboundType: "smart"}
+	node := &resolvedChainTestOutbound{tag: "HK-01", outboundType: "vless"}
+
+	trace := new(adapter.OutboundDialTrace)
+	ctx := adapter.ContextWithOutboundDialTrace(context.Background(), trace)
+	metadata := NewManager().newTrackerMetadata(ctx, adapter.InboundContext{
+		OutboundChain: []adapter.Outbound{proxy, smart},
+	}, nil, proxy, new(atomic.Int64), new(atomic.Int64))
+
+	// Before the group dials, the chain ends at the group itself.
+	require.Equal(t, []string{"Smart", "Proxy"}, metadata.ResolvedChain())
+	outbound, outboundType := metadata.ResolvedOutbound()
+	require.Equal(t, "Smart", outbound)
+	require.Equal(t, "smart", outboundType)
+
+	adapter.RecordGroupDial(ctx, "Smart", node)
+	require.Equal(t, []string{"HK-01", "Smart", "Proxy"}, metadata.ResolvedChain())
+	outbound, outboundType = metadata.ResolvedOutbound()
+	require.Equal(t, "HK-01", outbound)
+	require.Equal(t, "vless", outboundType)
+	// The route-time fields stay as they were.
+	require.Equal(t, []string{"Smart", "Proxy"}, metadata.Chain)
+	require.Equal(t, "Smart", metadata.Outbound)
 }

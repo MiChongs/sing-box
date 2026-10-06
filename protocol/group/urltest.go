@@ -498,6 +498,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
 		s.group.reportDialSuccess(outbound.Tag())
+		adapter.RecordGroupDial(ctx, s.Tag(), outbound)
 		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
 	}
 	if ctx.Err() != nil {
@@ -510,6 +511,7 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		conn, err = detour.DialContext(ctx, network, destination)
 		if err == nil {
 			s.group.reportDialSuccess(detour.Tag())
+			adapter.RecordGroupDial(ctx, s.Tag(), detour)
 			s.logger.InfoContext(ctx, "failover to ", detour.Tag())
 			return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
 		}
@@ -530,6 +532,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
 		s.group.reportDialSuccess(outbound.Tag())
+		adapter.RecordGroupDial(ctx, s.Tag(), outbound)
 		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
 	}
 	if ctx.Err() != nil {
@@ -541,6 +544,7 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		conn, err = detour.ListenPacket(ctx, destination)
 		if err == nil {
 			s.group.reportDialSuccess(detour.Tag())
+			adapter.RecordGroupDial(ctx, s.Tag(), detour)
 			s.logger.InfoContext(ctx, "failover to ", detour.Tag())
 			return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
 		}

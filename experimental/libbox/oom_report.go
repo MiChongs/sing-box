@@ -181,6 +181,7 @@ func buildOOMConnection(connection *trafficcontrol.TrackerMetadata) oomConnectio
 	} else {
 		rule = "final"
 	}
+	outbound, outboundType := connection.ResolvedOutbound()
 	info := oomConnectionInfo{
 		ID:           connection.ID.String(),
 		CreatedAt:    connection.CreatedAt.UTC().Format(time.RFC3339),
@@ -192,9 +193,9 @@ func buildOOMConnection(connection *trafficcontrol.TrackerMetadata) oomConnectio
 		User:         metadata.User,
 		Process:      process,
 		Rule:         rule,
-		Chain:        connection.Chain,
-		Outbound:     connection.Outbound,
-		OutboundType: connection.OutboundType,
+		Chain:        connection.ResolvedChain(),
+		Outbound:     outbound,
+		OutboundType: outboundType,
 		Upload:       byteformats.FormatBytes(uint64(connection.Upload.Load())),
 		Download:     byteformats.FormatBytes(uint64(connection.Download.Load())),
 	}

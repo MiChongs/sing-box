@@ -892,6 +892,19 @@ type connectionSnapshot struct {
 	uplink     int64
 	downlink   int64
 	hadTraffic bool
+	// outbound is the resolved outbound last sent to the client; a Smart or
+	// URLTest connection only learns its real node after the dial, so a
+	// change here re-sends the connection.
+	outbound string
+}
+
+func newConnectionSnapshot(metadata *trafficcontrol.TrackerMetadata) connectionSnapshot {
+	outbound, _ := metadata.ResolvedOutbound()
+	return connectionSnapshot{
+		uplink:   metadata.Upload.Load(),
+		downlink: metadata.Download.Load(),
+		outbound: outbound,
+	}
 }
 
 func (s *StartedService) buildInitialConnectionState(manager *trafficcontrol.Manager, snapshots map[uuid.UUID]connectionSnapshot) []*ConnectionEvent {
@@ -903,10 +916,7 @@ func (s *StartedService) buildInitialConnectionState(manager *trafficcontrol.Man
 			Id:         metadata.ID.String(),
 			Connection: buildConnectionProto(metadata),
 		})
-		snapshots[metadata.ID] = connectionSnapshot{
-			uplink:   metadata.Upload.Load(),
-			downlink: metadata.Download.Load(),
-		}
+		snapshots[metadata.ID] = newConnectionSnapshot(metadata)
 	}
 
 	for _, metadata := range manager.ClosedConnections() {
@@ -928,10 +938,7 @@ func (s *StartedService) applyConnectionEvent(event trafficcontrol.ConnectionEve
 		if _, exists := snapshots[event.ID]; exists {
 			return nil
 		}
-		snapshots[event.ID] = connectionSnapshot{
-			uplink:   event.Metadata.Upload.Load(),
-			downlink: event.Metadata.Download.Load(),
-		}
+		snapshots[event.ID] = newConnectionSnapshot(event.Metadata)
 		return &ConnectionEvent{
 			Type:       ConnectionEventType_CONNECTION_EVENT_NEW,
 			Id:         event.ID.String(),
@@ -973,16 +980,26 @@ func (s *StartedService) buildTrafficUpdates(manager *trafficcontrol.Manager, sn
 		currentDownload := metadata.Download.Load()
 		snapshot, exists := snapshots[metadata.ID]
 		if !exists {
-			snapshots[metadata.ID] = connectionSnapshot{
-				uplink:   currentUpload,
-				downlink: currentDownload,
-			}
+			snapshots[metadata.ID] = newConnectionSnapshot(metadata)
 			events = append(events, &ConnectionEvent{
 				Type:       ConnectionEventType_CONNECTION_EVENT_NEW,
 				Id:         metadata.ID.String(),
 				Connection: buildConnectionProto(metadata),
 			})
 			continue
+		}
+		if metadata.DialTrace != nil {
+			if outbound, _ := metadata.ResolvedOutbound(); outbound != snapshot.outbound {
+				// The connection replaces the client's copy, totals included,
+				// so the traffic baseline restarts from the current counters.
+				snapshots[metadata.ID] = newConnectionSnapshot(metadata)
+				events = append(events, &ConnectionEvent{
+					Type:       ConnectionEventType_CONNECTION_EVENT_NEW,
+					Id:         metadata.ID.String(),
+					Connection: buildConnectionProto(metadata),
+				})
+				continue
+			}
 		}
 		uplinkDelta := currentUpload - snapshot.uplink
 		downlinkDelta := currentDownload - snapshot.downlink
@@ -1067,6 +1084,7 @@ func buildConnectionProto(metadata *trafficcontrol.TrackerMetadata) *Connection 
 	}
 	uplinkTotal := metadata.Upload.Load()
 	downlinkTotal := metadata.Download.Load()
+	outbound, outboundType := metadata.ResolvedOutbound()
 	var processInfo *ProcessInfo
 	if metadata.Metadata.ProcessInfo != nil {
 		processInfo = &ProcessInfo{
@@ -1095,9 +1113,9 @@ func buildConnectionProto(metadata *trafficcontrol.TrackerMetadata) *Connection 
 		UplinkTotal:   uplinkTotal,
 		DownlinkTotal: downlinkTotal,
 		Rule:          rule,
-		Outbound:      metadata.Outbound,
-		OutboundType:  metadata.OutboundType,
-		ChainList:     metadata.Chain,
+		Outbound:      outbound,
+		OutboundType:  outboundType,
+		ChainList:     metadata.ResolvedChain(),
 		ProcessInfo:   processInfo,
 	}
 }

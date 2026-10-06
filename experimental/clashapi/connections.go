@@ -55,6 +55,7 @@ func connectionsSnapshot(trafficManager *trafficcontrol.Manager) render.M {
 type connectionObject trafficcontrol.TrackerMetadata
 
 func (c connectionObject) MarshalJSON() ([]byte, error) {
+	metadata := trafficcontrol.TrackerMetadata(c)
 	var inbound string
 	if c.Metadata.Inbound != "" {
 		inbound = c.Metadata.InboundType + "/" + c.Metadata.Inbound
@@ -112,7 +113,7 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 		"upload":      c.Upload.Load(),
 		"download":    c.Download.Load(),
 		"start":       c.CreatedAt,
-		"chains":      c.Chain,
+		"chains":      metadata.ResolvedChain(),
 		"rule":        rule,
 		"rulePayload": rulePayload,
 	})
@@ -219,9 +220,9 @@ func smartBlockConnection(ctx context.Context, trafficManager *trafficcontrol.Ma
 		}
 
 		// Walk the chain looking for a Smart group. The slot immediately after
-		// the Smart tag in the chain is the actual node it selected; Smart
-		// dials through itself, so it is normally terminal and Now() fills in.
-		chain := common.Map(target.Metadata.OutboundChain, adapter.Outbound.Tag)
+		// the Smart tag is the node it dialed for this connection (recorded by
+		// the dial trace); Now() is only a fallback when the dial left no trace.
+		chain := common.Map(target.ResolvedOutboundChain(), adapter.Outbound.Tag)
 		outboundMgr := service.FromContext[adapter.OutboundManager](ctx)
 		if outboundMgr == nil {
 			render.NoContent(w, r)

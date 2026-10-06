@@ -1973,6 +1973,23 @@ func (s *Smart) Now() string {
 	return ""
 }
 
+// recordDialedMember lets connection observers (Clash API chains) show the
+// member that carried this dial instead of stopping at the group.
+func (s *Smart) recordDialedMember(ctx context.Context, outbounds []adapter.Outbound, tag string) {
+	if adapter.OutboundDialTraceFromContext(ctx) == nil {
+		return
+	}
+	for _, outbound := range outbounds {
+		if outbound.Tag() == tag {
+			adapter.RecordGroupDial(ctx, s.Tag(), outbound)
+			return
+		}
+	}
+	if outbound, loaded := s.outboundMgr.Outbound(tag); loaded {
+		adapter.RecordGroupDial(ctx, s.Tag(), outbound)
+	}
+}
+
 // setLastSelected records a successful dial winner for Now() reporting
 // AND bumps the activity timestamp used by the idle-aware task
 // scheduler. Called from every successful DialContext / ListenPacket
@@ -2357,6 +2374,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		return nil, err
 	}
 	s.setLastSelected(proxyTag)
+	s.recordDialedMember(ctx, snap.outbounds, proxyTag)
 	s.rememberStickyChoice(meta.smartTarget, proxyTag, isUDP)
 	s.rememberHysteresisChoice(meta.smartTarget, proxyTag, isUDP)
 	s.markAlive(proxyTag) // successful dial = confirmed alive; clears knownDead
@@ -2497,6 +2515,7 @@ func (s *Smart) racePacketCandidates(
 
 		if err == nil {
 			s.setLastSelected(ob.Tag())
+			adapter.RecordGroupDial(ctx, s.Tag(), ob)
 			s.rememberStickyChoice(meta.smartTarget, ob.Tag(), true)
 			s.rememberHysteresisChoice(meta.smartTarget, ob.Tag(), true)
 			s.markAlive(ob.Tag())
