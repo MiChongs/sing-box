@@ -1,0 +1,50 @@
+{
+  "log": { "level": "warn" },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 11080
+    },
+    {
+      "type": "nowhere",
+      "tag": "nw-in",
+      "listen": "127.0.0.1",
+      "listen_port": 12077,
+      "password": "secret",
+      "network": ["tcp"],
+      "tls": {
+        "enabled": true,
+        "alpn": ["nw2"],
+        "certificate_path": "cert.pem",
+        "key_path": "key.pem"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "nowhere",
+      "tag": "nw-out",
+      "server": "127.0.0.1",
+      "server_port": 12077,
+      "password": "secret",
+      "up": "tcp",
+      "down": "tcp",
+      "pool": 2,
+      "tls": {
+        "enabled": true,
+        "server_name": "localhost",
+        "insecure": true,
+        "alpn": ["nw2"]
+      }
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rules": [
+      { "inbound": ["mixed-in"], "outbound": "nw-out" },
+      { "inbound": ["nw-in"], "outbound": "direct" }
+    ]
+  }
+}

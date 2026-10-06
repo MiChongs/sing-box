@@ -1,0 +1,14 @@
+{
+  "type": "nowhere",
+  "tag": "nw-in-udp",
+  "listen": "127.0.0.1",
+  "listen_port": 12077,
+  "password": "secret",
+  "network": ["udp"],
+  "tls": {
+    "enabled": true,
+    "alpn": ["nw2"],
+    "certificate_path": "cert.pem",
+    "key_path": "key.pem"
+  }
+}

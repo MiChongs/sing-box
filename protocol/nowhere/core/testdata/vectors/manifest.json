@@ -1,0 +1,40 @@
+{
+  "protocol": "nowhere-v2",
+  "upstream_version": "2.1.0",
+  "upstream_commit": "568031335b72a925e4904f15f8e39053ffc32866",
+  "exporter_version": "nowhere-vector-export/4",
+  "sources": {
+    "protocol_md": "Nowhere/docs/protocol.md",
+    "rust_auth": "Nowhere/src/tests/protocol/auth.rs::hkdf_and_auth_frames_match_fixed_vectors",
+    "rust_flow": "Nowhere/src/tests/protocol/flow.rs",
+    "rust_target": "Nowhere/src/tests/protocol/request.rs + util.rs",
+    "rust_datagram": "Nowhere/src/tests/protocol/datagram.rs",
+    "rust_uot": "Nowhere/src/tests/protocol/uot.rs::packet_codec_contains_only_u16_length_and_payload",
+    "rust_result": "Nowhere/src/tests/protocol/result.rs::every_result_has_one_stable_wire_byte",
+    "rust_mux": "Nowhere/src/tests/mux/wire.rs + Nowhere/src/mux/wire.rs",
+    "rust_morph": "Nowhere/src/tests/transport/morph/keys.rs"
+  },
+  "files": [
+    "auth.json",
+    "target.json",
+    "flow.json",
+    "datagram.json",
+    "uot.json",
+    "result.json",
+    "mux.json"
+  ],
+  "notes": [
+    "no upstream JSON corpus exists; vectors derive from the pinned Rust test suite (see sources) and are codec cross-checked",
+    "nowhere-go/testdata/vectors is the module-local conformance corpus",
+    "complete wire hex tables must not be maintained by hand",
+    "nw2 auth salt is SHA-256(\"nowhere/nw2/auth-root\"); tag = HMAC-SHA256(auth_key, transport || exporter || session_id)[0:16]",
+    "FlowHeader remains 5 bytes; flags high three bits carry HOPS 0..7 and flow_id is a 30-bit BE integer",
+    "OPEN/ATTACH may use equal carriers; Vector still emits DUPLEX when both directions match",
+    "mix is a client policy only; FlowHeader still carries TT, TQ, QT, or QQ",
+    "TLS Mux marker is 0xff after AuthFrame; MuxHeader is 7 bytes kind|value u16|flow_id u32",
+    "Morph TCP bootstrap is prelude[64] || nonce[12] with low7 (default) or full8 sender policy; UDP keys are directional udp c2s / udp s2c; incompatible with 2.0.x morph",
+    "setup result is a single byte (0..7); no magic/version prefix",
+    "UoT is u16 BE length + payload (no type byte)",
+    "QUIC UDP DATA/CLOSE are 4-byte packed headers, FRAGMENT is 12 bytes"
+  ]
+}

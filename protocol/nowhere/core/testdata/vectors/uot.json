@@ -1,0 +1,72 @@
+{
+  "protocol": "nowhere-v2",
+  "source": {
+    "rust": "Nowhere/src/tests/protocol/uot.rs::packet_codec_contains_only_u16_length_and_payload"
+  },
+  "cases": [
+    {
+      "id": "abc",
+      "operation": "encode",
+      "valid": true,
+      "payload_hex": "616263",
+      "frame_hex": "0003616263"
+    },
+    {
+      "id": "header-0x1234",
+      "operation": "header",
+      "valid": true,
+      "payload_hex": "",
+      "frame_hex": "1234"
+    },
+    {
+      "id": "header-max",
+      "operation": "header",
+      "valid": true,
+      "payload_hex": "",
+      "frame_hex": "ffff"
+    },
+    {
+      "id": "header-max-1",
+      "operation": "header",
+      "valid": true,
+      "payload_hex": "",
+      "frame_hex": "fffe"
+    },
+    {
+      "id": "header-one",
+      "operation": "header",
+      "valid": true,
+      "payload_hex": "",
+      "frame_hex": "0001"
+    },
+    {
+      "id": "header-oversize",
+      "operation": "header",
+      "valid": false,
+      "payload_hex": "",
+      "frame_hex": "",
+      "error_code": "payload_too_large"
+    },
+    {
+      "id": "header-zero",
+      "operation": "header",
+      "valid": true,
+      "payload_hex": "",
+      "frame_hex": "0000"
+    },
+    {
+      "id": "one-byte",
+      "operation": "encode",
+      "valid": true,
+      "payload_hex": "41",
+      "frame_hex": "000141"
+    },
+    {
+      "id": "zero-length",
+      "operation": "encode",
+      "valid": true,
+      "payload_hex": "",
+      "frame_hex": "0000"
+    }
+  ]
+}

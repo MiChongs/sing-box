@@ -1,0 +1,134 @@
+{
+  "protocol": "nowhere-v2",
+  "source": {
+    "rust": "Nowhere/src/tests/mux/wire.rs + Nowhere/src/mux/wire.rs"
+  },
+  "cases": [
+    {
+      "id": "open-stable-vector",
+      "operation": "header",
+      "valid": true,
+      "kind": "open",
+      "value": 1286,
+      "flow_id": "16909060",
+      "frame_hex": "01050601020304"
+    },
+    {
+      "id": "data-stable-vector",
+      "operation": "header",
+      "valid": true,
+      "kind": "data",
+      "value": 1286,
+      "flow_id": "16909060",
+      "frame_hex": "02050601020304"
+    },
+    {
+      "id": "window-connection",
+      "operation": "header",
+      "valid": true,
+      "kind": "window",
+      "value": 1286,
+      "flow_id": "0",
+      "frame_hex": "03050600000000"
+    },
+    {
+      "id": "fin-stable-vector",
+      "operation": "header",
+      "valid": true,
+      "kind": "fin",
+      "value": 0,
+      "flow_id": "16909060",
+      "frame_hex": "04000001020304"
+    },
+    {
+      "id": "reset-stable-vector",
+      "operation": "header",
+      "valid": true,
+      "kind": "reset",
+      "value": 0,
+      "flow_id": "16909060",
+      "frame_hex": "05000001020304"
+    },
+    {
+      "id": "window-stream",
+      "operation": "header",
+      "valid": true,
+      "kind": "window",
+      "value": 1,
+      "flow_id": "7",
+      "frame_hex": "03000100000007"
+    },
+    {
+      "id": "open-zero-flow-id",
+      "operation": "header",
+      "valid": false,
+      "frame_hex": "01000100000000",
+      "error_code": "invalid_flow_id"
+    },
+    {
+      "id": "data-zero-flow-id",
+      "operation": "header",
+      "valid": false,
+      "frame_hex": "02000100000000",
+      "error_code": "invalid_flow_id"
+    },
+    {
+      "id": "data-empty",
+      "operation": "header",
+      "valid": false,
+      "frame_hex": "02000000000001",
+      "error_code": "invalid_data"
+    },
+    {
+      "id": "window-zero-credit",
+      "operation": "header",
+      "valid": false,
+      "frame_hex": "03000000000000",
+      "error_code": "invalid_window"
+    },
+    {
+      "id": "fin-nonzero-value",
+      "operation": "header",
+      "valid": false,
+      "frame_hex": "04000100000001",
+      "error_code": "invalid_close"
+    },
+    {
+      "id": "reset-nonzero-value",
+      "operation": "header",
+      "valid": false,
+      "frame_hex": "05000100000001",
+      "error_code": "invalid_close"
+    },
+    {
+      "id": "unknown-kind",
+      "operation": "header",
+      "valid": false,
+      "frame_hex": "00000000000001",
+      "error_code": "unknown_kind"
+    },
+    {
+      "id": "overflow-flow-id",
+      "operation": "header",
+      "valid": false,
+      "frame_hex": "02000140000000",
+      "error_code": "invalid_flow_id"
+    },
+    {
+      "id": "short-6",
+      "operation": "header",
+      "valid": false,
+      "frame_hex": "010100000000",
+      "error_code": "invalid_length"
+    },
+    {
+      "id": "open-max-flow-id",
+      "operation": "header",
+      "valid": true,
+      "kind": "open",
+      "value": 0,
+      "flow_id": "1073741823",
+      "frame_hex": "0100003fffffff"
+    }
+  ]
+}

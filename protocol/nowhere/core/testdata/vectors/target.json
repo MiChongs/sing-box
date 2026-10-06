@@ -1,0 +1,90 @@
+{
+  "protocol": "nowhere-v2",
+  "source": {
+    "rust": "Nowhere/src/tests/protocol/request.rs + util.rs"
+  },
+  "accept": [
+    {
+      "id": "domain",
+      "atyp": 3,
+      "host": "xn--bcher-kva.example",
+      "port": 8080,
+      "wire_hex": "0315786e2d2d62636865722d6b76612e6578616d706c651f90"
+    },
+    {
+      "id": "domain-simple",
+      "atyp": 3,
+      "host": "example.com",
+      "port": 443,
+      "wire_hex": "030b6578616d706c652e636f6d01bb"
+    },
+    {
+      "id": "ipv4",
+      "atyp": 1,
+      "host": "192.0.2.1",
+      "ipv4": "192.0.2.1",
+      "port": 443,
+      "wire_hex": "01c000020101bb"
+    },
+    {
+      "id": "ipv6",
+      "atyp": 4,
+      "host": "2001:db8::1",
+      "ipv6": "2001:db8::1",
+      "port": 53,
+      "wire_hex": "0420010db80000000000000000000000010035"
+    }
+  ],
+  "reject": [
+    {
+      "id": "domain-bad-label",
+      "input_hex": "0301ff0050",
+      "reason": "invalid DNS label"
+    },
+    {
+      "id": "domain-no-length",
+      "input_hex": "03",
+      "reason": "missing domain length"
+    },
+    {
+      "id": "domain-truncated",
+      "input_hex": "030361620050",
+      "reason": "truncated domain"
+    },
+    {
+      "id": "domain-zero-length",
+      "input_hex": "03000050",
+      "reason": "invalid domain length"
+    },
+    {
+      "id": "domain-zero-port",
+      "input_hex": "0301610000",
+      "reason": "zero port"
+    },
+    {
+      "id": "empty",
+      "input_hex": "",
+      "reason": "missing address type"
+    },
+    {
+      "id": "ipv4-zero-port",
+      "input_hex": "017f0000010000",
+      "reason": "zero port"
+    },
+    {
+      "id": "truncated-ipv4",
+      "input_hex": "017f000001",
+      "reason": "truncated IPv4"
+    },
+    {
+      "id": "truncated-ipv6",
+      "input_hex": "040404040404040404040404040404040404",
+      "reason": "truncated IPv6"
+    },
+    {
+      "id": "unknown-atyp",
+      "input_hex": "02010203040050",
+      "reason": "unknown address type"
+    }
+  ]
+}

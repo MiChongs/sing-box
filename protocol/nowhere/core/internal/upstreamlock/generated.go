@@ -1,0 +1,13 @@
+// Code generated from UPSTREAM.lock by generate-upstream-lock-go.sh; DO NOT EDIT.
+
+package upstreamlock
+
+const (
+	Schema                  = 1
+	Repository              = "https://github.com/NodePassProject/Nowhere"
+	Version                 = "2.1.0"
+	Commit                  = "568031335b72a925e4904f15f8e39053ffc32866"
+	ProtocolSHA256          = "8a2ae8e8e7ae42fa8b74fab5317039c6932f57eb47f601b406b17195a8f65fc0"
+	VectorTreeHashAlgorithm = "sha256-tree-v1"
+	VectorTreeSHA256        = "3893637a5cdd7d3b46885b9e712d2d9beb29ddafaf8a6f554084358b3fb1f135"
+)

@@ -376,7 +376,7 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
 	if !direction {
 		if err == nil {
 			m.logger.DebugContext(ctx, "connection upload finished")
-		} else if !E.IsClosedOrCanceled(err) {
+		} else if !isBenignConnClose(err) {
 			m.logger.ErrorContext(ctx, "connection upload closed: ", err)
 		} else {
 			m.logger.TraceContext(ctx, "connection upload closed")
@@ -384,12 +384,27 @@ func (m *ConnectionManager) connectionCopy(ctx context.Context, source net.Conn,
 	} else {
 		if err == nil {
 			m.logger.DebugContext(ctx, "connection download finished")
-		} else if !E.IsClosedOrCanceled(err) {
+		} else if !isBenignConnClose(err) {
 			m.logger.ErrorContext(ctx, "connection download closed: ", err)
 		} else {
 			m.logger.TraceContext(ctx, "connection download closed")
 		}
 	}
+}
+
+// isBenignConnClose treats peer EOF/reset and a locally canceled stream (a
+// multiplexed QUIC/TLS stream torn down after the other direction finished) as
+// a normal close instead of a connection error.
+func isBenignConnClose(err error) bool {
+	if err == nil || E.IsClosedOrCanceled(err) {
+		return true
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "canceled by local") ||
+		strings.Contains(message, "cancelled by local") ||
+		strings.Contains(message, "stream canceled") ||
+		strings.Contains(message, "stream cancelled") ||
+		strings.Contains(message, "close called for canceled stream")
 }
 
 func (m *ConnectionManager) kickWriteHandshake(ctx context.Context, source net.Conn, destination net.Conn, serverFirst bool, direction bool, done *atomic.Bool, onClose N.CloseHandlerFunc) bool {

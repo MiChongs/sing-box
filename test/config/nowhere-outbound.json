@@ -1,0 +1,16 @@
+{
+  "type": "nowhere",
+  "tag": "nw-out",
+  "server": "example.com",
+  "server_port": 2077,
+  "password": "secret",
+  "up": "udp",
+  "down": "udp",
+  "tls": {
+    "enabled": true,
+    "server_name": "example.com",
+    "alpn": ["nw2"],
+    "min_version": "1.3",
+    "max_version": "1.3"
+  }
+}

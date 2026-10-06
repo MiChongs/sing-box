@@ -1,0 +1,166 @@
+{
+  "protocol": "nowhere-v2",
+  "source": {
+    "rust": "Nowhere/src/tests/protocol/flow.rs"
+  },
+  "cases": [
+    {
+      "id": "attach-udp-tcp-quic",
+      "operation": "flow_header",
+      "valid": true,
+      "role": "attach",
+      "flow_id": "7",
+      "kind": "udp",
+      "uplink": "tls_tcp",
+      "downlink": "quic",
+      "frame_hex": "1600000007"
+    },
+    {
+      "id": "duplex-carrier-mismatch",
+      "operation": "flow_header",
+      "valid": false,
+      "frame_hex": "1000000001",
+      "error_code": "duplex_carrier_mismatch"
+    },
+    {
+      "id": "duplex-tcp-tls-tls",
+      "operation": "flow_header",
+      "valid": true,
+      "role": "duplex",
+      "flow_id": "16909060",
+      "kind": "tcp",
+      "uplink": "tls_tcp",
+      "downlink": "tls_tcp",
+      "frame_hex": "0001020304"
+    },
+    {
+      "id": "duplex-udp-quic-quic",
+      "operation": "flow_header",
+      "valid": true,
+      "role": "duplex",
+      "flow_id": "16909060",
+      "kind": "udp",
+      "uplink": "quic",
+      "downlink": "quic",
+      "frame_hex": "1c01020304"
+    },
+    {
+      "id": "invalid-role",
+      "operation": "flow_header",
+      "valid": false,
+      "frame_hex": "0300000001",
+      "error_code": "invalid_role"
+    },
+    {
+      "id": "max-flow-id",
+      "operation": "flow_header",
+      "valid": true,
+      "role": "duplex",
+      "flow_id": "1073741823",
+      "kind": "tcp",
+      "uplink": "quic",
+      "downlink": "quic",
+      "frame_hex": "183fffffff"
+    },
+    {
+      "id": "max-hops-duplex-tcp-tls-tls",
+      "operation": "flow_header",
+      "valid": true,
+      "role": "duplex",
+      "flow_id": "42",
+      "kind": "tcp",
+      "uplink": "tls_tcp",
+      "downlink": "tls_tcp",
+      "hops": 7,
+      "frame_hex": "e00000002a"
+    },
+    {
+      "id": "hops-3-open-udp-tls-quic",
+      "operation": "flow_header",
+      "valid": true,
+      "role": "open",
+      "flow_id": "1073741823",
+      "kind": "udp",
+      "uplink": "tls_tcp",
+      "downlink": "quic",
+      "hops": 3,
+      "frame_hex": "753fffffff"
+    },
+    {
+      "id": "hops-6-attach-udp-quic-tls",
+      "operation": "flow_header",
+      "valid": true,
+      "role": "attach",
+      "flow_id": "2",
+      "kind": "udp",
+      "uplink": "quic",
+      "downlink": "tls_tcp",
+      "hops": 6,
+      "frame_hex": "ce00000002"
+    },
+    {
+      "id": "open-equal-carriers",
+      "operation": "flow_header",
+      "valid": true,
+      "role": "open",
+      "flow_id": "1",
+      "kind": "tcp",
+      "uplink": "tls_tcp",
+      "downlink": "tls_tcp",
+      "frame_hex": "0100000001"
+    },
+    {
+      "id": "open-udp-quic-tcp",
+      "operation": "flow_header",
+      "valid": true,
+      "role": "open",
+      "flow_id": "287454020",
+      "kind": "udp",
+      "uplink": "quic",
+      "downlink": "tls_tcp",
+      "frame_hex": "0d11223344"
+    },
+    {
+      "id": "short-4",
+      "operation": "flow_header",
+      "valid": false,
+      "frame_hex": "00000000",
+      "error_code": "invalid_length"
+    },
+    {
+      "id": "short-6",
+      "operation": "flow_header",
+      "valid": false,
+      "frame_hex": "000000000000",
+      "error_code": "invalid_length"
+    },
+    {
+      "id": "short-empty",
+      "operation": "flow_header",
+      "valid": false,
+      "frame_hex": "",
+      "error_code": "invalid_length"
+    },
+    {
+      "id": "zero-flow-id",
+      "operation": "flow_header",
+      "valid": false,
+      "frame_hex": "0000000000",
+      "error_code": "zero_flow_id"
+    },
+    {
+      "id": "overflow-flow-id",
+      "operation": "flow_header",
+      "valid": false,
+      "frame_hex": "0040000000",
+      "error_code": "flow_id_out_of_range"
+    },
+    {
+      "id": "u32-max-flow-id",
+      "operation": "flow_header",
+      "valid": false,
+      "frame_hex": "00ffffffff",
+      "error_code": "flow_id_out_of_range"
+    }
+  ]
+}

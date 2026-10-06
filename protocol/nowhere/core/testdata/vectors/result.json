@@ -1,0 +1,115 @@
+{
+  "protocol": "nowhere-v2",
+  "source": {
+    "rust": "Nowhere/src/tests/protocol/result.rs::every_result_has_one_stable_wire_byte"
+  },
+  "cases": [
+    {
+      "id": "flow-result-ready",
+      "operation": "flow_result",
+      "valid": true,
+      "setup_result": "ready",
+      "code": 0,
+      "frame_hex": "00"
+    },
+    {
+      "id": "flow-result-reject-pair-timeout",
+      "operation": "flow_result",
+      "valid": true,
+      "setup_result": "pair_timeout",
+      "code": 3,
+      "frame_hex": "03"
+    },
+    {
+      "id": "reject-empty",
+      "operation": "setup_result",
+      "valid": false,
+      "setup_result": "",
+      "code": 0,
+      "frame_hex": "",
+      "error_code": "invalid_length"
+    },
+    {
+      "id": "reject-two-bytes",
+      "operation": "setup_result",
+      "valid": false,
+      "setup_result": "",
+      "code": 0,
+      "frame_hex": "0001",
+      "error_code": "invalid_length"
+    },
+    {
+      "id": "reject-unknown-8",
+      "operation": "setup_result",
+      "valid": false,
+      "setup_result": "",
+      "code": 0,
+      "frame_hex": "08",
+      "error_code": "unknown_value"
+    },
+    {
+      "id": "result.dial_failed",
+      "operation": "setup_result",
+      "valid": true,
+      "setup_result": "dial_failed",
+      "code": 5,
+      "frame_hex": "05"
+    },
+    {
+      "id": "result.flow_limit",
+      "operation": "setup_result",
+      "valid": true,
+      "setup_result": "flow_limit",
+      "code": 4,
+      "frame_hex": "04"
+    },
+    {
+      "id": "result.internal_error",
+      "operation": "setup_result",
+      "valid": true,
+      "setup_result": "internal_error",
+      "code": 7,
+      "frame_hex": "07"
+    },
+    {
+      "id": "result.invalid_request",
+      "operation": "setup_result",
+      "valid": true,
+      "setup_result": "invalid_request",
+      "code": 1,
+      "frame_hex": "01"
+    },
+    {
+      "id": "result.metadata_conflict",
+      "operation": "setup_result",
+      "valid": true,
+      "setup_result": "metadata_conflict",
+      "code": 2,
+      "frame_hex": "02"
+    },
+    {
+      "id": "result.pair_timeout",
+      "operation": "setup_result",
+      "valid": true,
+      "setup_result": "pair_timeout",
+      "code": 3,
+      "frame_hex": "03"
+    },
+    {
+      "id": "result.ready",
+      "operation": "setup_result",
+      "valid": true,
+      "setup_result": "ready",
+      "code": 0,
+      "frame_hex": "00"
+    },
+    {
+      "id": "result.session_replaced",
+      "operation": "setup_result",
+      "valid": true,
+      "setup_result": "session_replaced",
+      "code": 6,
+      "frame_hex": "06"
+    }
+  ]
+}
