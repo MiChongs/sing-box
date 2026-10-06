@@ -50,9 +50,9 @@ func (c *STDClientConfig) SetServerName(serverName string) {
 		if c.disableSNI {
 			c.config.ServerName = ""
 		}
-		c.config.VerifyConnection = func(state tls.ConnectionState) error {
-			return VerifyCertificatePinSHA256(c.certificatePinSHA256, c.verificationServerName(), c.config.Time, state.PeerCertificates)
-		}
+		c.config.VerifyPeerCertificate = verifyPeerCertificates(func(certificates []*x509.Certificate) error {
+			return VerifyCertificatePinSHA256(c.certificatePinSHA256, c.verificationServerName(), c.config.Time, certificates)
+		})
 		return
 	}
 	if c.disableSNI {
@@ -61,7 +61,52 @@ func (c *STDClientConfig) SetServerName(serverName string) {
 		c.config.ServerName = serverName
 	}
 	if c.verifyServerName {
-		c.config.VerifyConnection = verifyConnection(c.config.RootCAs, c.config.Time, c.verificationServerName())
+		rootCAs, timeFunc, verificationServerName := c.config.RootCAs, c.config.Time, c.verificationServerName()
+		c.config.VerifyPeerCertificate = verifyPeerCertificates(func(certificates []*x509.Certificate) error {
+			if verificationServerName == "" {
+				return errMissingServerName
+			}
+			return verifySystemTLSPeer(rootCAs, verificationServerName, timeFunc, certificates)
+		})
+	}
+}
+
+// selectClientCertificate answers a certificate request with the first of
+// certificates the server accepts, or with no certificate, exactly as crypto/tls
+// selects from Config.Certificates. Client configs use it instead of
+// Certificates because QUIC's Chrome-parroting handshake refuses Certificates
+// as a server-side field and carries only GetClientCertificate.
+func selectClientCertificate(certificates []tls.Certificate) func(request *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	return func(request *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+		for index := range certificates {
+			if request.SupportsCertificate(&certificates[index]) == nil {
+				return &certificates[index], nil
+			}
+		}
+		return new(tls.Certificate), nil
+	}
+}
+
+// verifyPeerCertificates adapts a check of the parsed peer certificates to
+// tls.Config.VerifyPeerCertificate, which runs even with InsecureSkipVerify.
+//
+// The checks that replace the built-in verification use it rather than
+// VerifyConnection because QUIC's Chrome-parroting handshake builds a uTLS
+// config from this one: uTLS never produces the crypto/tls ConnectionState
+// VerifyConnection takes, so quic-go refuses such a config. Unlike
+// VerifyConnection it is not called on resumed connections, whose certificates
+// the handshake that created the session already verified with this config.
+func verifyPeerCertificates(verify func(certificates []*x509.Certificate) error) func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+	return func(rawCerts [][]byte, _ [][]*x509.Certificate) error {
+		certificates := make([]*x509.Certificate, 0, len(rawCerts))
+		for _, rawCert := range rawCerts {
+			certificate, err := x509.ParseCertificate(rawCert)
+			if err != nil {
+				return E.Cause(err, "parse peer certificate")
+			}
+			certificates = append(certificates, certificate)
+		}
+		return verify(certificates)
 	}
 }
 
@@ -254,7 +299,7 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 		if err != nil {
 			return nil, E.Cause(err, "parse client x509 key pair")
 		}
-		tlsConfig.Certificates = []tls.Certificate{keyPair}
+		tlsConfig.GetClientCertificate = selectClientCertificate([]tls.Certificate{keyPair})
 	} else if len(clientCertificate) > 0 || len(clientKey) > 0 {
 		return nil, E.New("client certificate and client key must be provided together")
 	}
@@ -303,15 +348,6 @@ func newSTDClient(ctx context.Context, logger logger.ContextLogger, serverAddres
 		}
 	}
 	return config, nil
-}
-
-func verifyConnection(rootCAs *x509.CertPool, timeFunc func() time.Time, serverName string) func(state tls.ConnectionState) error {
-	return func(state tls.ConnectionState) error {
-		if serverName == "" {
-			return errMissingServerName
-		}
-		return verifySystemTLSPeer(rootCAs, serverName, timeFunc, state.PeerCertificates)
-	}
 }
 
 func VerifyPinnedCertificate(certificateHashes [][]byte, publicKeyHashes [][]byte, rawCerts [][]byte) error {

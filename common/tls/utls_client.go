@@ -118,15 +118,21 @@ func (c *UTLSClientConfig) stdClientConfig() *STDClientConfig {
 	for _, curve := range c.config.CurvePreferences {
 		tlsConfig.CurvePreferences = append(tlsConfig.CurvePreferences, tls.CurveID(curve))
 	}
-	for _, certificate := range c.config.Certificates {
-		tlsConfig.Certificates = append(tlsConfig.Certificates, tls.Certificate{
-			Certificate: certificate.Certificate,
-			PrivateKey:  certificate.PrivateKey,
-			Leaf:        certificate.Leaf,
-		})
+	if len(c.config.Certificates) > 0 {
+		clientCertificates := make([]tls.Certificate, 0, len(c.config.Certificates))
+		for _, certificate := range c.config.Certificates {
+			clientCertificates = append(clientCertificates, tls.Certificate{
+				Certificate: certificate.Certificate,
+				PrivateKey:  certificate.PrivateKey,
+				Leaf:        certificate.Leaf,
+			})
+		}
+		// 与 newSTDClient 相同，用 GetClientCertificate 而不是 Certificates：
+		// QUIC 的 Chrome 指纹握手会把 Certificates 当作服务端字段拒绝。
+		tlsConfig.GetClientCertificate = selectClientCertificate(clientCertificates)
 	}
 	// uTLS 用 InsecureServerNameToVerify 校验另一个名字，标准库没有对应字段：
-	// 与 newSTDClient 相同，跳过内置校验，由 SetServerName 装上的 VerifyConnection 校验。
+	// 与 newSTDClient 相同，跳过内置校验，由 SetServerName 装上的 VerifyPeerCertificate 校验。
 	config := &STDClientConfig{
 		ctx:                   c.ctx,
 		config:                tlsConfig,

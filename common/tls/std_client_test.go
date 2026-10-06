@@ -35,10 +35,9 @@ func TestSTDClientCertificateServerNameDoesNotChangeSNI(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "sni.example", stdConfig.ServerName)
 	require.True(t, stdConfig.InsecureSkipVerify)
-	require.NotNil(t, stdConfig.VerifyConnection)
-	require.NoError(t, stdConfig.VerifyConnection(stdtls.ConnectionState{
-		PeerCertificates: []*x509.Certificate{certificate},
-	}))
+	require.Nil(t, stdConfig.VerifyConnection)
+	require.NotNil(t, stdConfig.VerifyPeerCertificate)
+	require.NoError(t, stdConfig.VerifyPeerCertificate([][]byte{certificate.Raw}, nil))
 }
 
 func TestSTDClientCertificateServerNameWithEmptySNI(t *testing.T) {
@@ -59,9 +58,7 @@ func TestSTDClientCertificateServerNameWithEmptySNI(t *testing.T) {
 	stdConfig, err := config.STDConfig()
 	require.NoError(t, err)
 	require.Empty(t, stdConfig.ServerName)
-	require.NoError(t, stdConfig.VerifyConnection(stdtls.ConnectionState{
-		PeerCertificates: []*x509.Certificate{certificate},
-	}))
+	require.NoError(t, stdConfig.VerifyPeerCertificate([][]byte{certificate.Raw}, nil))
 }
 
 func TestSTDClientCertificateServerNameWithIPServerName(t *testing.T) {
