@@ -68,13 +68,21 @@ const (
 	// persist beyond the active pin.
 	OpSavePinEndorsement
 	OpDeletePinEndorsement
+	// smart-loadbalance runtime state: the per-group region lock / mode /
+	// strategy overrides set through the Clash API, and the per-node exit
+	// country found by the exit probe.
+	OpSaveRegionState
+	OpDeleteRegionState
+	OpSaveExitGeo
+	OpDeleteExitGeo
 )
 
 // isDeleteOp reports whether an op type is a tombstone. Used by BatchSave
 // and GetSubBytesByPath to switch between Put and Delete semantics.
 func isDeleteOp(t int) bool {
 	switch t {
-	case OpDeleteManualPin, OpDeleteKnownDead, OpDeleteBreaker, OpDeletePinEndorsement:
+	case OpDeleteManualPin, OpDeleteKnownDead, OpDeleteBreaker, OpDeletePinEndorsement,
+		OpDeleteRegionState, OpDeleteExitGeo:
 		return true
 	}
 	return false
@@ -90,6 +98,8 @@ const (
 	KeyTypeKnownDead      = "dead"     // smart/dead/<cfg>/<grp>/<node>
 	KeyTypeBreaker        = "breaker"  // smart/breaker/<cfg>/<grp>/<node>
 	KeyTypePinEndorsement = "pinendor" // smart/pinendor/<cfg>/<grp>/<node>
+	KeyTypeRegionState    = "region"   // smart/region/<cfg>/<grp>
+	KeyTypeExitGeo        = "exitgeo"  // smart/exitgeo/<cfg>/<grp>/<node>
 
 	WeightTypeTCP    = "tcp"
 	WeightTypeUDP    = "udp"
@@ -447,6 +457,26 @@ type NodeState struct {
 type ManualPinRecord struct {
 	Tag       string `json:"tag"`
 	UpdatedAt int64  `json:"updated_at"` // unix seconds
+}
+
+// RegionStateRecord persists the runtime overrides of a smart-loadbalance
+// group: the region lock and the region mode / balance strategy / affinity
+// switched through the Clash API. Empty fields mean "use the configured
+// value".
+type RegionStateRecord struct {
+	Lock      string `json:"lock,omitempty"`
+	Mode      string `json:"mode,omitempty"`
+	Strategy  string `json:"strategy,omitempty"`
+	Affinity  string `json:"affinity,omitempty"`
+	UpdatedAt int64  `json:"updated_at"` // unix seconds
+}
+
+// ExitGeoRecord persists the exit country an exit probe found for a node,
+// so a restart does not re-probe every member. DetectedAt is unix seconds.
+type ExitGeoRecord struct {
+	Country    string `json:"country"`
+	IP         string `json:"ip,omitempty"`
+	DetectedAt int64  `json:"detected_at"`
 }
 
 // KnownDeadRecord persists "this node failed its last probe at DeadAt".
@@ -1345,6 +1375,10 @@ func FormatOperationKey(op *StoreOperation) string {
 		return FormatDBKey(KeyTypeBreaker, op.Config, op.Group, op.Node)
 	case OpSavePinEndorsement, OpDeletePinEndorsement:
 		return FormatDBKey(KeyTypePinEndorsement, op.Config, op.Group, op.Node)
+	case OpSaveRegionState, OpDeleteRegionState:
+		return FormatDBKey(KeyTypeRegionState, op.Config, op.Group)
+	case OpSaveExitGeo, OpDeleteExitGeo:
+		return FormatDBKey(KeyTypeExitGeo, op.Config, op.Group, op.Node)
 	}
 	return ""
 }

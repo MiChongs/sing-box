@@ -8,6 +8,13 @@ type RuntimeComponentRemover interface {
 	Remove(tag string) error
 }
 
+// OutboundAdder is implemented by the outbound manager. Groups that generate
+// member views (smart-loadbalance region outbounds) register outbounds they
+// constructed themselves through it, during construction or at runtime.
+type OutboundAdder interface {
+	AddOutbound(outbound Outbound) error
+}
+
 // StartRuntimeComponent starts a component created after its manager has
 // started, running every start stage through the manager scope at once. On
 // failure the component is closed again.

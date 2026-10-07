@@ -158,6 +158,10 @@ type smartDialMeta struct {
 	resolvedIPs []netip.Addr
 	isUDP       bool
 	destPort    uint16
+	source      netip.Addr // client address, for smart-loadbalance source affinity
+	// balance is set when a smart-region outbound dials through its
+	// smart-loadbalance group (see smartBalance.attachRequest).
+	balance *balanceRequest
 }
 
 // firstValidIPString returns the first valid IP from a slice as its string form, or "".
@@ -572,6 +576,10 @@ type Smart struct {
 	// pins to apply decayed multiplicative boosts.
 	pinEndorsements     *xsync.MapOf[string, *pinEndorsementEntry]
 	pinEndorsementsOnce sync.Once
+
+	// balance turns the group into a smart-loadbalance group (region pools
+	// and per-connection distribution, see smart_lb.go); nil for smart.
+	balance *smartBalance
 }
 
 // smartRankingSnapshot bundles the ranking slice with its computation
@@ -601,13 +609,21 @@ type finalizedRanking struct {
 const rankingFinalizeTTL = 30 * time.Second
 
 func NewSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartOutboundOptions) (adapter.Outbound, error) {
+	s, err := newSmart(ctx, router, logger, tag, C.TypeSmart, options)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
+func newSmart(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, outboundType string, options option.SmartOutboundOptions) (*Smart, error) {
 	networks := []string{N.NetworkTCP}
 	if !options.DisableUDP {
 		networks = append(networks, N.NetworkUDP)
 	}
 
 	s := &Smart{
-		Adapter:     outbound.NewAdapter(C.TypeSmart, tag, networks, options.Outbounds),
+		Adapter:     outbound.NewAdapter(outboundType, tag, networks, options.Outbounds),
 		ctx:         ctx,
 		router:      router,
 		outboundMgr: service.FromContext[adapter.OutboundManager](ctx),
@@ -759,6 +775,9 @@ func (s *Smart) startGroup() error {
 		tags[i] = internTag(tags[i])
 	}
 	s.state.Store(&smartGroupState{outbounds: outbounds, tags: tags})
+	if s.balance != nil {
+		s.balance.rebuild()
+	}
 	return nil
 }
 
@@ -877,6 +896,14 @@ func (s *Smart) postStart() error {
 	// pipeline consistent with the pre-shutdown view within TTL bounds.
 	s.hydratePersistedState()
 	s.restorePinEndorsements()
+	if s.balance != nil {
+		// Restored exit results feed classification, so re-sort after.
+		s.balance.hydrate()
+		s.balance.rebuild()
+		if s.balance.currentMode() == regionModeDestination || len(s.balance.destMap) > 0 {
+			s.balance.countryDatabase()
+		}
+	}
 
 	// Per-(target, node) liveness bookkeeping — used by
 	// deprioritiseSuspicious and the SNI-probe periodic task to tell
@@ -937,6 +964,16 @@ func (s *Smart) postStart() error {
 		// the probe from running on a sleeping phone. See
 		// smart_target_liveness.go for the policy details.
 		{"target-liveness", sniProbeInitialDelay, sniProbeInterval, s.runTargetLivenessProbes, false, true},
+	}
+	if s.balance != nil {
+		b := s.balance
+		tasks = append(tasks,
+			// Per-target region probes for the auto / destination modes.
+			taskDef{"region-probe", 90 * time.Second, b.probe.interval, b.runRegionProbes, false, true},
+			// Re-probe exits whose result expired, and retry failures.
+			taskDef{"region-exit", time.Hour, time.Hour, func() { b.scheduleExitDetection(b.snapshot(), false) }, false, false},
+			taskDef{"balance-prune", 3 * time.Minute, 5 * time.Minute, b.pruneMemory, false, false},
+		)
 	}
 
 	for _, t := range tasks {
@@ -1024,6 +1061,13 @@ func (s *Smart) postStart() error {
 	}
 
 	s.started.Store(true)
+	if s.balance != nil {
+		b := s.balance
+		s.logger.Info("smart-loadbalance[", s.Tag(), "] regions: ", b.summary(),
+			"; mode=", b.currentMode(), " strategy=", b.currentStrategy(),
+			" affinity=", b.currentAffinity(), " fallback=", b.fallback)
+		b.scheduleRefresh()
+	}
 	return nil
 }
 
@@ -1114,6 +1158,11 @@ func (s *Smart) close() error {
 		_ = s.countryDB.Close()
 		s.countryDB = nil
 	}
+	if s.balance != nil {
+		if db := s.balance.country.Swap(nil); db != nil {
+			_ = db.Close()
+		}
+	}
 	return nil
 }
 
@@ -1153,6 +1202,15 @@ func (s *Smart) getManualSelected() string {
 		return v
 	}
 	return ""
+}
+
+// activePin returns the pin governing this dial: a region view's own pin
+// for dials through a smart-region outbound, else the group's pin.
+func (s *Smart) activePin(meta *smartDialMeta) string {
+	if meta != nil && meta.balance != nil {
+		return meta.balance.pin
+	}
+	return s.getManualSelected()
 }
 
 // PinSuspended reports whether the user's pin is currently being
@@ -1200,6 +1258,23 @@ func (s *Smart) maybeResumePin(tag string) {
 // ClashAPI exposes this via `PUT /proxies/<tag>` with JSON `{"name": "..."}`,
 // mirroring the Selector behaviour and mihomo's Set/ForceSet.
 func (s *Smart) SelectOutbound(tag string) bool {
+	if s.balance != nil {
+		// smart-loadbalance: selecting a region (outbound tag or code)
+		// locks the region; selecting "" releases both lock and pin.
+		if tag == "" {
+			if s.balance.currentLock() != "" {
+				_, _ = s.SetRegionLock("")
+			}
+		} else if code, isRegion := s.balance.selectionRegion(tag); isRegion {
+			if s.getManualSelected() != "" {
+				s.manualSelected.Store("")
+				s.pinSuspended.Store(false)
+				s.persistManualPinDelete()
+			}
+			_, err := s.SetRegionLock(code)
+			return err == nil
+		}
+	}
 	if tag == "" {
 		s.manualSelected.Store("")
 		s.pinSuspended.Store(false)
@@ -1729,7 +1804,11 @@ func (s *Smart) FlushStore() (smart.FlushStats, error) {
 	s.targetConnsMu.Unlock()
 
 	smart.ClearBlockedNodesCache(s.Tag(), smartConfigName)
-	return s.store.FlushByGroup(s.Tag(), smartConfigName)
+	stats, err := s.store.FlushByGroup(s.Tag(), smartConfigName)
+	if s.balance != nil {
+		s.balance.reset()
+	}
+	return stats, err
 }
 
 // SmartStore exposes the underlying store for global-flush operations.
@@ -1776,6 +1855,12 @@ func (s *Smart) ClearSelection() ClearSelectionResult {
 	s.pinSuspended.Store(false)
 	s.lastSelectedTag.Store("")
 	s.persistManualPinDelete()
+	if s.balance != nil && s.balance.currentLock() != "" {
+		if res.PreviousPin == "" {
+			res.PreviousPin = s.balance.lockDisplay()
+		}
+		_, _ = s.SetRegionLock("")
+	}
 
 	if s.store != nil {
 		s.store.ClearUnwrapByGroup(s.Tag(), smartConfigName)
@@ -1895,6 +1980,11 @@ func (s *Smart) Now() string {
 	if pinned := s.getManualSelected(); pinned != "" && !s.pinSuspended.Load() {
 		return pinned
 	}
+	if s.balance != nil {
+		if region := s.balance.now(); region != "" {
+			return region
+		}
+	}
 	if v, ok := s.lastSelectedTag.Load().(string); ok && v != "" {
 		return v
 	}
@@ -2006,6 +2096,11 @@ func (s *Smart) isGroupIdle() bool {
 
 // All returns a snapshot of all outbound tags.
 func (s *Smart) All() []string {
+	if s.balance != nil {
+		if members := s.balance.allMembers(); members != nil {
+			return members
+		}
+	}
 	snap := s.state.Load()
 	if snap == nil {
 		return nil
@@ -2055,6 +2150,7 @@ func (s *Smart) buildMeta(metadata adapter.InboundContext, isUDP bool) *smartDia
 		resolvedIPs: ips,
 		isUDP:       isUDP,
 		destPort:    metadata.Destination.Port,
+		source:      metadata.Source.Addr,
 	}
 }
 
@@ -2218,7 +2314,7 @@ func (s *Smart) metaFromDestination(existing *smartDialMeta, destination M.Socks
 		geoIP = s.lookupCountry(ips)
 	}
 
-	return &smartDialMeta{
+	meta := &smartDialMeta{
 		host:        host,
 		smartTarget: target,
 		asnCode:     asnCode,
@@ -2227,6 +2323,10 @@ func (s *Smart) metaFromDestination(existing *smartDialMeta, destination M.Socks
 		isUDP:       isUDP,
 		destPort:    destination.Port,
 	}
+	if existing != nil {
+		meta.source = existing.source
+	}
+	return meta
 }
 
 // DialContext implements the race-dial with retry logic.
@@ -2251,6 +2351,11 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	meta, _ := ctx.Value(smartMetaCtxKey{}).(*smartDialMeta)
 	if meta == nil || meta.smartTarget == "" {
 		meta = s.metaFromDestination(meta, destination, isUDP)
+	} else if s.balance != nil && dialIsChainedHop(meta, destination) {
+		meta = s.metaFromDestination(&smartDialMeta{source: meta.source}, destination, isUDP)
+	}
+	if s.balance != nil {
+		meta = s.balance.attachRequest(ctx, meta)
 	}
 
 	snap := s.state.Load()
@@ -2296,8 +2401,11 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	s.logger.DebugContext(ctx, "smart[", s.Tag(), "] select via ", source,
 		": target=", displayTarget(meta, destination), " asn=", displayASN(meta),
 		" candidates=", proxyTagsPreview(selectedOutbounds, 5))
+	if len(selectedOutbounds) == 0 {
+		return nil, E.New(s.Type(), "[", s.Tag(), "]: no node can serve ", destination, " (", source, ")")
+	}
 
-	if !isUnwrap && s.store != nil && meta.smartTarget != "" {
+	if !isUnwrap && s.balance == nil && s.store != nil && meta.smartTarget != "" {
 		names := outboundNames(selectedOutbounds)
 		s.store.StoreUnwrapResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP, names)
 	}
@@ -2312,7 +2420,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	// Fast-path 命中时 selectedOutbounds 已经是单元素，重排无意义且会
 	// 触发 store 和 node-stats lookup —— 完全跳过以兑现 "Telegram 秒连"
 	// 承诺（从入口到 dialWithRetry 只走 map lookup + isAlive）。
-	if !isFastPath {
+	if !isFastPath && s.balance == nil {
 		selectedOutbounds = s.reorderForRequestScene(selectedOutbounds, meta)
 
 		// True-alive check: push nodes whose recent stats OR active SNI
@@ -2328,6 +2436,13 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	// which targets are worth actively verifying.
 	s.recordTargetHit(meta.smartTarget)
 
+	if s.balance != nil {
+		// Count the dial against its node while it is in flight, so a burst
+		// of connections spreads instead of all seeing the same idle node.
+		picked := selectedOutbounds[0].Tag()
+		s.balance.pendingAdd(picked, 1)
+		defer s.balance.pendingAdd(picked, -1)
+	}
 	conn, proxyTag, connectTime, err := s.dialWithRetry(ctx, network, destination, selectedOutbounds, meta)
 	if err != nil {
 		s.logger.WarnContext(ctx, "smart[", s.Tag(), "] dial failed to ", destination,
@@ -2338,6 +2453,9 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 	s.recordDialedMember(ctx, snap.outbounds, proxyTag)
 	s.rememberStickyChoice(meta.smartTarget, proxyTag, isUDP)
 	s.rememberHysteresisChoice(meta.smartTarget, proxyTag, isUDP)
+	if s.balance != nil {
+		s.balance.onDialSuccess(meta, proxyTag)
+	}
 	s.markAlive(proxyTag) // successful dial = confirmed alive; clears knownDead
 	// Synchronously decay storm counter on success. Previously only
 	// happened inside the eventual recordStats path on conn close,
@@ -2372,6 +2490,11 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	meta, _ := ctx.Value(smartMetaCtxKey{}).(*smartDialMeta)
 	if meta == nil || meta.smartTarget == "" {
 		meta = s.metaFromDestination(meta, destination, true)
+	} else if s.balance != nil && dialIsChainedHop(meta, destination) {
+		meta = s.metaFromDestination(&smartDialMeta{source: meta.source}, destination, true)
+	}
+	if s.balance != nil {
+		meta = s.balance.attachRequest(ctx, meta)
 	}
 
 	snap := s.state.Load()
@@ -2384,20 +2507,29 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	s.logger.DebugContext(ctx, "smart[", s.Tag(), "] select via ", source,
 		" (UDP): target=", displayTarget(meta, destination), " asn=", displayASN(meta),
 		" candidates=", proxyTagsPreview(selectedOutbounds, 5))
+	if len(selectedOutbounds) == 0 {
+		return nil, E.New(s.Type(), "[", s.Tag(), "]: no node can serve UDP to ", destination, " (", source, ")")
+	}
 
-	if !isUnwrap && s.store != nil && meta.smartTarget != "" {
+	if !isUnwrap && s.balance == nil && s.store != nil && meta.smartTarget != "" {
 		names := outboundNames(selectedOutbounds)
 		s.store.StoreUnwrapResult(s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, true, names)
 	}
 
-	// Request-level scene rerank — same contract as DialContext,
-	// biases top-K dial order by what THIS request needs.
-	selectedOutbounds = s.reorderForRequestScene(selectedOutbounds, meta)
+	if s.balance == nil {
+		// Request-level scene rerank — same contract as DialContext,
+		// biases top-K dial order by what THIS request needs.
+		selectedOutbounds = s.reorderForRequestScene(selectedOutbounds, meta)
 
-	// Per-target liveness deprioritisation — same contract as
-	// DialContext. Pushes nodes known to be broken for meta.smartTarget
-	// to the tail so the UDP race picks a trusted candidate first.
-	selectedOutbounds = s.deprioritiseSuspicious(selectedOutbounds, meta.smartTarget)
+		// Per-target liveness deprioritisation — same contract as
+		// DialContext. Pushes nodes known to be broken for meta.smartTarget
+		// to the tail so the UDP race picks a trusted candidate first.
+		selectedOutbounds = s.deprioritiseSuspicious(selectedOutbounds, meta.smartTarget)
+	} else {
+		picked := selectedOutbounds[0].Tag()
+		s.balance.pendingAdd(picked, 1)
+		defer s.balance.pendingAdd(picked, -1)
+	}
 
 	// Record the target hit so the periodic SNI probe task knows
 	// which targets are worth actively verifying.
@@ -2419,7 +2551,7 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 	// UDP ListenPacket call that eventually succeeds on a non-pin
 	// node instead of surfacing the pin error.
 	if len(selectedOutbounds) == 1 {
-		if pin := s.getManualSelected(); pin != "" && selectedOutbounds[0].Tag() == pin {
+		if pin := s.activePin(meta); pin != "" && selectedOutbounds[0].Tag() == pin {
 			fresh, _, fallbackSrc := s.selectProxiesTracedOpts(meta, snap.outbounds, true, true)
 			if len(fresh) > 0 && !sameOutboundSet(selectedOutbounds, fresh) {
 				s.logger.InfoContext(ctx, "smart[", s.Tag(),
@@ -2427,7 +2559,9 @@ func (s *Smart) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.
 					"] failed; temporarily falling back to algorithm-selected candidates (source=",
 					fallbackSrc, ", fresh=", proxyTagsPreview(fresh, 5),
 					"); pin state preserved for future dials")
-				s.setPinSuspended(true)
+				if meta.balance == nil {
+					s.setPinSuspended(true)
+				}
 				fresh = s.reorderForRequestScene(fresh, meta)
 
 				pc2, tag2, ct2, err2, finalErr2 := s.racePacketCandidates(ctx, destination, fresh, meta, fallbackSrc)
@@ -2479,6 +2613,9 @@ func (s *Smart) racePacketCandidates(
 			adapter.RecordGroupDial(ctx, s.Tag(), ob)
 			s.rememberStickyChoice(meta.smartTarget, ob.Tag(), true)
 			s.rememberHysteresisChoice(meta.smartTarget, ob.Tag(), true)
+			if s.balance != nil {
+				s.balance.onDialSuccess(meta, ob.Tag())
+			}
 			s.markAlive(ob.Tag())
 			// Sync storm-counter decay — same rationale as the TCP DialContext
 			// success path: releases the probe gate within one good dial
@@ -2540,6 +2677,11 @@ func (s *Smart) selectProxiesTraced(meta *smartDialMeta, all []adapter.Outbound,
 // zero-arg selectProxiesTraced for every existing caller; only
 // dialWithRetry's pin-fallback path needs to opt in.
 func (s *Smart) selectProxiesTracedOpts(meta *smartDialMeta, all []adapter.Outbound, isUDP bool, bypassManualPin bool) ([]adapter.Outbound, bool, string) {
+	if s.balance != nil && meta != nil && meta.balance != nil {
+		// A region view has its own pin and ignores the group's.
+		out, source := s.balance.selectCandidates(meta, isUDP, bypassManualPin)
+		return out, false, source
+	}
 	// Manual selection short-circuit — respects the user's pin.
 	//
 	// Three cases:
@@ -2598,6 +2740,11 @@ func (s *Smart) selectProxiesTracedOpts(meta *smartDialMeta, all []adapter.Outbo
 			s.pinBypassLogged.Store(false)
 			return []adapter.Outbound{pinnedOb}, true, "manual"
 		}
+	}
+
+	if s.balance != nil {
+		out, source := s.balance.selectCandidates(meta, isUDP, bypassManualPin)
+		return out, false, source
 	}
 
 	target := ""
@@ -2985,7 +3132,7 @@ func (s *Smart) dialWithRetry(ctx context.Context, network string, dest M.Socksa
 					// gets immediate service instead of a raw error.
 					bypassPin := false
 					if len(outbounds) == 1 {
-						if pin := s.getManualSelected(); pin != "" && outbounds[0].Tag() == pin {
+						if pin := s.activePin(meta); pin != "" && outbounds[0].Tag() == pin {
 							bypassPin = true
 						}
 					}
@@ -3005,7 +3152,9 @@ func (s *Smart) dialWithRetry(ctx context.Context, network string, dest M.Socksa
 							// in manualSelected so recovery is
 							// automatic — this flag just changes what
 							// the UI reports meanwhile.
-							s.setPinSuspended(true)
+							if meta == nil || meta.balance == nil {
+								s.setPinSuspended(true)
+							}
 						} else {
 							s.logger.DebugContext(ctx, "smart[", s.Tag(),
 								"] hot re-selection after all candidates failed; fresh=",
@@ -3146,6 +3295,11 @@ func (s *Smart) getBatch(outbounds []adapter.Outbound, meta *smartDialMeta, roun
 	} else {
 		// Rounds 1+ advance further down the ranked list in batches.
 		begin := smartRound0Parallel + (round-1)*smartParallelDials
+		if s.balance != nil {
+			// smart-loadbalance dials one node in round 0; continue right
+			// after it so the next node of the pool is not skipped.
+			begin = 1 + (round-1)*smartParallelDials
+		}
 		if begin >= len(outbounds) {
 			return nil, 0
 		}
@@ -3847,6 +4001,9 @@ type smartTrackedPacketConn struct {
 	meta        *smartDialMeta
 	connectTime int64
 	startTime   time.Time
+	// countsLoad: smart-loadbalance counts UDP sessions in the node load
+	// it balances on; plain Smart groups keep TCP-only load.
+	countsLoad bool
 
 	upload   atomic.Int64
 	download atomic.Int64
@@ -3926,6 +4083,9 @@ func (c *smartTrackedPacketConn) samplePktRate() {
 
 func (c *smartTrackedPacketConn) Close() error {
 	c.closeOnce.Do(func() {
+		if c.countsLoad && c.s.nodeLoad != nil {
+			c.s.nodeLoad.dec(c.proxyTag)
+		}
 		durMS := time.Since(c.startTime).Milliseconds()
 		up := c.upload.Load()
 		down := c.download.Load()
@@ -4140,14 +4300,19 @@ func (s *Smart) inNetworkStorm() bool {
 }
 
 func (s *Smart) wrapPacketConn(pc net.PacketConn, tag string, meta *smartDialMeta, connectTime int64) net.PacketConn {
-	return &smartTrackedPacketConn{
+	tracked := &smartTrackedPacketConn{
 		PacketConn:  pc,
 		s:           s,
 		proxyTag:    tag,
 		meta:        meta,
 		connectTime: connectTime,
 		startTime:   time.Now(),
+		countsLoad:  s.balance != nil && s.nodeLoad != nil,
 	}
+	if tracked.countsLoad {
+		s.nodeLoad.inc(tag)
+	}
+	return tracked
 }
 
 // ─── connection statistics ────────────────────────────────────────────────────
@@ -6352,6 +6517,9 @@ func (s *Smart) onProviderUpdated(tag string) error {
 		tags[i] = internTag(tags[i])
 	}
 	s.state.Store(&smartGroupState{outbounds: outbounds, tags: tags})
+	if s.balance != nil {
+		s.balance.onMembersChanged()
+	}
 	return nil
 }
 

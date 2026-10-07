@@ -54,10 +54,12 @@ const (
 )
 
 const (
-	TypeSelector    = "selector"
-	TypeURLTest     = "urltest"
-	TypeLoadBalance = "loadbalance"
-	TypeSmart       = "smart"
+	TypeSelector         = "selector"
+	TypeURLTest          = "urltest"
+	TypeLoadBalance      = "loadbalance"
+	TypeSmart            = "smart"
+	TypeSmartLoadBalance = "smart-loadbalance"
+	TypeSmartRegion      = "smart-region"
 )
 
 func ProxyDisplayName(proxyType string) string {
@@ -144,7 +146,7 @@ func ProxyDisplayName(proxyType string) string {
 		return "URLTest"
 	case TypeLoadBalance:
 		return "LoadBalance"
-	case TypeSmart:
+	case TypeSmart, TypeSmartLoadBalance, TypeSmartRegion:
 		return "Smart"
 	default:
 		return "Unknown"

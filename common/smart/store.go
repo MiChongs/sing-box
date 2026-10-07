@@ -620,9 +620,9 @@ func isLeafKey(keyType string, depth int) bool {
 	switch keyType {
 	case KeyTypeStats:
 		return depth == 6
-	case KeyTypeRanking, KeyTypeManualPin:
+	case KeyTypeRanking, KeyTypeManualPin, KeyTypeRegionState:
 		return depth == 4
-	case KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures, KeyTypeKnownDead, KeyTypeBreaker, KeyTypePinEndorsement:
+	case KeyTypeNode, KeyTypePrefetch, KeyTypeHostFailures, KeyTypeKnownDead, KeyTypeBreaker, KeyTypePinEndorsement, KeyTypeExitGeo:
 		return depth == 5
 	}
 	return false
@@ -2597,12 +2597,14 @@ type FlushStats struct {
 	KnownDead      int `json:"known_dead"`
 	Breakers       int `json:"breakers"`
 	PinEndorsement int `json:"pin_endorsement"`
+	RegionState    int `json:"region_state"`
+	ExitGeo        int `json:"exit_geo"`
 }
 
 // Total sums every deletion bucket — convenient for "nothing happened" checks.
 func (f FlushStats) Total() int {
 	return f.Stats + f.Nodes + f.Ranking + f.Prefetch + f.Failures + f.Queue +
-		f.ManualPin + f.KnownDead + f.Breakers + f.PinEndorsement
+		f.ManualPin + f.KnownDead + f.Breakers + f.PinEndorsement + f.RegionState + f.ExitGeo
 }
 
 // FlushByLevel clears queue and DB data at the given level and returns the
@@ -2657,6 +2659,8 @@ func (s *Store) FlushByLevel(level, config, group string) (FlushStats, error) {
 		stats.KnownDead = deleteCount(FormatDBKey(KeyTypeKnownDead), false)
 		stats.Breakers = deleteCount(FormatDBKey(KeyTypeBreaker), false)
 		stats.PinEndorsement = deleteCount(FormatDBKey(KeyTypePinEndorsement), false)
+		stats.RegionState = deleteCount(FormatDBKey(KeyTypeRegionState), false)
+		stats.ExitGeo = deleteCount(FormatDBKey(KeyTypeExitGeo), false)
 	case "config":
 		stats.Stats = deleteCount(FormatDBKey(KeyTypeStats, config), true)
 		stats.Nodes = deleteCount(FormatDBKey(KeyTypeNode, config), true)
@@ -2667,6 +2671,8 @@ func (s *Store) FlushByLevel(level, config, group string) (FlushStats, error) {
 		stats.KnownDead = deleteCount(FormatDBKey(KeyTypeKnownDead, config), true)
 		stats.Breakers = deleteCount(FormatDBKey(KeyTypeBreaker, config), true)
 		stats.PinEndorsement = deleteCount(FormatDBKey(KeyTypePinEndorsement, config), true)
+		stats.RegionState = deleteCount(FormatDBKey(KeyTypeRegionState, config), true)
+		stats.ExitGeo = deleteCount(FormatDBKey(KeyTypeExitGeo, config), true)
 	case "group":
 		stats.Stats = deleteCount(FormatDBKey(KeyTypeStats, config, group), true)
 		stats.Nodes = deleteCount(FormatDBKey(KeyTypeNode, config, group), true)
@@ -2677,6 +2683,8 @@ func (s *Store) FlushByLevel(level, config, group string) (FlushStats, error) {
 		stats.KnownDead = deleteCount(FormatDBKey(KeyTypeKnownDead, config, group), true)
 		stats.Breakers = deleteCount(FormatDBKey(KeyTypeBreaker, config, group), true)
 		stats.PinEndorsement = deleteCount(FormatDBKey(KeyTypePinEndorsement, config, group), true)
+		stats.RegionState = deleteCount(FormatDBKey(KeyTypeRegionState, config, group), true)
+		stats.ExitGeo = deleteCount(FormatDBKey(KeyTypeExitGeo, config, group), true)
 	}
 	// Purged queue entries may have fed stats indexes that no bbolt delete
 	// covered; drop the affected indexes regardless.

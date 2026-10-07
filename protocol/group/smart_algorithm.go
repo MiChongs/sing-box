@@ -92,6 +92,11 @@ func normalizeAlgorithm(raw string) string {
 //
 // Returned values are clamped to [1, smartRound0Parallel].
 func (s *Smart) algoRound0Width() int {
+	if s.balance != nil {
+		// smart-loadbalance has already picked the node for this
+		// connection; racing a second one would undo the distribution.
+		return 1
+	}
 	switch s.currentAlgorithm() {
 	case smartAlgoStickySession,
 		smartAlgoRoundRobin,
@@ -481,7 +486,7 @@ func (s *Smart) stickyFastPath(meta *smartDialMeta, all []adapter.Outbound, isUD
 	if meta == nil || meta.smartTarget == "" {
 		return nil
 	}
-	if s.stickyByTarget == nil {
+	if s.stickyByTarget == nil || s.balance != nil {
 		return nil
 	}
 	// 手动 pin 有单独语义，让慢路径处理。

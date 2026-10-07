@@ -34,6 +34,13 @@ func smartRouter(ctx context.Context) http.Handler {
 	r.Put("/groups/{name}/algorithm", setSmartAlgorithm(ctx))
 	r.Post("/groups/{name}/recompute", recomputeSmartWeights(ctx))
 	r.Post("/groups/{name}/clear-selection", clearSmartSelection(ctx))
+	// smart-loadbalance: region table, region lock / mode, balance
+	// strategy / affinity, member re-detection.
+	r.Get("/groups/{name}/regions", getSmartRegions(ctx))
+	r.Put("/groups/{name}/regions", updateSmartRegions(ctx))
+	r.Delete("/groups/{name}/regions/lock", unlockSmartRegion(ctx))
+	r.Post("/groups/{name}/regions/detect", redetectSmartRegions(ctx))
+	r.Put("/groups/{name}/balance", updateSmartBalance(ctx))
 	return r
 }
 
@@ -116,6 +123,11 @@ func setSmartAlgorithm(ctx context.Context) func(w http.ResponseWriter, r *http.
 		if !ok {
 			render.Status(r, http.StatusBadRequest)
 			render.JSON(w, r, newError("not a Smart group"))
+			return
+		}
+		if sg.IsLoadBalance() {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("smart-loadbalance groups have no algorithm; use PUT /smart/groups/{name}/balance"))
 			return
 		}
 		previous := sg.CurrentAlgorithm()
@@ -214,6 +226,8 @@ func listSmartGroups(ctx context.Context) func(w http.ResponseWriter, r *http.Re
 			Hysteresis         string           `json:"hysteresis,omitempty"`
 			PinSuspended       bool             `json:"pinSuspended"`
 			HTTP3FallbackNodes int              `json:"http3FallbackNodes"`
+			Type               string           `json:"type"`
+			LoadBalance        map[string]any   `json:"loadBalance,omitempty"`
 		}
 		out := []groupInfo{}
 		for _, ob := range outboundMgr.Outbounds() {
@@ -227,9 +241,11 @@ func listSmartGroups(ctx context.Context) func(w http.ResponseWriter, r *http.Re
 				UseASN:      sg.UseASN(),
 				UseLightGBM: sg.UseLightGBM(),
 				CollectData: sg.CollectData(),
-				Fixed:       sg.PinnedTag(),
+				Fixed:       sg.FixedSelection(),
 				Now:         sg.Now(),
-				Members:     len(sg.All()),
+				Members:     len(sg.MemberTags()),
+				Type:        sg.Type(),
+				LoadBalance: sg.BalanceInfo(),
 				// Surface the parsed rules so operators can verify the
 				// policy_priority string was understood as intended.
 				// Only present (omitempty) when rules exist.
@@ -339,7 +355,7 @@ func blockSmartNode(ctx context.Context) func(w http.ResponseWriter, r *http.Req
 		// Verify the node is actually in the group before blocking, otherwise
 		// we'd write a NodeState for a non-existent node.
 		inGroup := false
-		for _, tag := range sg.All() {
+		for _, tag := range sg.MemberTags() {
 			if tag == node {
 				inGroup = true
 				break
@@ -368,5 +384,142 @@ func blockSmartNode(ctx context.Context) func(w http.ResponseWriter, r *http.Req
 			"node":          node,
 			"blocked_until": time.Now().Add(duration).Format(time.RFC3339),
 		})
+	}
+}
+
+// resolveLoadBalanceGroup resolves a smart-loadbalance group or answers the
+// request with the error.
+func resolveLoadBalanceGroup(ctx context.Context, w http.ResponseWriter, r *http.Request) (*group.Smart, bool) {
+	name := chi.URLParam(r, "name")
+	sg, err := resolveSmartGroup(ctx, name)
+	if err != nil {
+		render.Status(r, http.StatusNotFound)
+		render.JSON(w, r, newError(err.Error()))
+		return nil, false
+	}
+	if !sg.IsLoadBalance() {
+		render.Status(r, http.StatusBadRequest)
+		render.JSON(w, r, newError("not a smart-loadbalance group: "+name))
+		return nil, false
+	}
+	return sg, true
+}
+
+// getSmartRegions returns the region table of a smart-loadbalance group:
+// every region with its members, their detection source, health, load and
+// quality, plus the live mode / lock / strategy settings.
+func getSmartRegions(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sg, ok := resolveLoadBalanceGroup(ctx, w, r)
+		if !ok {
+			return
+		}
+		render.JSON(w, r, sg.RegionTable())
+	}
+}
+
+// updateSmartRegions changes the region lock and / or the region mode.
+// Body: {"lock": "JP"} (region code, built-in name or region outbound tag;
+// "" unlocks) and / or {"mode": "destination"} ("" restores the configured
+// mode). Fields left out are not touched.
+func updateSmartRegions(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sg, ok := resolveLoadBalanceGroup(ctx, w, r)
+		if !ok {
+			return
+		}
+		var body struct {
+			Lock *string `json:"lock"`
+			Mode *string `json:"mode"`
+		}
+		if err := render.DecodeJSON(r.Body, &body); err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("invalid JSON body: "+err.Error()))
+			return
+		}
+		if body.Lock == nil && body.Mode == nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError(`body must set "lock" and / or "mode"`))
+			return
+		}
+		response := render.M{"group": sg.Tag()}
+		if body.Mode != nil {
+			mode, err := sg.SetRegionMode(*body.Mode)
+			if err != nil {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, newError(err.Error()))
+				return
+			}
+			response["mode"] = mode
+		}
+		if body.Lock != nil {
+			lock, err := sg.SetRegionLock(*body.Lock)
+			if err != nil {
+				render.Status(r, http.StatusBadRequest)
+				render.JSON(w, r, newError(err.Error()))
+				return
+			}
+			response["lock"] = lock
+		}
+		response["now"] = sg.Now()
+		render.JSON(w, r, response)
+	}
+}
+
+func unlockSmartRegion(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sg, ok := resolveLoadBalanceGroup(ctx, w, r)
+		if !ok {
+			return
+		}
+		previous := sg.RegionLock()
+		if _, err := sg.SetRegionLock(""); err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError(err.Error()))
+			return
+		}
+		render.JSON(w, r, render.M{"group": sg.Tag(), "previous": previous, "now": sg.Now()})
+	}
+}
+
+// redetectSmartRegions re-sorts the members into regions and starts exit
+// probes; ?force=true probes every member, not just those that need it.
+func redetectSmartRegions(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sg, ok := resolveLoadBalanceGroup(ctx, w, r)
+		if !ok {
+			return
+		}
+		force := r.URL.Query().Get("force") == "true" || r.URL.Query().Get("force") == "1"
+		started := sg.RedetectRegions(force)
+		render.JSON(w, r, render.M{"group": sg.Tag(), "exitProbes": started})
+	}
+}
+
+// updateSmartBalance switches the balance strategy and / or affinity.
+// Body: {"strategy": "least-connections", "affinity": "site"}; "default"
+// restores the configured value, fields left out are not touched.
+func updateSmartBalance(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		sg, ok := resolveLoadBalanceGroup(ctx, w, r)
+		if !ok {
+			return
+		}
+		var body struct {
+			Strategy string `json:"strategy"`
+			Affinity string `json:"affinity"`
+		}
+		if err := render.DecodeJSON(r.Body, &body); err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("invalid JSON body: "+err.Error()))
+			return
+		}
+		strategy, affinity, err := sg.SetBalance(body.Strategy, body.Affinity)
+		if err != nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError(err.Error()))
+			return
+		}
+		render.JSON(w, r, render.M{"group": sg.Tag(), "strategy": strategy, "affinity": affinity})
 	}
 }

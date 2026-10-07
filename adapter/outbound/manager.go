@@ -15,6 +15,7 @@ import (
 var (
 	_ adapter.OutboundManager         = (*Manager)(nil)
 	_ adapter.RuntimeComponentRemover = (*Manager)(nil)
+	_ adapter.OutboundAdder           = (*Manager)(nil)
 )
 
 type Manager struct {
@@ -187,6 +188,26 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if err != nil {
 		return err
 	}
+	return m.add(tag, outbound, false)
+}
+
+// AddOutbound registers an outbound its owner constructed itself (the region
+// views of a smart-loadbalance group). Going through Create from inside a
+// constructor would re-enter the registry, which holds its lock while a
+// constructor runs. Before the manager starts, a duplicate tag is an error;
+// afterwards the outbound is started as a runtime outbound and replaces any
+// outbound with the same tag. A generated outbound only becomes the default
+// outbound when route.final names it: owners register it before themselves,
+// so it must not take the "first outbound" default from its owner.
+func (m *Manager) AddOutbound(outbound adapter.Outbound) error {
+	if outbound == nil || outbound.Tag() == "" {
+		return os.ErrInvalid
+	}
+	return m.add(outbound.Tag(), outbound, true)
+}
+
+func (m *Manager) add(tag string, outbound adapter.Outbound, generated bool) error {
+	var err error
 	m.access.Lock()
 	scope := m.scope
 	_, loaded := m.outboundByTag[tag]
@@ -216,7 +237,7 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if scope != nil {
 		m.runtime[outbound] = struct{}{}
 	}
-	if tag == m.defaultTag || (m.defaultTag == "" && m.defaultOutbound == nil) || (replaced != nil && m.defaultOutbound == replaced) {
+	if tag == m.defaultTag || (!generated && m.defaultTag == "" && m.defaultOutbound == nil) || (replaced != nil && m.defaultOutbound == replaced) {
 		m.defaultOutbound = outbound
 	}
 	m.access.Unlock()

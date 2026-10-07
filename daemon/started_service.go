@@ -783,6 +783,10 @@ func (s *StartedService) SelectOutbound(ctx context.Context, request *SelectOutb
 		if !p.SelectOutbound(request.OutboundTag) {
 			return nil, status.Error(codes.NotFound, "outbound not found in smart: "+request.OutboundTag)
 		}
+	case *group.SmartRegion:
+		if !p.SelectOutbound(request.OutboundTag) {
+			return nil, status.Error(codes.NotFound, "outbound not found in smart-region: "+request.OutboundTag)
+		}
 	default:
 		return nil, status.Error(codes.InvalidArgument, "outbound group does not support manual selection: "+request.GroupTag)
 	}

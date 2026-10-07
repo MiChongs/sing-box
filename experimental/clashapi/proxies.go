@@ -77,6 +77,14 @@ func clearProxySelection(w http.ResponseWriter, r *http.Request) {
 	switch p := proxy.(type) {
 	case *group.Smart:
 		render.JSON(w, r, p.ClearSelection())
+	case *group.SmartRegion:
+		previous := p.PinnedTag()
+		p.SelectOutbound("")
+		render.JSON(w, r, render.M{
+			"group":        p.Tag(),
+			"previous_pin": previous,
+			"now":          p.Now(),
+		})
 	case *group.URLTest:
 		// URLTest's temporary manual pin — empty tag clears it. The pin
 		// also auto-clears on the next user-triggered speed test, so
@@ -95,7 +103,7 @@ func clearProxySelection(w http.ResponseWriter, r *http.Request) {
 		})
 	default:
 		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError("only Smart and URLTest groups support clearing the manual pin; Selector requires PUT with a node name"))
+		render.JSON(w, r, newError("only Smart, smart-region and URLTest groups support clearing the manual pin; Selector requires PUT with a node name"))
 	}
 }
 
@@ -112,6 +120,22 @@ func clearProxySelection(w http.ResponseWriter, r *http.Request) {
 //	                 GetBestProxyForTarget sees at dial time.
 func getSmartGroupWeights(w http.ResponseWriter, r *http.Request) {
 	proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
+	if region, isRegion := proxy.(*group.SmartRegion); isRegion {
+		// A region outbound reports its group's ranking restricted to the
+		// region's members.
+		weights, err := region.WeightRanking(r.URL.Query().Get("refresh") == "true")
+		if err != nil {
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, render.M{"weights": []any{}, "error": err.Error()})
+			return
+		}
+		payload := render.M{"weights": weights, "group": region.Group(), "region": region.Region()}
+		if len(weights) == 0 {
+			payload["message"] = "no weight data available for this region"
+		}
+		render.JSON(w, r, payload)
+		return
+	}
 	sg, ok := proxy.(*group.Smart)
 	if !ok {
 		render.Status(r, http.StatusBadRequest)
@@ -258,12 +282,25 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 			info.Put("fixedActive", selected)
 		}
 
+		if region, ok := detour.(*group.SmartRegion); ok {
+			info.Put("group", region.Group())
+			info.Put("region", region.Region())
+			info.Put("fallback", region.Fallback())
+			info.Put("generated", region.Generated())
+			info.Put("fixed", region.PinnedTag())
+			info.Put("fixedSuspended", false)
+			info.Put("fixedActive", region.PinnedTag())
+			if parent := region.Parent(); parent != nil {
+				info.Put("testUrl", parent.TestURL())
+			}
+		}
+
 		if sg, ok := detour.(*group.Smart); ok {
 			info.Put("testUrl", sg.TestURL())
 			info.Put("useASN", sg.UseASN())
 			info.Put("useLightGBM", sg.UseLightGBM())
 			info.Put("collectData", sg.CollectData())
-			info.Put("fixed", sg.PinnedTag())
+			info.Put("fixed", sg.FixedSelection())
 			// pin suspension state — true when Smart had to fall back
 			// to an algorithm-selected node because the user's pin
 			// just failed a dial (and the breaker hasn't tripped
@@ -278,7 +315,7 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 			if suspended {
 				info.Put("fixedActive", now)
 			} else {
-				info.Put("fixedActive", sg.PinnedTag())
+				info.Put("fixedActive", sg.FixedSelection())
 			}
 			// Live algorithm + anti-flap window so /proxies dashboards
 			// can verify what's actually in effect (especially after a
@@ -296,6 +333,9 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 			info.Put("pinEndorsements", sg.PinEndorsementDebug())
 			if age := sg.LGBMModelAge(); age > 0 {
 				info.Put("lgbmModelAge", age.Truncate(time.Second).String())
+			}
+			if sg.IsLoadBalance() {
+				info.Put("loadBalance", sg.BalanceInfo())
 			}
 		}
 	}
@@ -397,10 +437,19 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	case *group.Smart:
-		// Empty name clears manual pinning; non-empty pins a node (mihomo parity).
+		// Empty name clears manual pinning; non-empty pins a node (mihomo
+		// parity). On smart-loadbalance groups a region (outbound tag or
+		// code) locks the region.
 		if !p.SelectOutbound(req.Name) {
 			render.Status(r, http.StatusBadRequest)
 			render.JSON(w, r, newError("Smart update error: not found"))
+			return
+		}
+	case *group.SmartRegion:
+		// Pins a member of the region for this region outbound; "" clears.
+		if !p.SelectOutbound(req.Name) {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("smart-region update error: not a member of the region"))
 			return
 		}
 	case *group.URLTest:
@@ -413,7 +462,7 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	default:
 		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError("Must be a Selector, Smart, or URLTest"))
+		render.JSON(w, r, newError("Must be a Selector, Smart, smart-region, or URLTest"))
 		return
 	}
 
