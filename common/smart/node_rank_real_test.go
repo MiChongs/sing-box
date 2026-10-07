@@ -3,6 +3,7 @@ package smart
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/sagernet/bbolt"
@@ -46,40 +47,9 @@ func freshStore(t testing.TB) *Store {
 		_ = db.Close()
 		_ = os.RemoveAll(dir)
 	})
-	// GetOrInitStore is a sync.Once singleton — first caller wins. On
-	// the SECOND test that calls freshStore, the singleton still holds
-	// the previous test's (now-closed) db handle and would silently
-	// return empty results from every read. Force the swap by writing
-	// globalDB directly; package-internal access lets us bypass the
-	// sync.Once for tests without touching production semantics. The swap
-	// happens under flushMu so the background flusher is never mid-commit,
-	// and writes earlier tests left queued are dropped with their database.
-	s := GetOrInitStore(db)
-	flushMu.Lock()
-	globalQueueMu.Lock()
-	clear(globalQueueOps)
-	globalQueueOps = globalQueueOps[:0]
-	clear(globalQueueIdx)
-	globalQueueMu.Unlock()
-	globalDB = db
-	flushMu.Unlock()
-	if dbResultCache != nil {
-		dbResultCache.Clear()
-	}
-	if recordCache != nil {
-		recordCache.Clear()
-	}
-	if blockedNodesCache != nil {
-		blockedNodesCache.Clear()
-	}
-	if unwrapCache != nil {
-		unwrapCache.Clear()
-	}
-	if targetCache != nil {
-		targetCache.Clear()
-	}
-	invalidateStatsIndexes(FormatDBKey())
-	return s
+	// Each test owns a new db, so GetOrInitStore rebinds the singleton to
+	// it and drops whatever earlier tests left queued or cached.
+	return GetOrInitStore(db)
 }
 
 // TestGetLiveNodeRanking_RealCoverageOnly verifies that TargetCount
@@ -150,5 +120,61 @@ func TestGetLiveNodeRanking_NoStatsZeroCoverage(t *testing.T) {
 					r.TargetCount, r.SampleCount)
 			}
 		}
+	}
+}
+
+// TestGetOrInitStore_RebindsReopenedDB: a reloaded box closes the cache
+// file and opens it again. The store must follow the new handle instead of
+// writing to the closed one, keep what was flushed, and drop writes still
+// queued for the old handle together with anything cached from it.
+func TestGetOrInitStore_RebindsReopenedDB(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cache.db")
+	openDB := func() *bbolt.DB {
+		db, err := bbolt.Open(path, 0600, nil)
+		if err != nil {
+			t.Fatalf("open bbolt: %v", err)
+		}
+		t.Cleanup(func() { _ = db.Close() })
+		return db
+	}
+	const grp, cfg = "g_rebind", "c_rebind"
+
+	first := openDB()
+	store := GetOrInitStore(first)
+	stageStats(t, store, grp, cfg, "kept.example", "A", 10, 0, 1.5)
+	if err := store.StoreFlushNow(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	stageStats(t, store, grp, cfg, "stale.example", "A", 10, 0, 1.5)
+	// Warm the scan cache and stats index from the old handle.
+	if all, err := store.GetAllStats(grp, cfg); err != nil || len(all) != 2 {
+		t.Fatalf("before reload: got %v, %v; want 2 targets", all, err)
+	}
+	if err := first.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	second := openDB()
+	if got := GetOrInitStore(second); got != store {
+		t.Fatal("GetOrInitStore replaced the singleton store")
+	}
+	if globalDB.Load() != second {
+		t.Fatal("store still bound to the closed database")
+	}
+	stageStats(t, store, grp, cfg, "fresh.example", "B", 5, 0, 1.2)
+	if err := store.StoreFlushNow(); err != nil {
+		t.Fatalf("flush after reload: %v", err)
+	}
+
+	all, err := store.GetAllStats(grp, cfg)
+	if err != nil {
+		t.Fatalf("GetAllStats: %v", err)
+	}
+	var targets []string
+	for target := range all {
+		targets = append(targets, target)
+	}
+	if got, want := sortedStrings(targets), []string{"fresh.example", "kept.example"}; !slices.Equal(got, want) {
+		t.Fatalf("targets after reload = %v, want %v", got, want)
 	}
 }

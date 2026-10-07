@@ -11,6 +11,7 @@ import (
 	"github.com/sagernet/bbolt"
 	bboltErrors "github.com/sagernet/bbolt/errors"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/smart"
 	"github.com/sagernet/sing-box/experimental/deprecated"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -37,6 +38,9 @@ var (
 		string(bucketBranch),
 		string(bucketRDRC),
 		string(bucketDNSCache),
+		// Written by Smart groups through SmartDB; listed so opening the
+		// cache file does not purge it.
+		smart.BucketName,
 	}
 
 	cacheIDDefault = []byte("default")
@@ -133,6 +137,10 @@ func New(ctx context.Context, logger logger.Logger, options option.CacheFileOpti
 func (c *CacheFile) Name() string {
 	return "cache-file"
 }
+
+// Smart groups find the store through this assertion; keep it compiled in
+// so a signature drift fails the build instead of disabling persistence.
+var _ smart.SmartDBProvider = (*CacheFile)(nil)
 
 func (c *CacheFile) SmartDB() *bbolt.DB {
 	return c.DB

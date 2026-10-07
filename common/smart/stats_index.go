@@ -665,7 +665,8 @@ func evictStatsIndexes(keep *statsSlot) {
 // buildStatsIndex decodes a group's stats from a consistent snapshot:
 // queued and in-flight writes first (they win), then bbolt.
 func buildStatsIndex(scope string) (*statsIndex, error) {
-	if globalDB == nil {
+	db := globalDB.Load()
+	if db == nil {
 		return nil, errors.New("smart: store not initialised")
 	}
 	ix := newStatsIndex()
@@ -681,7 +682,7 @@ func buildStatsIndex(scope string) (*statsIndex, error) {
 	globalQueueMu.RUnlock()
 
 	head := []byte(scope + "/")
-	err := globalDB.View(func(tx *bbolt.Tx) error {
+	err := db.View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(bucketSmartStats)
 		if bucket == nil {
 			return nil

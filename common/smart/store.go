@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/bbolt"
@@ -29,8 +30,10 @@ var json = struct {
 }
 
 var (
-	globalDB         *bbolt.DB
-	bucketSmartStats = []byte("smart_stats")
+	// globalDB is the cache file's database the store reads and writes. It
+	// is swapped when a reloaded box reopens the cache file; see rebindDB.
+	globalDB         atomic.Pointer[bbolt.DB]
+	bucketSmartStats = []byte(BucketName)
 
 	globalStoreOnce sync.Once
 	globalStore     *Store
@@ -107,16 +110,57 @@ type dbScan struct {
 // Store is a singleton that wraps bbolt + in-memory caches.
 type Store struct{}
 
-// GetOrInitStore returns the global Store, initializing it with db on first call.
+// BucketName is the top-level cache file bucket holding all Smart data.
+const BucketName = "smart_stats"
+
+// SmartDBProvider is implemented by the cache file service to hand its
+// database to the Smart store.
+type SmartDBProvider interface {
+	SmartDB() *bbolt.DB
+}
+
+// GetOrInitStore returns the global Store bound to db, initializing the
+// process-wide caches and flusher on first call. A later call with another
+// db — the cache file reopened after a SIGHUP / Clash API reload or a
+// restarted platform service — rebinds the store to it.
 func GetOrInitStore(db *bbolt.DB) *Store {
 	globalStoreOnce.Do(func() {
-		globalDB = db
+		globalDB.Store(db)
 		initCaches()
 		initQueue()
 		globalStore = &Store{}
 		go globalStore.runFlusher()
 	})
+	if globalDB.Load() != db {
+		rebindDB(db)
+	}
 	return globalStore
+}
+
+// rebindDB points the store at db and drops everything derived from the
+// previous database. That database belonged to the previous box, which
+// closed it after its Smart groups flushed; writes still queued for it are
+// discarded with it, and caches and stats indexes reload lazily from db.
+func rebindDB(db *bbolt.DB) {
+	flushMu.Lock()
+	defer flushMu.Unlock()
+	if globalDB.Load() == db {
+		return
+	}
+	globalQueueMu.Lock()
+	clear(globalQueueOps)
+	globalQueueOps = globalQueueOps[:0]
+	clear(globalQueueIdx)
+	globalDB.Store(db)
+	scanEpoch++
+	globalQueueMu.Unlock()
+
+	targetCache.Clear()
+	unwrapCache.Clear()
+	recordCache.Clear()
+	dbResultCache.Clear()
+	blockedNodesCache.Clear()
+	invalidateStatsIndexes(FormatDBKey())
 }
 
 func initCaches() {
@@ -412,7 +456,7 @@ func (s *Store) FlushQueue(force bool) {
 // unless the database was opened with NoSync, so there is no extra Sync
 // per batch; StoreFlushNow adds the explicit one shutdown paths rely on.
 func commitBatch(batch []queuedOp) error {
-	return globalDB.Update(func(tx *bbolt.Tx) error {
+	return globalDB.Load().Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists(bucketSmartStats)
 		if err != nil {
 			return err
@@ -470,11 +514,11 @@ func (s *Store) BatchSave(operations []StoreOperation) error {
 // the "everything the Smart group has observed is on disk" guarantee.
 // Idempotent and safe to call concurrently.
 func (s *Store) StoreFlushNow() error {
-	if s == nil || globalDB == nil {
+	if s == nil || globalDB.Load() == nil {
 		return nil
 	}
 	s.FlushQueue(true)
-	return globalDB.Sync()
+	return globalDB.Load().Sync()
 }
 
 // noteWriteLocked bumps the write generations covering key (a full key or
@@ -702,7 +746,7 @@ func (s *Store) DBViewPrefixScan(prefix string, maxResults int, strict bool) (ma
 	var reservoir []kv
 	seen := 0
 
-	err := globalDB.View(func(tx *bbolt.Tx) error {
+	err := globalDB.Load().View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(bucketSmartStats)
 		if bucket == nil {
 			return nil
@@ -759,7 +803,7 @@ func deletePrefix(prefix string, strict bool) (int, error) {
 	for {
 		var keys [][]byte
 		more := false
-		err = globalDB.Update(func(tx *bbolt.Tx) error {
+		err = globalDB.Load().Update(func(tx *bbolt.Tx) error {
 			bucket := tx.Bucket(bucketSmartStats)
 			if bucket == nil {
 				return nil
@@ -801,7 +845,7 @@ func deleteKeys(keys [][]byte) error {
 	for len(keys) > 0 {
 		chunk := keys[:min(len(keys), deleteChunkSize)]
 		keys = keys[len(chunk):]
-		err := globalDB.Update(func(tx *bbolt.Tx) error {
+		err := globalDB.Load().Update(func(tx *bbolt.Tx) error {
 			bucket := tx.Bucket(bucketSmartStats)
 			if bucket == nil {
 				return nil
@@ -827,7 +871,7 @@ func deleteKeysTx(bucket *bbolt.Bucket, keys [][]byte) error {
 // walkKeys calls fn for every bbolt key under prefix + "/" (keys only).
 func walkKeys(prefix string, fn func(k []byte)) error {
 	head := []byte(prefix + "/")
-	return globalDB.View(func(tx *bbolt.Tx) error {
+	return globalDB.Load().View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(bucketSmartStats)
 		if bucket == nil {
 			return nil
@@ -854,7 +898,7 @@ func queuedKeys(prefix string, fn func(key string)) {
 }
 
 func (s *Store) DBBatchPutItem(key string, value []byte) error {
-	err := globalDB.Update(func(tx *bbolt.Tx) error {
+	err := globalDB.Load().Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists(bucketSmartStats)
 		if err != nil {
 			return err
@@ -2170,7 +2214,7 @@ func (s *Store) RemoveNodesData(group, config string, nodes []string) error {
 	rankingKey := FormatDBKey(KeyTypeRanking, config, group)
 	nodeScope := FormatDBKey(KeyTypeNode, config, group)
 
-	err := globalDB.Update(func(tx *bbolt.Tx) error {
+	err := globalDB.Load().Update(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(bucketSmartStats)
 		if bucket == nil {
 			return nil
@@ -2275,7 +2319,7 @@ func (s *Store) GetAllGroupsForConfig(config string) ([]string, error) {
 	})
 
 	head := []byte(scope + "/")
-	err := globalDB.View(func(tx *bbolt.Tx) error {
+	err := globalDB.Load().View(func(tx *bbolt.Tx) error {
 		bucket := tx.Bucket(bucketSmartStats)
 		if bucket == nil {
 			return nil
@@ -2416,7 +2460,7 @@ func (s *Store) CleanupOldRecords(group, config string) error {
 
 		var items []cleanupItem
 		head := []byte(scope + "/")
-		err := globalDB.View(func(tx *bbolt.Tx) error {
+		err := globalDB.Load().View(func(tx *bbolt.Tx) error {
 			bucket := tx.Bucket(bucketSmartStats)
 			if bucket == nil {
 				return nil

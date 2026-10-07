@@ -42,7 +42,7 @@ func stagePerfStats(tb testing.TB, group, config string, ds perfDataset) map[str
 		r.Read(blob)
 		digest = `,"rtt_digest":"` + base64.StdEncoding.EncodeToString(blob) + `"`
 	}
-	err := globalDB.Update(func(tx *bbolt.Tx) error {
+	err := globalDB.Load().Update(func(tx *bbolt.Tx) error {
 		bk, err := tx.CreateBucketIfNotExists(bucketSmartStats)
 		if err != nil {
 			return err

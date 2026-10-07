@@ -286,7 +286,7 @@ func randomStatsValue(r *rand.Rand, now int64) []byte {
 func stageEquivalenceData(t *testing.T, s *Store, group, config string, r *rand.Rand, now int64) {
 	t.Helper()
 	nodes := equivalenceNodes()
-	err := globalDB.Update(func(tx *bbolt.Tx) error {
+	err := globalDB.Load().Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists(bucketSmartStats)
 		if err != nil {
 			return err

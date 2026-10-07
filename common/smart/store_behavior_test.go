@@ -17,7 +17,7 @@ import (
 
 func putRaw(t *testing.T, key string, value []byte) {
 	t.Helper()
-	err := globalDB.Update(func(tx *bbolt.Tx) error {
+	err := globalDB.Load().Update(func(tx *bbolt.Tx) error {
 		bucket, err := tx.CreateBucketIfNotExists(bucketSmartStats)
 		if err != nil {
 			return err
@@ -32,7 +32,7 @@ func putRaw(t *testing.T, key string, value []byte) {
 func rawExists(t *testing.T, key string) bool {
 	t.Helper()
 	found := false
-	err := globalDB.View(func(tx *bbolt.Tx) error {
+	err := globalDB.Load().View(func(tx *bbolt.Tx) error {
 		if bucket := tx.Bucket(bucketSmartStats); bucket != nil {
 			found = bucket.Get([]byte(key)) != nil
 		}
@@ -248,7 +248,7 @@ func TestQueuedWritesOverlayStore(t *testing.T) {
 	// must stay visible while it is in flight.
 	held, release := make(chan struct{}), make(chan struct{})
 	go func() {
-		_ = globalDB.Update(func(*bbolt.Tx) error {
+		_ = globalDB.Load().Update(func(*bbolt.Tx) error {
 			close(held)
 			<-release
 			return nil
