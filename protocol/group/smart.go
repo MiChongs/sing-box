@@ -27,6 +27,7 @@ import (
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/smart"
 	"github.com/sagernet/sing-box/common/smart/lightgbm"
+	"github.com/sagernet/sing-box/common/smart/tcpinfo"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	smartservice "github.com/sagernet/sing-box/experimental/smart"
@@ -1028,9 +1029,12 @@ func (s *Smart) postStart() error {
 	}
 	mlStatus := "off"
 	if s.useLightGBM {
-		if s.weightModel != nil && s.weightModel.IsLoaded() {
+		switch {
+		case s.weightModel != nil && s.weightModel.IsLoaded():
 			mlStatus = "loaded"
-		} else {
+		case s.weightModel != nil && s.weightModel.LoadError() != nil:
+			mlStatus = "unusable"
+		default:
 			mlStatus = "pending"
 		}
 	}
@@ -2536,7 +2540,7 @@ func (s *Smart) racePacketCandidates(
 		s.onDialOutcome(false)
 		tag, ct, m := ob.Tag(), connectTime, meta
 		getSmartWorker().bookkeep(func() {
-			s.recordStats("failed", m, tag, ct, 0, 0, 0, 0, 0, 0)
+			s.recordStats("failed", m, tag, ct, 0, 0, 0, 0, 0, 0, tcpinfo.Info{})
 		})
 	}
 	if finalErr == nil {
@@ -3508,7 +3512,7 @@ func (s *Smart) recordFailedDial(tag string, meta *smartDialMeta, connectTime in
 	if meta == nil {
 		return
 	}
-	s.recordStats("failed", meta, tag, connectTime, 0, 0, 0, 0, 0, 0)
+	s.recordStats("failed", meta, tag, connectTime, 0, 0, 0, 0, 0, 0, tcpinfo.Info{})
 }
 
 // ─── tracked connection wrappers ──────────────────────────────────────────────
@@ -3855,6 +3859,10 @@ func (c *smartTrackedConn) Close() error {
 			}
 		}
 
+		// The kernel counters vanish with the socket, so read them before
+		// c.Conn.Close below; zero when no TCP socket is reachable.
+		tcpStats, _ := tcpinfo.Read(c.Conn)
+
 		cs, meta, tag, ctime := c.s, c.meta, c.proxyTag, c.connectTime
 		statusCopy := status
 		latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy := latency, up, down, maxUpBps, maxDownBps, durMS
@@ -3863,7 +3871,7 @@ func (c *smartTrackedConn) Close() error {
 		// the sample instead of stalling the caller.
 		getSmartWorker().bookkeep(func() {
 			cs.recordStats(statusCopy, meta, tag, ctime,
-				latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy)
+				latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy, tcpStats)
 		})
 	})
 	return c.Conn.Close()
@@ -3975,7 +3983,7 @@ func (c *smartTrackedPacketConn) Close() error {
 		// See smartTrackedConn.Close.
 		getSmartWorker().bookkeep(func() {
 			cs.recordStats("closed", meta, tag, ctime,
-				latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy)
+				latCopy, upCopy, downCopy, muCopy, mdCopy, durCopy, tcpinfo.Info{})
 		})
 	})
 	return c.PacketConn.Close()
@@ -4198,6 +4206,7 @@ func smartSkipType(t string) bool {
 func (s *Smart) recordStats(
 	status string, meta *smartDialMeta, proxyTag string,
 	connectTime, latency, uploadBytes, downloadBytes, maxUploadRate, maxDownloadRate, durationMS int64,
+	tcpStats tcpinfo.Info,
 ) {
 	// Skip special types — prevents polluting the weight store with results
 	// from direct / block / dns outbounds (mihomo parity).
@@ -4297,6 +4306,14 @@ func (s *Smart) recordStats(
 			record.SetFloat64("duration", durationMin)
 		}
 	}
+	// TCP retransmission share of this connection and, accumulated, of
+	// every connection on this (target, node): LightGBM's loss_rate and
+	// cumul_loss_rate inputs.
+	var lossRate float64
+	if sent := tcpStats.Sent(); sent > 0 {
+		record.AddTCPCounters(sent, tcpStats.Retransmitted())
+		lossRate = tcpStats.LossRate()
+	}
 
 	// CRITICAL: snapshot history BEFORE mutating totals. ModelInput semantics
 	// (mihomo parity): UploadTotal / MaxuploadRate / DownloadTotal / MaxdownloadRate
@@ -4374,6 +4391,9 @@ func (s *Smart) recordStats(
 		MaxdownloadRate:        maxDownKB,
 		HistoryMaxDownloadRate: historyMaxDownloadRate,
 		ConnectionDuration:     record.GetFloat64("duration"),
+		LastConnectionDuration: durationMin,
+		LossRate:               lossRate,
+		CumulLossRate:          record.CumulLossRate(),
 		LastUsed:               record.GetInt64("lastUsed"),
 		DestIPASN:              meta.asnCode,
 		Host:                   meta.host,

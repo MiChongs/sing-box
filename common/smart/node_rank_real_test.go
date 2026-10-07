@@ -178,3 +178,39 @@ func TestGetOrInitStore_RebindsReopenedDB(t *testing.T) {
 		t.Fatalf("targets after reload = %v, want %v", got, want)
 	}
 }
+
+// TestCumulLossRatePersists: the TCP counters behind cumul_loss_rate are
+// stored with the record and restored when it is read back from bbolt.
+func TestCumulLossRatePersists(t *testing.T) {
+	store := freshStore(t)
+	const grp, cfg, target, node = "g_loss", "c_loss", "example.com", "n1"
+	key := FormatDBKey(KeyTypeStats, cfg, grp, target, node)
+
+	rec := store.GetOrCreateAtomicRecord(key, grp, cfg, target, node)
+	if got := rec.CumulLossRate(); got != 0 {
+		t.Fatalf("fresh record CumulLossRate = %v, want 0", got)
+	}
+	rec.AddTCPCounters(200, 10)
+	rec.AddTCPCounters(300, 15)
+	if got := rec.CumulLossRate(); got != 0.05 {
+		t.Fatalf("CumulLossRate = %v, want 0.05", got)
+	}
+
+	snapshot := rec.CreateStatsSnapshot()
+	data, err := MarshalStatsRecord(snapshot)
+	ReleaseStatsRecord(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.AppendToGlobalQueue(StoreOperation{Type: OpSaveStats, Group: grp, Config: cfg, Target: target, Node: node, Data: data})
+	store.FlushQueue(true)
+	recordCache.Clear()
+
+	restored := store.GetOrCreateAtomicRecord(key, grp, cfg, target, node)
+	if restored == rec {
+		t.Fatal("record was not reloaded from bbolt")
+	}
+	if got := restored.CumulLossRate(); got != 0.05 {
+		t.Fatalf("restored CumulLossRate = %v, want 0.05", got)
+	}
+}

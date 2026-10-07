@@ -2,6 +2,7 @@ package lightgbm
 
 import (
 	"encoding/csv"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -55,7 +56,10 @@ func TestCollectorHeaderMatchesRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	c.AddSample(&smart.ModelInput{Success: 3, GroupName: "g", NodeName: "n"}, nil, 1.0, "traditional")
+	c.AddSample(&smart.ModelInput{
+		Success: 3, GroupName: "g", NodeName: "n",
+		LastConnectionDuration: math.E - 1, LossRate: 0.25, CumulLossRate: 0.125,
+	}, nil, 1.0, "traditional")
 	if c.WrittenRows() != 1 {
 		t.Fatalf("sample not written: dropped=%d", c.DroppedRows())
 	}
@@ -86,10 +90,13 @@ func TestCollectorHeaderMatchesRows(t *testing.T) {
 		}
 	}
 	for name, want := range map[string]string{
-		"group_name":     "g",
-		"node_name":      "n",
-		"weight_source":  "traditional",
-		"schema_version": collectorSchemaVersion,
+		"group_name":               "g",
+		"node_name":                "n",
+		"weight_source":            "traditional",
+		"current_duration_minutes": "1.000000",
+		"loss_rate":                "0.250000",
+		"cumul_loss_rate":          "0.125000",
+		"schema_version":           collectorSchemaVersion,
 	} {
 		if got := row[slices.Index(header, name)]; got != want {
 			t.Fatalf("%s = %q, want %q", name, got, want)

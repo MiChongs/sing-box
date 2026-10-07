@@ -1,0 +1,286 @@
+tree
+version=v4
+num_class=1
+num_tree_per_iteration=1
+label_index=0
+max_feature_idx=29
+objective=huber
+feature_names=success failure connect_time latency upload_mb history_upload_mb maxuploadrate_kb history_maxuploadrate_kb download_mb history_download_mb maxdownloadrate_kb history_maxdownloadrate_kb duration_minutes history_duration_minutes last_used_seconds is_udp is_tcp loss_rate cumul_loss_rate asn_feature country_feature address_feature port_feature traffic_ratio traffic_density connection_type_feature asn_hash host_hash ip_hash geoip_hash
+feature_infos=[-3.0571583563633196:3.381874490145194] [-3.4624921541117586:3.263351112221764] [-3.5613497722788265:2.8630189930239185] [-3.4678406253788268:3.6235676883680048] [-3.0936863206592382:3.3322891429383352] [-3.554684957892829:3.7230885349670335] [-3.4172418451857682:4.8749335612940596] [-2.7734103109778756:3.7344864251866272] [-3.6476867182779884:3.2711982455910356] [-3.707887820637163:3.0220980120845535] [-3.6985320086977769:3.2161545030341712] [-3.6286167800916522:3.4293632192109098] [-3.257806273448951:3.7315614658206586] [-3.2086242945446437:3.0620176304008013] [-3.2801979676076956:3.2169856054771464] [-3.0315197078577922:3.0314296074369889] [-3.4557502889155205:3.6585210139788238] [-3.2815755102421402:3.5995925269436468] [-3.2547598609623334:4.0542973610343811] [-3.2744750252613533:3.1342715493128348] [-3.4472343376145043:3.2818068939356255] [-3.0568788979273802:4.3059134140478044] [-3.1314984855049239:3.1052348894536581] [-3.6739946837590298:3.5923361516098375] [-4.2068146081049953:3.6499235268580694] [-3.2389669911260865:2.9171367405601281] [-3.4703608674068565:3.3147091635898782] [-3.5847695726726814:2.8172157213305766] [-3.3241813441241406:3.7369551913300256] [-3.325417591020253:3.8333890664441892]
+tree_sizes=657 668 677 682 682
+
+Tree=0
+num_leaves=6
+num_cat=0
+split_feature=17 12 12 3 3
+split_gain=83.1137 32.1074 15.1059 13.6238 10.5809
+threshold=0.45069483695332618 -0.18681148713044349 0.087412380604609138 -0.029626816046399811 0.051443401470140364
+decision_type=2 2 2 2 2
+left_child=1 4 -2 -3 -1
+right_child=2 3 -4 -5 -6
+leaf_value=0.85274759524590249 0.80028705820583035 0.88319928160847117 0.83135448709332527 0.8577104334144956 0.82448892406919805
+leaf_weight=277 340 426 290 413 254
+leaf_count=277 340 426 290 413 254
+internal_value=0.844649 0.858473 0.814588 0.870652 0.83923
+internal_weight=2000 1370 630 839 531
+internal_count=2000 1370 630 839 531
+is_linear=0
+shrinkage=1
+
+
+Tree=1
+num_leaves=6
+num_cat=0
+split_feature=17 12 12 0 0
+split_gain=67.585 27.1251 12.98 12.6358 9.04949
+threshold=0.45069483695332618 0.18462423021388935 0.422731372284536 0.065847852407369858 -0.16635794118248651
+decision_type=2 2 2 2 2
+left_child=1 3 -2 -1 -3
+right_child=2 4 -4 -5 -6
+leaf_value=-0.013139250457466833 -0.036672388323726525 0.013798498466144688 -0.0055793527658961565 0.012786842309607659 0.03831045783545
+leaf_weight=379 436 260 194 373 358
+leaf_count=379 436 260 194 373 358
+internal_value=1.0457e-05 0.0124763 -0.0270977 -0.000279633 0.027998
+internal_weight=2000 1370 630 752 618
+internal_count=2000 1370 630 752 618
+is_linear=0
+shrinkage=0.1
+
+
+Tree=2
+num_leaves=6
+num_cat=0
+split_feature=17 12 3 0 0
+split_gain=55.6001 24.4491 11.9386 11.3293 9.48517
+threshold=0.55782514871672861 -0.25557926816134174 0.28301048414764035 0.28263110810736064 -0.29941532632864049
+decision_type=2 2 2 2 2
+left_child=1 -1 4 -2 -3
+right_child=3 2 -4 -5 -6
+leaf_value=-0.0067533269133035938 -0.037483112411744533 0.013166481633035635 0.0058126050342963585 -0.0082524048645386504 0.039768731344420653
+leaf_weight=523 354 220 348 212 343
+leaf_count=523 354 220 348 212 343
+internal_value=4.78288e-06 0.0104798 0.0203733 -0.0265345 0.0293735
+internal_weight=2000 1434 911 566 563
+internal_count=2000 1434 911 566 563
+is_linear=0
+shrinkage=0.1
+
+
+Tree=3
+num_leaves=6
+num_cat=0
+split_feature=17 12 3 12 0
+split_gain=45.0615 21.0285 14.5696 10.3528 7.44928
+threshold=0.55782514871672861 0.62159873309497471 0.051443401470140364 0.093317407860987425 -0.44069765739892869
+decision_type=2 2 2 2 2
+left_child=1 2 4 -2 -1
+right_child=3 -3 -4 -5 -6
+leaf_value=-0.0048571697848105062 -0.03649063397147239 0.028343205400947785 -0.011057393589093393 -0.0093739090281088951 0.020683838968912786
+leaf_weight=164 303 417 477 263 376
+leaf_count=164 303 417 477 263 376
+internal_value=1.64368e-06 0.00943186 0.00167765 -0.0238905 0.0129269
+internal_weight=2000 1434 1017 566 540
+internal_count=2000 1434 1017 566 540
+is_linear=0
+shrinkage=0.1
+
+
+Tree=4
+num_leaves=6
+num_cat=0
+split_feature=17 12 3 0 3
+split_gain=37.3874 16.9645 11.1762 10.9053 8.33964
+threshold=0.3764751702195091 -0.67882411638145801 0.078591914424616896 0.15336478721442326 -0.48630737442759386
+decision_type=2 2 2 2 2
+left_child=1 -1 -2 4 -3
+right_child=2 3 -4 -5 -6
+leaf_value=-0.010658079711531362 -0.0065997306699864568 0.024902987535807327 -0.032143300739637497 0.027304971490344748 -0.0019747728719924978
+leaf_weight=308 355 168 331 469 369
+leaf_count=308 355 168 331 469 369
+internal_value=-1.99157e-06 0.00987698 -0.0189247 0.0161641 0.00643391
+internal_weight=2000 1314 686 1006 537
+internal_count=2000 1314 686 1006 537
+is_linear=0
+shrinkage=0.1
+
+
+end of trees
+
+feature_importances:
+duration_minutes=8
+success=6
+latency=6
+loss_rate=5
+
+parameters:
+[boosting: gbdt]
+[objective: huber]
+[metric: huber]
+[tree_learner: serial]
+[device_type: cpu]
+[data_sample_strategy: bagging]
+[data: ]
+[valid: ]
+[num_iterations: 5]
+[learning_rate: 0.1]
+[num_leaves: 6]
+[num_threads: 0]
+[seed: 0]
+[deterministic: 0]
+[force_col_wise: 0]
+[force_row_wise: 0]
+[histogram_pool_size: -1]
+[max_depth: -1]
+[min_data_in_leaf: 50]
+[min_sum_hessian_in_leaf: 0.001]
+[bagging_fraction: 1]
+[pos_bagging_fraction: 1]
+[neg_bagging_fraction: 1]
+[bagging_freq: 0]
+[bagging_seed: 3]
+[bagging_by_query: 0]
+[feature_fraction: 1]
+[feature_fraction_bynode: 1]
+[feature_fraction_seed: 2]
+[extra_trees: 0]
+[extra_seed: 6]
+[early_stopping_round: 0]
+[early_stopping_min_delta: 0]
+[first_metric_only: 0]
+[max_delta_step: 0]
+[lambda_l1: 0]
+[lambda_l2: 0]
+[linear_lambda: 0]
+[min_gain_to_split: 0]
+[drop_rate: 0.1]
+[max_drop: 50]
+[skip_drop: 0.5]
+[xgboost_dart_mode: 0]
+[uniform_drop: 0]
+[drop_seed: 4]
+[top_rate: 0.2]
+[other_rate: 0.1]
+[min_data_per_group: 100]
+[max_cat_threshold: 32]
+[cat_l2: 10]
+[cat_smooth: 10]
+[max_cat_to_onehot: 4]
+[top_k: 20]
+[monotone_constraints: ]
+[monotone_constraints_method: basic]
+[monotone_penalty: 0]
+[feature_contri: ]
+[forcedsplits_filename: ]
+[refit_decay_rate: 0.9]
+[cegb_tradeoff: 1]
+[cegb_penalty_split: 0]
+[cegb_penalty_feature_lazy: ]
+[cegb_penalty_feature_coupled: ]
+[path_smooth: 0]
+[interaction_constraints: ]
+[verbosity: -1]
+[saved_feature_importance_type: 0]
+[use_quantized_grad: 0]
+[num_grad_quant_bins: 4]
+[quant_train_renew_leaf: 0]
+[stochastic_rounding: 1]
+[linear_tree: 0]
+[max_bin: 255]
+[max_bin_by_feature: ]
+[min_data_in_bin: 3]
+[bin_construct_sample_cnt: 200000]
+[data_random_seed: 1]
+[is_enable_sparse: 1]
+[enable_bundle: 1]
+[use_missing: 1]
+[zero_as_missing: 0]
+[feature_pre_filter: 1]
+[pre_partition: 0]
+[two_round: 0]
+[header: 0]
+[label_column: ]
+[weight_column: ]
+[group_column: ]
+[ignore_column: ]
+[categorical_feature: ]
+[forcedbins_filename: ]
+[precise_float_parser: 0]
+[parser_config_file: ]
+[objective_seed: 5]
+[num_class: 1]
+[is_unbalance: 0]
+[scale_pos_weight: 1]
+[sigmoid: 1]
+[boost_from_average: 1]
+[reg_sqrt: 0]
+[alpha: 0.9]
+[fair_c: 1]
+[poisson_max_delta_step: 0.7]
+[tweedie_variance_power: 1.5]
+[lambdarank_truncation_level: 30]
+[lambdarank_norm: 1]
+[label_gain: ]
+[lambdarank_position_bias_regularization: 0]
+[eval_at: ]
+[multi_error_top_k: 1]
+[auc_mu_weights: ]
+[num_machines: 1]
+[local_listen_port: 12400]
+[time_out: 120]
+[machine_list_filename: ]
+[machines: ]
+[gpu_platform_id: -1]
+[gpu_device_id: -1]
+[gpu_device_id_list: ]
+[gpu_use_dp: 0]
+[num_gpu: 1]
+
+end of parameters
+
+pandas_categorical:null
+
+[transforms]
+[order]
+0=success
+1=failure
+2=connect_time
+3=latency
+4=upload_mb
+5=history_upload_mb
+6=maxuploadrate_kb
+7=history_maxuploadrate_kb
+8=download_mb
+9=history_download_mb
+10=maxdownloadrate_kb
+11=history_maxdownloadrate_kb
+12=duration_minutes
+13=history_duration_minutes
+14=last_used_seconds
+15=is_udp
+16=is_tcp
+17=loss_rate
+18=cumul_loss_rate
+19=asn_feature
+20=country_feature
+21=address_feature
+22=port_feature
+23=traffic_ratio
+24=traffic_density
+25=connection_type_feature
+26=asn_hash
+27=host_hash
+28=ip_hash
+29=geoip_hash
+[/order]
+[definitions]
+std_type=StandardScaler
+std_features=2,12
+std_mean=4.0,0.5
+std_scale=2.0,0.25
+robust_type=RobustScaler
+robust_features=0
+robust_center=10.0
+robust_scale=20.0
+[/definitions]
+transform=true
+[/transforms]

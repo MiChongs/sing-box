@@ -989,6 +989,8 @@ func (s *Store) GetOrCreateAtomicRecord(cacheKey, group, config, target, proxy s
 				record.storeFloat(&record.duration, sr.ConnectionDuration)
 				record.storeFloat(&record.maxUploadRate, sr.MaxUploadRate)
 				record.storeFloat(&record.maxDownloadRate, sr.MaxDownloadRate)
+				record.cumulSent.Store(sr.CumulSent)
+				record.cumulRetrans.Store(sr.CumulRetrans)
 				if sr.Weights != nil {
 					record.weightsMu.Lock()
 					for k, v := range sr.Weights {

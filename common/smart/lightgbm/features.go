@@ -206,11 +206,18 @@ var (
 	}
 )
 
-// PrepareFeatures extracts a 27-dimensional feature vector from a ModelInput.
-// The order and semantics are byte-identical to mihomo for model compatibility.
+// PrepareFeatures returns the MaxFeatureSize-dimensional layout of the
+// feature catalog: the mihomo-parity 27 features followed by the 8
+// extended ones. It is what the collector records and what models without
+// feature names are read against; named models pick catalog slots through
+// their layout instead (see resolveLayout).
 func PrepareFeatures(input *smart.ModelInput) []float64 {
-	features := make([]float64, 0, MaxFeatureSize)
+	return fillCatalog(input, make([]float64, 0, catalogSize))[:MaxFeatureSize]
+}
 
+// fillCatalog appends every catalog feature of input to features, in slot
+// order.
+func fillCatalog(input *smart.ModelInput, features []float64) []float64 {
 	uploadMB := input.UploadTotal
 	downloadMB := input.DownloadTotal
 	maxUploadRateKB := input.MaxuploadRate
@@ -299,9 +306,11 @@ func PrepareFeatures(input *smart.ModelInput) []float64 {
 	features = append(features, float64(input.HourBucket)/24.0)
 	features = append(features, math.Log1p(float64(input.TCPRetransmissions)))
 
-	if len(features) > MaxFeatureSize {
-		features = features[:MaxFeatureSize]
-	}
+	// catalog-only slots, see slotHistoryDuration
+	features = append(features, math.Log1p(input.ConnectionDuration))
+	features = append(features, input.LossRate)
+	features = append(features, input.CumulLossRate)
+	features = append(features, math.Log1p(input.LastConnectionDuration))
 	return features
 }
 

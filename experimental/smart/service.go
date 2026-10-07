@@ -5,6 +5,8 @@ package smart
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -146,10 +148,14 @@ func (s *Service) initModel() error {
 	modelPath = filemanager.BasePath(s.ctx, modelPath)
 
 	s.model = lightgbm.NewWeightModel(modelPath)
-	if err := s.model.Load(); err != nil {
-		s.logger.Debug("lightgbm model not yet available (", err, "); will fallback to traditional algorithm until downloaded")
-	} else {
+	modelMissing := false
+	if err := s.model.Load(); err == nil {
 		s.logger.Info("lightgbm model loaded from ", modelPath)
+	} else if errors.Is(err, fs.ErrNotExist) {
+		modelMissing = true
+		s.logger.Debug("lightgbm model not yet available; traditional weights until it is downloaded")
+	} else {
+		s.logger.Warn("lightgbm: cannot use model ", modelPath, ": ", err, "; traditional weights until a usable model replaces it")
 	}
 
 	url := opts.URL
@@ -198,7 +204,10 @@ func (s *Service) initModel() error {
 		}
 		s.logger.Info("lightgbm: auto-update enabled (interval=", interval, ", via=", via, ")")
 		s.dl.Start()
-	} else if !s.model.IsLoaded() {
+	} else if modelMissing {
+		// Only a missing file is fetched. Downloads replace the file
+		// atomically, so one that exists is complete, and fetching the
+		// same release again on every start cannot make it loadable.
 		s.logger.Info("lightgbm: model file missing, fetching once from ", url)
 		go func() {
 			if fetchErr := s.dl.FetchOnce(s.ctx); fetchErr != nil {

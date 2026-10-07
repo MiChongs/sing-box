@@ -81,7 +81,7 @@ func LoadTransformsFromModel(modelPath string) (*FeatureTransforms, error) {
 	if startIdx == -1 {
 		return &FeatureTransforms{
 			TransformsEnabled: false,
-			FeatureOrder:      getDefaultFeatureOrder(),
+			FeatureOrder:      map[int]string{},
 			Transforms:        []TransformParams{},
 		}, nil
 	}
@@ -131,7 +131,7 @@ func parseTransformsContent(content string) (*FeatureTransforms, error) {
 		switch currentSection {
 		case "order":
 			idx, err := strconv.Atoi(key)
-			if err != nil || idx < 0 || idx >= MaxFeatureSize {
+			if err != nil || idx < 0 {
 				continue
 			}
 			ft.FeatureOrder[idx] = value
@@ -161,29 +161,13 @@ func parseTransformsContent(content string) (*FeatureTransforms, error) {
 		if err != nil || len(transform.FeatureIndices) == 0 {
 			continue
 		}
-		valid := true
-		for _, idx := range transform.FeatureIndices {
-			if idx < 0 || idx >= MaxFeatureSize {
-				valid = false
-				break
-			}
-		}
-		if valid {
-			ft.Transforms = append(ft.Transforms, *transform)
-		}
+		// Indices are checked against the model's feature count by
+		// ValidateTransforms once the model is loaded.
+		ft.Transforms = append(ft.Transforms, *transform)
 	}
 
-	if len(ft.FeatureOrder) == 0 {
-		ft.FeatureOrder = getDefaultFeatureOrder()
-	} else {
-		defaultOrder := getDefaultFeatureOrder()
-		for idx, name := range defaultOrder {
-			if _, ok := ft.FeatureOrder[idx]; !ok {
-				ft.FeatureOrder[idx] = name
-			}
-		}
-	}
-
+	// FeatureOrder holds only what the [order] block lists; the model
+	// loader fills the rest from the model's own feature_names.
 	return ft, nil
 }
 
@@ -375,6 +359,36 @@ func (ft *FeatureTransforms) applyRobustScaler(features []float64, transform Tra
 			features[featureIdx] = (features[featureIdx] - center[i]) / scale[i]
 		}
 	}
+}
+
+// alignFeatureOrder checks the [order] block against the model inputs it
+// describes and fills the indices it omits. With real feature names the
+// block must agree with them; without, it must name the catalog slot each
+// positional input reads.
+func (ft *FeatureTransforms) alignFeatureOrder(names []string, layout []int) error {
+	if ft.FeatureOrder == nil {
+		ft.FeatureOrder = make(map[int]string, len(layout))
+	}
+	expected := names
+	if !hasFeatureNames(names) {
+		order := getDefaultFeatureOrder()
+		expected = make([]string, len(layout))
+		for i, slot := range layout {
+			expected[i] = order[slot]
+		}
+	}
+	for idx, name := range ft.FeatureOrder {
+		if idx >= len(expected) {
+			return fmt.Errorf("transforms [order] lists index %d, model has %d features", idx, len(expected))
+		}
+		if name != expected[idx] {
+			return fmt.Errorf("transforms [order] names feature %d %q, model feature is %q", idx, name, expected[idx])
+		}
+	}
+	for i, name := range expected {
+		ft.FeatureOrder[i] = name
+	}
+	return nil
 }
 
 // ValidateTransforms checks that all transforms reference valid feature indices

@@ -169,6 +169,11 @@ type StatsRecord struct {
 	MaxUploadRate      float64            `json:"max_upload_rate"`
 	MaxDownloadRate    float64            `json:"max_download_rate"`
 	ConnectionDuration float64            `json:"connection_duration"`
+	// TCP send-side totals over every connection that exposed them (see
+	// tcpinfo.Info.Sent / Retransmitted); their ratio is the cumulative
+	// loss rate LightGBM models read as cumul_loss_rate.
+	CumulSent    uint64 `json:"cumul_sent,omitempty"`
+	CumulRetrans uint64 `json:"cumul_retrans,omitempty"`
 
 	// Rows written by older builds may also carry "rtt_digest", a
 	// serialised latency t-digest nothing read back. Both decoders skip
@@ -268,6 +273,17 @@ type ModelInput struct {
 	HistoryMaxDownloadRate float64
 	ConnectionDuration     float64
 	LastUsed               int64
+
+	// LastConnectionDuration is the duration of the connection being
+	// recorded, in minutes; ConnectionDuration is the record's smoothed
+	// average including it. Models that name history_duration_minutes read
+	// this one as duration_minutes.
+	LastConnectionDuration float64
+	// LossRate is the TCP retransmission rate of the connection being
+	// recorded and CumulLossRate the record's rate across every connection
+	// that exposed TCP counters (both 0..1, 0 when unknown).
+	LossRate      float64
+	CumulLossRate float64
 
 	IsUDP bool
 	IsTCP bool
@@ -623,6 +639,11 @@ type AtomicStatsRecord struct {
 	prevCtStdDev  float64
 	prevLatStdDev float64
 
+	// cumulSent / cumulRetrans total the TCP send-side counters of every
+	// connection that exposed them; persisted as cumul_sent / cumul_retrans.
+	cumulSent    atomic.Uint64
+	cumulRetrans atomic.Uint64
+
 	weightsMu sync.Mutex
 	weights   map[string]float64
 
@@ -780,6 +801,23 @@ func (r *AtomicStatsRecord) AddInt64(field string, delta int64) {
 		}
 		r.recordSuccessOutcome(delta, 0.0)
 	}
+}
+
+// AddTCPCounters adds one connection's TCP send-side counters (see
+// tcpinfo.Info.Sent / Retransmitted).
+func (r *AtomicStatsRecord) AddTCPCounters(sent, retrans uint64) {
+	r.cumulSent.Add(sent)
+	r.cumulRetrans.Add(retrans)
+}
+
+// CumulLossRate is the retransmitted share of everything sent over the
+// record's connections, clamped to [0, 1]; 0 before any TCP counters.
+func (r *AtomicStatsRecord) CumulLossRate() float64 {
+	sent := r.cumulSent.Load()
+	if sent == 0 {
+		return 0
+	}
+	return min(float64(r.cumulRetrans.Load())/float64(sent), 1)
 }
 
 func (r *AtomicStatsRecord) AddUpload(delta float64) {
@@ -1079,6 +1117,8 @@ func (r *AtomicStatsRecord) CreateStatsSnapshot() *StatsRecord {
 	out.MaxUploadRate = r.loadFloat(&r.maxUploadRate)
 	out.MaxDownloadRate = r.loadFloat(&r.maxDownloadRate)
 	out.ConnectionDuration = r.loadFloat(&r.duration)
+	out.CumulSent = r.cumulSent.Load()
+	out.CumulRetrans = r.cumulRetrans.Load()
 	out.Weights = r.GetAllWeights()
 	return out
 }

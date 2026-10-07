@@ -8,8 +8,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/dmitryikh/leaves"
 	"github.com/sagernet/sing-box/common/smart"
+	"github.com/vernesong/leaves"
 )
 
 // WeightModel wraps a loaded LightGBM ensemble with its feature transforms.
@@ -18,8 +18,14 @@ type WeightModel struct {
 	path       string
 	model      *leaves.Ensemble
 	transforms *FeatureTransforms
+	// layout is the catalog slot feeding each model input, see
+	// resolveLayout.
+	layout     []int
 	lastUpdate time.Time
-	mu         sync.RWMutex
+	// loadErr is why the model file on disk was rejected; nil while the
+	// file loads or does not exist yet.
+	loadErr error
+	mu      sync.RWMutex
 
 	// reloadInFlight guards against concurrent reload requests.
 	reloadInFlight atomic.Bool
@@ -74,41 +80,89 @@ func (m *WeightModel) IsLoaded() bool {
 	return m.model != nil
 }
 
-// Load reads the .bin file from m.path, parses transforms, and atomically
-// swaps in the new model+transforms under the write lock.
+// LoadError reports why the model file on disk was rejected, or nil.
+func (m *WeightModel) LoadError() error {
+	if m == nil {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.loadErr
+}
+
+// Load reads the model file at m.path — a LightGBM text model (format v2
+// to v4) — maps its inputs onto the feature catalog by name, parses its
+// transforms, and atomically swaps the result in. A missing file returns
+// an error wrapping fs.ErrNotExist; any other failure is also kept for
+// LoadError. Either way the previously loaded model stays in place.
 func (m *WeightModel) Load() error {
 	if m == nil {
 		return fmt.Errorf("nil WeightModel")
 	}
-	if _, err := os.Stat(m.path); err != nil {
-		return fmt.Errorf("model file unavailable: %v", err)
+	var (
+		model      *leaves.Ensemble
+		layout     []int
+		transforms *FeatureTransforms
+		loadErr    error
+	)
+	_, err := os.Stat(m.path)
+	if err == nil {
+		model, layout, transforms, loadErr = loadModelFile(m.path)
+		err = loadErr
+	} else {
+		err = fmt.Errorf("model file unavailable: %w", err)
 	}
-
-	model, err := leaves.LGEnsembleFromFile(m.path, false)
-	if err != nil {
-		return fmt.Errorf("load binary model: %v", err)
-	}
-
-	transforms, err := LoadTransformsFromModel(m.path)
-	if err != nil {
-		// non-fatal: fall back to disabled transforms
-		transforms = &FeatureTransforms{
-			TransformsEnabled: false,
-			FeatureOrder:      getDefaultFeatureOrder(),
-			Transforms:        []TransformParams{},
-		}
-	} else if transforms.TransformsEnabled {
-		if err := transforms.ValidateTransforms(MaxFeatureSize); err != nil {
-			transforms.TransformsEnabled = false
-		}
-	}
-
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.loadErr = loadErr
+	if err != nil {
+		return err
+	}
 	m.model = model
+	m.layout = layout
 	m.transforms = transforms
 	m.lastUpdate = time.Now()
-	m.mu.Unlock()
+	m.predCache.Clear()
 	return nil
+}
+
+func loadModelFile(path string) (*leaves.Ensemble, []int, *FeatureTransforms, error) {
+	model, err := leaves.LGEnsembleFromFile(path, false)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load model: %v", err)
+	}
+	names, err := readFeatureNames(path)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read feature names: %v", err)
+	}
+	transforms, err := LoadTransformsFromModel(path)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("load transforms: %v", err)
+	}
+	nFeatures := model.NFeatures()
+	// Models trained on unnamed columns may still name them in [order].
+	if !hasFeatureNames(names) && len(transforms.FeatureOrder) == nFeatures {
+		names = make([]string, nFeatures)
+		for i := range names {
+			names[i] = transforms.FeatureOrder[i]
+		}
+	}
+	layout, err := resolveLayout(names, nFeatures)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if transforms.TransformsEnabled {
+		// Scaling the wrong inputs would make every prediction
+		// meaningless, so a model whose transforms do not fit is
+		// rejected rather than run without them.
+		if err := transforms.alignFeatureOrder(names, layout); err != nil {
+			return nil, nil, nil, err
+		}
+		if err := transforms.ValidateTransforms(nFeatures); err != nil {
+			return nil, nil, nil, fmt.Errorf("invalid transforms: %v", err)
+		}
+	}
+	return model, layout, transforms, nil
 }
 
 // Reload re-reads the model file from disk. Safe to call concurrently;
@@ -217,6 +271,7 @@ func (m *WeightModel) predictBase(input *smart.ModelInput, priorityFactor float6
 	m.mu.RLock()
 	model := m.model
 	transforms := m.transforms
+	layout := m.layout
 	m.mu.RUnlock()
 
 	if model == nil {
@@ -224,18 +279,7 @@ func (m *WeightModel) predictBase(input *smart.ModelInput, priorityFactor float6
 		return w, p, 0
 	}
 
-	features := PrepareFeatures(input)
-	if len(features) == 0 {
-		w, p := smart.CalculateWeight(input, priorityFactor)
-		return w, p, 0
-	}
-
-	// Backward compat: if model was trained with fewer features (e.g. 27-dim
-	// legacy), truncate to what the model expects. New 35-dim models use the
-	// full vector.
-	if numFeat := model.NFeatures(); numFeat > 0 && numFeat < len(features) {
-		features = features[:numFeat]
-	}
+	features := layoutFeatures(input, layout)
 
 	if transforms != nil && transforms.TransformsEnabled {
 		features = transforms.ApplyTransforms(features)

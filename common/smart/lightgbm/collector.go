@@ -26,19 +26,24 @@ const DefaultCollectorSizeMB = 100
 // Bumped when the column list changes at all — new columns append to the
 // right, never insert in the middle, to keep forward-compatible string
 // parsing in downstream tools.
-const collectorSchemaVersion = "4"
+const collectorSchemaVersion = "5"
 
 // collectorHeader names every column AddSample writes, in order: the
 // MaxFeatureSize model features (named as in the model's feature order),
 // 10 metadata columns, the xiaobaf14g phase-A block (9 raw ModelInput
-// dimensions) and the phase-B block (5 more + schema_version, which must
-// stay last). Raw columns that share a name with a transformed feature
-// carry a "_raw" suffix so every name is unique.
+// dimensions), the phase-B block (5 more), the phase-C block (the catalog
+// features only newer model layouts read, in model space) and
+// schema_version, which must stay last. Raw columns that share a name with
+// a transformed feature carry a "_raw" suffix so every name is unique.
+//
+// Phase C feeds layouts like vernesong/mihomo's 30-feature one, whose
+// duration_minutes is current_duration_minutes here and whose
+// history_duration_minutes is this file's duration_minutes.
 var collectorHeader = buildCollectorHeader()
 
 func buildCollectorHeader() []string {
 	order := getDefaultFeatureOrder()
-	header := make([]string, 0, MaxFeatureSize+25)
+	header := make([]string, 0, MaxFeatureSize+28)
 	for i := 0; i < MaxFeatureSize; i++ {
 		header = append(header, order[i])
 	}
@@ -53,7 +58,10 @@ func buildCollectorHeader() []string {
 		"http3_fallback_count", "lightgbm_confidence", "hour_bucket_raw",
 		// phase B
 		"tcp_retransmissions_raw", "tcp_losses", "path_mtu",
-		"long_rtt", "long_success_rate", "schema_version",
+		"long_rtt", "long_success_rate",
+		// phase C
+		"current_duration_minutes", "loss_rate", "cumul_loss_rate",
+		"schema_version",
 	)
 }
 
@@ -214,11 +222,8 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, meta *CollectorMeta, 
 		}
 	}
 
-	features := PrepareFeatures(input)
-	if len(features) == 0 {
-		c.droppedRows.Add(1)
-		return
-	}
+	catalog := fillCatalog(input, make([]float64, 0, catalogSize))
+	features := catalog[:MaxFeatureSize]
 
 	if meta == nil {
 		meta = &CollectorMeta{}
@@ -280,15 +285,22 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, meta *CollectorMeta, 
 	)
 
 	// xiaobaf14g phase-B extension columns — kernel TCP metrics + long-
-	// term EWMA pair + schema version. Schema version sits at the very
-	// tail so parsers can find it with a stable negative index. Must
-	// stay last.
+	// term EWMA pair.
 	sample = append(sample,
 		fmt.Sprintf("%d", input.TCPRetransmissions),
 		fmt.Sprintf("%d", input.TCPLosses),
 		fmt.Sprintf("%d", input.PathMTU),
 		fmt.Sprintf("%.6f", input.LongRTT),
 		fmt.Sprintf("%.6f", input.LongSuccessRate),
+	)
+
+	// Phase C: catalog features outside the PrepareFeatures layout, then
+	// the schema version, which sits at the very tail so parsers can find
+	// it with a stable negative index. Must stay last.
+	sample = append(sample,
+		fmt.Sprintf("%.6f", catalog[slotLastDuration]),
+		fmt.Sprintf("%.6f", catalog[slotLossRate]),
+		fmt.Sprintf("%.6f", catalog[slotCumulLossRate]),
 		collectorSchemaVersion,
 	)
 
