@@ -32,7 +32,7 @@ const link = (to: string) => (/^https?:/.test(to) || to.startsWith('#') ? to : h
           c.to && 'hover:shadow-lift',
         ]}
       >
-        <p class="font-serif text-[1.12rem] text-fg group-hover:text-accent">
+        <p class="font-display text-[1.05rem] font-semibold text-fg group-hover:text-accent">
           {c.title}{c.to && <span class="ml-1 text-subtle transition-transform group-hover:translate-x-0.5 inline-block" aria-hidden="true">→</span>}
         </p>
         <p class="mt-2 text-[0.92rem] leading-relaxed text-muted" set:html={inline(c.body, base)} />

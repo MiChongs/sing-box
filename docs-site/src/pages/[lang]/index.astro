@@ -48,7 +48,7 @@ const mark = (v: string) =>
       <div class="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {t.features.items.map((f) => (
           <a href={href(lang, f.to)} class="group rounded-card bg-surface p-5 shadow-ring transition-shadow hover:shadow-lift">
-            <p class="font-serif text-[1.15rem] text-fg group-hover:text-accent">{f.title}</p>
+            <p class="font-display text-[1.06rem] font-semibold text-fg group-hover:text-accent">{f.title}</p>
             <p class="mt-2 text-[0.93rem] leading-relaxed text-muted" set:html={inline(f.body, base)} />
           </a>
         ))}
@@ -87,7 +87,7 @@ const mark = (v: string) =>
       <div class="mt-8 grid gap-4 md:grid-cols-3">
         {t.paths.items.map((p) => (
           <div class="rounded-card bg-surface p-5 shadow-ring">
-            <p class="font-serif text-[1.15rem] text-fg">{p.title}</p>
+            <p class="font-display text-[1.06rem] font-semibold text-fg">{p.title}</p>
             <p class="mt-2 text-[0.93rem] text-muted">{p.body}</p>
             <ul class="mt-4 space-y-1.5 text-[0.93rem]">
               {p.links.map((l) => (

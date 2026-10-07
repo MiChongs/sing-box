@@ -34,10 +34,32 @@ export default {
         'info-soft': token('info-soft'),
         focus: token('focus'),
       },
+      // Latin and digits come from the self-hosted Inter / JetBrains Mono
+      // (bundled by Astro, no third-party CDN). Chinese falls through to
+      // the best CJK face the platform ships: a self-hosted CJK webfont
+      // would add tens of megabytes. Headings use the same sans family as
+      // the body (`display`), so Chinese and Latin in one heading match.
       fontFamily: {
-        serif: ['"Anthropic Serif"', 'Georgia', '"Noto Serif SC"', '"Source Han Serif SC"', '"Songti SC"', 'serif'],
-        sans: ['"Anthropic Sans"', 'Inter', 'system-ui', '-apple-system', '"PingFang SC"', '"Microsoft YaHei"', '"Noto Sans SC"', 'sans-serif'],
-        mono: ['"Anthropic Mono"', '"JetBrains Mono"', 'ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', 'monospace'],
+        sans: [
+          '"Inter Variable"', 'Inter',
+          '"PingFang SC"', '"HarmonyOS Sans SC"', 'MiSans', '"Hiragino Sans GB"',
+          '"Microsoft YaHei UI"', '"Microsoft YaHei"',
+          '"Noto Sans CJK SC"', '"Noto Sans SC"', '"Source Han Sans SC"', '"WenQuanYi Micro Hei"',
+          'system-ui', '-apple-system', '"Segoe UI"', 'Roboto', 'sans-serif',
+        ],
+        display: [
+          '"Inter Variable"', 'Inter',
+          '"PingFang SC"', '"HarmonyOS Sans SC"', 'MiSans', '"Hiragino Sans GB"',
+          '"Microsoft YaHei UI"', '"Microsoft YaHei"',
+          '"Noto Sans CJK SC"', '"Noto Sans SC"', '"Source Han Sans SC"', '"WenQuanYi Micro Hei"',
+          'system-ui', '-apple-system', '"Segoe UI"', 'Roboto', 'sans-serif',
+        ],
+        mono: [
+          '"JetBrains Mono Variable"', '"JetBrains Mono"',
+          'ui-monospace', 'SFMono-Regular', 'Menlo', 'Consolas', '"Liberation Mono"',
+          '"PingFang SC"', '"Microsoft YaHei UI"', '"Microsoft YaHei"', '"Noto Sans CJK SC"', '"Noto Sans SC"',
+          'monospace',
+        ],
       },
       boxShadow: {
         ring: 'var(--sh-ring)',
@@ -48,7 +70,9 @@ export default {
         card: '12px',
       },
       maxWidth: {
-        prose: '72ch',
+        // In rem rather than ch: ch follows the font's digit width, and
+        // ~40 Han characters / ~80 Latin characters per line read best.
+        prose: '41rem',
         page: '88rem',
       },
     },

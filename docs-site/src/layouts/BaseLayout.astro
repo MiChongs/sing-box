@@ -1,4 +1,10 @@
 ---
+// Self-hosted variable fonts: Inter (with the optical-size axis, so headings
+// get the tighter display cut) and JetBrains Mono. The CSS ships one file per
+// script subset; browsers fetch only the subsets a page uses.
+import '@fontsource-variable/inter/opsz.css';
+import '@fontsource-variable/jetbrains-mono/wght.css';
+import interLatin from '@fontsource-variable/inter/files/inter-latin-opsz-normal.woff2?url';
 import '../styles/global.css';
 import Header from '../components/Header.astro';
 import Footer from '../components/Footer.astro';
@@ -36,6 +42,7 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
     <link rel="alternate" hreflang="zh-CN" href={new URL(Astro.url.pathname.replace(/\/en(\/|$)/, '/zh$1'), Astro.site).href} />
     <link rel="alternate" hreflang="en" href={new URL(Astro.url.pathname.replace(/\/zh(\/|$)/, '/en$1'), Astro.site).href} />
     <link rel="icon" href={`${import.meta.env.BASE_URL}favicon.svg`} />
+    <link rel="preload" href={interLatin} as="font" type="font/woff2" crossorigin />
     <title>{fullTitle}</title>
     <script is:inline>
       // Apply the theme before first paint. Storage may be unavailable
@@ -60,7 +67,7 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
         aria-label={t.menu}
       >
         <div class="flex items-center justify-between mb-4">
-          <span class="font-serif text-lg text-fg">{t.siteName}</span>
+          <span class="font-display text-lg font-semibold tracking-tight text-fg">{t.siteName}</span>
           <button
             type="button"
             data-drawer-close

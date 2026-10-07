@@ -3,26 +3,10 @@
 @tailwind utilities;
 
 /*
- * Anthropic* faces are commercial and cannot be self-hosted, so they are
- * declared with local() only: visitors who have them installed get them,
- * everyone else falls through to Georgia / system UI fonts. No url() means
- * no network fetch and no licensing exposure.
+ * Fonts: Inter Variable and JetBrains Mono Variable are self-hosted
+ * (imported in BaseLayout); Chinese uses the platform's CJK sans, see the
+ * stacks in tailwind.config.mjs.
  */
-@font-face {
-  font-family: 'Anthropic Serif';
-  src: local('Anthropic Serif'), local('AnthropicSerif');
-  font-display: swap;
-}
-@font-face {
-  font-family: 'Anthropic Sans';
-  src: local('Anthropic Sans'), local('AnthropicSans');
-  font-display: swap;
-}
-@font-face {
-  font-family: 'Anthropic Mono';
-  src: local('Anthropic Mono'), local('AnthropicMono');
-  font-display: swap;
-}
 
 /* ── Theme tokens (RGB triplets, consumed by tailwind.config.mjs) ───────── */
 :root {
@@ -90,17 +74,38 @@ body {
   font-family: theme('fontFamily.sans');
   font-size: 16px;
   line-height: 1.7;
+  /* Inter: l with a tail and I with serifs, so tags such as "Il1" stay
+     unambiguous in technical text. */
+  font-feature-settings: 'cv05', 'cv08';
+  font-optical-sizing: auto;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
   text-rendering: optimizeLegibility;
 }
+/* Chinese pages: a thin space between Han and Latin / digits (browsers
+   that support text-autospace), and a little more leading for Han text. */
+:lang(zh) {
+  text-autospace: normal;
+}
 h1, h2, h3, h4 {
-  font-family: theme('fontFamily.serif');
-  font-weight: 500;
+  font-family: theme('fontFamily.display');
+  font-weight: 650;
   color: rgb(var(--fg));
   text-wrap: balance;
 }
+/* Tighter tracking suits Inter at display sizes, but squeezes Han
+   characters, so it only applies to Latin pages. */
+:lang(en) :where(h1, h2) {
+  letter-spacing: -0.02em;
+}
+:lang(en) :where(h3) {
+  letter-spacing: -0.01em;
+}
 code, pre, kbd {
   font-family: theme('fontFamily.mono');
+  font-feature-settings: normal;
+  /* Show "->", "!=", "==" exactly as typed in configs. */
+  font-variant-ligatures: none;
 }
 a {
   color: rgb(var(--accent));
@@ -136,8 +141,8 @@ html.dark .shiki span {
   padding: 1.1rem 1.25rem !important;
   border-radius: 0 !important;
   overflow-x: auto;
-  font-size: 0.86rem;
-  line-height: 1.7;
+  font-size: 0.84rem;
+  line-height: 1.72;
   tab-size: 2;
 }
 
@@ -161,30 +166,34 @@ html.dark .shiki span {
 .prose-doc {
   color: rgb(var(--fg-2));
   font-size: 1rem;
-  line-height: 1.8;
+  line-height: 1.75;
   overflow-wrap: break-word;
+}
+.prose-doc:lang(zh) {
+  font-size: 1.0125rem;
+  line-height: 1.85;
 }
 .prose-doc > :first-child { margin-top: 0; }
 .prose-doc :where(h2):not(:where(.not-prose, .not-prose *)) {
-  font-size: 1.6rem;
+  font-size: 1.55rem;
   line-height: 1.3;
   margin: 3rem 0 1rem;
   padding-top: 1.25rem;
   border-top: 1px solid rgb(var(--line-soft));
 }
 .prose-doc :where(h3):not(:where(.not-prose, .not-prose *)) {
-  font-size: 1.22rem;
-  line-height: 1.35;
+  font-size: 1.2rem;
+  line-height: 1.4;
   margin: 2.2rem 0 0.75rem;
 }
 .prose-doc :where(h4):not(:where(.not-prose, .not-prose *)) {
   font-family: theme('fontFamily.sans');
-  font-weight: 600;
+  font-weight: 650;
   font-size: 1rem;
   margin: 1.6rem 0 0.5rem;
 }
 .prose-doc :where(p):not(:where(.not-prose, .not-prose *)) { margin: 0.9rem 0; }
-.prose-doc :where(strong):not(:where(.not-prose, .not-prose *)) { color: rgb(var(--fg)); font-weight: 600; }
+.prose-doc :where(strong):not(:where(.not-prose, .not-prose *)) { color: rgb(var(--fg)); font-weight: 620; }
 .prose-doc :where(a):not(:where(.not-prose, .not-prose *)) {
   text-decoration: underline;
   text-decoration-color: rgb(var(--accent) / 0.35);
@@ -211,9 +220,9 @@ html.dark .shiki span {
 .prose-doc :where(:not(pre) > code:not([class])) {
   background: rgb(var(--surface-2));
   color: rgb(var(--fg));
-  padding: 0.1em 0.38em;
+  padding: 0.12em 0.4em;
   border-radius: 5px;
-  font-size: 0.86em;
+  font-size: 0.85em;
   overflow-wrap: anywhere;
 }
 .prose-doc :where(pre.astro-code):not(:where(.not-prose *)) {
@@ -233,7 +242,7 @@ html.dark .shiki span {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.9rem;
-  line-height: 1.6;
+  line-height: 1.65;
 }
 .prose-doc :where(.table-wrap th) {
   text-align: left;
