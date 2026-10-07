@@ -690,7 +690,30 @@ func (b *smartBalance) blockedNodes() map[string]bool {
 
 func (b *smartBalance) nodeHealthy(ob adapter.Outbound, isUDP bool, blocked map[string]bool) bool {
 	tag := ob.Tag()
-	return !blocked[tag] && b.s.isAlive(tag) && (!isUDP || b.s.supportsUDP(ob))
+	return !blocked[tag] && b.nodeAlive(tag) && (!isUDP || b.s.supportsUDP(ob))
+}
+
+// nodeAlive is isAlive without its freshness rule. Health checks pause while
+// the group is idle, so after a quiet spell every probe result is older than
+// 3 × interval; isAlive reads that as dead. Plain Smart survives because
+// fillProxies falls back to every member, but a group that reads "stale" as
+// "dead" would have no node left to dial — and since only a successful dial
+// ends the idle state, it would stay that way. Stale is unknown, not dead:
+// an open breaker, a known-dead mark or a failed probe still count.
+func (b *smartBalance) nodeAlive(tag string) bool {
+	s := b.s
+	if s.isBreakerOpen(tag) {
+		return false
+	}
+	if deadAt, dead := s.knownDead.Load(tag); dead && time.Since(deadAt) < knownDeadTTL {
+		return false
+	}
+	if s.history != nil {
+		if h := s.history.LoadURLTestHistory(tag); h != nil && h.Delay == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // healthyCounts returns the number of healthy members per region, cached
@@ -771,24 +794,31 @@ func (b *smartBalance) newScorer(meta *smartDialMeta, isUDP bool) *balanceScorer
 
 const balanceNeutralQuality = 0.55
 
-func (sc *balanceScorer) baseQuality(tag string) (quality float64, targetWeak bool) {
+// baseQuality returns the quality and whether it is a learned weight. Learned
+// weights (per destination, and the overall ranking averaged from them)
+// already include the policy_priority factor — recordStats passes it to
+// CalculateWeight — so only the delay-derived and neutral values still need
+// it.
+func (sc *balanceScorer) baseQuality(tag string) (quality float64, targetWeak, learned bool) {
 	if w, ok := sc.weights[tag]; ok {
-		return w, w < smart.AllowedWeight
+		return w, w < smart.AllowedWeight, true
 	}
 	if w, ok := sc.rank[tag]; ok {
-		return w * 0.9, false
+		return w * 0.9, false, true
 	}
 	if history := sc.b.s.history; history != nil {
 		if h := history.LoadURLTestHistory(tag); h != nil && h.Delay > 0 {
-			return 0.4 + 0.4*300/(300+float64(h.Delay)), false
+			return 0.4 + 0.4*300/(300+float64(h.Delay)), false, false
 		}
 	}
-	return balanceNeutralQuality, false
+	return balanceNeutralQuality, false, false
 }
 
 func (sc *balanceScorer) quality(tag string) (float64, bool) {
-	q, weak := sc.baseQuality(tag)
-	q *= sc.b.s.getPriorityFactor(tag)
+	q, weak, learned := sc.baseQuality(tag)
+	if !learned {
+		q *= sc.b.s.getPriorityFactor(tag)
+	}
 	if q <= 0 {
 		q = 0.01
 	}
@@ -870,13 +900,13 @@ func (b *smartBalance) decideRegions(meta *smartDialMeta, snap *regionSnapshot, 
 		scores[code] = v
 		return v
 	}
-	best := func(skip string) string {
+	pickBest := func(skip string, accept func(string) bool) string {
 		var (
 			bestCode  string
 			bestScore = -1.0
 		)
 		for _, code := range snap.codes {
-			if code == skip || !eligible(code) {
+			if code == skip || !accept(code) {
 				continue
 			}
 			if v := score(code); v > bestScore {
@@ -884,6 +914,14 @@ func (b *smartBalance) decideRegions(meta *smartDialMeta, snap *regionSnapshot, 
 			}
 		}
 		return bestCode
+	}
+	// best is the best eligible region; when no region reaches min_nodes,
+	// the best allowed region with any healthy node rather than none.
+	best := func(skip string) string {
+		if code := pickBest(skip, eligible); code != "" {
+			return code
+		}
+		return pickBest(skip, func(code string) bool { return b.allowed(code) && usable(code) })
 	}
 	finish := func(primary, source string, allowFallback bool) regionDecision {
 		if primary == "" {
@@ -914,17 +952,27 @@ func (b *smartBalance) decideRegions(meta *smartDialMeta, snap *regionSnapshot, 
 	}
 	// fallbackPrimary picks a region when the requested one cannot serve:
 	// the best region by score, or the first eligible priority region.
+	// firstPriority is the first priority region that is eligible, else
+	// the first one with any healthy node (min_nodes relaxed, as in best).
+	firstPriority := func() string {
+		for _, code := range b.priority {
+			if eligible(code) {
+				return code
+			}
+		}
+		for _, code := range b.priority {
+			if b.allowed(code) && usable(code) {
+				return code
+			}
+		}
+		return ""
+	}
 	fallbackPrimary := func() string {
 		switch b.fallback {
 		case regionFallbackNone:
 			return ""
 		case regionFallbackPriority:
-			for _, code := range b.priority {
-				if eligible(code) {
-					return code
-				}
-			}
-			return ""
+			return firstPriority()
 		}
 		return best("")
 	}
@@ -951,10 +999,8 @@ func (b *smartBalance) decideRegions(meta *smartDialMeta, snap *regionSnapshot, 
 	case regionModeOff:
 		return regionDecision{order: []string{""}, source: "global"}
 	case regionModePriority:
-		for _, code := range b.priority {
-			if eligible(code) {
-				return finish(code, "priority", true)
-			}
+		if code := firstPriority(); code != "" {
+			return finish(code, "priority", true)
 		}
 		if b.fallback == regionFallbackAuto {
 			return finish(best(""), "priority-fallback", true)
@@ -1553,7 +1599,26 @@ func (b *smartBalance) selectCandidates(meta *smartDialMeta, isUDP bool, bypassP
 		}
 	}
 	if primary == nil {
-		return nil, decision.source + " (no healthy node)"
+		// Nothing dialable where the connection may go. Like Smart's last
+		// resort, try the members anyway — health data may be wrong or
+		// stale, and one success revives the group. With a region chosen
+		// (its healthy nodes were all filtered out for this destination),
+		// stay in it; otherwise go wherever lastResortScope allows.
+		code, ok := "", true
+		if len(decision.order) > 0 {
+			code = decision.order[0]
+		} else {
+			code, ok = b.lastResortScope(meta, snap, isUDP)
+		}
+		if !ok {
+			return nil, decision.source + " (no healthy node)"
+		}
+		primary = b.lastResortPool(code, snap, meta, isUDP, blocked, sc)
+		if len(primary) == 0 {
+			return nil, decision.source + " (no node)"
+		}
+		picked = 0
+		source = decision.source + " (last resort: no healthy node)"
 	}
 	reach := 1 + (smartMaxRetries-1)*smartParallelDials
 	if len(fallbacks) > balanceFallbackSlots {
@@ -1568,6 +1633,50 @@ func (b *smartBalance) selectCandidates(meta *smartDialMeta, isUDP bool, bypassP
 		}
 	}
 	return append(candidates, fallbacks...), source
+}
+
+// lastResortScope decides where the last resort may look when no healthy
+// node could be chosen: a region outbound without fallback or a region
+// locked with fallback none stays in its region, everything else may use
+// every allowed member. It refuses when healthy members exist in scope —
+// then the configuration (fallback none, allow / deny, min_nodes) is what
+// rejected the connection, and that is honoured.
+func (b *smartBalance) lastResortScope(meta *smartDialMeta, snap *regionSnapshot, isUDP bool) (string, bool) {
+	code := ""
+	switch {
+	case meta != nil && meta.balance != nil && meta.balance.region != "" && !meta.balance.fallback:
+		code = meta.balance.region
+	case meta != nil && meta.balance != nil && meta.balance.region != "":
+		code = ""
+	case b.currentLock() != "" && b.fallback == regionFallbackNone:
+		code = b.currentLock()
+	}
+	counts := b.healthyCounts(snap, isUDP)
+	if code != "" {
+		return code, counts[code] == 0
+	}
+	for region, n := range counts {
+		if n > 0 && b.allowed(region) {
+			return "", false
+		}
+	}
+	return "", true
+}
+
+// lastResortPool is the members of the scope that are not blocked and can
+// carry the connection, best quality first, health ignored.
+func (b *smartBalance) lastResortPool(code string, snap *regionSnapshot, meta *smartDialMeta, isUDP bool, blocked map[string]bool, sc *balanceScorer) []poolEntry {
+	var pool []poolEntry
+	for _, ob := range b.regionMembers(snap, code) {
+		tag := ob.Tag()
+		if blocked[tag] || (isUDP && !b.s.supportsUDP(ob)) {
+			continue
+		}
+		q, _ := sc.quality(tag)
+		pool = append(pool, poolEntry{ob: ob, tag: tag, q: q, load: b.nodeLoad(tag)})
+	}
+	sort.SliceStable(pool, func(i, j int) bool { return pool[i].q > pool[j].q })
+	return pool
 }
 
 // dialIsChainedHop reports whether a dial is a hop of a proxy chain rather

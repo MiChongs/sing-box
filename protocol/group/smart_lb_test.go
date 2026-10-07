@@ -327,10 +327,11 @@ func TestRegionLockPriorityAndFallback(t *testing.T) {
 	if region, _ := regionOfFirst(t, s, meta); region == "US" || region == "" {
 		t.Fatalf("dead lock not bypassed: %q", region)
 	}
-	// … and fails with fallback=none.
+	// … and with fallback=none never leaves the region: the last resort
+	// only retries the locked region's own (dead) node.
 	s.balance.fallback = regionFallbackNone
-	if candidates, _ := s.balance.selectCandidates(meta, false, false); len(candidates) != 0 {
-		t.Fatalf("fallback none still served: %v", outboundNames(candidates))
+	if candidates, source := s.balance.selectCandidates(meta, false, false); len(candidates) != 1 || candidates[0].Tag() != "US01" {
+		t.Fatalf("fallback none left the region: %v (%s)", outboundNames(candidates), source)
 	}
 	s.balance.fallback = regionFallbackAuto
 	s.knownDead.Clear()
@@ -422,12 +423,16 @@ func TestRegionViewRequest(t *testing.T) {
 	if candidates, source := s.balance.selectCandidates(meta, false, false); len(candidates) != 1 || candidates[0].Tag() != "JP02" || source != "region-pin" {
 		t.Fatalf("region pin: %v %s", outboundNames(candidates), source)
 	}
-	// Without fallback a dead region fails; with fallback it moves on.
+	// Without fallback a dead region is retried in place (last resort);
+	// with fallback the view moves on to a healthy region.
 	s.knownDead.Store("JP01", time.Now())
 	s.knownDead.Store("JP02", time.Now())
 	meta.balance.pin = ""
-	if candidates, _ := s.balance.selectCandidates(meta, false, false); len(candidates) != 0 {
-		t.Fatalf("dead region view served %v", outboundNames(candidates))
+	candidates, source := s.balance.selectCandidates(meta, false, false)
+	for _, ob := range candidates {
+		if s.RegionOf(ob.Tag()) != "JP" {
+			t.Fatalf("region view without fallback left its region: %v (%s)", outboundNames(candidates), source)
+		}
 	}
 	meta.balance.fallback = true
 	if candidates, _ := s.balance.selectCandidates(meta, false, false); len(candidates) == 0 || candidates[0].Tag() != "HK01" {
@@ -780,5 +785,93 @@ func TestRegionStatePersistence(t *testing.T) {
 	}
 	if _, ok := restored.balance.freshExit("JP01"); ok {
 		t.Fatal("flush kept exit results")
+	}
+}
+
+// After an idle spell every probe result is older than 3 × interval (health
+// checks pause while the group is idle). Stale is not dead: the group must
+// keep serving, otherwise no dial ever succeeds to wake it up again.
+func TestBalanceServesWithStaleProbes(t *testing.T) {
+	s := newTestLoadBalance(t, context.Background(), option.SmartLoadBalanceOutboundOptions{}, "HK01", "HK02", "JP01")
+	history := urltest.NewHistoryStorage()
+	for _, tag := range []string{"HK01", "HK02", "JP01"} {
+		history.StoreURLTestHistory(tag, &adapter.URLTestHistory{Time: time.Now().Add(-time.Hour), Delay: 80})
+	}
+	s.history = history
+	if s.isAlive("HK01") {
+		t.Fatal("precondition: stale history reads as not alive")
+	}
+	if candidates, source := s.balance.selectCandidates(&smartDialMeta{smartTarget: "t"}, false, false); len(candidates) == 0 {
+		t.Fatalf("stale probes stopped the group: %s", source)
+	}
+	// A failed probe (delay 0) still counts as down.
+	history.StoreURLTestHistory("JP01", &adapter.URLTestHistory{Time: time.Now(), Delay: 0})
+	s.balance.healthTCP.Store(nil)
+	if s.balance.healthyCounts(s.balance.snapshot(), false)["JP"] != 0 {
+		t.Fatal("failed probe counted as healthy")
+	}
+}
+
+// When every member is down, the group still tries them (as smart does)
+// instead of failing outright; one success brings it back.
+func TestBalanceLastResortWhenNothingHealthy(t *testing.T) {
+	s := newTestLoadBalance(t, context.Background(), option.SmartLoadBalanceOutboundOptions{}, "HK01", "JP01")
+	s.knownDead.Store("HK01", time.Now())
+	s.knownDead.Store("JP01", time.Now())
+	candidates, source := s.balance.selectCandidates(&smartDialMeta{smartTarget: "t"}, false, false)
+	if len(candidates) != 2 {
+		t.Fatalf("last resort: %v (%s)", outboundNames(candidates), source)
+	}
+	// A region outbound without fallback stays in its region.
+	meta := &smartDialMeta{smartTarget: "t", balance: &balanceRequest{group: "LB", region: "JP"}}
+	candidates, _ = s.balance.selectCandidates(meta, false, false)
+	if len(candidates) != 1 || candidates[0].Tag() != "JP01" {
+		t.Fatalf("region view last resort: %v", outboundNames(candidates))
+	}
+	// With healthy nodes elsewhere, fallback none still refuses to leave.
+	s.knownDead.Delete("HK01")
+	s.balance.healthTCP.Store(nil)
+	if _, err := s.SetRegionLock("JP"); err != nil {
+		t.Fatal(err)
+	}
+	s.balance.fallback = regionFallbackNone
+	candidates, _ = s.balance.selectCandidates(&smartDialMeta{smartTarget: "t"}, false, false)
+	if len(candidates) != 1 || candidates[0].Tag() != "JP01" {
+		t.Fatalf("locked region with fallback none: %v", outboundNames(candidates))
+	}
+}
+
+// policy_priority is already part of learned weights; the pool must not
+// apply it a second time, but must apply it to delay-derived qualities.
+func TestBalancePriorityAppliedOnce(t *testing.T) {
+	options := option.SmartLoadBalanceOutboundOptions{}
+	options.PolicyPriority = "A:2"
+	s := newTestLoadBalance(t, context.Background(), options, "A", "B")
+	s.publishRankingSnapshot([]smart.NodeRank{{Name: "A", Weight: 1.0}})
+	setDelays(s, map[string]uint16{"B": 300})
+	sc := s.balance.newScorer(&smartDialMeta{smartTarget: "t"}, false)
+	if q, _ := sc.quality("A"); math.Abs(q-0.9) > 1e-9 {
+		t.Fatalf("learned quality re-weighted: %v", q)
+	}
+	s.parsePolicyPriority("B:2")
+	if q, _ := sc.quality("B"); math.Abs(q-1.2) > 1e-9 {
+		t.Fatalf("delay quality not weighted: %v", q)
+	}
+}
+
+// A region whose healthy nodes are all soft-blocked for the destination is
+// still tried, and min_nodes that no region meets does not fail the dial.
+func TestBalanceRelaxesBeforeFailing(t *testing.T) {
+	s := newTestLoadBalance(t, context.Background(), option.SmartLoadBalanceOutboundOptions{}, "HK01", "HK02")
+	s.markDeadForTarget("t", "HK01")
+	s.markDeadForTarget("t", "HK02")
+	if candidates, source := s.balance.selectCandidates(&smartDialMeta{smartTarget: "t"}, false, false); len(candidates) != 2 {
+		t.Fatalf("debargoed region: %v (%s)", outboundNames(candidates), source)
+	}
+	options := option.SmartLoadBalanceOutboundOptions{Region: option.SmartRegionOptions{MinNodes: 3}}
+	s = newTestLoadBalance(t, context.Background(), options, "HK01", "JP01", "JP02")
+	setDelays(s, map[string]uint16{"HK01": 30, "JP01": 200, "JP02": 220})
+	if region, source := regionOfFirst(t, s, &smartDialMeta{smartTarget: "t"}); region != "HK" {
+		t.Fatalf("min_nodes unmet everywhere: %s (%s)", region, source)
 	}
 }
