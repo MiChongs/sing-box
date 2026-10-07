@@ -55,24 +55,24 @@ Set `collect_data: true` on a Smart group, and a row is appended to a CSV file e
 - File: `experimental.smart.collector.path`, by default `smart_weight_data.csv` in the data directory.
 - Writes: flushed every 100 rows or every 30 seconds. Samples may be dropped when the stats queue is busy.
 - Limit: `size_limit_mb` (default 100 MB). Once the limit is reached, writing stops and one WARN is logged. The file is not rotated. Writing resumes automatically within 30 seconds after you delete or truncate the file.
-- Old format: an old file without the `history_upload_mb` column is renamed to `.bak.<timestamp>` as a backup.
+- Header: the first line holds the 60 column names. If an existing file's header does not match the current format (including the 37-column header written by versions before 2026-10-07), the file is renamed to `<path>.bak.<timestamp>` and a new one is created. An empty file gets a header.
 
-Each row has 60 columns:
+Each row has 60 columns, with these header names:
 
 <div class="not-prose my-6 overflow-hidden rounded-card bg-surface shadow-ring">
   {csvColumns.map((c) => (
     <div class="grid grid-cols-[4.5rem_1fr] gap-3 border-t border-line-soft px-4 py-2.5 text-[0.9rem] first:border-0">
       <span class="font-mono text-subtle">{c.range}</span>
       <div>
-        <code class="font-mono text-[0.82rem] text-accent">{c.nameEn ?? c.name}</code>
+        <code class="break-words font-mono text-[0.82rem] text-accent">{c.name}</code>
         <p class="mt-0.5 text-fg-2" set:html={c.en.replace(/`([^`]+)`/g, '<code>$1</code>')} />
       </div>
     </div>
   ))}
 </div>
 
-<Callout type="warn" title="Read columns by index">
-  In the current version, the header in the first line of the CSV names only 37 columns and does not line up with the 60-column data rows. When parsing, skip the first line and read values by the column indexes in the table above.
+<Callout type="note" title="Backups from older versions">
+  Versions before 2026-10-07 wrote a header with only 37 names, misaligned with the data from column 28 on. Old files renamed to `.bak.<timestamp>` have the same row format as today; when reading them, skip the first line and read values by the column indexes in the table above.
 </Callout>
 
 ## Training your own model
@@ -83,9 +83,9 @@ The repository does not ship a training script. Below is a minimal workflow usin
 import pandas as pd
 import lightgbm as lgb
 
-df = pd.read_csv("smart_weight_data.csv", header=None, skiprows=1)
+df = pd.read_csv("smart_weight_data.csv")
 X = df.iloc[:, 0:35].astype(float)   # columns 0–34: features
-y = df.iloc[:, 42].astype(float)     # column 42: weight label
+y = df["weight"].astype(float)       # weight label
 
 booster = lgb.train(
     {"objective": "regression", "learning_rate": 0.05, "num_leaves": 31, "verbose": -1},

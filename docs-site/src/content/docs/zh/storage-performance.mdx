@@ -31,6 +31,8 @@ Smart 使用 `experimental.cache_file` 指定的 bbolt 数据库（默认 `cache
 
 ### 重启后恢复什么
 
+冷启动，以及通过 SIGHUP 或 Clash API 重新加载配置后，Smart 都会从缓存文件恢复以下数据：
+
 | 数据 | 恢复规则 |
 |---|---|
 | 统计、权重、预取、排名 | 全部保留，读取时按时间衰减 |

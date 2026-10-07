@@ -55,24 +55,24 @@ import example from '../../../examples/03-lightgbm.json?raw';
 - 文件：`experimental.smart.collector.path`，默认数据目录下的 `smart_weight_data.csv`。
 - 写入：每 100 行或每 30 秒刷新一次。统计队列繁忙时样本可能被丢弃。
 - 上限：`size_limit_mb`（默认 100 MB），达到后停止写入并记录一次 WARN，不会轮转；删除或截短文件后 30 秒内自动恢复。
-- 旧格式：没有 `history_upload_mb` 列的旧文件会被改名为 `.bak.<时间戳>` 备份。
+- 表头：首行是 60 个列名。已有文件的表头与当前格式不一致时（包括 2026-10-07 之前版本写出的 37 列表头），文件会被改名为 `<path>.bak.<时间戳>` 备份，然后新建；空文件会补写表头。
 
-每行 60 列：
+每行 60 列，表头列名如下：
 
 <div class="not-prose my-6 overflow-hidden rounded-card bg-surface shadow-ring">
   {csvColumns.map((c) => (
     <div class="grid grid-cols-[4.5rem_1fr] gap-3 border-t border-line-soft px-4 py-2.5 text-[0.9rem] first:border-0">
       <span class="font-mono text-subtle">{c.range}</span>
       <div>
-        <code class="font-mono text-[0.82rem] text-accent">{c.name}</code>
+        <code class="break-words font-mono text-[0.82rem] text-accent">{c.name}</code>
         <p class="mt-0.5 text-fg-2" set:html={c.zh.replace(/`([^`]+)`/g, '<code>$1</code>')} />
       </div>
     </div>
   ))}
 </div>
 
-<Callout type="warn" title="请按列序号读取">
-  当前版本 CSV 首行的表头只命名了 37 列，与 60 列的数据行不对齐。解析时请跳过首行，按上表的列序号取值。
+<Callout type="note" title="旧版本的备份文件">
+  2026-10-07 之前的版本写出的表头只有 37 个列名，从第 28 列起与数据错位。被改名为 `.bak.<时间戳>` 的这类旧文件，数据行格式与现在相同，读取时请跳过首行、按上表的列序号取值。
 </Callout>
 
 ## 自行训练
@@ -83,9 +83,9 @@ import example from '../../../examples/03-lightgbm.json?raw';
 import pandas as pd
 import lightgbm as lgb
 
-df = pd.read_csv("smart_weight_data.csv", header=None, skiprows=1)
+df = pd.read_csv("smart_weight_data.csv")
 X = df.iloc[:, 0:35].astype(float)   # 第 0–34 列：特征
-y = df.iloc[:, 42].astype(float)     # 第 42 列：权重标签
+y = df["weight"].astype(float)       # 权重标签
 
 booster = lgb.train(
     {"objective": "regression", "learning_rate": 0.05, "num_leaves": 31, "verbose": -1},

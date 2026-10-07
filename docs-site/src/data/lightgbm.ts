@@ -50,22 +50,30 @@ export const features: Feature[] = [
 export interface Column {
   range: string;
   name: string;
-  nameEn?: string;
   zh: string;
   en: string;
 }
 
+// Header names come from collectorHeader in collector.go. A `_raw` suffix
+// marks the untransformed value of a feature that shares the name.
 export const csvColumns: Column[] = [
-  { range: '0–34', name: '35 个特征',
-    nameEn: '35 features', zh: '与上表顺序相同，格式 `%.6f`', en: 'Same order as the table above, formatted `%.6f`' },
+  { range: '0–34', name: 'success … tcp_retransmissions', zh: '35 个特征，列名与顺序同上表，格式 `%.6f`', en: 'The 35 features, with the names and order of the table above, formatted `%.6f`' },
   { range: '35', name: 'group_name', zh: 'Smart 组标签', en: 'Smart group tag' },
   { range: '36', name: 'node_name', zh: '节点标签', en: 'Node tag' },
   { range: '37–41', name: 'asn_raw, host_raw, ip_raw, port_raw, geoip_raw', zh: '原始的 ASN、域名、IP、端口、国家，缺失时为 `unknown`', en: 'Raw ASN, host, IP, port and country; `unknown` when missing' },
   { range: '42', name: 'weight', zh: '训练标签：最终权重除以优先级系数', en: 'Training label: final weight divided by the priority factor' },
   { range: '43', name: 'weight_source', zh: '`traditional` 或 `lightgbm`，手动指定期间追加 `:manual`', en: '`traditional` or `lightgbm`, with `:manual` appended while pinned' },
   { range: '44', name: 'timestamp', zh: 'RFC 3339 时间', en: 'RFC 3339 time' },
-  { range: '45–53', name: '扩展列 A',
-    nameEn: 'Extension A', zh: '延迟标准差变化、建连标准差变化、活跃连接数、TLS 会话是否复用、DNS 耗时、TLS 耗时、HTTP/3 回退次数、模型置信度、小时（0–23）', en: 'Latency std-dev delta, connect std-dev delta, active connections, TLS session resumed, DNS time, TLS time, HTTP/3 fallback count, model confidence, hour (0–23)' },
-  { range: '54–59', name: '扩展列 B',
-    nameEn: 'Extension B', zh: 'TCP 重传、TCP 丢包、路径 MTU、长期 RTT、长期成功率、格式版本（固定为 `4`）', en: 'TCP retransmissions, TCP losses, path MTU, long-term RTT, long-term success rate, schema version (always `4`)' },
+  {
+    range: '45–53',
+    name: 'latency_stddev_delta, connect_time_stddev_delta, active_conns_raw, tls_session_resumed, dns_resolve_time, tls_handshake_time_raw, http3_fallback_count, lightgbm_confidence, hour_bucket_raw',
+    zh: '延迟标准差变化、建连标准差变化、活跃连接数、TLS 会话是否复用、DNS 耗时、TLS 握手耗时、HTTP/3 回退次数、模型置信度、小时（0–23）。带 `_raw` 后缀的是同名特征未经变换的原始值',
+    en: 'Latency std-dev delta, connect std-dev delta, active connections, TLS session resumed, DNS time, TLS handshake time, HTTP/3 fallback count, model confidence, hour (0–23). A `_raw` suffix marks the untransformed value of the feature with the same name',
+  },
+  {
+    range: '54–59',
+    name: 'tcp_retransmissions_raw, tcp_losses, path_mtu, long_rtt, long_success_rate, schema_version',
+    zh: 'TCP 重传、TCP 丢包、路径 MTU、长期 RTT、长期成功率、格式版本（固定为 `4`）',
+    en: 'TCP retransmissions, TCP losses, path MTU, long-term RTT, long-term success rate, schema version (always `4`)',
+  },
 ];

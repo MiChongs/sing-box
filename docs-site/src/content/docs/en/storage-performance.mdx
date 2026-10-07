@@ -31,6 +31,8 @@ Records are written as JSON. The following live only in memory and build up agai
 
 ### What is restored after a restart
 
+After a cold start, and after a config reload through SIGHUP or the Clash API, Smart restores the following from the cache file:
+
 | Data | Restore rule |
 |---|---|
 | Statistics, weights, prefetch, ranking | All kept; time decay applies when they are read |

@@ -221,8 +221,8 @@ export const collectorFields: Field[] = [
     name: 'path',
     type: 'string',
     default: 'smart_weight_data.csv',
-    zh: '训练数据 CSV 路径，相对路径基于数据目录。旧格式的文件（没有 `history_upload_mb` 列）会被改名为 `<path>.bak.<时间戳>` 后重新创建。',
-    en: 'Training-data CSV path, relative to the data directory. An old-format file (no `history_upload_mb` column) is renamed to `<path>.bak.<timestamp>` and a new one is created.',
+    zh: '训练数据 CSV 路径，相对路径基于数据目录。已有文件的表头与当前格式不一致时，会被改名为 `<path>.bak.<时间戳>` 后重新创建。',
+    en: 'Training-data CSV path, relative to the data directory. If an existing file\'s header does not match the current format, it is renamed to `<path>.bak.<timestamp>` and a new one is created.',
   },
   {
     name: 'size_limit_mb',

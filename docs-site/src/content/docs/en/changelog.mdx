@@ -7,6 +7,17 @@ Only changes that affect usage are listed, newest first. For the full commit his
 
 ## 2026-10
 
+**Learned data takes effect and survives restarts** (Oct 7)
+
+- Fixed Smart groups never receiving the cache file's database. Since 2026-06-08, stats, weights, LightGBM inference, training-data collection and persistence did not work at all, and Smart picked nodes by URL test latency only.
+- Fixed the cache file deleting `smart_stats` when it opens, which wiped learned data on every start, SIGHUP or Clash API reload.
+- After a config reload, Smart uses the newly opened cache file instead of the closed old database.
+
+**Training-data CSV header matches the data columns** (Oct 7)
+
+- The header now holds the 60 column names of the data rows, so columns can be read by name.
+- An existing file whose header does not match the current format (including the old 37-column header) is renamed to `.bak.<timestamp>` and a new one is created. An empty file gets a header.
+
 **Connection chains extended to the actual node** (Oct 6)
 
 - For connections through Smart in `/connections`, `chains` now includes the node that was actually dialed, with the final node first, such as `["HK-01", "auto", "proxy"]`. When members are nested groups, the chain is expanded level by level.
