@@ -125,6 +125,7 @@ func (r *SmartRegion) Parent() *Smart { return r.parent.Load() }
 func (r *SmartRegion) request() *balanceRequest {
 	return &balanceRequest{
 		group:    r.groupTag,
+		via:      r.Tag(),
 		region:   r.region,
 		fallback: r.fallback,
 		pin:      *r.pinned.Load(),

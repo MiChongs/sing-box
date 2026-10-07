@@ -2026,18 +2026,30 @@ func (s *Smart) Now() string {
 
 // recordDialedMember lets connection observers (Clash API chains) show the
 // member that carried this dial instead of stopping at the group.
-func (s *Smart) recordDialedMember(ctx context.Context, outbounds []adapter.Outbound, tag string) {
+//
+// A dial made for a smart-region outbound is recorded for that outbound too:
+// the route chain of such a connection ends at the region outbound, not at
+// this group, so only its own entry lets the chain reach the node.
+func (s *Smart) recordDialedMember(ctx context.Context, meta *smartDialMeta, outbounds []adapter.Outbound, tag string) {
 	if adapter.OutboundDialTraceFromContext(ctx) == nil {
 		return
 	}
+	var member adapter.Outbound
 	for _, outbound := range outbounds {
 		if outbound.Tag() == tag {
-			adapter.RecordGroupDial(ctx, s.Tag(), outbound)
-			return
+			member = outbound
+			break
 		}
 	}
-	if outbound, loaded := s.outboundMgr.Outbound(tag); loaded {
-		adapter.RecordGroupDial(ctx, s.Tag(), outbound)
+	if member == nil {
+		member, _ = s.outboundMgr.Outbound(tag)
+	}
+	if member == nil {
+		return
+	}
+	adapter.RecordGroupDial(ctx, s.Tag(), member)
+	if meta != nil && meta.balance != nil && meta.balance.via != "" {
+		adapter.RecordGroupDial(ctx, meta.balance.via, member)
 	}
 }
 
@@ -2450,7 +2462,7 @@ func (s *Smart) DialContext(ctx context.Context, network string, destination M.S
 		return nil, err
 	}
 	s.setLastSelected(proxyTag)
-	s.recordDialedMember(ctx, snap.outbounds, proxyTag)
+	s.recordDialedMember(ctx, meta, snap.outbounds, proxyTag)
 	s.rememberStickyChoice(meta.smartTarget, proxyTag, isUDP)
 	s.rememberHysteresisChoice(meta.smartTarget, proxyTag, isUDP)
 	if s.balance != nil {
@@ -2611,6 +2623,9 @@ func (s *Smart) racePacketCandidates(
 		if err == nil {
 			s.setLastSelected(ob.Tag())
 			adapter.RecordGroupDial(ctx, s.Tag(), ob)
+			if meta.balance != nil && meta.balance.via != "" {
+				adapter.RecordGroupDial(ctx, meta.balance.via, ob)
+			}
 			s.rememberStickyChoice(meta.smartTarget, ob.Tag(), true)
 			s.rememberHysteresisChoice(meta.smartTarget, ob.Tag(), true)
 			if s.balance != nil {

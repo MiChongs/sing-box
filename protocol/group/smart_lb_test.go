@@ -875,3 +875,46 @@ func TestBalanceRelaxesBeforeFailing(t *testing.T) {
 		t.Fatalf("min_nodes unmet everywhere: %s (%s)", region, source)
 	}
 }
+
+type lbDialStub struct{ lbStub }
+
+func (s *lbDialStub) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
+	client, server := net.Pipe()
+	go func() { _ = server.Close() }()
+	return client, nil
+}
+
+// Connections routed to a region outbound must show the node that carried
+// them: the route chain ends at the region outbound, so the trace has to
+// record the region outbound's member, not only the group's.
+func TestRegionOutboundRecordsDialedNode(t *testing.T) {
+	logger := log.NewNOPFactory().NewLogger("smart-loadbalance")
+	s, err := newSmart(context.Background(), nil, logger, "LB", C.TypeSmartLoadBalance, option.SmartOutboundOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.balance, err = newSmartBalance(s, option.SmartBalanceOptions{}, option.SmartRegionOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	node := &lbDialStub{lbStub{tag: "🇭🇰 香港 01", udp: true}}
+	s.state.Store(&smartGroupState{outbounds: []adapter.Outbound{node}, tags: []string{node.tag}})
+	s.balance.rebuild()
+	region := newSmartRegion(context.Background(), logger, "🇭🇰 香港负载", "LB", "HK", false, false, "", []string{N.NetworkTCP})
+	region.parent.Store(s)
+
+	trace := new(adapter.OutboundDialTrace)
+	ctx := adapter.ContextWithOutboundDialTrace(context.Background(), trace)
+	conn, err := region.DialContext(ctx, N.NetworkTCP, M.ParseSocksaddrHostPort("www.example.com", 443))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	chain := trace.Resolve([]adapter.Outbound{region})
+	if len(chain) != 2 || chain[1].Tag() != node.tag {
+		tags := make([]string, len(chain))
+		for i, ob := range chain {
+			tags[i] = ob.Tag()
+		}
+		t.Fatalf("chain through the region outbound stops early: %v", tags)
+	}
+}

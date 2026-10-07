@@ -185,6 +185,7 @@ func normaliseRegionFallback(raw string) (string, bool) {
 // outbound into its group's dial path.
 type balanceRequest struct {
 	group     string
+	via       string // tag of the smart-region outbound making the dial
 	region    string
 	fallback  bool
 	pin       string

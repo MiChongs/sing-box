@@ -239,7 +239,12 @@ func smartBlockConnection(ctx context.Context, trafficManager *trafficcontrol.Ma
 			}
 			sg, ok := ob.(*group.Smart)
 			if !ok {
-				continue
+				// A smart-region outbound blocks the node in its group.
+				region, isRegion := ob.(*group.SmartRegion)
+				if !isRegion || region.Parent() == nil {
+					continue
+				}
+				sg = region.Parent()
 			}
 			nodeTag := ""
 			if i+1 < len(chain) {
