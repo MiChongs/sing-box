@@ -15,7 +15,7 @@ export const sidebar: NavSection[] = [
   {
     zh: '指南',
     en: 'Guides',
-    slugs: ['algorithms', 'priority-and-pinning', 'health', 'lightgbm', 'asn-geox', 'storage-performance', 'examples'],
+    slugs: ['algorithms', 'smart-loadbalance', 'priority-and-pinning', 'health', 'lightgbm', 'asn-geox', 'storage-performance', 'examples'],
   },
   { zh: '参考', en: 'Reference', slugs: ['config', 'clash-api', 'troubleshooting', 'changelog'] },
 ];

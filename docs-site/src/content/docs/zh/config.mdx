@@ -1,6 +1,6 @@
 ---
 title: 配置字段
-description: Smart 出站组、experimental.smart、experimental.geox 的全部字段，以及影响 Smart 的环境变量。默认值与校验规则均以源码为准。
+description: Smart 出站组、smart-loadbalance 与 smart-region、experimental.smart、experimental.geox 的全部字段，以及影响 Smart 的环境变量。默认值与校验规则均以源码为准。
 ---
 
 import FieldList from '../../../components/FieldList.astro';
@@ -8,9 +8,11 @@ import Callout from '../../../components/Callout.astro';
 import {
   membershipFields, probeFields, selectionFields, learningFields, asnFields, displayFields,
   lightgbmFields, collectorFields, geoxFields, envVars,
+  lbBalanceFields, lbRegionFields, lbRuleFields, lbDestinationFields, lbDetectFields, lbProbeFields,
+  lbOutboundsFields, smartRegionFields,
 } from '../../../data/fields';
 
-Smart 的配置分三处：出站组本身（`type: "smart"`）、全局的 `experimental.smart`（LightGBM 模型与训练数据），以及全局的 `experimental.geox`（ASN 与国家数据库下载）。另外，Smart 的学习数据保存在 `experimental.cache_file` 中。
+Smart 的配置分三处：出站组本身（`type: "smart"`，或按地区分摊连接的 `type: "smart-loadbalance"`）、全局的 `experimental.smart`（LightGBM 模型与训练数据），以及全局的 `experimental.geox`（ASN 与国家数据库下载）。另外，Smart 的学习数据保存在 `experimental.cache_file` 中。
 
 ## 结构总览
 
@@ -110,6 +112,100 @@ Smart 的配置分三处：出站组本身（`type: "smart"`）、全局的 `exp
 
 <FieldList lang="zh" fields={displayFields} prefix="field-" />
 
+## smart-loadbalance
+
+`smart-loadbalance` 组接受上面 `smart` 组的全部字段，含义不变，只有 `algorithm` 与 `hysteresis` 被忽略（启动时记录 WARN），分别由 `balance` 与 `region` 取代。工作方式见 [Smart 负载均衡](../smart-loadbalance/)。与 `algorithm` 不同，`balance`、`region` 中的取值写错会直接报配置错误。
+
+```json
+{
+  "type": "smart-loadbalance",
+  "tag": "balance",
+  "providers": ["my-subscription"],
+
+  "balance": {
+    "strategy": "smart",
+    "affinity": "none",
+    "affinity_ttl": "10m",
+    "max_nodes": 0,
+    "min_quality": 0.5,
+    "max_connections_per_node": 0
+  },
+  "region": {
+    "mode": "auto",
+    "priority": [],
+    "allow": [],
+    "deny": [],
+    "weights": {},
+    "fallback": "auto",
+    "min_nodes": 1,
+    "sticky": "30m",
+    "switch_margin": 0.25,
+    "unknown": "keep",
+    "rules": [],
+    "destination": { "map": {}, "disable_tld": false, "disable_resolve": false },
+    "detect": {
+      "disable_name": false,
+      "exit": "fallback",
+      "exit_url": "https://www.cloudflare.com/cdn-cgi/trace",
+      "exit_ttl": "24h",
+      "exit_timeout": "8s",
+      "exit_concurrency": 4
+    },
+    "probe": { "disabled": false, "interval": "10m", "targets": 6, "regions": 5 },
+    "outbounds": {
+      "enabled": false,
+      "regions": [],
+      "auto": false,
+      "tag": "{group}-{region}",
+      "fallback": false,
+      "members": "regions",
+      "hidden": false,
+      "icon": ""
+    }
+  }
+}
+```
+
+地区可以写代码（`HK`、`GB`，`UK` 等同 `GB`）、中英文名称（`香港`、`Japan`）或旗帜（`🇯🇵`），不区分大小写；不认识的值按大写原样作为自定义地区。
+
+### balance
+
+<FieldList lang="zh" fields={lbBalanceFields} prefix="balance-" />
+
+### region
+
+<FieldList lang="zh" fields={lbRegionFields} prefix="region-" />
+
+### region.rules
+
+<FieldList lang="zh" fields={lbRuleFields} prefix="rule-" />
+
+### region.destination
+
+<FieldList lang="zh" fields={lbDestinationFields} prefix="destination-" />
+
+### region.detect
+
+<FieldList lang="zh" fields={lbDetectFields} prefix="detect-" />
+
+### region.probe
+
+<FieldList lang="zh" fields={lbProbeFields} prefix="probe-" />
+
+### region.outbounds
+
+<FieldList lang="zh" fields={lbOutboundsFields} prefix="outbounds-" />
+
+## smart-region
+
+`smart-loadbalance` 组某个地区的出站。通常由 `region.outbounds` 自动生成，也可以手动声明。经它的连接走所属组的完整流程，地区固定。
+
+```json
+{ "type": "smart-region", "tag": "日本前置", "group": "balance", "region": "JP", "fallback": false }
+```
+
+<FieldList lang="zh" fields={smartRegionFields} prefix="smart-region-" />
+
 ## experimental.smart
 
 所有 Smart 组共享的模型与训练数据采集器。这一块没有 `enabled` 开关，也不需要显式填写：只有当某个组设置了 `use_lightgbm` 才会加载、下载模型；只有当某个组设置了 `collect_data` 才会创建 CSV。
@@ -124,7 +220,7 @@ Smart 的配置分三处：出站组本身（`type: "smart"`）、全局的 `exp
 
 ## experimental.geox
 
-全局地理数据下载。目前**唯一的使用者是 Smart**：`url.asn` 为未设置 `asn_database` 的组提供 ASN 数据库，`url.mmdb` 提供国家数据库。各项没有默认下载地址，只有填写了 URL 的文件才会下载。文件名固定，保存在数据目录下。
+全局地理数据下载。目前**唯一的使用者是 Smart**：`url.asn` 为未设置 `asn_database` 的组提供 ASN 数据库，`url.mmdb` 提供国家数据库（LightGBM、训练数据采集与 `smart-loadbalance` 的 `destination` 模式使用）。各项没有默认下载地址，只有填写了 URL 的文件才会下载。文件名固定，保存在数据目录下。
 
 <FieldList lang="zh" fields={geoxFields} prefix="geox-" />
 

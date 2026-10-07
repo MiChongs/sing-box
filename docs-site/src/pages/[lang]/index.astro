@@ -60,11 +60,11 @@ const mark = (v: string) =>
       <h2 class="text-[1.8rem] sm:text-[2.1rem]">{t.comparison.title}</h2>
       <p class="mt-3 max-w-[44rem] text-muted">{t.comparison.lead}</p>
       <div class="scroll-thin mt-8 overflow-x-auto rounded-card bg-surface shadow-ring">
-        <table class="w-full min-w-[40rem] text-[0.92rem]">
+        <table class="w-full min-w-[48rem] text-[0.92rem]">
           <thead>
             <tr class="text-left">
               {t.comparison.headers.map((h, i) => (
-                <th class:list={['px-4 py-3 font-semibold', i === 4 ? 'text-accent' : 'text-fg']}>{h}</th>
+                <th class:list={['px-4 py-3 font-semibold', i >= 4 ? 'text-accent' : 'text-fg']}>{h}</th>
               ))}
             </tr>
           </thead>

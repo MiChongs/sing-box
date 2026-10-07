@@ -113,6 +113,22 @@ For a model you trained yourself, check it against [Model format](../lightgbm/#m
 - Avoid having multiple Smart groups reference the same set of nodes;
 - Lower `SMART_CACHE_BUDGET_MB` when memory is tight (command-line version only).
 
+## Smart load balancing
+
+**Config errors**: invalid values in `balance` and `region` are errors, such as `unknown balance strategy: ...`, `unknown region mode: ...`, `region.mode priority requires region.priority` and `region.outbounds.tag must contain {region}, {name}, {name_en} or {flag}`. A generated region outbound whose tag is already taken fails with `register region outbound <tag>: duplicate outbound tag: <tag>`; change the `region.outbounds.tag` template or the other outbound's tag.
+
+**`dependency[...] not found` when referencing a region outbound**: only region outbounds listed in `region.outbounds.regions` exist at startup; those created by `auto` at runtime cannot be referenced from the config. Add the region to `regions`.
+
+**A node lands in the wrong region**: check each member's `source` in `GET /smart/groups/{name}/regions`. Fix name misdetections with `region.rules` (a regex or member list); to trust the real exit instead, set `detect.exit: prefer` and call `POST /smart/groups/{name}/regions/detect?force=true`.
+
+**`no node can serve ...`**: the part in brackets is the region decision. `region-view-unavailable` means a region outbound's region has no healthy member and `fallback` is off; `priority-unavailable` means no region of `priority` is available; otherwise it is usually `fallback: none` with no healthy member in the chosen region. Check `healthy` per region in `/regions`, or relax `fallback`, `min_nodes` or `allow` / `deny`.
+
+**Connections keep landing on one node**: check whether `affinity` is `target` / `site` / `source` (which binds connections to one node); whether the pool is down to one node (`min_quality` too high, `max_nodes: 1`, or the region's other members unhealthy); and whether a node is pinned in the dashboard. With `log.level: debug` each connection logs `region=... pick=... pool=...`.
+
+**Exit probes never return a result**: the probe fetches `detect.exit_url` through the node and fails when the node is down or the URL is blocked; it is retried after 30 minutes. Another URL that reports a country, such as a JSON endpoint with `country_code`, works too.
+
+**The destination country cannot be determined (destination mode)**: make sure the country database has been downloaded (GeoX downloads it in the background; until then only TLDs work). With FakeIP, resolved answers have no country; rely on `destination.map` and TLDs, or use `auto`.
+
 ## Resetting all Smart data
 
 | Method | Scope |

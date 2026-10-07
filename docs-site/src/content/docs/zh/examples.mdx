@@ -1,6 +1,6 @@
 ---
 title: 示例配置
-description: 六份可直接使用的 Smart 配置：最小配置、调参、LightGBM、ASN、按流量类型分组与嵌套策略组。
+description: 八份可直接使用的 Smart 配置：最小配置、调参、LightGBM、ASN、按流量类型分组、嵌套策略组、Smart 负载均衡与嵌套代理前置。
 ---
 
 import CodeBlock from '../../../components/CodeBlock.astro';
@@ -11,6 +11,8 @@ import ex3 from '../../../examples/03-lightgbm.json?raw';
 import ex4 from '../../../examples/04-asn-geox.json?raw';
 import ex5 from '../../../examples/05-algorithms.json?raw';
 import ex6 from '../../../examples/06-nested.json?raw';
+import ex7 from '../../../examples/07-smart-loadbalance.json?raw';
+import ex8 from '../../../examples/08-chain.json?raw';
 
 以下示例都经过 `sing-box check` 验证。除第一份外，示例只列出与 Smart 相关的部分；订阅 `my-subscription`、`direct` 出站与 `cache_file` 的写法见第一份。
 
@@ -74,3 +76,23 @@ import ex6 from '../../../examples/06-nested.json?raw';
 - `policy_priority: "=HK:1.2"` 用 `=` 精确匹配，只作用于名为 `HK` 的成员。
 - 最外层的 `selector` 默认使用 `auto`，需要时可以在面板中切到固定地区。
 - 这种结构候选少、学习快，适合节点很多但只关心地区的场景；代价是 Smart 看不到地区内具体节点的差异。
+
+## Smart 负载均衡
+
+<CodeBlock code={ex7} filename="07-smart-loadbalance.json" locale="zh" />
+
+- 订阅的全部节点交给一个 `smart-loadbalance` 组，按名称自动分地区；名称中带 `IPLC`、`IEPL` 的节点归入自定义地区“专线”，`deny` 排除中国大陆节点。
+- `mode: auto` 为每个网站学习最优地区，`weights` 让香港略占优势；`affinity: site` 让同一网站固定使用一个节点，避免登录态因出口 IP 变化失效。
+- `max_connections_per_node: 64` 防止单个节点并发过多。
+- `region.outbounds` 为四个地区生成 `🇭🇰 香港负载` 等出站。组在面板中把它们列为成员，点选即锁定地区；它们也可以像 `proxy` 这样被 `selector` 直接引用。
+- 详细说明见 [Smart 负载均衡](../smart-loadbalance/)。
+
+## 嵌套代理前置
+
+<CodeBlock code={ex8} filename="08-chain.json" locale="zh" />
+
+- 两个落地节点经机场节点连接。`front` 把前置连接分摊到选中地区的多个机场节点上。
+- `landing-us` 以 `front` 为前置：`destination` 模式按落地服务器所在国家选地区，`map` 让美国落地优先用美国、其次日本的前置，英国落地用德国、荷兰的前置。落地服务器以域名填写时，组会先解析域名再判断国家。
+- `landing-hk` 固定用 `front-HK`（香港前置）。`fallback: true` 让香港前置全部不可用时改用其他地区，而不是直接失败。
+- `members: "nodes"` 让 `front` 在面板中仍列出节点。
+- 前置组保持默认的 `affinity: none`；设置 `site` 或 `target` 会让到同一落地服务器的所有连接落在同一个前置节点上。

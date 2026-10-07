@@ -7,6 +7,15 @@ description: 2026 年 4 月文档站上线以来 Smart 出站组的行为变化�
 
 ## 2026-10
 
+**新增 smart-loadbalance：按地区分池的智能负载均衡**（10-07）
+
+- 新出站类型 `smart-loadbalance`：订阅的全部节点按地区自动分池，每条连接先选地区，再在地区内的好节点之间按 Smart 学到的质量与实时连接数分摊。学习、熔断、Watchdog、持久化、LightGBM、ASN 与 `smart` 组完全相同。见 [Smart 负载均衡](../smart-loadbalance/)。
+- 地区识别：自定义规则、节点名称（旗帜、中英文国名与城市、ISO / 机场代码、`沪日` `广港` 等专线写法、中转名称）与出口探测（经节点请求 Cloudflare trace，按真实出口国家归类，结果保存 24 小时）。
+- 地区模式：`auto` 按目标学习最优地区并记住 30 分钟、明显更好才换；`destination` 按目标所在国家匹配（IP、国家顶级域或解析域名）；`priority` 按顺序；`off` 不分地区。可在面板或 Clash API 中锁定地区，`fallback` 控制跨地区回退。`auto` 模式还会为常访问的网站主动比较各地区的 TLS 握手耗时。
+- 分配策略 `smart`、`least-connections`、`round-robin`、`weighted-round-robin`、`weighted-random`、`random`、`consistent-hashing`，会话亲和 `target`、`site`、`source`、`source-site`，以及质量下限、节点数与单节点连接数上限。
+- 新出站类型 `smart-region`：组可以为每个地区生成出站，供路由规则、落地节点的 `detour` 与 `selector` 引用；在面板中点选即锁定地区。作为嵌套代理前置时，组按落地服务器而不是网站学习和选地区。
+- 新增 Clash API：`GET/PUT /smart/groups/{name}/regions`、`DELETE /smart/groups/{name}/regions/lock`、`POST /smart/groups/{name}/regions/detect`、`PUT /smart/groups/{name}/balance`；`/proxies` 新增 `loadBalance` 块；`/smart/groups` 新增 `type` 字段。地区锁定与运行时设置保存在缓存文件中，重启后恢复。
+
 **ASN 与国家数据库热重载，下载完整接入 http_client**（10-07）
 
 - GeoX 下载或更新 ASN、国家数据库后立即重新加载，所有 Smart 组随即使用新数据；启动时还没下载好的数据库在下载完成后自动启用。此前都需要重启。

@@ -1,6 +1,6 @@
 ---
 title: Examples
-description: Six ready-to-use Smart configurations covering a minimal setup, tuning, LightGBM, ASN, groups per traffic type and nested groups.
+description: Eight ready-to-use Smart configurations covering a minimal setup, tuning, LightGBM, ASN, groups per traffic type, nested groups, Smart load balancing and the front of chained proxies.
 ---
 
 import CodeBlock from '../../../components/CodeBlock.astro';
@@ -11,6 +11,8 @@ import ex3 from '../../../examples/03-lightgbm.json?raw';
 import ex4 from '../../../examples/04-asn-geox.json?raw';
 import ex5 from '../../../examples/05-algorithms.json?raw';
 import ex6 from '../../../examples/06-nested.json?raw';
+import ex7 from '../../../examples/07-smart-loadbalance.json?raw';
+import ex8 from '../../../examples/08-chain.json?raw';
 
 All examples below pass `sing-box check`. Except for the first one, each example lists only the Smart-related parts; see the first one for how to write the `my-subscription` subscription, the `direct` outbound and `cache_file`.
 
@@ -74,3 +76,23 @@ Four Smart groups reference the same subscription, and route rules assign traffi
 - `policy_priority: "=HK:1.2"` uses `=` for an exact match, so it applies only to the member named `HK`.
 - The outermost `selector` uses `auto` by default. You can switch to a fixed region in the dashboard when needed.
 - This structure has few candidates and learns fast, which suits setups with many nodes where you only care about the region. The cost is that Smart cannot see differences between individual nodes within a region.
+
+## Smart load balancing
+
+<CodeBlock code={ex7} filename="07-smart-loadbalance.json" locale="en" />
+
+- Every node of the subscription goes into one `smart-loadbalance` group and is sorted into regions by name; nodes whose names contain `IPLC` or `IEPL` go to a custom region named "专线" (private line), and `deny` leaves out mainland-China nodes.
+- `mode: auto` learns the best region per site, `weights` gives Hong Kong a slight edge, and `affinity: site` keeps each site on one node so logins do not break on exit-IP changes.
+- `max_connections_per_node: 64` keeps any single node from taking too many concurrent connections.
+- `region.outbounds` generates outbounds such as `🇭🇰 香港负载` for four regions. The group lists them as its members in dashboards — picking one locks that region — and a `selector` such as `proxy` can reference them directly.
+- Details in [Smart load balancing](../smart-loadbalance/).
+
+## Front of chained proxies
+
+<CodeBlock code={ex8} filename="08-chain.json" locale="en" />
+
+- Two landing nodes connect through provider nodes. `front` spreads the front connections over several provider nodes of the chosen region.
+- `landing-us` uses `front` itself: the `destination` mode picks the region by the landing server's country, and `map` sends US landing servers through US, then Japanese, fronts and UK ones through German or Dutch fronts. A landing server given by domain is resolved first.
+- `landing-hk` always uses `front-HK`, the Hong Kong front. `fallback: true` lets it move to another region when every Hong Kong front is down instead of failing.
+- `members: "nodes"` keeps `front` listing nodes in dashboards.
+- The front group keeps the default `affinity: none`; `site` or `target` would put every connection to one landing server on a single front node.

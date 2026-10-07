@@ -1,0 +1,296 @@
+---
+title: Smart load balancing
+description: The smart-loadbalance group sorts every node into region pools on its own, then spreads connections across a region by the node quality Smart has learned. Covers region detection, region modes, strategies, affinity, region outbounds and chained proxies (front + landing).
+---
+
+import Flow from '../../../components/Flow.astro';
+import Callout from '../../../components/Callout.astro';
+
+A `smart` group concentrates traffic on the node it thinks is best — a smarter `urltest`. A `loadbalance` group spreads connections, but it neither knows which nodes are good nor cares about regions. `smart-loadbalance` combines the two:
+
+- **Region pools**: put every node of a subscription in one group, and it sorts them into regions by name (flags, Chinese and English names, cities, codes, relay shorthands), by your rules, or by their real exit IP.
+- **Region per connection**: each connection first gets a region — learned per destination, matched to the destination's country, taken in priority order, or locked from a dashboard. A site keeps one exit country.
+- **Spread inside the region**: connections are distributed across every good node of the chosen region, weighted by the quality Smart has learned and by live connection counts, instead of piling onto one node.
+- **Region outbounds**: the group can generate one outbound per region for route rules, the `detour` of landing nodes and `selector` groups — made for chained proxies.
+
+Learning, circuit breakers, the watchdog, persistence, LightGBM and ASN work exactly as in `smart`, and every `smart` field except `algorithm` and `hysteresis` keeps its meaning.
+
+| | `loadbalance` | `smart` | `smart-loadbalance` |
+|---|---|---|---|
+| Node per connection | Round-robin / hash / sticky | Learned best node (fine-tuned among the top few) | Spread over every good node of the chosen region by quality and load |
+| Node quality | Probe reachability only | Learned per destination | Learned per destination |
+| Regions | None | None | Automatic pools, region chosen per destination |
+| Front of chained proxies | Possible, but region-blind and unaware of bad nodes | One front node | Front spread within a region; region lockable or matched to the landing country |
+
+## Quick start
+
+```json
+{
+  "type": "smart-loadbalance",
+  "tag": "balance",
+  "providers": ["my-subscription"]
+}
+```
+
+With nothing else set: regions come from node names, and members whose names say nothing get an exit probe; each destination gets the best region and keeps it for 30 minutes; connections inside a region are spread by the `smart` strategy; nothing is bound to a node. As with `smart`, **`experimental.cache_file` must be enabled** for any learning to happen.
+
+The startup log shows the pools:
+
+```
+smart-loadbalance[balance] regions: HK(12) JP(8) SG(5) US(4) OTHER(1); mode=auto strategy=smart affinity=none fallback=auto
+```
+
+See [Examples](../examples/#smart-load-balancing) for complete configurations and [Configuration](../config/#smart-loadbalance) for every field.
+
+## How a connection is handled
+
+<Flow
+  items={[
+    { title: 'Identify the destination', body: 'As in `smart`, the domain is folded into a destination key such as `*.example.com`. As the `detour` of a landing node, the destination is the landing server, not the website.' },
+    { title: 'Choose regions', body: 'The lock, a region outbound or the region mode decides the primary region; `fallback` orders the fallback regions.' },
+    { title: 'Build the pool', body: 'Healthy members of the primary region, minus those bad for this destination, below the quality floor or over the connection cap.' },
+    { title: 'Pick a node', body: 'Affinity first, then the strategy picks the node for this connection.' },
+    { title: 'Dial and fail over', body: 'Only the picked node is dialed; if it looks suspect, the next one is hedged after 250 ms. On failure the rest of the pool, then the fallback regions, are tried in order.' },
+    { title: 'Learn', body: 'The outcome is recorded as usual; a successful node refreshes the affinity binding, and the destination\'s region memory follows the region actually used.' },
+  ]}
+/>
+
+## Region detection
+
+Each member gets its region from the first of these that applies:
+
+1. **`region.rules`**, in order: a regex on the name, or an explicit list of members.
+2. **Exit probe (with `detect.exit: prefer`)**: a valid probe result.
+3. **Member name** (unless `detect.disable_name`): see below.
+4. **Exit probe (the default `fallback`)**: the result for members the name could not place.
+5. **Nothing matched**: handled by `region.unknown`, by default the `OTHER` region.
+
+Provider members lose their `provider/` tag prefix before detection, so a provider called `jp-sub` does not make every member Japanese. Members can be plain nodes or other groups.
+
+### Names
+
+The detector collects every region hint in the name and scores it by how specific it is: country and city names (Chinese or English) score 3, flags 2, ISO / airport codes 1. The highest total wins; on a tie the later hint wins, because relay names put the exit last.
+
+| Member name | Region | Why |
+|---|---|---|
+| `🇭🇰 香港 01`, `HK01`, `hk-bgp-1` | HK | Flag, Chinese name, code (digits may follow directly) |
+| `Japan Tokyo 02`, `JP-NRT-3` | JP | English country and city, airport code |
+| `沪日 IPLC 01`, `IEPL 深港 2` | JP, HK | Private-line shorthands |
+| `香港中转美国`, `HK → JP` | US, JP | An entry region followed by "中转" / "→" barely counts |
+| `美国 洛杉矶 [HK中转]`, `CN2 GIA 洛杉矶` | US | `CN2` is a carrier backbone, not China |
+| `🇨🇳 台湾 01` | TW | Mainland China in a name only counts when nothing else matches |
+| `印度尼西亚 01`, `白俄罗斯` | ID, BY | Longer names win, so not India or Russia |
+| `🇺🇸 US LA 01` | US | `LA` and `NY` in names are US cities |
+| `Ｈｏｎｇ Ｋｏｎｇ` | HK | Full-width characters are normalised first |
+| `剩余流量：100.5 GB`, `节点 NO.1` | none | Traffic units and numbering are not Britain or Norway |
+
+The name table covers 94 countries and regions with common cities and airport codes; flags work for any country. Two-letter codes that read as words or labels (`NO`, `ID`, `IT`, `CO`, `AT`, …) are ignored; those regions are detected from flags and names. Correct misdetections with `region.rules`:
+
+```json
+"rules": [
+  { "region": "IPLC", "name": "Private line", "match": "(?i)IPLC|IEPL" },
+  { "region": "JP", "outbounds": ["mystery-node-7"] },
+  { "region": "HK", "name": "HK picks", "icon": "https://example.com/hk.png" }
+]
+```
+
+`region` can be built-in or custom (like `IPLC` above). A rule with only `region` and `name` / `icon` matches no member; it only renames or decorates the region.
+
+### Exit probes
+
+An exit probe fetches `detect.exit_url` (default `https://www.cloudflare.com/cdn-cgi/trace`) through the member and reads its exit IP and country. That is the address websites actually see, which helps most with members whose names are missing, wrong, or whose entry is a domestic relay.
+
+- `fallback` (default): probes only members the rules and the name could not place.
+- `prefer`: probes every member not placed by a rule; results override names. With many members the first round takes a while, and names are used meanwhile.
+- `off`: no probes.
+
+Probes run after start and after subscription updates for the members that need one, at most `exit_concurrency` (default 4) at a time. Results last 24 hours and are saved in the cache file, so restarts reuse them; failed members are retried after 30 minutes. `direct`, `block` and `dns` members are never probed.
+
+`GET /smart/groups/{name}/regions` shows every member's region and its source (`rule`, `name`, `exit`, `unknown`); `POST /smart/groups/{name}/regions/detect?force=true` re-probes every member. See [Clash API](../clash-api/#smart-load-balancing).
+
+## Region modes
+
+`region.mode` picks the primary region of each connection; `region.fallback` then orders the fallback regions.
+
+### auto (default)
+
+Learns the best region per destination. A region's score is the mean quality of its 3 best healthy members, with a small bonus for deeper pools (+5% per doubling, at most +20%), times the factor in `region.weights` and the region-probe result. A member's quality is, in order: the weight learned for this destination, the member's overall weight (×0.9), a value derived from its probe delay, or a neutral 0.55, times its `policy_priority` factor. Members whose learned weight for this destination is below 0.4 count half.
+
+Each destination remembers its region for `sticky` (30 minutes by default, refreshed on use). Within that time:
+
+- other regions are compared at most every 30 s, and must score `switch_margin` (25% by default) higher to take over;
+- the destination moves at once when its region drops below `min_nodes` healthy members;
+- after a dial fails over into another region and succeeds, the memory follows the new region.
+
+So a site keeps its exit country unless another region is clearly better or its region goes down.
+
+### destination
+
+Picks the region by the destination's country — for games, local streaming, and choosing the front by where the landing server is. The country comes from, in order:
+
+1. the destination IP in the country database;
+2. the domain's country-code TLD (`.jp`, `.co.uk`, …; turn off with `destination.disable_tld`). Suffixes used as generic domains, such as `.io`, `.co`, `.tv`, `.me`, `.ai`, are never used;
+3. the IP of the domain resolved through the DNS router (turn off with `destination.disable_resolve`). The lookup waits at most 300 ms and is cached per domain for 10 minutes, so a landing server configured by name is matched by where it is. For websites behind a CDN this yields the country of the edge nearest the DNS server; with FakeIP it yields nothing.
+
+`destination.map` maps a country to a list of regions, for example `{"KR": ["JP", "HK"]}`: a Korean destination tries Japan, then Hong Kong. Without a mapping the region of the same code is used. When the country is unknown or no listed region is available, `auto` decides.
+
+This mode needs the country database. When the mode is `destination` or `destination.map` is set, GeoX starts downloading it in the background at startup (`experimental.geox.url.mmdb`, or the default GeoLite2-Country); switching to `destination` at runtime starts the download then. Until it arrives, only TLDs can tell the country.
+
+### priority
+
+The first region of `region.priority` with at least `min_nodes` healthy members. `priority` is required. When none of the listed regions is available, `fallback: auto` uses the best other region; otherwise the connection fails.
+
+### off
+
+No regions: every member (of regions allowed by `allow` / `deny`) is in one pool. For "load balancing with learning" when the exit country does not matter.
+
+### Locking a region
+
+Pick a region outbound in a dashboard, or set `lock` with `PUT /smart/groups/{name}/regions`, to lock the group to one region; this overrides the region mode. The lock is saved in the cache file and survives restarts. When the locked region cannot serve, `fallback` applies; set `fallback: none` to never leave it.
+
+### Fallback
+
+| `region.fallback` | Primary region unavailable | Dial candidates |
+|---|---|---|
+| `auto` (default) | Best-scoring other region | Up to 7 nodes of the primary region, then the best nodes of the fallback regions (up to 2 regions, 3 nodes in all) |
+| `priority` | Next region of `priority` | Same, fallback regions limited to `priority` |
+| `none` | Fails: `no node can serve ...` | Primary region only |
+
+`allow` / `deny` restrict which regions can be chosen or fallen back to; `min_nodes` is how many healthy members a region needs to be chosen. A locked region and region outbounds ignore `allow` / `deny` and need just one healthy member.
+
+## Region probes
+
+The `auto` mode learns from real traffic, but traffic only flows through the region it already picked, so how other regions do for that destination stays unknown. Region probes fill that gap: every `probe.interval` (10 minutes by default) the group takes the `probe.targets` (6) most visited HTTPS sites and times a TCP connect plus TLS handshake to each site through the best node of each of the top `probe.regions` (5) regions.
+
+Results stay valid for 3 intervals and scale region scores by "fastest region's time ÷ this region's time" (no lower than 0.35); a failed region gets 0.25; a region without a result while others have one gets 0.85.
+
+Only domains reached over TCP 443 are probed. Probes are skipped while the group is idle (no dial for 2 minutes), the network is down, a region is locked, or the mode is `priority` or `off`. They go through Smart's shared probe queue and its concurrency limit. Set `probe.disabled: true` to turn them off.
+
+## The node pool
+
+Once a region is chosen, its pool is built from the region's members:
+
+1. Healthy members only: breaker closed, not marked unavailable, probe data valid, not blocked; UDP connections also need UDP support.
+2. Members soft-blocked for this destination are dropped; members failing often for it recently have their quality ×0.3.
+3. Members whose learned weight for this destination is below 0.4 are dropped as long as others remain.
+4. Members below the best member × `min_quality` (0.5 by default) are dropped.
+5. With `max_nodes`, only the best ones are kept.
+6. With `max_connections_per_node`, members at the cap are skipped, unless all of them are.
+
+## Strategies
+
+`balance.strategy` picks which pool member carries the connection. "Load" is the member's live connections through this group (TCP and UDP) plus dials in flight, so a burst of simultaneous connections spreads too.
+
+| Strategy | Aliases | Behavior |
+|---|---|---|
+| `smart` (default) | `auto`, `adaptive` | Cost is (load + 1) ÷ quality; members within 1.1× of the lowest cost share a quality-weighted draw. At equilibrium connections are proportional to quality: a member twice as good carries about twice the connections |
+| `least-connections` | `lc`, `least-conn`, `least-loaded` | Lowest load; ties are a quality-weighted draw |
+| `round-robin` | `rr` | Rotates in name order, counted per region |
+| `weighted-round-robin` | `wrr`, `weighted-rr` | Smooth weighted round-robin (as in nginx): deterministic and interleaved in proportion to quality |
+| `weighted-random` | `wr` | Quality-weighted random |
+| `random` | | Uniform random |
+| `consistent-hashing` | `chash`, `hash`, `rendezvous` | Weighted rendezvous hashing: the same key (the affinity key, or the destination without affinity) keeps landing on the same member; when a member leaves, only its own keys move |
+
+## Affinity
+
+`balance.affinity` keeps a set of connections on one node, so a site or a device does not hop between exit IPs:
+
+| Value | Bound together | Use for |
+|---|---|---|
+| `none` (default) | Nothing; every connection is placed on its own | Downloads, the front of chained proxies — anywhere the load should really spread |
+| `target` | Same destination key, such as `*.example.com` | General browsing |
+| `site` | Same registrable domain, such as `img.example.com` and `api.example.com` | Sites tying logins or risk checks to the exit IP (AI services, banks, some streaming) |
+| `source` | Same client IP | Per-device placement on a LAN |
+| `source-site` | Same client, same site | Similar to `sticky-sessions` of `loadbalance` |
+
+Bindings are kept per region for `affinity_ttl` (10 minutes by default, refreshed on use). A binding whose node is not in the current pool (unhealthy, soft-blocked, over the cap) is placed again. `PUT /smart/groups/{name}/balance` switches affinity at runtime.
+
+<Callout type="note" title="Affinity versus spreading">
+  The wider the affinity, the more connections share one node. Do not set `target` or `site` on the front group of chained proxies: every connection to the same landing server would land on one front node, which defeats the spreading.
+</Callout>
+
+## Dialing and failover
+
+Unlike `smart`, round 0 dials only the picked node, without racing the runner-up, so the distribution holds. When the picked node looks suspect (recent dial failures, marked unavailable, or never dialed successfully), the next pool member is hedged after 250 ms. Then up to 3 more rounds dial 3 candidates each, in order: the rest of the pool, then the fallback regions. The candidate list holds at most 10 nodes, exactly what these 4 rounds reach. If everything fails, the group selects once more with the updated breaker state.
+
+## Region outbounds
+
+With `region.outbounds.enabled`, the group generates `smart-region` outbounds for regions:
+
+```json
+"region": {
+  "outbounds": {
+    "enabled": true,
+    "regions": ["HK", "JP", "US"],
+    "tag": "{flag} {name_en} LB"
+  }
+}
+```
+
+This creates `🇭🇰 Hong Kong LB`, `🇯🇵 Japan LB` and `🇺🇸 United States LB`. Connections through a region outbound still run the group's full pipeline — learning, breakers and spreading are shared — with the region fixed:
+
+- Outbounds in **`regions`** are created at startup and can be referenced by route rules, `detour` and `selector`.
+- **`auto`** (implied when `regions` is empty) creates outbounds for regions that appear at runtime and removes them when the region disappears. Runtime-created outbounds cannot be referenced from the configuration.
+- **`members`**: by default `regions` — the group lists its region outbounds as members in dashboards, and picking one locks that region; `nodes` keeps listing nodes.
+- **`fallback`**: whether a region outbound may use other regions when its own has no available node; off by default (it fails instead).
+- Each region outbound can pin one of its own region's nodes in a dashboard without affecting the group.
+
+Region outbounds can also be declared by hand, for example to set `fallback` or `hidden` per region:
+
+```json
+{ "type": "smart-region", "tag": "japan-front", "group": "balance", "region": "JP", "fallback": true }
+```
+
+## Chained proxies (front + landing)
+
+Landing nodes (your own VPS, static residential IPs and so on) connect through provider nodes with `detour`, which hides the landing server and can improve routes. With a `smart-loadbalance` group or one of its region outbounds as the `detour`, the front traffic spreads across several provider nodes and stays in a suitable region:
+
+```json
+{
+  "outbounds": [
+    {
+      "type": "smart-loadbalance",
+      "tag": "front",
+      "providers": ["my-subscription"],
+      "region": {
+        "mode": "destination",
+        "outbounds": { "enabled": true, "regions": ["HK", "JP"], "members": "nodes" }
+      }
+    },
+    { "type": "shadowsocks", "tag": "landing-us", "server": "us.landing.example.com", "server_port": 8388,
+      "method": "aes-256-gcm", "password": "landing-password", "detour": "front" },
+    { "type": "shadowsocks", "tag": "landing-hk", "server": "hk.landing.example.com", "server_port": 8388,
+      "method": "aes-256-gcm", "password": "landing-password", "detour": "front-HK" }
+  ]
+}
+```
+
+- `landing-us` uses the group itself as its front. The group sees the **landing server** as the destination, not the website: the `destination` mode picks the front region by the landing server's country (resolving its domain first), and `auto` learns the best front region per landing server.
+- `landing-hk` always uses the Hong Kong front.
+- The front group keeps the default `affinity: none`, so connections to one landing server spread over several nodes of the region, and one throttled or blocked provider node does not take them all down.
+- The landing nodes may themselves sit in a `smart` or `selector` group: the front group recognises the dial as one hop of a proxy chain and learns and picks regions for the landing server rather than the outer website.
+
+## Runtime control
+
+| Action | Endpoint |
+|---|---|
+| Regions, members, detection sources, load and quality | `GET /smart/groups/{name}/regions` |
+| Lock / unlock a region, switch the region mode | `PUT /smart/groups/{name}/regions`, `DELETE /smart/groups/{name}/regions/lock` |
+| Switch strategy and affinity | `PUT /smart/groups/{name}/balance` |
+| Re-detect regions, re-probe exits | `POST /smart/groups/{name}/regions/detect` |
+| Pick a region outbound / node in a dashboard | `PUT /proxies/{name}`: a region locks, a node pins |
+
+The lock and runtime mode, strategy and affinity are saved in the cache file and restored after a restart; `default` or an empty value restores the configuration. See [Clash API](../clash-api/#smart-load-balancing). Pinning a node works as in `smart`; see [Pinning](../priority-and-pinning/).
+
+## Choosing settings
+
+| Situation | Suggestion |
+|---|---|
+| Large subscription, no wish to hand-write region groups | Defaults, plus `region.outbounds` to switch regions in the dashboard |
+| A site must keep its exit IP | `affinity: site` |
+| Multi-threaded downloads, more total bandwidth | `strategy: smart` or `least-connections`, `affinity: none` |
+| Games, local streaming | `mode: destination`, with `destination.map` for substitute regions |
+| Only a few regions, in order | `mode: priority` with `priority`, or `allow` |
+| Front of chained proxies | `mode: destination` or `auto`, region outbounds as `detour`, `affinity: none` |
+| Provider limits concurrent connections per node | `max_connections_per_node` |
+| Just concentrate on the best node | Use a `smart` group |

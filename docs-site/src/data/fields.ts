@@ -287,6 +287,356 @@ export const geoxFields: Field[] = [
   },
 ];
 
+// smart-loadbalance (option.SmartLoadBalanceOutboundOptions). Defaults
+// come from newSmartBalance and friends in protocol/group/smart_lb*.go.
+
+export const lbBalanceFields: Field[] = [
+  {
+    name: 'strategy',
+    type: 'string',
+    default: 'smart',
+    zh: '在选中地区的节点池内分配连接的方式：`smart`（按质量加权的最少连接）、`least-connections`、`round-robin`、`weighted-round-robin`、`weighted-random`、`random`、`consistent-hashing`，见 [分配策略](/zh/smart-loadbalance/#分配策略)。不区分大小写，`_` 与空格视同 `-`，接受别名（如 `lc`、`rr`、`wrr`、`chash`）。\n\n与 `smart` 的 `algorithm` 不同，写错**会报错**：`unknown balance strategy: ...`。运行时可用 `PUT /smart/groups/{name}/balance` 切换，切换会保存到缓存文件。',
+    en: 'How connections are spread across the node pool of the chosen region: `smart` (quality-weighted least connections), `least-connections`, `round-robin`, `weighted-round-robin`, `weighted-random`, `random` or `consistent-hashing`; see [Strategies](/en/smart-loadbalance/#strategies). Case-insensitive, `_` and spaces count as `-`, aliases such as `lc`, `rr`, `wrr`, `chash` are accepted.\n\nUnlike the `algorithm` of `smart`, an unknown value **is an error**: `unknown balance strategy: ...`. `PUT /smart/groups/{name}/balance` switches it at runtime, and the change is saved to the cache file.',
+  },
+  {
+    name: 'affinity',
+    type: 'string',
+    default: 'none',
+    zh: '把哪些连接绑定到同一个节点：`none`（每条连接独立分配）、`target`（同一目标）、`site`（同一可注册域名，如 `*.google.com` 全部）、`source`（同一客户端 IP）、`source-site`（同一客户端访问同一网站）。绑定按地区分别记录，节点不健康时自动重新分配。见 [会话亲和](/zh/smart-loadbalance/#会话亲和)。',
+    en: 'Which connections stick to one node: `none` (every connection is placed independently), `target` (same target), `site` (same registrable domain, for example all of `*.google.com`), `source` (same client IP) or `source-site` (same client, same site). Bindings are kept per region and re-placed when the node becomes unhealthy. See [Affinity](/en/smart-loadbalance/#affinity).',
+  },
+  {
+    name: 'affinity_ttl',
+    type: 'duration',
+    default: '10m',
+    zh: '亲和绑定的有效期。每次经绑定的节点成功拨号都会刷新，所以是滑动窗口。',
+    en: 'Lifetime of an affinity binding. Each successful dial through the bound node refreshes it, so the window slides.',
+  },
+  {
+    name: 'max_nodes',
+    type: 'int',
+    default: '0',
+    zh: '节点池最多保留质量最高的几个节点，`0` 表示不限制。负数报错。',
+    en: 'Keeps at most this many of the best nodes in a pool; `0` means no limit. Negative values are an error.',
+  },
+  {
+    name: 'min_quality',
+    type: 'float',
+    default: '0.5',
+    zh: '质量下限，取值 (0, 1]：质量低于池内最佳节点 × 该值的节点不参与分配。`0` 按默认值处理，大于 1 报错。',
+    en: 'Quality floor in (0, 1]: nodes below the best node of the pool × this value take no connections. `0` means the default; values above 1 are an error.',
+  },
+  {
+    name: 'max_connections_per_node',
+    type: 'int',
+    default: '0',
+    zh: '单节点活跃连接（含进行中的拨号）达到该值后暂不分配新连接；池内所有节点都达到上限时仍照常分配。`0` 表示不限制。适合限制并发连接数的机场。',
+    en: 'A node with this many live connections (in-flight dials included) gets no new ones until some close; when every node of the pool is at the cap, they are used anyway. `0` means no limit. Useful for providers that limit concurrent connections.',
+  },
+];
+
+export const lbRegionFields: Field[] = [
+  {
+    name: 'mode',
+    type: 'string',
+    default: 'auto',
+    zh: '为每条连接选择地区的方式：`auto`（按目标学习，自动选最优地区）、`destination`（按目标所在国家匹配地区）、`priority`（按 `priority` 顺序取第一个可用地区）、`off`（不分地区，所有节点为一个池）。写错报错。运行时可用 `PUT /smart/groups/{name}/regions` 切换。见 [地区模式](/zh/smart-loadbalance/#地区模式)。',
+    en: 'How a region is chosen per connection: `auto` (learned per target), `destination` (matches the country of the target), `priority` (first available region of `priority`) or `off` (no regions, one pool of all nodes). Unknown values are an error. `PUT /smart/groups/{name}/regions` switches it at runtime. See [Region modes](/en/smart-loadbalance/#region-modes).',
+  },
+  {
+    name: 'priority',
+    type: 'string[]',
+    zh: '地区优先级，写地区代码或名称（`HK`、`香港`、`Japan`、`🇯🇵` 均可）。`priority` 模式必填，否则报错 `region.mode priority requires region.priority`；其他模式下决定地区的显示顺序，以及 `fallback: priority` 时的回退顺序。',
+    en: 'Region priority, as codes or names (`HK`, `香港`, `Japan`, `🇯🇵` all work). Required by the `priority` mode (`region.mode priority requires region.priority` otherwise); in other modes it sets the display order and the order of `fallback: priority`.',
+  },
+  {
+    name: 'allow',
+    type: 'string[]',
+    zh: '只允许这些地区承载连接。为空表示全部允许。不限制锁定的地区与地区出站。',
+    en: 'Only these regions carry connections; empty allows all. Does not restrict a locked region or a region outbound.',
+  },
+  {
+    name: 'deny',
+    type: 'string[]',
+    zh: '这些地区不承载连接，优先于 `allow`。同样不限制锁定的地区与地区出站。',
+    en: 'These regions carry no connections; takes precedence over `allow`. Does not restrict a locked region or a region outbound either.',
+  },
+  {
+    name: 'weights',
+    type: 'object',
+    zh: '地区评分系数，如 `{"HK": 1.2, "US": 0.8}`，乘在 `auto` 模式与 `fallback: auto` 的地区评分上。必须为正数。',
+    en: 'Region score factors such as `{"HK": 1.2, "US": 0.8}`, applied to the region scores of the `auto` mode and `fallback: auto`. Must be positive.',
+  },
+  {
+    name: 'fallback',
+    type: 'string',
+    default: 'auto',
+    zh: '选中的地区无法服务时怎么办：`auto`（改用评分最高的其他地区，并在候选列表末尾附上其他地区的节点供拨号失败时切换）、`priority`（只按 `priority` 顺序回退）、`none`（不跨地区，直接失败）。',
+    en: 'What happens when the chosen region cannot serve: `auto` (use the best-scoring other region, and append nodes of other regions to the candidate list for dial failover), `priority` (fall back only along `priority`) or `none` (never leave the region; fail).',
+  },
+  {
+    name: 'min_nodes',
+    type: 'int',
+    default: '1',
+    zh: '地区至少有这么多健康节点才参与 `auto`、`priority`、`destination` 的选择。锁定的地区与地区出站只要求 1 个。',
+    en: 'A region needs at least this many healthy nodes to be chosen by `auto`, `priority` or `destination`. A locked region and region outbounds only need one.',
+  },
+  {
+    name: 'sticky',
+    type: 'duration',
+    default: '30m',
+    zh: '`auto` 模式下每个目标记住所用地区的时长，每次使用都会刷新。期间只有当前地区不可用，或其他地区评分高出 `switch_margin` 时才会换。',
+    en: 'How long the `auto` mode remembers the region of a target; each use refreshes it. Within it, the target only moves when its region becomes unavailable or another region scores `switch_margin` higher.',
+  },
+  {
+    name: 'switch_margin',
+    type: 'float',
+    default: '0.25',
+    zh: '换地区的门槛：其他地区的评分必须高于当前地区 × (1 + 该值)。`0` 按默认值处理。',
+    en: 'Switching threshold: another region must score above the current one × (1 + this value). `0` means the default.',
+  },
+  {
+    name: 'unknown',
+    type: 'string',
+    default: 'keep',
+    zh: '无法识别地区的节点怎么处理：`keep` 放入地区 `OTHER`（显示为“其他”），`exclude` 不使用这些节点，写地区代码或名称则全部归入该地区。',
+    en: 'What to do with members whose region cannot be detected: `keep` puts them in region `OTHER`, `exclude` leaves them out, and a region code or name puts them all in that region.',
+  },
+  {
+    name: 'rules',
+    type: 'object[]',
+    zh: '自定义地区规则，按顺序在名称识别之前生效，字段见 [region.rules](#rule-region)。',
+    en: 'Custom region rules, applied in order before name detection; fields in [region.rules](#rule-region).',
+  },
+];
+
+export const lbRuleFields: Field[] = [
+  {
+    name: 'region',
+    type: 'string',
+    required: true,
+    zh: '地区代码。可以是内置地区（写名称也行，如 `香港`），也可以是自定义地区，如 `IPLC`、`EU`。缺失时报错 `region.rules[i]: missing region`。',
+    en: 'Region code: a built-in region (names such as `香港` work) or a custom one such as `IPLC` or `EU`. Missing it fails with `region.rules[i]: missing region`.',
+  },
+  {
+    name: 'match',
+    type: 'regex',
+    zh: 'Go RE2 正则，匹配节点名称（去掉订阅前缀 `provider/` 后）或完整标签。',
+    en: 'Go RE2 regex matched against the member name (without the `provider/` prefix) or its full tag.',
+  },
+  {
+    name: 'outbounds',
+    type: 'string[]',
+    zh: '直接列出属于该地区的节点，写完整标签或去掉订阅前缀的名称都可以。',
+    en: 'Members that belong to the region, by full tag or by name without the provider prefix.',
+  },
+  {
+    name: 'name',
+    type: 'string',
+    zh: '地区的显示名称，用于 Clash API 与地区出站标签中的 `{name}`。只写 `region` 与 `name`/`icon` 的规则不匹配节点，只给地区改名。',
+    en: 'Display name of the region, used by the Clash API and by `{name}` in region outbound tags. A rule with only `region` and `name`/`icon` matches no member; it just names the region.',
+  },
+  {
+    name: 'icon',
+    type: 'string',
+    zh: '地区图标；生成的地区出站在未设置 `outbounds.icon` 时使用它。',
+    en: 'Region icon; generated region outbounds use it when `outbounds.icon` is not set.',
+  },
+];
+
+export const lbDestinationFields: Field[] = [
+  {
+    name: 'map',
+    type: 'object',
+    zh: '目标国家 → 地区列表，如 `{"KR": ["JP", "HK"], "GB": ["DE", "NL"]}`：目标在韩国时依次尝试日本、香港。没有映射的国家默认找同名地区。',
+    en: 'Destination country → regions, such as `{"KR": ["JP", "HK"], "GB": ["DE", "NL"]}`: a destination in Korea tries Japan, then Hong Kong. Countries without a mapping look for the region of the same code.',
+  },
+  {
+    name: 'disable_tld',
+    type: 'bool',
+    default: 'false',
+    zh: '不再根据域名的国家顶级域（`.jp`、`.co.uk`、`.de` 等）判断目标国家。`.io`、`.co`、`.tv`、`.me`、`.ai` 等常被当作通用域名的后缀本来就不参与判断。',
+    en: 'Stops guessing the destination country from country-code TLDs (`.jp`, `.co.uk`, `.de`, …). Suffixes commonly used as generic domains, such as `.io`, `.co`, `.tv`, `.me`, `.ai`, are never used.',
+  },
+  {
+    name: 'disable_resolve',
+    type: 'bool',
+    default: 'false',
+    zh: '不再解析域名目标。默认情况下，没有 IP、顶级域也看不出国家的域名（例如以域名填写的落地服务器）会经 DNS 路由解析，按 IP 查国家；最多等待 300 ms，结果按域名缓存 10 分钟（失败 1 分钟）。使用 FakeIP 时解析结果没有国家。',
+    en: 'Stops resolving domain targets. By default a domain with no IP and no telling TLD (a landing server configured by name, for example) is resolved through the DNS router and its IP looked up; the lookup waits at most 300 ms and is cached per domain for 10 minutes (1 minute on failure). With FakeIP the answers carry no country.',
+  },
+];
+
+export const lbDetectFields: Field[] = [
+  {
+    name: 'disable_name',
+    type: 'bool',
+    default: 'false',
+    zh: '不根据节点名称识别地区，只用 `rules` 与出口探测。',
+    en: 'Does not detect regions from member names; only `rules` and exit probes are used.',
+  },
+  {
+    name: 'exit',
+    type: 'string',
+    default: 'fallback',
+    zh: '出口探测：经节点请求 `exit_url`，按真实出口 IP 的国家归类。`fallback` 只探测规则与名称都无法识别的节点；`prefer` 探测除规则命中外的所有节点，探测结果优先于名称；`off` 关闭。',
+    en: 'Exit probing: fetches `exit_url` through the member and uses the country of its real exit IP. `fallback` probes members that neither the rules nor the name could place; `prefer` probes every member not placed by a rule and lets the result override the name; `off` disables it.',
+  },
+  {
+    name: 'exit_url',
+    type: 'string',
+    default: 'https://www.cloudflare.com/cdn-cgi/trace',
+    zh: '出口探测地址，必须是 http(s)。支持 Cloudflare trace 的 `loc=`、`ip=` 行，返回 `country`/`country_code`/`countryCode` 字段的 JSON，以及只返回 IP 的纯文本（此时用国家数据库查询）。',
+    en: 'Exit probe URL, http(s) only. Understands the `loc=` / `ip=` lines of Cloudflare trace, JSON with a `country` / `country_code` / `countryCode` field, and plain-text answers with just the IP (looked up in the country database).',
+  },
+  {
+    name: 'exit_ttl',
+    type: 'duration',
+    default: '24h',
+    zh: '探测结果的有效期，结果保存在缓存文件中，重启后继续使用。失败的探测在 30 分钟（或更短的 `exit_ttl`）后重试。',
+    en: 'Lifetime of a probe result. Results are saved in the cache file and survive restarts. A failed probe is retried after 30 minutes (or `exit_ttl` if shorter).',
+  },
+  {
+    name: 'exit_timeout',
+    type: 'duration',
+    default: '8s',
+    zh: '单次出口探测的超时。',
+    en: 'Timeout of one exit probe.',
+  },
+  {
+    name: 'exit_concurrency',
+    type: 'int',
+    default: '4',
+    zh: '同时进行的出口探测数。',
+    en: 'How many exit probes run at once.',
+  },
+];
+
+export const lbProbeFields: Field[] = [
+  {
+    name: 'disabled',
+    type: 'bool',
+    default: 'false',
+    zh: '关闭地区探测。地区探测为最常访问的 HTTPS 网站测量经各地区最佳节点的 TLS 握手耗时，用来比较地区，见 [地区探测](/zh/smart-loadbalance/#地区探测)。',
+    en: 'Turns region probes off. Region probes time a TLS handshake to the most visited HTTPS sites through the best node of each region to compare regions; see [Region probes](/en/smart-loadbalance/#region-probes).',
+  },
+  {
+    name: 'interval',
+    type: 'duration',
+    default: '10m',
+    zh: '探测周期，首次约在启动 90 秒后。结果在 3 个周期内有效。组空闲（2 分钟无拨号）或网络故障期间跳过。',
+    en: 'Probe period; the first run is about 90 s after start. Results stay valid for 3 periods. Skipped while the group is idle (no dial for 2 minutes) or the network is down.',
+  },
+  {
+    name: 'targets',
+    type: 'int',
+    default: '6',
+    zh: '每轮最多探测的网站数，按近期访问次数选取。',
+    en: 'Sites probed per round at most, picked by recent visits.',
+  },
+  {
+    name: 'regions',
+    type: 'int',
+    default: '5',
+    zh: '每个网站最多比较的地区数，取当前评分最高的几个。',
+    en: 'Regions compared per site at most, the best-scoring ones.',
+  },
+];
+
+export const lbOutboundsFields: Field[] = [
+  {
+    name: 'enabled',
+    type: 'bool',
+    default: 'false',
+    zh: '为地区生成 `smart-region` 出站，可以作为路由出站、落地节点的 `detour` 或 `selector` 成员。',
+    en: 'Generates `smart-region` outbounds for regions, usable as route outbounds, as the `detour` of landing nodes or as `selector` members.',
+  },
+  {
+    name: 'regions',
+    type: 'string[]',
+    zh: '启动时就创建的地区出站，配置的其他部分可以引用它们。地区暂时没有节点时，经它的连接会失败（除非开启 `fallback`）。',
+    en: 'Region outbounds created at startup, so the rest of the configuration can reference them. While such a region has no members, connections through it fail (unless `fallback` is on).',
+  },
+  {
+    name: 'auto',
+    type: 'bool',
+    default: 'false',
+    zh: '运行中为新出现的地区自动创建出站（`OTHER` 除外），地区消失后删除自动创建的出站。`regions` 为空时自动开启。运行中创建的出站不能在配置中引用。',
+    en: 'Creates outbounds for regions that appear at runtime (except `OTHER`) and removes them once their region disappears. Implied when `regions` is empty. Outbounds created at runtime cannot be referenced from the configuration.',
+  },
+  {
+    name: 'tag',
+    type: 'string',
+    default: '{group}-{region}',
+    zh: '出站标签模板，可用 `{group}`、`{region}`、`{name}`、`{name_en}`、`{flag}`，必须包含后四个之一。例如 `{flag} {name}负载` 生成 `🇭🇰 香港负载`。与已有出站重名时启动报错。',
+    en: 'Outbound tag template with `{group}`, `{region}`, `{name}`, `{name_en}` and `{flag}`; it must contain one of the last four. `{flag} {name_en} LB` gives `🇭🇰 Hong Kong LB`. A clash with an existing tag fails startup.',
+  },
+  {
+    name: 'fallback',
+    type: 'bool',
+    default: 'false',
+    zh: '生成的地区出站在本地区无法服务时，按组的 `region.fallback` 改用其他地区。关闭时直接失败。',
+    en: 'Lets generated region outbounds move to other regions (per the group\'s `region.fallback`) when their region cannot serve. Off means they fail instead.',
+  },
+  {
+    name: 'members',
+    type: 'string',
+    default: 'regions',
+    zh: '组在 Clash API 中列出的成员：`regions` 列出地区出站（在面板中点选即锁定该地区），`nodes` 列出节点。',
+    en: 'What the group lists as members in the Clash API: `regions` lists the region outbounds (picking one in a dashboard locks the region), `nodes` lists the nodes.',
+  },
+  {
+    name: 'hidden',
+    type: 'bool',
+    default: 'false',
+    zh: '生成的地区出站带上 `hidden: true`。',
+    en: 'Marks generated region outbounds `hidden: true`.',
+  },
+  {
+    name: 'icon',
+    type: 'string',
+    zh: '生成的地区出站的图标，默认使用 `rules` 中该地区的 `icon`。',
+    en: 'Icon of generated region outbounds; defaults to the region\'s `icon` from `rules`.',
+  },
+];
+
+export const smartRegionFields: Field[] = [
+  {
+    name: 'group',
+    type: 'string',
+    required: true,
+    zh: '所属的 `smart-loadbalance` 组。不是该类型时启动报错 `<group> is not a smart-loadbalance group`。',
+    en: 'The `smart-loadbalance` group. Any other type fails startup with `<group> is not a smart-loadbalance group`.',
+  },
+  {
+    name: 'region',
+    type: 'string',
+    required: true,
+    zh: '地区代码或名称。',
+    en: 'Region code or name.',
+  },
+  {
+    name: 'fallback',
+    type: 'bool',
+    default: 'false',
+    zh: '本地区无法服务时按组的 `region.fallback` 改用其他地区。',
+    en: 'Moves to other regions (per the group\'s `region.fallback`) when the region cannot serve.',
+  },
+  {
+    name: 'hidden',
+    type: 'bool',
+    default: 'false',
+    zh: '在 Clash API 中带上 `hidden: true`。',
+    en: 'Adds `hidden: true` in Clash API output.',
+  },
+  {
+    name: 'icon',
+    type: 'string',
+    zh: '面板图标。',
+    en: 'Dashboard icon.',
+  },
+];
+
 export interface EnvVar {
   name: string;
   default: { zh: string; en: string };

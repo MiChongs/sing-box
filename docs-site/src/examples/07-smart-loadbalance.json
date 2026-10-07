@@ -1,0 +1,38 @@
+{
+  "outbounds": [
+    {
+      "type": "smart-loadbalance",
+      "tag": "balance",
+      "providers": ["my-subscription"],
+      "exclude": "(?i)剩余|到期|官网|traffic|expire",
+      "balance": {
+        "strategy": "smart",
+        "affinity": "site",
+        "max_connections_per_node": 64
+      },
+      "region": {
+        "mode": "auto",
+        "priority": ["HK", "JP", "SG"],
+        "deny": ["CN"],
+        "weights": { "HK": 1.1 },
+        "rules": [
+          { "region": "IPLC", "name": "专线", "match": "(?i)IPLC|IEPL" }
+        ],
+        "outbounds": {
+          "enabled": true,
+          "regions": ["HK", "JP", "SG", "US"],
+          "tag": "{flag} {name}负载"
+        }
+      }
+    },
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": ["balance", "🇭🇰 香港负载", "🇯🇵 日本负载", "🇸🇬 新加坡负载", "🇺🇸 美国负载"],
+      "default": "balance"
+    }
+  ],
+  "route": {
+    "final": "proxy"
+  }
+}

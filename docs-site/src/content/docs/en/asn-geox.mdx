@@ -43,7 +43,7 @@ Database readers are shared between groups. When GeoX downloads or updates a dat
 
 The LightGBM country features (17 and 26) need a country database. Smart prefers the `country.mmdb` downloaded via `experimental.geox.url.mmdb`. If that is not configured, it uses the default GeoLite2-Country from the P3TERX releases page, which GeoX downloads to `country.mmdb` in the data directory. As with the ASN database, a download or update takes effect at once.
 
-Only groups with `use_lightgbm` or `collect_data` on open the country database and look up countries.
+Only groups with `use_lightgbm` or `collect_data` on, and `smart-loadbalance` groups in the `destination` region mode (or with `destination.map` set), open the country database and look up countries; a `smart-loadbalance` group switched to `destination` at runtime starts the download then. See [Smart load balancing](../smart-loadbalance/#destination).
 
 ## experimental.geox
 

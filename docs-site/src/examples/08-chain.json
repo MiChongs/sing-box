@@ -1,0 +1,48 @@
+{
+  "outbounds": [
+    {
+      "type": "smart-loadbalance",
+      "tag": "front",
+      "providers": ["my-subscription"],
+      "region": {
+        "mode": "destination",
+        "destination": {
+          "map": { "US": ["US", "JP"], "GB": ["DE", "NL"] }
+        },
+        "outbounds": {
+          "enabled": true,
+          "regions": ["HK", "JP"],
+          "fallback": true,
+          "members": "nodes"
+        }
+      }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "landing-us",
+      "server": "us.landing.example.com",
+      "server_port": 8388,
+      "method": "aes-256-gcm",
+      "password": "landing-password",
+      "detour": "front"
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "landing-hk",
+      "server": "hk.landing.example.com",
+      "server_port": 8388,
+      "method": "aes-256-gcm",
+      "password": "landing-password",
+      "detour": "front-HK"
+    },
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": ["landing-us", "landing-hk"],
+      "default": "landing-us"
+    }
+  ],
+  "route": {
+    "final": "proxy"
+  }
+}

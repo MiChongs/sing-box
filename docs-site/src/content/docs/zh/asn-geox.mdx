@@ -43,7 +43,7 @@ import example from '../../../examples/04-asn-geox.json?raw';
 
 LightGBM 的国家特征（第 17、26 维）需要国家数据库。Smart 优先使用 `experimental.geox.url.mmdb` 下载的 `country.mmdb`；没有配置时使用默认的 GeoLite2-Country（来自 P3TERX 的发布页），由 GeoX 下载到数据目录下的 `country.mmdb`。与 ASN 数据库一样，下载或更新后立即生效。
 
-只有开启了 `use_lightgbm` 或 `collect_data` 的组才会打开国家数据库并查询国家。
+只有开启了 `use_lightgbm` 或 `collect_data` 的组，以及使用 `destination` 地区模式（或设置了 `destination.map`）的 `smart-loadbalance` 组，才会打开国家数据库并查询国家；`smart-loadbalance` 运行中切换到 `destination` 模式时才开始下载。见 [Smart 负载均衡](../smart-loadbalance/#destination)。
 
 ## experimental.geox
 

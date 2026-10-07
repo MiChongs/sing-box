@@ -113,6 +113,22 @@ import Callout from '../../../components/Callout.astro';
 - 避免多个 Smart 组引用同一批节点；
 - 内存紧张时调低 `SMART_CACHE_BUDGET_MB`（仅命令行版本）。
 
+## Smart 负载均衡
+
+**配置报错**：`balance` 与 `region` 的取值写错会直接报错，例如 `unknown balance strategy: ...`、`unknown region mode: ...`、`region.mode priority requires region.priority`、`region.outbounds.tag must contain {region}, {name}, {name_en} or {flag}`。生成的地区出站与已有出站重名时报 `register region outbound <tag>: duplicate outbound tag: <tag>`，改 `region.outbounds.tag` 模板或已有出站的标签即可。
+
+**引用地区出站时报 `dependency[...] not found`**：只有 `region.outbounds.regions` 中列出的地区出站在启动时创建；`auto` 运行中创建的不能在配置里引用。把要引用的地区加入 `regions`。
+
+**节点被分到错误的地区**：用 `GET /smart/groups/{name}/regions` 查看每个节点的 `source`。名称识别有误时，用 `region.rules` 按正则或节点名纠正；想以真实出口为准，设 `detect.exit: prefer`，然后调用 `POST /smart/groups/{name}/regions/detect?force=true`。
+
+**报错 `no node can serve ...`**：括号中是地区决策的来源。`region-view-unavailable` 表示地区出站的地区没有健康节点且未开启 `fallback`；`priority-unavailable` 表示 `priority` 中的地区都不可用；其他情况通常是 `fallback: none` 而选中地区没有健康节点。检查 `/regions` 中各地区的 `healthy`，或放宽 `fallback`、`min_nodes`、`allow` / `deny`。
+
+**连接总是落在同一个节点**：依次检查 `affinity` 是否为 `target` / `site` / `source`（同一批连接会被绑定到一个节点）；节点池是否只剩一个节点（`min_quality` 过高、`max_nodes: 1`，或地区内其他节点不健康）；是否在面板中手动指定了节点。把 `log.level` 设为 `debug`，每条连接的日志会显示 `region=... pick=... pool=...`。
+
+**出口探测一直没有结果**：探测请求经节点访问 `detect.exit_url`，节点不通或该地址被拦截时会失败，30 分钟后重试。可以换一个能返回国家的地址，如返回 `country_code` 字段的 JSON 接口。
+
+**目标国家判断不出来（destination 模式）**：先确认国家数据库已下载（GeoX 后台下载，完成前只能看域名后缀）；使用 FakeIP 时解析结果没有国家，可依靠 `destination.map` 与顶级域，或改用 `auto`。
+
 ## 重置 Smart 的全部数据
 
 | 方法 | 影响范围 |

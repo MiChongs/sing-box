@@ -1,6 +1,6 @@
 ---
 title: Clash API
-description: How Smart groups appear in the Clash API, and every endpoint for querying weights, diagnostics, pinning, blocking nodes, switching algorithms and clearing data.
+description: How Smart groups appear in the Clash API, and every endpoint for querying weights, diagnostics, pinning, blocking nodes, switching algorithms, clearing data, and controlling smart-loadbalance regions and balancing.
 ---
 
 import Callout from '../../../components/Callout.astro';
@@ -109,17 +109,20 @@ When there is no data, the response also includes `"message": "no weight data av
 
 ### `DELETE /proxies/{name}/weights`
 
-Clears all of this group's data in the cache file (stats, node state, ranking, prefetch, destination failure counts, write queue, pin, unavailable markers, circuit breakers, pin endorsements), then recomputes.
+Clears all of this group's data in the cache file (stats, node state, ranking, prefetch, destination failure counts, write queue, pin, unavailable markers, circuit breakers, pin endorsements, and the region lock, runtime settings and exit-probe results of `smart-loadbalance`), then recomputes.
 
 ```json
 {
   "group": "auto",
   "deleted": { "stats": 1203, "nodes": 42, "ranking": 1, "prefetch": 380, "failures": 12,
-               "queue": 3, "manual_pin": 1, "known_dead": 2, "breakers": 1, "pin_endorsement": 1 },
+               "queue": 3, "manual_pin": 1, "known_dead": 2, "breakers": 1, "pin_endorsement": 1,
+               "region_state": 0, "exit_geo": 0 },
   "total": 1646,
   "recomputed": true
 }
 ```
+
+On a `smart-loadbalance` group the in-memory state is reset as well: the region lock is released, mode, strategy and affinity return to the configuration, exit results, region memories, affinity bindings and region-probe results are dropped, and regions are re-detected and exits re-probed.
 
 ### `GET /smart/weights`
 
@@ -150,7 +153,9 @@ Lists all Smart groups and their settings:
 }
 ```
 
-`lgbmModelAge`, `policyPriority`, `pinEndorsements` and `hysteresis` are omitted when empty. `policyPriority` lists, for each rule, the parsed pattern, the match kind (`substring`, `exact`, `regex`, `glob`), whether it is negated, and the factor, so you can confirm that the rules are parsed as intended. `http3FallbackNodes` is currently always 0.
+`smart-loadbalance` groups are listed too, with `type` set to `smart-loadbalance` (`smart` for plain groups) and the same `loadBalance` block as `/proxies`; `members` is always the node count, and `fixed` is the pinned node or the locked region.
+
+`lgbmModelAge`, `policyPriority`, `pinEndorsements`, `hysteresis` and `loadBalance` are omitted when empty. `policyPriority` lists, for each rule, the parsed pattern, the match kind (`substring`, `exact`, `regex`, `glob`), whether it is negated, and the factor, so you can confirm that the rules are parsed as intended. `http3FallbackNodes` is currently always 0.
 
 ### `GET /smart/groups/{name}/diag`
 
@@ -182,7 +187,7 @@ curl -X PUT http://127.0.0.1:9090/smart/groups/auto/algorithm -d '{"algorithm":"
 { "group": "auto", "requested": "p2c", "applied": "p2c", "previous": "strict-best" }
 ```
 
-For values and aliases, see [Selection algorithms](../algorithms/). An unrecognized value does not cause an error; `applied` is `strict-best`. The switch is not written back to the config and is reverted on restart.
+For values and aliases, see [Selection algorithms](../algorithms/). An unrecognized value does not cause an error; `applied` is `strict-best`. The switch is not written back to the config and is reverted on restart. On a `smart-loadbalance` group it returns 400; use `PUT /smart/groups/{name}/balance` instead.
 
 ### `POST /smart/groups/{name}/block/{node}`
 
@@ -203,6 +208,136 @@ Recomputes prefetch and ranking in the background, and immediately returns a rec
 ### `POST /smart/groups/{name}/clear-selection`
 
 Same as `DELETE /proxies/{name}`. Returns `{"group": "auto", "cleared": true}`.
+
+## Smart load balancing
+
+A `smart-loadbalance` group and its region outbounds (`smart-region`) both show `type: "Smart"` in dashboards, and every Smart endpoint above works on them. Below are the extra fields and endpoints; for the concepts see [Smart load balancing](../smart-loadbalance/).
+
+### `GET /proxies/{name}`
+
+A `smart-loadbalance` group carries an extra `loadBalance` block:
+
+```json
+{
+  "type": "Smart",
+  "name": "balance",
+  "now": "🇭🇰 Hong Kong LB",
+  "all": ["🇭🇰 Hong Kong LB", "🇯🇵 Japan LB", "🇺🇸 United States LB", "unknown-node-1"],
+  "fixed": "",
+  "loadBalance": {
+    "strategy": "smart", "affinity": "none", "mode": "auto", "lock": "", "fallback": "auto",
+    "regions": [
+      { "code": "HK", "name": "香港", "nameEn": "Hong Kong", "flag": "🇭🇰", "count": 12, "healthy": 11, "outbound": "🇭🇰 Hong Kong LB" },
+      { "code": "OTHER", "name": "其他", "nameEn": "Other", "flag": "", "count": 1, "healthy": 1 }
+    ]
+  }
+}
+```
+
+- With `region.outbounds.members` at `regions` (the default) and region outbounds generated, `all` lists the region outbounds, then declared region outbounds without members yet, then the members of regions without an outbound; `now` is the locked region's outbound, else the outbound of the region that carried the last connection. With `members: "nodes"`, `all` and `now` behave as in a plain Smart group.
+- `fixed` is the pinned node; with no pin but a locked region, it is that region's outbound (the region code when region outbounds are not listed).
+- `healthy` counts healthy members for TCP; `icon` and `outbound` appear only when present. `name` is the Chinese display name (or a name set in `region.rules`), `nameEn` the English one.
+
+A region outbound carries `group`, `region`, `fallback` and `generated` (whether the group generated it); `all` is the region's members, and `now` is, in order, its own pinned node, the node of its last connection, the region's last used node, or the region's best healthy member. `fixed` is its own pinned node.
+
+### `PUT /proxies/{name}`
+
+On a `smart-loadbalance` group:
+
+- `{"name": "<region outbound tag>"}` or `{"name": "JP"}` (a region code or name) locks that region and clears the pinned node;
+- `{"name": "<node>"}` pins a node as in a Smart group; the region lock stays but the pin takes precedence;
+- `{"name": ""}` clears both the pin and the lock.
+
+A node whose name equals a region name is treated as a node. On a region outbound, `{"name": "<node of this region>"}` pins a node for that outbound only; a node of another region returns 400 `smart-region update error: not a member of the region`, and `""` clears. `DELETE /proxies/{name}` works too: on the group it clears both the pin and the lock (`previous_pin` shows the lock when there was no pin), on a region outbound it clears its pin, returning `{"group", "previous_pin", "now"}`.
+
+Selections made in the SFA / SFW / SFL GUI clients follow the same rules.
+
+### `GET /proxies/{name}/weights`
+
+On a region outbound, returns the part of the group's ranking that belongs to the region, plus `group` and `region`: `{"weights": [...], "group": "balance", "region": "HK"}`.
+
+### `GET /smart/groups/{name}/regions`
+
+Regions in detail, with the current settings:
+
+```json
+{
+  "group": "balance",
+  "mode": "auto", "configMode": "auto", "lock": "",
+  "strategy": "smart", "configStrategy": "smart",
+  "affinity": "none", "configAffinity": "none", "affinityTtl": "10m0s",
+  "fallback": "auto", "priority": ["HK", "JP"], "minNodes": 1, "minQuality": 0.5,
+  "maxNodes": 0, "maxConnections": 0, "sticky": "30m0s", "switchMargin": 0.25, "unknown": "keep",
+  "detect": { "name": true, "exit": "fallback", "exitUrl": "https://www.cloudflare.com/cdn-cgi/trace", "exitTtl": "24h0m0s" },
+  "probe": { "enabled": true, "interval": "10m0s", "targets": 6, "regions": 5, "tracked": 14, "results": 22 },
+  "outbounds": { "enabled": true, "auto": false, "members": "regions", "tag": "{flag} {name_en} LB" },
+  "regions": [
+    {
+      "code": "HK", "name": "香港", "nameEn": "Hong Kong", "flag": "🇭🇰",
+      "count": 12, "healthy": 11, "load": 37, "score": 0.912, "allowed": true,
+      "outbound": "🇭🇰 Hong Kong LB", "last": "🇭🇰 香港 03",
+      "members": [
+        { "name": "🇭🇰 香港 03", "source": "name", "healthy": true, "load": 4, "quality": 0.947 },
+        { "name": "mystery-7", "source": "exit", "healthy": true, "load": 2, "quality": 0.55, "exit": "HK", "exitIp": "203.0.113.7" }
+      ]
+    }
+  ],
+  "excluded": [],
+  "memory": { "regionTargets": 128, "affinity": 0 }
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `mode` / `strategy` / `affinity` | Values in effect; `config*` are the configured ones |
+| `members[].source` | Where the region came from: `rule`, `name`, `exit`, `unknown` |
+| `members[].quality` | Destination-independent quality (overall weight or probe-derived), `policy_priority` applied |
+| `load` | Live connections through this group (TCP and UDP) plus dials in flight |
+| `score` | Destination-independent region score, without region-probe factors |
+| `last` | Node of the region's last connection |
+| `excluded` | Members dropped by `unknown: exclude` |
+| `memory` | Destinations with a remembered region, affinity bindings |
+
+A missing group returns 404, a group of another type 400 `not a smart-loadbalance group: <name>`; the same applies to the endpoints below.
+
+### `PUT /smart/groups/{name}/regions`
+
+Locks a region and / or switches the region mode; absent fields are left alone:
+
+```bash
+curl -X PUT http://127.0.0.1:9090/smart/groups/balance/regions -d '{"lock":"JP"}'
+curl -X PUT http://127.0.0.1:9090/smart/groups/balance/regions -d '{"mode":"destination"}'
+```
+
+```json
+{ "group": "balance", "mode": "destination", "lock": "JP", "now": "🇯🇵 Japan LB" }
+```
+
+- `lock` takes a region code, name, flag or region outbound tag; the region must have members, otherwise 400 `unknown region: ...`. `""` unlocks.
+- `mode` set to `""` restores the configured mode; `priority` is refused when no `priority` list is configured. Switching the mode forgets every destination's remembered region.
+- A body with neither returns 400. Lock and mode are saved in the cache file and restored after a restart. With `interrupt_exist_connections`, changing the lock interrupts existing connections.
+
+### `DELETE /smart/groups/{name}/regions/lock`
+
+Releases the lock and returns `{"group", "previous", "now"}`.
+
+### `POST /smart/groups/{name}/regions/detect`
+
+Re-detects every member's region and starts exit probes for members that need one; `?force=true` re-probes every member. Returns `{"group": "balance", "exitProbes": 3}`; probes run in the background and regions update when they finish.
+
+### `PUT /smart/groups/{name}/balance`
+
+Switches the strategy and / or affinity; empty fields are left alone, `"default"` restores the configured value:
+
+```bash
+curl -X PUT http://127.0.0.1:9090/smart/groups/balance/balance -d '{"strategy":"least-connections","affinity":"site"}'
+```
+
+```json
+{ "group": "balance", "strategy": "least-connections", "affinity": "site" }
+```
+
+Unknown values return 400. The switch is saved in the cache file; changing the affinity drops the existing bindings.
 
 ## Clearing the cache
 

@@ -1,6 +1,6 @@
 ---
 title: Clash API
-description: Smart 组在 Clash API 中的表示，以及查询权重、诊断、手动指定、屏蔽节点、切换算法、清空数据的全部接口。
+description: Smart 组在 Clash API 中的表示，以及查询权重、诊断、手动指定、屏蔽节点、切换算法、清空数据，和 smart-loadbalance 地区与分配控制的全部接口。
 ---
 
 import Callout from '../../../components/Callout.astro';
@@ -109,17 +109,20 @@ Smart 组的 `type` 为 `Smart`，在标准字段之外附带 Smart 的状态：
 
 ### `DELETE /proxies/{name}/weights`
 
-清空本组在缓存文件中的全部数据（统计、节点状态、排名、预取、目标失败计数、写入队列、手动指定、不可用标记、熔断器、手动指定认可记录），然后重新计算。
+清空本组在缓存文件中的全部数据（统计、节点状态、排名、预取、目标失败计数、写入队列、手动指定、不可用标记、熔断器、手动指定认可记录，以及 `smart-loadbalance` 的地区锁定与运行时设置、出口探测结果），然后重新计算。
 
 ```json
 {
   "group": "auto",
   "deleted": { "stats": 1203, "nodes": 42, "ranking": 1, "prefetch": 380, "failures": 12,
-               "queue": 3, "manual_pin": 1, "known_dead": 2, "breakers": 1, "pin_endorsement": 1 },
+               "queue": 3, "manual_pin": 1, "known_dead": 2, "breakers": 1, "pin_endorsement": 1,
+               "region_state": 0, "exit_geo": 0 },
   "total": 1646,
   "recomputed": true
 }
 ```
+
+对 `smart-loadbalance` 组，内存中的状态也一并重置：解除地区锁定，模式、策略与亲和恢复配置值，清空出口结果、地区记忆、亲和绑定与地区探测结果，随后重新识别地区并重新探测出口。
 
 ### `GET /smart/weights`
 
@@ -150,7 +153,9 @@ Smart 组的 `type` 为 `Smart`，在标准字段之外附带 Smart 的状态：
 }
 ```
 
-`lgbmModelAge`、`policyPriority`、`pinEndorsements`、`hysteresis` 为空时省略。`policyPriority` 列出每条规则解析后的模式、匹配方式（`substring`、`exact`、`regex`、`glob`）、是否取反与系数，用来确认规则是否按预期解析。`http3FallbackNodes` 目前始终为 0。
+`smart-loadbalance` 组也在列表中，`type` 为 `smart-loadbalance`（普通组为 `smart`），并带有与 `/proxies` 相同的 `loadBalance` 块；`members` 始终是节点数，`fixed` 是手动指定的节点或锁定的地区。
+
+`lgbmModelAge`、`policyPriority`、`pinEndorsements`、`hysteresis`、`loadBalance` 为空时省略。`policyPriority` 列出每条规则解析后的模式、匹配方式（`substring`、`exact`、`regex`、`glob`）、是否取反与系数，用来确认规则是否按预期解析。`http3FallbackNodes` 目前始终为 0。
 
 ### `GET /smart/groups/{name}/diag`
 
@@ -182,7 +187,7 @@ curl -X PUT http://127.0.0.1:9090/smart/groups/auto/algorithm -d '{"algorithm":"
 { "group": "auto", "requested": "p2c", "applied": "p2c", "previous": "strict-best" }
 ```
 
-取值与别名见 [选路算法](../algorithms/)。无法识别的值不会报错，`applied` 为 `strict-best`。切换不写回配置，重启后恢复。
+取值与别名见 [选路算法](../algorithms/)。无法识别的值不会报错，`applied` 为 `strict-best`。切换不写回配置，重启后恢复。对 `smart-loadbalance` 组返回 400，请改用 `PUT /smart/groups/{name}/balance`。
 
 ### `POST /smart/groups/{name}/block/{node}`
 
@@ -203,6 +208,136 @@ curl -X PUT http://127.0.0.1:9090/smart/groups/auto/algorithm -d '{"algorithm":"
 ### `POST /smart/groups/{name}/clear-selection`
 
 与 `DELETE /proxies/{name}` 相同，返回 `{"group": "auto", "cleared": true}`。
+
+## Smart 负载均衡
+
+`smart-loadbalance` 组与它的地区出站（`smart-region`）在面板中的 `type` 都是 `Smart`，上文所有 Smart 接口对它们同样有效。下面是额外的字段与接口，概念见 [Smart 负载均衡](../smart-loadbalance/)。
+
+### `GET /proxies/{name}`
+
+`smart-loadbalance` 组额外带有 `loadBalance` 块：
+
+```json
+{
+  "type": "Smart",
+  "name": "balance",
+  "now": "🇭🇰 香港负载",
+  "all": ["🇭🇰 香港负载", "🇯🇵 日本负载", "🇺🇸 美国负载", "unknown-node-1"],
+  "fixed": "",
+  "loadBalance": {
+    "strategy": "smart", "affinity": "none", "mode": "auto", "lock": "", "fallback": "auto",
+    "regions": [
+      { "code": "HK", "name": "香港", "nameEn": "Hong Kong", "flag": "🇭🇰", "count": 12, "healthy": 11, "outbound": "🇭🇰 香港负载" },
+      { "code": "OTHER", "name": "其他", "nameEn": "Other", "flag": "", "count": 1, "healthy": 1 }
+    ]
+  }
+}
+```
+
+- `region.outbounds.members` 为 `regions`（默认）且生成了地区出站时，`all` 依次列出地区出站、尚无节点的已声明地区出站，以及没有地区出站的地区里的节点；`now` 是锁定地区的出站，否则是最近一条连接所在地区的出站。`members` 为 `nodes` 时，`all` 与 `now` 与普通 Smart 组相同。
+- `fixed` 是手动指定的节点；没有手动指定而锁定了地区时，是该地区的出站（不列地区出站时为地区代码）。
+- `regions` 中的 `healthy` 是 TCP 意义下的健康节点数；`icon`、`outbound` 只在存在时出现。
+
+地区出站额外带有 `group`、`region`、`fallback`、`generated`（是否由组自动生成），`all` 为该地区的节点，`now` 依次为单独指定的节点、经它的最近一条连接所用节点、该地区最近使用的节点、该地区质量最高的健康节点。`fixed` 为单独指定的节点。
+
+### `PUT /proxies/{name}`
+
+对 `smart-loadbalance` 组：
+
+- `{"name": "<地区出站标签>"}` 或 `{"name": "JP"}`（地区代码、名称）锁定该地区，同时取消手动指定的节点；
+- `{"name": "<节点>"}` 手动指定节点，与 Smart 组相同，地区锁定保留但被手动指定覆盖；
+- `{"name": ""}` 同时取消手动指定与地区锁定。
+
+节点名与地区名相同时按节点处理。对地区出站，`{"name": "<本地区节点>"}` 在该出站内单独指定节点，传其他地区的节点返回 400 `smart-region update error: not a member of the region`，`""` 取消。`DELETE /proxies/{name}` 同样有效：对组同时清除手动指定与地区锁定（没有手动指定时 `previous_pin` 显示原锁定），对地区出站清除单独指定，返回 `{"group", "previous_pin", "now"}`。
+
+SFA / SFW / SFL 图形客户端的选择操作走同样的逻辑。
+
+### `GET /proxies/{name}/weights`
+
+对地区出站返回所属组的排名中属于该地区的部分，并带上 `group` 与 `region`：`{"weights": [...], "group": "balance", "region": "HK"}`。
+
+### `GET /smart/groups/{name}/regions`
+
+地区明细与当前设置：
+
+```json
+{
+  "group": "balance",
+  "mode": "auto", "configMode": "auto", "lock": "",
+  "strategy": "smart", "configStrategy": "smart",
+  "affinity": "none", "configAffinity": "none", "affinityTtl": "10m0s",
+  "fallback": "auto", "priority": ["HK", "JP"], "minNodes": 1, "minQuality": 0.5,
+  "maxNodes": 0, "maxConnections": 0, "sticky": "30m0s", "switchMargin": 0.25, "unknown": "keep",
+  "detect": { "name": true, "exit": "fallback", "exitUrl": "https://www.cloudflare.com/cdn-cgi/trace", "exitTtl": "24h0m0s" },
+  "probe": { "enabled": true, "interval": "10m0s", "targets": 6, "regions": 5, "tracked": 14, "results": 22 },
+  "outbounds": { "enabled": true, "auto": false, "members": "regions", "tag": "{flag} {name}负载" },
+  "regions": [
+    {
+      "code": "HK", "name": "香港", "nameEn": "Hong Kong", "flag": "🇭🇰",
+      "count": 12, "healthy": 11, "load": 37, "score": 0.912, "allowed": true,
+      "outbound": "🇭🇰 香港负载", "last": "🇭🇰 香港 03",
+      "members": [
+        { "name": "🇭🇰 香港 03", "source": "name", "healthy": true, "load": 4, "quality": 0.947 },
+        { "name": "mystery-7", "source": "exit", "healthy": true, "load": 2, "quality": 0.55, "exit": "HK", "exitIp": "203.0.113.7" }
+      ]
+    }
+  ],
+  "excluded": [],
+  "memory": { "regionTargets": 128, "affinity": 0 }
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `mode` / `strategy` / `affinity` | 当前生效的值；`config*` 是配置中的值 |
+| `members[].source` | 地区来源：`rule`、`name`、`exit`、`unknown` |
+| `members[].quality` | 不针对具体目标的节点质量（总体权重或测速换算），已乘 `policy_priority` |
+| `load` | 经本组的活跃连接数（TCP 与 UDP）加正在拨号数 |
+| `score` | 不针对具体目标的地区评分，不含地区探测系数 |
+| `last` | 该地区最近一条连接所用的节点 |
+| `excluded` | `unknown: exclude` 时被排除的节点 |
+| `memory` | 记住地区的目标数、亲和绑定数 |
+
+组不存在返回 404，不是 `smart-loadbalance` 组返回 400 `not a smart-loadbalance group: <name>`。下面几个接口相同。
+
+### `PUT /smart/groups/{name}/regions`
+
+锁定地区和 / 或切换地区模式，未出现的字段不改变：
+
+```bash
+curl -X PUT http://127.0.0.1:9090/smart/groups/balance/regions -d '{"lock":"JP"}'
+curl -X PUT http://127.0.0.1:9090/smart/groups/balance/regions -d '{"mode":"destination"}'
+```
+
+```json
+{ "group": "balance", "mode": "destination", "lock": "JP", "now": "🇯🇵 日本负载" }
+```
+
+- `lock` 可写地区代码、名称、旗帜或地区出站标签，地区必须有成员，否则 400 `unknown region: ...`；`""` 解锁。
+- `mode` 写 `""` 恢复配置中的模式；没有配置 `priority` 时不能切到 `priority`。切换模式会清空各目标记住的地区。
+- 两者都没有时返回 400。锁定与模式会保存到缓存文件，重启后恢复。开启了 `interrupt_exist_connections` 时，锁定变化会中断已有连接。
+
+### `DELETE /smart/groups/{name}/regions/lock`
+
+解除锁定，返回 `{"group", "previous", "now"}`。
+
+### `POST /smart/groups/{name}/regions/detect`
+
+重新识别全部成员的地区，并为需要的节点启动出口探测；`?force=true` 对全部节点重新探测。返回 `{"group": "balance", "exitProbes": 3}`，探测在后台进行，完成后地区自动更新。
+
+### `PUT /smart/groups/{name}/balance`
+
+切换分配策略和 / 或会话亲和，空字段不改变，`"default"` 恢复配置值：
+
+```bash
+curl -X PUT http://127.0.0.1:9090/smart/groups/balance/balance -d '{"strategy":"least-connections","affinity":"site"}'
+```
+
+```json
+{ "group": "balance", "strategy": "least-connections", "affinity": "site" }
+```
+
+无法识别的值返回 400。切换会保存到缓存文件；更换亲和会清空已有绑定。
 
 ## 清空缓存
 

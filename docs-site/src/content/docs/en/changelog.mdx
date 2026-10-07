@@ -7,6 +7,15 @@ Only changes that affect usage are listed, newest first. For the full commit his
 
 ## 2026-10
 
+**New smart-loadbalance: region-aware smart load balancing** (Oct 7)
+
+- New outbound type `smart-loadbalance`: every node of a subscription is sorted into region pools; each connection first gets a region, then is spread over the good nodes of that region by the quality Smart has learned and by live connection counts. Learning, breakers, the watchdog, persistence, LightGBM and ASN work as in `smart`. See [Smart load balancing](../smart-loadbalance/).
+- Region detection: custom rules, member names (flags, Chinese and English country and city names, ISO / airport codes, private-line shorthands such as `沪日` and `广港`, relay names) and exit probes (Cloudflare trace through the node, classified by the real exit country, results kept for 24 hours).
+- Region modes: `auto` learns the best region per destination, remembers it for 30 minutes and only switches for a clear gain; `destination` matches the destination's country (IP, country-code TLD or resolved domain); `priority` goes in order; `off` ignores regions. Regions can be locked from dashboards or the Clash API, and `fallback` controls cross-region fallback. In `auto` mode the group also compares regions' TLS handshake times for frequently visited sites.
+- Strategies `smart`, `least-connections`, `round-robin`, `weighted-round-robin`, `weighted-random`, `random`, `consistent-hashing`; affinity `target`, `site`, `source`, `source-site`; plus a quality floor and caps on pool size and per-node connections.
+- New outbound type `smart-region`: the group can generate one outbound per region for route rules, the `detour` of landing nodes and `selector` groups; picking one in a dashboard locks the region. As the front of chained proxies, the group learns and picks regions per landing server rather than per website.
+- New Clash API endpoints: `GET/PUT /smart/groups/{name}/regions`, `DELETE /smart/groups/{name}/regions/lock`, `POST /smart/groups/{name}/regions/detect`, `PUT /smart/groups/{name}/balance`; `/proxies` gains a `loadBalance` block and `/smart/groups` a `type` field. The region lock and runtime settings are saved in the cache file and restored after a restart.
+
 **ASN and country databases reload without restart; downloads use the full http_client** (Oct 7)
 
 - When GeoX downloads or updates an ASN or country database, it is reloaded at once and every Smart group uses the new data. A database still downloading at startup is picked up automatically when the download completes. Both used to require a restart.

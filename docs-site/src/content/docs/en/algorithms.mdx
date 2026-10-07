@@ -115,3 +115,7 @@ The request body must be a JSON object. `applied` is the algorithm actually in e
 | Spread traffic evenly, avoid overloading a single node | `weighted-rr` or `round-robin` |
 
 Route rules can send different kinds of traffic to Smart groups that use different algorithms. See [Examples](../examples/#groups-per-traffic-type).
+
+<Callout type="note" title="Spreading connections over a whole region">
+  These algorithms only reorder the top 3–5 candidates, and `round-robin` and the like ignore regions. To spread connections over every good node of a region while a site keeps its exit country, use [Smart load balancing](../smart-loadbalance/) (a `smart-loadbalance` group).
+</Callout>

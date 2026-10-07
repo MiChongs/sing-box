@@ -115,3 +115,7 @@ curl -X PUT http://127.0.0.1:9090/smart/groups/auto/algorithm \
 | 平摊流量、避免单节点过载 | `weighted-rr` 或 `round-robin` |
 
 不同类型的流量可以通过路由规则分到使用不同算法的 Smart 组，见 [示例配置](../examples/#按流量类型分组)。
+
+<Callout type="note" title="想把连接分摊到整个地区">
+  这些算法只在前 3–5 名候选之间调整，`round-robin` 等也不区分地区。需要把连接分摊到某个地区的全部好节点、并让同一网站保持出口国家时，使用 [Smart 负载均衡](../smart-loadbalance/)（`smart-loadbalance` 组）。
+</Callout>

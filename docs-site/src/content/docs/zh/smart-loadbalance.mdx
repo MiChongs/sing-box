@@ -1,0 +1,296 @@
+---
+title: Smart 负载均衡
+description: smart-loadbalance 组把所有节点按地区自动分池，再用 Smart 学到的节点质量在地区内分摊连接。涵盖地区识别、地区模式、分配策略、会话亲和、地区出站与嵌套代理（前置 + 落地）。
+---
+
+import Flow from '../../../components/Flow.astro';
+import Callout from '../../../components/Callout.astro';
+
+`smart` 组把流量集中到它认为最好的节点上，本质上是更聪明的 `urltest`；`loadbalance` 组能分摊连接，但不知道哪个节点好、也不分地区。`smart-loadbalance` 把两者结合起来：
+
+- **按地区分池**：把订阅中的全部节点丢进一个组，按节点名称（旗帜、中英文名、城市、代码、中转写法）、自定义规则或真实出口 IP 自动分到各个地区。
+- **选地区**：每条连接先决定由哪个地区承载——按目标学习最优地区、按目标所在国家匹配、按优先级，或在面板里锁定。同一网站的出口国家保持稳定。
+- **地区内分摊**：在选中地区的所有好节点之间分配连接，按 Smart 学到的质量加权、兼顾实时连接数，而不是全部挤在一个节点上。
+- **地区出站**：可为每个地区生成一个出站，供路由规则、落地节点的 `detour`、`selector` 直接引用，适合嵌套代理。
+
+学习、熔断、Watchdog、持久化、LightGBM、ASN 等能力与 `smart` 组完全相同，`smart` 组的字段（除 `algorithm`、`hysteresis` 外）在这里含义不变。
+
+| | `loadbalance` | `smart` | `smart-loadbalance` |
+|---|---|---|---|
+| 每条连接用哪个节点 | 轮询 / 哈希 / 粘性 | 学到的最佳节点（前几名之间微调） | 选中地区内所有好节点按质量与负载分摊 |
+| 节点质量 | 只看测速是否通 | 按目标学习 | 按目标学习 |
+| 地区 | 无 | 无 | 自动分池，按目标选地区 |
+| 嵌套代理前置 | 可以，但不分地区、不识别差节点 | 集中到单个前置 | 前置按地区分摊，地区可锁定、可匹配落地国家 |
+
+## 快速上手
+
+```json
+{
+  "type": "smart-loadbalance",
+  "tag": "balance",
+  "providers": ["my-subscription"]
+}
+```
+
+不写其他字段时：按节点名称识别地区，名称识别不了的节点用出口探测确定；每个目标自动选最优地区并记住 30 分钟；地区内用 `smart` 策略按质量与连接数分摊；不绑定会话。与 `smart` 组一样，**必须开启 `experimental.cache_file`** 才会学习。
+
+启动日志会列出分池结果：
+
+```
+smart-loadbalance[balance] regions: HK(12) JP(8) SG(5) US(4) OTHER(1); mode=auto strategy=smart affinity=none fallback=auto
+```
+
+完整的示例见 [示例配置](../examples/#smart-负载均衡)，全部字段见 [配置字段](../config/#smart-loadbalance)。
+
+## 一条连接的处理流程
+
+<Flow
+  items={[
+    { title: '识别目标', body: '与 `smart` 相同，把域名归并为目标键，如 `*.example.com`。作为落地节点的 `detour` 时，目标是落地服务器，而不是网站。' },
+    { title: '选地区', body: '按锁定、地区出站、地区模式依次决定主地区，并按 `fallback` 排出备选地区。' },
+    { title: '建节点池', body: '取主地区的健康节点，去掉对该目标表现差、低于质量下限、超过连接上限的节点。' },
+    { title: '选节点', body: '先看会话亲和，再按分配策略选出这条连接的节点。' },
+    { title: '拨号与切换', body: '只拨选中的节点；它可疑时 250 ms 后对冲拨号下一个。失败后依次尝试池内其他节点，再到备选地区。' },
+    { title: '学习', body: '连接结果照常记入统计；成功的节点刷新亲和绑定，目标的地区记忆跟随实际使用的地区。' },
+  ]}
+/>
+
+## 地区识别
+
+每个成员按以下顺序确定地区，命中即停：
+
+1. **`region.rules`**：按顺序匹配，可用正则匹配名称，或直接列出节点。
+2. **出口探测（`detect.exit: prefer` 时）**：有有效探测结果就用它。
+3. **节点名称**（`detect.disable_name` 关闭）：见下文。
+4. **出口探测（默认 `fallback`）**：名称识别不了的节点用探测结果。
+5. **都识别不了**：按 `region.unknown` 处理，默认放入地区 `OTHER`（显示为“其他”）。
+
+节点来自订阅时，识别前会去掉标签前缀 `订阅名/`，避免订阅名本身（如 `jp-sub`）干扰结果。成员可以是普通节点，也可以是其他策略组。
+
+### 名称识别
+
+识别器收集名称中的所有地区线索，按可信度计分：国家、城市的中英文名记 3 分，旗帜记 2 分，ISO / 机场代码记 1 分，取总分最高的地区；同分时取位置靠后的，因为中转节点通常把出口写在后面。
+
+| 节点名称 | 识别结果 | 说明 |
+|---|---|---|
+| `🇭🇰 香港 01`、`HK01`、`hk-bgp-1` | HK | 旗帜、中文名、代码（代码后可紧跟数字） |
+| `Japan Tokyo 02`、`JP-NRT-3` | JP | 英文国名与城市、机场代码 |
+| `沪日 IPLC 01`、`IEPL 深港 2` | JP、HK | 专线简写 |
+| `香港中转美国`、`HK → JP` | US、JP | 入口地区后跟“中转”“→”等时几乎不计分 |
+| `美国 洛杉矶 [HK中转]`、`CN2 GIA 洛杉矶` | US | `CN2` 是线路名，不是中国 |
+| `🇨🇳 台湾 01` | TW | 名称中的中国只在没有其他线索时采用 |
+| `印度尼西亚 01`、`白俄罗斯` | ID、BY | 较长的名称优先，不会误判为印度、俄罗斯 |
+| `🇺🇸 US LA 01` | US | 节点名中的 `LA`、`NY` 视为美国城市 |
+| `Ｈｏｎｇ Ｋｏｎｇ` | HK | 全角字符会先规范化 |
+| `剩余流量：100.5 GB`、`节点 NO.1` | 无 | 流量单位与编号不当作英国、挪威 |
+
+名称表内置 94 个国家和地区，涵盖常见城市与机场代码；旗帜可以识别任何国家。`NO`、`ID`、`IT`、`CO`、`AT` 等容易与普通单词或编号混淆的两字母代码不参与识别，这些地区通过旗帜或名称识别。识别不准时，用 `region.rules` 纠正：
+
+```json
+"rules": [
+  { "region": "IPLC", "name": "专线", "match": "(?i)IPLC|IEPL" },
+  { "region": "JP", "outbounds": ["mystery-node-7"] },
+  { "region": "HK", "name": "港区精选", "icon": "https://example.com/hk.png" }
+]
+```
+
+`region` 既可以是内置地区，也可以是自定义地区（如上面的 `IPLC`）。只写 `region` 与 `name` / `icon` 的规则不匹配节点，只用来给地区改显示名称或图标。
+
+### 出口探测
+
+出口探测经节点请求 `detect.exit_url`（默认 `https://www.cloudflare.com/cdn-cgi/trace`），从响应中取出口 IP 与国家。它反映网站真正看到的出口，对名称不规范、名称与实际不符、入口是国内中转的节点尤其有用。
+
+- `fallback`（默认）：只探测规则与名称都无法识别的节点。
+- `prefer`：探测除规则命中外的所有节点，结果优先于名称。节点很多时首轮探测需要一些时间，期间按名称分池。
+- `off`：不探测。
+
+探测在启动后、订阅更新后对需要的节点进行，最多 `exit_concurrency`（默认 4）个同时进行；结果有效 24 小时并保存在缓存文件中，重启后直接使用，失败的节点 30 分钟后重试。`direct`、`block`、`dns` 类型的成员不探测。
+
+用 `GET /smart/groups/{name}/regions` 查看每个节点的地区与识别来源（`rule`、`name`、`exit`、`unknown`），用 `POST /smart/groups/{name}/regions/detect?force=true` 重新探测全部节点，见 [Clash API](../clash-api/#smart-负载均衡)。
+
+## 地区模式
+
+`region.mode` 决定每条连接的主地区。主地区之后，`region.fallback` 决定备选地区。
+
+### auto（默认）
+
+按目标学习最优地区。地区的评分是该地区质量最高的 3 个健康节点的平均质量，节点多的地区有少量加成（每翻一倍 +5%，最多 +20%），再乘以 `region.weights` 中的系数和地区探测的结果。节点质量依次取：该节点对这个目标学到的权重、节点的总体权重（×0.9）、由测速延迟换算的值、默认值 0.55，最后乘以 `policy_priority` 系数。对这个目标学到的权重低于 0.4 的节点在评分中只计一半。
+
+每个目标记住所选地区 `sticky`（默认 30 分钟，每次使用刷新）。期间：
+
+- 最多每 30 秒重新比较一次，其他地区的评分必须高出当前地区 `switch_margin`（默认 25%）才会换；
+- 当前地区的健康节点少于 `min_nodes` 时立即换；
+- 拨号失败切到其他地区并成功后，记忆跟随新地区。
+
+这样同一网站的出口国家保持稳定，只有明显更好或原地区不可用时才会变化。
+
+### destination
+
+按目标所在国家选地区，适合游戏、本地流媒体，以及按落地服务器所在国选择前置。目标国家依次取自：
+
+1. 目标 IP 在国家数据库中的结果；
+2. 域名的国家顶级域（`.jp`、`.co.uk` 等，可用 `destination.disable_tld` 关闭）。`.io`、`.co`、`.tv`、`.me`、`.ai` 等常被当作通用域名的后缀不参与判断；
+3. 经 DNS 路由解析域名后的 IP（可用 `destination.disable_resolve` 关闭）。最多等待 300 ms，结果按域名缓存 10 分钟，所以以域名填写的落地服务器也能按所在国匹配。普通网站经 CDN 时，解析到的是离 DNS 服务器最近的节点所在国；使用 FakeIP 时没有结果。
+
+`destination.map` 把国家映射到地区列表，例如 `{"KR": ["JP", "HK"]}`：目标在韩国时依次尝试日本、香港。没有映射时找同名地区。国家未知或没有可用地区时，按 `auto` 选择。
+
+这个模式需要国家数据库：配置为 `destination` 或设置了 `destination.map` 时，启动即由 GeoX 在后台下载（`experimental.geox.url.mmdb` 或默认的 GeoLite2-Country）；运行中切换到 `destination` 时开始下载。下载完成前只能依靠域名后缀判断。
+
+### priority
+
+按 `region.priority` 的顺序，取第一个健康节点不少于 `min_nodes` 的地区。必须设置 `priority`。所有列出的地区都不可用时，`fallback: auto` 会改用评分最高的其他地区，否则失败。
+
+### off
+
+不分地区，所有节点（`allow` / `deny` 允许的地区内）组成一个池。适合只想要“带学习的负载均衡”、不在乎出口国家的场景。
+
+### 锁定地区
+
+在面板中点选地区出站，或调用 `PUT /smart/groups/{name}/regions` 设置 `lock`，即可把组锁定到一个地区，优先于地区模式。锁定会保存到缓存文件，重启后保持。锁定的地区不可用时按 `fallback` 处理；要求严格不出该地区时，设 `fallback: none`。
+
+### 备选地区（fallback）
+
+| `region.fallback` | 主地区不可用时 | 拨号候选列表 |
+|---|---|---|
+| `auto`（默认） | 改用评分最高的其他地区 | 主地区最多 7 个节点，之后附上备选地区的最佳节点（最多 2 个地区、共 3 个） |
+| `priority` | 按 `priority` 顺序回退 | 同上，备选地区只取 `priority` 中列出的 |
+| `none` | 失败：`no node can serve ...` | 只有主地区的节点 |
+
+`allow` / `deny` 限定哪些地区可以被选中或作为备选；`min_nodes` 是地区参与选择所需的最少健康节点数。锁定的地区和地区出站不受 `allow` / `deny` 限制，只要有 1 个健康节点即可。
+
+## 地区探测
+
+`auto` 模式从真实流量中学习，但流量只会流向已选中的地区，其他地区对这个目标的表现无从得知。地区探测补上这一点：每 `probe.interval`（默认 10 分钟），取近期访问最多的 `probe.targets`（默认 6）个 HTTPS 网站，经评分前 `probe.regions`（默认 5）个地区各自的最佳节点，测量到该网站的 TLS 握手耗时。
+
+探测结果在 3 个周期内有效，按“最快地区耗时 ÷ 本地区耗时”（不低于 0.35）缩放地区评分；探测失败的地区乘以 0.25；同一网站其他地区有结果而本地区没有时乘以 0.85。
+
+只探测经 TCP 443 访问的域名；组空闲（2 分钟无拨号）、网络故障、锁定了地区，或模式为 `priority`、`off` 时跳过。探测走 Smart 的共享探测队列，与健康检查共用并发上限。不需要时设 `probe.disabled: true`。
+
+## 节点池
+
+选中地区后，组从该地区的成员中建立节点池：
+
+1. 只保留健康节点：未熔断、未被判定不可用、测速有效、未被屏蔽；UDP 连接还要求节点支持 UDP。
+2. 去掉对这个目标被软屏蔽的节点；对这个目标近期失败率高的节点质量乘以 0.3。
+3. 对这个目标学到的权重低于 0.4 的节点，只要池里还有其他节点就去掉。
+4. 质量低于池内最佳节点 × `min_quality`（默认 0.5）的节点去掉。
+5. 设置了 `max_nodes` 时只保留质量最高的几个。
+6. 设置了 `max_connections_per_node` 时，跳过活跃连接已达上限的节点；全部达到上限时照常使用。
+
+## 分配策略
+
+`balance.strategy` 决定池内由哪个节点承载这条连接。“负载”是该节点经本组的活跃连接数（TCP 与 UDP），加上正在拨号的连接数，所以一批同时发起的连接也会被分散开。
+
+| 策略 | 别名 | 行为 |
+|---|---|---|
+| `smart`（默认） | `auto`、`adaptive` | 按“(负载 + 1) ÷ 质量”计算成本，在成本不超过最低值 1.1 倍的节点中按质量加权随机。稳定后连接数与质量成正比：质量高一倍的节点承载约两倍的连接 |
+| `least-connections` | `lc`、`least-conn`、`least-loaded` | 负载最低的节点；并列时按质量加权随机 |
+| `round-robin` | `rr` | 按节点名排序后轮流，每个地区单独计数 |
+| `weighted-round-robin` | `wrr`、`weighted-rr` | 平滑加权轮询（与 nginx 相同），按质量比例交错分配，结果确定 |
+| `weighted-random` | `wr` | 按质量加权随机 |
+| `random` | | 均匀随机 |
+| `consistent-hashing` | `chash`、`hash`、`rendezvous` | 加权最高随机权重哈希：同一键（亲和键，未设置亲和时为目标）固定落到同一节点；节点离开时只有原本落在它上面的键会移动 |
+
+## 会话亲和
+
+`balance.affinity` 让一组连接固定使用同一个节点，避免同一网站或同一设备在多个出口 IP 之间跳动：
+
+| 取值 | 绑定范围 | 适用 |
+|---|---|---|
+| `none`（默认） | 不绑定，每条连接独立分配 | 下载、嵌套代理前置等需要真正分摊的场景 |
+| `target` | 同一目标键，如 `*.example.com` | 一般网页 |
+| `site` | 同一可注册域名，如 `img.example.com` 与 `api.example.com` | 登录态、风控与出口 IP 绑定的网站（AI 服务、银行、部分流媒体） |
+| `source` | 同一客户端 IP | 局域网内按设备分配 |
+| `source-site` | 同一客户端访问同一网站 | 与 `loadbalance` 的 `sticky-sessions` 类似 |
+
+绑定按地区分别记录，有效期 `affinity_ttl`（默认 10 分钟，每次使用刷新）。绑定的节点不在当前节点池中（不健康、被软屏蔽、超过连接上限）时重新分配。不同取值之间可以在运行时用 `PUT /smart/groups/{name}/balance` 切换。
+
+<Callout type="note" title="亲和与分摊的取舍">
+  亲和越宽，同一批连接越集中在一个节点上。嵌套代理的前置组不要设置 `target` 或 `site`：所有到同一落地服务器的连接会落到同一个前置节点，失去分摊的意义。
+</Callout>
+
+## 拨号与失败切换
+
+与 `smart` 组不同，第 0 轮只拨选中的那一个节点，不与第二名竞速，以免打乱分配。选中的节点可疑（近期拨号失败、被判定不可用或从未拨通过）时，250 ms 后对冲拨号池内下一个节点。之后最多 3 轮、每轮按顺序再拨 3 个：先是池内其他节点，再是备选地区的节点，候选列表最多 10 个，正好在这 4 轮内拨完。全部失败后，组会按更新后的熔断状态重新选一次。
+
+## 地区出站
+
+开启 `region.outbounds.enabled` 后，组为地区生成 `smart-region` 类型的出站：
+
+```json
+"region": {
+  "outbounds": {
+    "enabled": true,
+    "regions": ["HK", "JP", "US"],
+    "tag": "{flag} {name}负载"
+  }
+}
+```
+
+这会创建 `🇭🇰 香港负载`、`🇯🇵 日本负载`、`🇺🇸 美国负载` 三个出站。经地区出站的连接仍走所属组的完整流程（学习、熔断、分摊都共享），只是地区固定为该地区：
+
+- **`regions`** 中的出站在启动时创建，可以在路由规则、`detour`、`selector` 中引用。
+- **`auto`**（`regions` 为空时自动开启）为运行中新出现的地区创建出站，地区消失后删除。运行中创建的出站不能在配置文件中引用。
+- **`members`**：默认 `regions`，组在面板中把地区出站列为成员，点选一个即锁定该地区；`nodes` 时仍列出节点。
+- **`fallback`**：地区没有可用节点时是否改用其他地区，默认关闭（直接失败）。
+- 每个地区出站可以在面板中单独指定节点（只能指定本地区的节点），不影响组本身。
+
+也可以手动声明地区出站，适合需要单独设置 `fallback`、`hidden` 的场景：
+
+```json
+{ "type": "smart-region", "tag": "日本前置", "group": "balance", "region": "JP", "fallback": true }
+```
+
+## 嵌套代理（前置 + 落地）
+
+落地节点（自建 VPS、静态住宅 IP 等）通过 `detour` 经机场节点连接，可以隐藏落地服务器、改善线路。把 `smart-loadbalance` 或它的地区出站作为 `detour`，前置流量就会在多个机场节点间分摊，并保持在合适的地区：
+
+```json
+{
+  "outbounds": [
+    {
+      "type": "smart-loadbalance",
+      "tag": "front",
+      "providers": ["my-subscription"],
+      "region": {
+        "mode": "destination",
+        "outbounds": { "enabled": true, "regions": ["HK", "JP"], "members": "nodes" }
+      }
+    },
+    { "type": "shadowsocks", "tag": "landing-us", "server": "us.landing.example.com", "server_port": 8388,
+      "method": "aes-256-gcm", "password": "landing-password", "detour": "front" },
+    { "type": "shadowsocks", "tag": "landing-hk", "server": "hk.landing.example.com", "server_port": 8388,
+      "method": "aes-256-gcm", "password": "landing-password", "detour": "front-HK" }
+  ]
+}
+```
+
+- `landing-us` 以组本身为前置。组看到的目标是**落地服务器**而不是网站：`destination` 模式按落地服务器所在国家选前置地区（以域名填写时先解析），`auto` 模式则为每台落地服务器学习最优前置地区。
+- `landing-hk` 固定使用香港前置。
+- 前置组保持默认的 `affinity: none`，到同一落地服务器的多条连接会分散到地区内多个节点，避免单个机场节点限速或被封时影响全部连接。
+- 落地节点本身放在 `smart` 或 `selector` 组中也没关系：前置组会识别出这是代理链中的一跳，按落地服务器而不是外层的网站来学习和选地区。
+
+## 运行时控制
+
+| 操作 | 接口 |
+|---|---|
+| 查看地区、成员、识别来源、负载与质量 | `GET /smart/groups/{name}/regions` |
+| 锁定 / 解锁地区，切换地区模式 | `PUT /smart/groups/{name}/regions`，`DELETE /smart/groups/{name}/regions/lock` |
+| 切换分配策略与会话亲和 | `PUT /smart/groups/{name}/balance` |
+| 重新识别地区、重新探测出口 | `POST /smart/groups/{name}/regions/detect` |
+| 面板中点选地区出站 / 节点 | `PUT /proxies/{name}`：地区即锁定，节点即手动指定 |
+
+锁定、运行中切换的模式、策略与亲和都会保存到缓存文件，重启后恢复；传入 `default` 或空值恢复配置中的值。详见 [Clash API](../clash-api/#smart-负载均衡)。手动指定节点的行为与 `smart` 组相同，见 [手动指定节点](../priority-and-pinning/#手动指定节点)。
+
+## 如何选择
+
+| 场景 | 建议 |
+|---|---|
+| 大订阅、不想手写一堆地区组 | 默认配置，开启 `region.outbounds` 让面板按地区切换 |
+| 同一网站要保持出口 IP | `affinity: site` |
+| 多线程下载、提高总带宽 | `strategy: smart` 或 `least-connections`，`affinity: none` |
+| 游戏、本地流媒体 | `mode: destination`，必要时用 `destination.map` 指定替代地区 |
+| 只用某几个地区，按顺序兜底 | `mode: priority` 加 `priority`，或 `allow` |
+| 嵌套代理前置 | `mode: destination` 或 `auto`，地区出站作为 `detour`，`affinity: none` |
+| 机场限制每节点并发 | `max_connections_per_node` |
+| 只需要集中到最好的节点 | 用 `smart` 组 |
