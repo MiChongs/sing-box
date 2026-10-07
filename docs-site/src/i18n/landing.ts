@@ -46,7 +46,7 @@ export const landing: Record<Lang, Landing> = {
         },
         {
           title: 'LightGBM 评分',
-          body: '35 维特征的预训练模型直接给出节点权重，兼容 27 维旧模型；也可采集本地数据离线训练自己的模型。',
+          body: '预训练模型直接给出节点权重，按特征名兼容 vernesong/mihomo 的 v4 模型与 27 维旧模型；也可采集本地数据离线训练自己的模型。',
           to: 'lightgbm',
         },
         {
@@ -138,7 +138,7 @@ export const landing: Record<Lang, Landing> = {
         },
         {
           title: 'LightGBM scoring',
-          body: 'A pre-trained model on 35 features produces node weights directly, and 27-feature models still load. You can also collect local data to train your own.',
+          body: 'A pre-trained model produces node weights directly. Inputs are matched by feature name, so vernesong/mihomo v4 models and older 27-feature models both load. You can also collect local data to train your own.',
           to: 'lightgbm',
         },
         {

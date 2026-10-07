@@ -3,7 +3,6 @@ title: ASN and GeoX
 description: How Smart aggregates what it learns by the destination's autonomous system when use_asn is on, where the ASN and country databases come from, and when experimental.geox downloads files and when they take effect.
 ---
 
-import Callout from '../../../components/Callout.astro';
 import CodeBlock from '../../../components/CodeBlock.astro';
 import example from '../../../examples/04-asn-geox.json?raw';
 
@@ -32,21 +31,19 @@ Each group with `use_asn` on picks its database in this order:
 
 1. The group's own `asn_database`. The path is used as is and is not joined with the data directory. In GUI clients a relative path is relative to the process working directory, so use an absolute path.
 2. The file that `experimental.geox.url.asn` downloads into the data directory (requires `geox.enabled: true`).
-3. If neither is available, Smart automatically downloads `https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb` to `GeoLite2-ASN.mmdb` in the data directory.
+3. If neither is available, the default database `https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb`, which GeoX downloads to `GeoLite2-ASN.mmdb` in the data directory.
 
 When several databases are listed, all of them are opened. Lookups try them in order and take the first non-zero result. Databases that fail to open are skipped. A database must use the MaxMind GeoLite2-ASN format (records have an `autonomous_system_number` field). Databases with different fields (for example, IPinfo's ASN database) return no results.
 
-<Callout type="warn" title="Do not rely on option 3">
-  The automatic download runs **synchronously** during startup, always goes direct, waits up to 90 seconds, and **downloads again on every startup**. If the download fails, ASN is disabled for that run, even if an old file is on disk. Provide the database explicitly with `asn_database` or `geox.url.asn`.
-</Callout>
+GeoX downloads the databases of options 2 and 3 with the `http_client`, `auto_update` and `update_interval` from `experimental.geox`; for the default database this holds even when GeoX is not enabled. Downloads run in the background and do not block startup. An existing file is used as is and is not downloaded again on every start.
 
-Database readers are shared between groups, but each group opens them only once, at startup. An updated database takes effect only after a restart.
+Database readers are shared between groups. When GeoX downloads or updates a database, it is reloaded at once and every group uses the new data, with no restart. A database that is still downloading at startup is picked up automatically when the download completes; until then the startup log shows `asn=on(downloading)`. Local files set with `asn_database` are read only at startup, so replacing one requires a restart.
 
 ## Country database
 
-The LightGBM country features (17 and 26) need a country database. Smart prefers the `country.mmdb` downloaded via `experimental.geox.url.mmdb`. If that is not configured, Smart checks for `country.mmdb` in the data directory at startup and, if it is missing, downloads GeoLite2-Country from the P3TERX releases page.
+The LightGBM country features (17 and 26) need a country database. Smart prefers the `country.mmdb` downloaded via `experimental.geox.url.mmdb`. If that is not configured, it uses the default GeoLite2-Country from the P3TERX releases page, which GeoX downloads to `country.mmdb` in the data directory. As with the ASN database, a download or update takes effect at once.
 
-Only groups with `use_lightgbm` or `collect_data` on look up the country.
+Only groups with `use_lightgbm` or `collect_data` on open the country database and look up countries.
 
 ## experimental.geox
 
@@ -54,22 +51,21 @@ GeoX manages downloading and updating geographic data files in one place. Smart 
 
 <CodeBlock code={example} filename="04-asn-geox.json" locale="en" />
 
-- With `enabled: false`, no files are downloaded, and Smart does not get the paths from here either.
-- There are no default download URLs. Only files that have a URL set are downloaded.
+- With `enabled: false`, the files under `url` are not downloaded, and Smart does not get their paths from here. The default databases Smart needs are still downloaded with the download settings in this section.
+- `url` has no defaults. Only files that have a URL set are downloaded.
 - File names are fixed: `GeoLite2-ASN.mmdb` (with several ASN URLs, the first is still `GeoLite2-ASN.mmdb` and the rest are `GeoLite2-ASN-1.mmdb`, `GeoLite2-ASN-2.mmdb` and so on), `country.mmdb`, `geoip.dat` and `geosite.dat`. No component uses `geoip.dat` or `geosite.dat` yet.
-- With `auto_update: true`, each file is updated every `update_interval`. Otherwise a file is downloaded only once, when it is missing.
-
-<Callout type="note" title="Restart once after the first run">
-  GeoX downloads asynchronously at startup, while Smart opens the database when startup completes. On a fresh install the files are usually not downloaded yet, and the log shows `smart: use_asn is true but no ASN database available; ASN features disabled`. Restart once after the download finishes.
-</Callout>
+- With `auto_update: true`, each file is updated every `update_interval`. Otherwise a file is downloaded only while it is missing, and an existing file is never updated.
+- When the download of a missing file fails (for example, because the network is not up yet at boot), it is retried after 30 seconds, doubling up to 30 minutes, until it succeeds.
+- Downloads use all `http_client` settings: the outbound and other dial options, TLS, headers and HTTP version. Without `http_client`, `download_detour` is used, and without either, the default HTTP client (`route.default_http_client`).
 
 ## Log messages
 
 | Log message | Meaning |
 |---|---|
 | `smart: ASN database loaded from <path>` | The database was opened |
-| `smart: ASN database not configured per-group; using ...` | Using the database provided by GeoX |
-| `smart: no ASN database configured; auto-downloading default` | Downloading the default database automatically |
+| `smart: ASN database not configured per-group; using ...` | Using the `url.asn` databases GeoX downloads |
+| `smart: no ASN database configured; using the default database GeoX keeps at <path>` | Using the default database |
+| `smart: ASN database <path> is downloading; it is used once the download completes` | The database is still downloading and is picked up when it finishes |
 | `smart: failed to open ASN database [<path>] ...` | One database failed to open; the others are still tried |
-| `smart: all configured ASN databases failed to open; ASN features disabled` | All databases failed to open |
-| `smart: use_asn is true but no ASN database available; ASN features disabled` | No database is available |
+| `geox: reloaded <name> from <path>` | A download or update finished and the database was reloaded |
+| `assetdl[<name>]: download failed, retrying in <delay>: ...` | The download of a missing file failed and will be retried |

@@ -129,7 +129,7 @@ Global geo data download. Currently **Smart is the only consumer**: `url.asn` pr
 <FieldList lang="en" fields={geoxFields} prefix="geox-" />
 
 <Callout type="note" title="First download and when it takes effect">
-  GeoX downloads asynchronously during startup, while Smart opens the databases when startup completes. On the first run the files are often not downloaded yet, so the ASN feature is turned off. **You need to restart once after the download finishes for it to take effect.** Later automatic updates are likewise read by Smart only at the next start.
+  GeoX downloads in the background without blocking startup. It does not matter if the files are not downloaded yet when Smart starts: when a database is downloaded or updated, it is reloaded at once and every group uses the new data, **with no restart**.
 </Callout>
 
 ## Environment variables

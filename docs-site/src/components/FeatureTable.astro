@@ -3,8 +3,10 @@ import { features } from '../data/lightgbm';
 import type { Lang } from '../data/nav';
 import { inline } from '../lib/inline';
 
-// LightGBM feature vector as a stacked list: index + name on one line,
-// meaning below, so long names never force horizontal scrolling.
+// LightGBM feature catalog as a stacked list: index + name on one line,
+// meaning below, so long names never force horizontal scrolling. Thicker
+// dividers open the fork's 8 extended features and the name-only ones,
+// which show "+" instead of an index.
 
 export interface Props {
   lang: Lang;
@@ -15,8 +17,8 @@ const { lang } = Astro.props;
 
 <ol class="not-prose my-6 overflow-hidden rounded-card bg-surface shadow-ring">
   {features.map((f) => (
-    <li class:list={['grid grid-cols-[2.25rem_1fr] gap-x-2 px-4 py-2 text-[0.9rem]', f.i > 0 && 'border-t border-line-soft', f.i === 27 && 'border-t-2 border-t-line']}>
-      <span class="pt-px font-mono text-[0.8rem] text-subtle">{f.i}</span>
+    <li class:list={['grid grid-cols-[2.25rem_1fr] gap-x-2 px-4 py-2 text-[0.9rem]', f.i > 0 && 'border-t border-line-soft', (f.i === 27 || f.i === 35) && 'border-t-2 border-t-line']}>
+      <span class="pt-px font-mono text-[0.8rem] text-subtle">{f.extra ? '+' : f.i}</span>
       <div class="min-w-0 sm:flex sm:gap-4">
         <code class="block break-all font-mono text-[0.82rem] text-accent sm:w-60 sm:shrink-0">{f.name}</code>
         <p class="mt-0.5 text-fg-2 sm:mt-0" set:html={inline(f[lang])} />

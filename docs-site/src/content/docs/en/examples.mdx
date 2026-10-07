@@ -45,7 +45,7 @@ All examples below pass `sing-box check`. Except for the first one, each example
 <CodeBlock code={ex4} filename="04-asn-geox.json" locale="en" />
 
 - GeoX downloads the ASN and country databases and updates them once a week. The ASN database is used by `use_asn`, and the country database is used by LightGBM.
-- On a fresh install, the first download takes time. ASN takes effect only **after you restart once when the download finishes**; see [ASN and GeoX](../asn-geox/#experimentalgeox).
+- On a fresh install, the first download takes time. ASN takes effect automatically when the download finishes, with no restart; see [ASN and GeoX](../asn-geox/#experimentalgeox).
 - To use only a local file, remove `geox` and write `"asn_database": "/path/to/GeoLite2-ASN.mmdb"` in the group.
 
 ## Groups per traffic type

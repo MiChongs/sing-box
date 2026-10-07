@@ -81,7 +81,7 @@ import Callout from '../../../components/Callout.astro';
 
 查看启动日志中的 ASN 相关行（见 [ASN 与 GeoX](../asn-geox/#相关日志)）：
 
-- 使用 GeoX 的全新安装，首次运行时数据库还没下载好，需要下载完成后重启一次；
+- 数据库还在下载时，启动日志显示 `asn=on(downloading)`，下载完成后自动生效；一直没有生效时，查看 `assetdl[...]: download failed` 日志，并检查 `experimental.geox` 的 `http_client` 能否访问下载地址；
 - 数据库格式需要是 MaxMind GeoLite2-ASN；
 - `asn_database` 中的相对路径不会拼接数据目录；
 - 只有拨号时已经知道目标 IP 才能查到 ASN；CDN 与骨干网 ASN 被有意忽略。
@@ -89,6 +89,16 @@ import Callout from '../../../components/Callout.astro';
 ## 模型一直是 ml=pending
 
 模型还没下载成功。检查 `download_detour` 或 `http_client` 指定的出站能否访问 GitHub；也可以手动下载 `Model-large.bin` 放到 `model_path`（默认数据目录下的 `smart_lgbm_model.bin`）后重启。
+
+## 模型显示 ml=unusable
+
+模型文件存在，但被拒绝使用。日志中 `lightgbm: cannot use model ...` 这条 WARN 给出了原因，常见的有：
+
+- 文件损坏或不是 LightGBM 文本格式模型；
+- 使用了 Smart 不认识的特征名；
+- `[transforms]` 块与模型的特征名不一致。
+
+自行训练的模型请对照 [模型格式](../lightgbm/#模型格式) 检查。使用默认模型时，删除该文件后重启会重新下载；`auto_update` 关闭时，已存在的文件不会被自动替换。
 
 ## 训练数据不再增长
 

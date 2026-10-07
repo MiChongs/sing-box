@@ -129,7 +129,7 @@ Smart 的配置分三处：出站组本身（`type: "smart"`）、全局的 `exp
 <FieldList lang="zh" fields={geoxFields} prefix="geox-" />
 
 <Callout type="note" title="首次下载与生效时机">
-  GeoX 在启动阶段异步下载，而 Smart 在启动完成时打开数据库。首次运行时文件往往还没下载完，此时 ASN 功能会被关闭，**下载完成后需要重启一次才会生效**；之后的自动更新同样要到下次启动才会被 Smart 读到。
+  GeoX 在后台下载，不阻塞启动。Smart 启动时文件还没下载好也没关系：数据库下载或更新完成后立即重新加载，所有组随即使用新数据，**无需重启**。
 </Callout>
 
 ## 环境变量

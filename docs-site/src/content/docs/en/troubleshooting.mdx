@@ -81,7 +81,7 @@ When `expected_status` is empty, any HTTP response counts as a successful probe,
 
 Check the ASN-related lines in the startup log (see [ASN and GeoX](../asn-geox/#log-messages)):
 
-- On a fresh install that uses GeoX, the database is not downloaded yet on the first run. Restart once after the download finishes;
+- While the database is still downloading, the startup log shows `asn=on(downloading)`, and ASN takes effect when the download completes. If it never does, look for `assetdl[...]: download failed` in the log and check that the `http_client` of `experimental.geox` can reach the download URL;
 - The database must be in MaxMind GeoLite2-ASN format;
 - Relative paths in `asn_database` are not joined with the data directory;
 - An ASN can be looked up only if the destination IP is already known at dial time. CDN and backbone ASNs are ignored on purpose.
@@ -89,6 +89,16 @@ Check the ASN-related lines in the startup log (see [ASN and GeoX](../asn-geox/#
 ## The model stays at ml=pending
 
 The model has not been downloaded successfully. Check that the outbound specified by `download_detour` or `http_client` can reach GitHub. You can also download `Model-large.bin` manually, place it at `model_path` (by default `smart_lgbm_model.bin` in the data directory), and restart.
+
+## The model shows ml=unusable
+
+The model file exists but was rejected. The WARN starting with `lightgbm: cannot use model` in the log gives the reason. Common ones:
+
+- The file is corrupted or is not a LightGBM text model.
+- The model uses a feature name Smart does not know.
+- The `[transforms]` block disagrees with the model's feature names.
+
+For a model you trained yourself, check it against [Model format](../lightgbm/#model-format). For the default model, delete the file and restart to download it again; with `auto_update` off, an existing file is never replaced automatically.
 
 ## Training data stops growing
 

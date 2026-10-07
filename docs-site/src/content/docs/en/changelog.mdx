@@ -7,6 +7,22 @@ Only changes that affect usage are listed, newest first. For the full commit his
 
 ## 2026-10
 
+**ASN and country databases reload without restart; downloads use the full http_client** (Oct 7)
+
+- When GeoX downloads or updates an ASN or country database, it is reloaded at once and every Smart group uses the new data. A database still downloading at startup is picked up automatically when the download completes. Both used to require a restart.
+- The default ASN and country databases are now downloaded by GeoX in the background, with GeoX's `http_client`, `auto_update` and `update_interval`. Startup no longer waits for the download, and an existing ASN database is no longer downloaded again on every start.
+- Downloads by GeoX, of the LightGBM model and of the default databases use all `http_client` settings (the outbound and other dial options, TLS, headers and HTTP version); previously only its outbound was used. Without any setting, the default HTTP client is used.
+- A failed download of a missing file is retried after 30 seconds, doubling up to 30 minutes, instead of waiting for the next update cycle or a restart.
+- The country database is opened and downloaded only for groups with `use_lightgbm` or `collect_data` on.
+
+**LightGBM loads v4 models** (Oct 7)
+
+- Model parsing now supports LightGBM text formats v2 to v4, including linear trees. Previously the default model `Model-large.bin` (format v4) could not be loaded, so `use_lightgbm` always fell back to the traditional formula.
+- Model inputs are now matched to features by `feature_names`, so the default model's 30-input layout is read correctly. Added three features: `history_duration_minutes`, `loss_rate` and `cumul_loss_rate`.
+- A model that cannot be used is rejected with the reason logged, and the startup log shows `ml=unusable`. A `[transforms]` block that fails validation no longer gets dropped while the model loads anyway.
+- With `auto_update` off, an existing model file that cannot be used is no longer downloaded again on every start.
+- The training data format is upgraded to version 5: columns 59–61 are added, for 63 columns in total.
+
 **Learned data takes effect and survives restarts** (Oct 7)
 
 - Fixed Smart groups never receiving the cache file's database. Since 2026-06-08, stats, weights, LightGBM inference, training-data collection and persistence did not work at all, and Smart picked nodes by URL test latency only.
@@ -74,7 +90,7 @@ Content in the old documentation that did not match the source code:
 |---|---|
 | Fields `tolerance`, `idle_timeout` | Not supported by Smart; setting them causes a config error |
 | 11 sorting algorithms | 10 |
-| LightGBM uses 27+ features, combined with the traditional weights | 35 dimensions; the model output replaces the traditional formula directly |
+| LightGBM uses 27+ features, combined with the traditional weights | Values are taken by the model's feature names from 38 features (the default model uses 30); the model output replaces the traditional formula directly |
 | Recognizes 22 kinds of fatal errors | 7 reset substrings + system error codes; after the first byte, another 26 substrings and GOAWAY rules |
 | A stall is declared after 30 seconds without data after the first byte | A stall is declared only after 60 seconds with no response at all after a write; idle connections are not affected |
 | Linear weight reduction + a cooldown of 30 minutes or more | A single failure makes the node unavailable for 3 minutes; the circuit breaker starts at 15 seconds; a block of 93 minutes or more only after 30 accumulated failures |

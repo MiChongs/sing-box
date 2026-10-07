@@ -1,12 +1,12 @@
 ---
 title: LightGBM 模型
-description: 用预训练的 LightGBM 模型代替传统公式为节点评分：模型下载与加载、35 维特征、推理缓存、训练数据采集与自行训练。
+description: 用预训练的 LightGBM 模型代替传统公式为节点评分：模型下载与加载、支持的模型格式、按名称匹配的特征、推理缓存、训练数据采集与自行训练。
 ---
 
 import Callout from '../../../components/Callout.astro';
 import CodeBlock from '../../../components/CodeBlock.astro';
 import FeatureTable from '../../../components/FeatureTable.astro';
-import { csvColumns } from '../../../data/lightgbm';
+import { csvColumns, defaultModelInputs } from '../../../data/lightgbm';
 import example from '../../../examples/03-lightgbm.json?raw';
 
 ## 启用
@@ -15,22 +15,48 @@ import example from '../../../examples/03-lightgbm.json?raw';
 
 <CodeBlock code={example} filename="03-lightgbm.json" locale="zh" />
 
-- 第一次启用时，模型文件不存在，Smart 在后台下载默认模型 `Model-large.bin`（来自 vernesong/mihomo 的发布页）到数据目录下的 `smart_lgbm_model.bin`。即使 `auto_update` 为 `false`，缺失的模型也会下载一次。
+- 第一次启用时，模型文件不存在，Smart 在后台下载默认模型 `Model-large.bin`（来自 vernesong/mihomo 的发布页）到数据目录下的 `smart_lgbm_model.bin`。即使 `auto_update` 为 `false`，缺失的模型也会下载，失败时按 30 秒起、最长 30 分钟的间隔重试。
+- `auto_update` 为 `false` 时，已存在的模型文件不会再被下载，即使它无法使用。要重新下载，删除该文件后重启。
 - `auto_update: true` 时每隔 `update_interval`（默认 72 小时）借助 ETag / Last-Modified 检查更新，下载成功后热加载，无需重启。
-- 下载的出站由 `http_client` 的出站或 `download_detour` 决定，建议指向 `direct` 或一个稳定节点。`http_client` 中除出站以外的设置会被忽略。
-- 模型下载完成之前，启动日志显示 `ml=pending`，权重继续由传统公式计算。
+- 下载使用 `http_client` 的全部设置：出站与其他拨号选项、TLS、请求头、HTTP 版本。没有 `http_client` 时使用 `download_detour`，都没有则使用默认 HTTP 客户端（`route.default_http_client`）。建议让下载经过 `direct` 或一个稳定节点。
+- 模型下载完成之前，启动日志显示 `ml=pending`，权重继续由传统公式计算。模型文件存在但无法使用时显示 `ml=unusable`，见下一节。
 
 没有任何组设置 `use_lightgbm` 时，模型不会被加载或下载。
+
+## 模型格式
+
+支持 LightGBM 的文本格式模型，即 `save_model` 输出的文件，格式版本 v2 到 v4，包括 LightGBM 4.x 的线性树（`linear_tree`）。
+
+模型的每个输入按文件中的 `feature_names` 与[下表](#特征)的特征名匹配，与顺序无关。默认模型 `Model-large.bin` 使用其中 30 个，顺序如下：
+
+<ol class="not-prose my-6 grid gap-x-6 gap-y-1 rounded-card bg-surface px-4 py-3 shadow-ring sm:grid-cols-2">
+  {defaultModelInputs.map((name, i) => (
+    <li class="flex gap-2 text-[0.85rem]">
+      <span class="w-5 shrink-0 text-right font-mono text-[0.8rem] text-subtle">{i}</span>
+      <code class="break-all font-mono text-[0.82rem] text-accent">{name}</code>
+    </li>
+  ))}
+</ol>
+
+训练时没有指定特征名的模型（特征名为 `Column_0`、`Column_1` …）按 35 维特征的顺序逐位读取；如果附带的 `[transforms]` 块在 `[order]` 中给出了名称，则按这些名称匹配。
+
+以下模型会被拒绝：
+
+- 使用了下表之外的特征名；
+- 没有特征名，且输入超过 35 个；
+- `[transforms]` 的 `[order]` 与 `feature_names` 不一致，或缩放的特征序号超出模型的输入个数。
+
+被拒绝时，日志记录一条 `lightgbm: cannot use model ...` 的 WARN 并给出原因，启动日志显示 `ml=unusable`，权重由传统公式计算。自动更新下载的新模型被拒绝时，已加载的模型继续使用。
 
 ## 模型如何参与选路
 
 模型不与传统公式混合，而是**直接替代**它：
 
-1. 连接关闭后，Smart 为该（目标, 节点）组装 35 维特征向量，交给模型预测；
+1. 连接关闭后，Smart 按模型的特征名为该（目标, 节点）组装输入向量，交给模型预测；
 2. 预测值乘以优先级系数（`policy_priority`、手动指定学习加成、手动指定期间的 1.15）作为本次权重；
 3. 与旧权重平滑合并后保存，此后的选路流程与传统公式完全相同：权重低于 0.4 的节点不会被选中。
 
-以下情况退回传统公式：模型未加载、特征为空、预测出错、结果为 NaN 或不大于 0。同一（目标, 节点）样本少于 2 个时不预测。
+以下情况退回传统公式：模型未加载、预测出错、结果为 NaN 或不大于 0。同一（目标, 节点）样本少于 2 个时不预测。
 
 预测结果按 `节点|目标`（UDP 再加 `|u`）缓存 30 秒，高并发时同一组合不会重复推理。缓存保存的是乘系数之前的值，所以修改 `policy_priority` 立即生效。
 
@@ -38,15 +64,17 @@ import example from '../../../examples/03-lightgbm.json?raw';
 
 ## 特征
 
-特征顺序是模型的输入约定，与 mihomo 的 27 维特征完全一致，并在其后追加了 8 维。旧的 27 维模型仍可使用：向量会被截断到模型声明的特征数。
+Smart 能计算下表的 38 个特征，模型按特征名从中选用。编号是 35 维特征中的位置，也是训练数据 CSV 中的列号：第 0–26 维与 mihomo 的 27 维特征相同，第 27–34 维为本分支新增，标 `+` 的 3 个特征不在 35 维中，只能按名称使用。
 
 <FeatureTable lang="zh" />
 
-第 0–26 维与 mihomo 相同，第 27–34 维为本分支新增。几点说明：
+几点说明：
 
 - 第 16、23 维依赖 `use_asn`；第 17、26 维依赖国家数据库（`experimental.geox.url.mmdb`，或自动下载的 `country.mmdb`）。
 - 第 29、30 维来自内存中的滑动平均，重启后需要重新积累。
 - 第 32、34 维来自最近一次健康检查探测；TCP 重传次数只在 Linux 与 Android 上可读。
+- `loss_rate` 与 `cumul_loss_rate` 在连接关闭时读取底层 TCP 连接的发送与重传计数：Linux、Android、macOS、iOS 按报文段计算，FreeBSD 与 Windows 按字节计算。经 QUIC 等 UDP 传输的节点没有这两项，取值为 0。
+- `duration_minutes` 的含义随模型而定：模型同时使用 `history_duration_minutes` 时（如默认模型），它表示本次连接的时长，平均时长由 `history_duration_minutes` 提供；否则表示平均时长。
 
 ## 采集训练数据
 
@@ -55,9 +83,9 @@ import example from '../../../examples/03-lightgbm.json?raw';
 - 文件：`experimental.smart.collector.path`，默认数据目录下的 `smart_weight_data.csv`。
 - 写入：每 100 行或每 30 秒刷新一次。统计队列繁忙时样本可能被丢弃。
 - 上限：`size_limit_mb`（默认 100 MB），达到后停止写入并记录一次 WARN，不会轮转；删除或截短文件后 30 秒内自动恢复。
-- 表头：首行是 60 个列名。已有文件的表头与当前格式不一致时（包括 2026-10-07 之前版本写出的 37 列表头），文件会被改名为 `<path>.bak.<时间戳>` 备份，然后新建；空文件会补写表头。
+- 表头：首行是 63 个列名。已有文件的表头与当前格式不一致时（包括之前版本写出的 37 列与 60 列表头），文件会被改名为 `<path>.bak.<时间戳>` 备份，然后新建；空文件会补写表头。
 
-每行 60 列，表头列名如下：
+每行 63 列，表头列名如下：
 
 <div class="not-prose my-6 overflow-hidden rounded-card bg-surface shadow-ring">
   {csvColumns.map((c) => (
@@ -72,7 +100,7 @@ import example from '../../../examples/03-lightgbm.json?raw';
 </div>
 
 <Callout type="note" title="旧版本的备份文件">
-  2026-10-07 之前的版本写出的表头只有 37 个列名，从第 28 列起与数据错位。被改名为 `.bak.<时间戳>` 的这类旧文件，数据行格式与现在相同，读取时请跳过首行、按上表的列序号取值。
+  被改名为 `.bak.<时间戳>` 的旧文件有两种：表头有 60 个列名的（格式版本 `4`）可以直接按列名读取，只是没有第 59–61 列；表头只有 37 个列名的（2026-10-07 之前的版本），从第 28 列起与数据错位，读取时请跳过首行、按上表第 0–58 列的序号取值。
 </Callout>
 
 ## 自行训练
@@ -84,7 +112,7 @@ import pandas as pd
 import lightgbm as lgb
 
 df = pd.read_csv("smart_weight_data.csv")
-X = df.iloc[:, 0:35].astype(float)   # 第 0–34 列：特征
+X = df.iloc[:, 0:35].astype(float)   # 第 0–34 列：35 维特征，列名即特征名
 y = df["weight"].astype(float)       # 权重标签
 
 booster = lgb.train(
@@ -97,9 +125,18 @@ booster.save_model("smart_lgbm_model.bin")   # LightGBM 文本格式
 
 把生成的文件放到 `model_path`，并关闭 `auto_update`，以免被默认模型覆盖。
 
+DataFrame 的列名会写入模型的 `feature_names`，Smart 按这些名称取值，所以可以自由挑选、重排特征列，只要列名都在[特征表](#特征)中。例如加入第 59–61 列、训练与默认模型相同的布局时，先把两列时长改名，使 `duration_minutes` 表示本次连接时长：
+
+```python
+df = df.rename(columns={"duration_minutes": "history_duration_minutes",
+                        "current_duration_minutes": "duration_minutes"})
+X = df[["success", "failure", "connect_time", "latency", "duration_minutes",
+        "history_duration_minutes", "loss_rate", "cumul_loss_rate"]].astype(float)
+```
+
 需要注意：
 
 - **标签就是当时的权重**。直接用采集到的 `weight` 训练，模型学到的只是现有公式（或现有模型）的输出。要让模型更好，需要自己构造标签，例如结合连接是否成功、吞吐与时长。
 - 预测值会被直接当作权重使用，低于 0.4 的节点不会被选中，所以标签的数值范围应与传统权重相近（大多在 0.1–2 之间）。
-- 模型文件末尾可以附带 mihomo 格式的 `[transforms]` 块（StandardScaler 或 RobustScaler），在推理前对特征做缩放；校验失败时忽略该块，模型照常加载。
-- 训练 35 维以外的特征需要修改源码中的特征提取与 `MaxFeatureSize`，并重新编译。
+- 模型文件末尾可以附带 mihomo 格式的 `[transforms]` 块（StandardScaler 或 RobustScaler），在推理前对特征做缩放。它必须位于文件的最后 16 KB 内；序号指模型输入的位置，与 `feature_names` 的顺序一致。校验失败的模型会被拒绝，见[模型格式](#模型格式)。
+- 模型只能使用特征表中的 38 个特征名。使用其他特征需要在源码中加入它的计算（`common/smart/lightgbm/layout.go`）并重新编译。

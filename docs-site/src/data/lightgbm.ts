@@ -1,12 +1,16 @@
-// LightGBM feature vector (common/smart/lightgbm/features.go PrepareFeatures,
-// names from transform.go getDefaultFeatureOrder) and collector CSV tail
-// columns (collector.go). Index order is the model contract.
+// LightGBM feature catalog (common/smart/lightgbm/features.go fillCatalog,
+// names from transform.go getDefaultFeatureOrder and layout.go
+// featureSlots) and collector CSV columns (collector.go). Models pick
+// catalog features by the names in their feature_names; `i` is the
+// position in the 35-feature layout that unnamed models and the CSV use.
 
 export interface Feature {
   i: number;
   name: string;
   zh: string;
   en: string;
+  // Only reachable by name: not part of the 35-feature layout.
+  extra?: boolean;
 }
 
 export const features: Feature[] = [
@@ -22,7 +26,7 @@ export const features: Feature[] = [
   { i: 9, name: 'history_download_mb', zh: 'log1p(此前累计下载 MB)', en: 'log1p(download before this connection, MB)' },
   { i: 10, name: 'maxdownloadrate_kb', zh: 'log1p(本次峰值下载 KB/s)', en: 'log1p(peak download this connection, KB/s)' },
   { i: 11, name: 'history_maxdownloadrate_kb', zh: 'log1p(历史峰值下载 KB/s)', en: 'log1p(historical peak download, KB/s)' },
-  { i: 12, name: 'duration_minutes', zh: 'log1p(平均连接时长 分钟)', en: 'log1p(average connection duration, minutes)' },
+  { i: 12, name: 'duration_minutes', zh: 'log1p(平均连接时长 分钟)。模型同时使用 `history_duration_minutes` 时（如默认模型），改为 log1p(本次连接时长 分钟)', en: 'log1p(average connection duration, minutes). When the model also uses `history_duration_minutes` (as the default model does), log1p(duration of this connection, minutes) instead' },
   { i: 13, name: 'last_used_seconds', zh: 'log1p(距上次使用的秒数)', en: 'log1p(seconds since previous use)' },
   { i: 14, name: 'is_udp', zh: '是否 UDP（0/1）', en: 'UDP (0/1)' },
   { i: 15, name: 'is_tcp', zh: '是否 TCP（0/1）', en: 'TCP (0/1)' },
@@ -44,7 +48,20 @@ export const features: Feature[] = [
   { i: 31, name: 'active_conns', zh: 'log1p(节点当前活跃连接数)', en: 'log1p(live connections on the node)' },
   { i: 32, name: 'tls_handshake_time', zh: 'log1p(最近一次探测的 TLS 握手耗时)', en: 'log1p(TLS handshake time of the last probe)' },
   { i: 33, name: 'hour_bucket', zh: '本地小时 / 24', en: 'Local hour / 24' },
-  { i: 34, name: 'tcp_retransmissions', zh: 'log1p(TCP 重传次数)，仅 Linux / Android', en: 'log1p(TCP retransmissions); Linux / Android only' },
+  { i: 34, name: 'tcp_retransmissions', zh: 'log1p(最近一次探测的 TCP 重传次数)，仅 Linux / Android', en: 'log1p(TCP retransmissions of the last probe); Linux / Android only' },
+  { i: 35, extra: true, name: 'history_duration_minutes', zh: 'log1p(平均连接时长 分钟)', en: 'log1p(average connection duration, minutes)' },
+  { i: 36, extra: true, name: 'loss_rate', zh: '本次连接的 TCP 重传率（0–1）', en: 'TCP retransmission rate of this connection (0–1)' },
+  { i: 37, extra: true, name: 'cumul_loss_rate', zh: '该（目标, 节点）所有连接累计的 TCP 重传率（0–1），保存在缓存文件中', en: 'TCP retransmission rate accumulated over all connections of the (destination, node) pair (0–1), kept in the cache file' },
+];
+
+// Input order of the default model, vernesong/mihomo's Model-large.bin.
+export const defaultModelInputs = [
+  'success', 'failure', 'connect_time', 'latency', 'upload_mb', 'history_upload_mb',
+  'maxuploadrate_kb', 'history_maxuploadrate_kb', 'download_mb', 'history_download_mb',
+  'maxdownloadrate_kb', 'history_maxdownloadrate_kb', 'duration_minutes', 'history_duration_minutes',
+  'last_used_seconds', 'is_udp', 'is_tcp', 'loss_rate', 'cumul_loss_rate', 'asn_feature',
+  'country_feature', 'address_feature', 'port_feature', 'traffic_ratio', 'traffic_density',
+  'connection_type_feature', 'asn_hash', 'host_hash', 'ip_hash', 'geoip_hash',
 ];
 
 export interface Column {
@@ -71,9 +88,16 @@ export const csvColumns: Column[] = [
     en: 'Latency std-dev delta, connect std-dev delta, active connections, TLS session resumed, DNS time, TLS handshake time, HTTP/3 fallback count, model confidence, hour (0–23). A `_raw` suffix marks the untransformed value of the feature with the same name',
   },
   {
-    range: '54–59',
-    name: 'tcp_retransmissions_raw, tcp_losses, path_mtu, long_rtt, long_success_rate, schema_version',
-    zh: 'TCP 重传、TCP 丢包、路径 MTU、长期 RTT、长期成功率、格式版本（固定为 `4`）',
-    en: 'TCP retransmissions, TCP losses, path MTU, long-term RTT, long-term success rate, schema version (always `4`)',
+    range: '54–58',
+    name: 'tcp_retransmissions_raw, tcp_losses, path_mtu, long_rtt, long_success_rate',
+    zh: 'TCP 重传、TCP 丢包、路径 MTU、长期 RTT、长期成功率',
+    en: 'TCP retransmissions, TCP losses, path MTU, long-term RTT, long-term success rate',
   },
+  {
+    range: '59–61',
+    name: 'current_duration_minutes, loss_rate, cumul_loss_rate',
+    zh: '不在 35 维中的特征，取值与模型输入相同：log1p(本次连接时长 分钟)、本次连接的 TCP 重传率、累计 TCP 重传率',
+    en: 'Features outside the 35, with the values the model receives: log1p(duration of this connection, minutes), TCP retransmission rate of this connection, accumulated TCP retransmission rate',
+  },
+  { range: '62', name: 'schema_version', zh: '格式版本，固定为 `5`，始终是最后一列', en: 'Format version, always `5`, and always the last column' },
 ];

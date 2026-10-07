@@ -45,7 +45,7 @@ import ex6 from '../../../examples/06-nested.json?raw';
 <CodeBlock code={ex4} filename="04-asn-geox.json" locale="zh" />
 
 - GeoX 下载 ASN 与国家数据库，每周更新一次；ASN 数据库被 `use_asn` 使用，国家数据库被 LightGBM 使用。
-- 全新安装时首次下载需要时间，**下载完成后重启一次** ASN 才会生效，见 [ASN 与 GeoX](../asn-geox/#experimentalgeox)。
+- 全新安装时首次下载需要时间，下载完成后 ASN 自动生效，无需重启，见 [ASN 与 GeoX](../asn-geox/#experimentalgeox)。
 - 只想用本地文件时，去掉 `geox`，在组内写 `"asn_database": "/path/to/GeoLite2-ASN.mmdb"`。
 
 ## 按流量类型分组

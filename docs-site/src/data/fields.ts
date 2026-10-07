@@ -115,8 +115,8 @@ export const learningFields: Field[] = [
     name: 'use_lightgbm',
     type: 'bool',
     default: 'false',
-    zh: '使用 `experimental.smart.lightgbm` 中的共享 LightGBM 模型为节点评分。模型尚未下载或加载失败时自动退回传统权重公式。启动日志中的 `ml=loaded|pending|off` 显示模型状态。详见 [LightGBM 模型](/zh/lightgbm/)。',
-    en: 'Scores nodes with the shared LightGBM model from `experimental.smart.lightgbm`. While the model is not downloaded or fails to load, the classic weight formula is used. The startup log shows the model state as `ml=loaded|pending|off`. See [LightGBM model](/en/lightgbm/).',
+    zh: '使用 `experimental.smart.lightgbm` 中的共享 LightGBM 模型为节点评分。模型尚未下载或加载失败时自动退回传统权重公式。启动日志中的 `ml=loaded|pending|unusable|off` 显示模型状态。详见 [LightGBM 模型](/zh/lightgbm/)。',
+    en: 'Scores nodes with the shared LightGBM model from `experimental.smart.lightgbm`. While the model is not downloaded or fails to load, the classic weight formula is used. The startup log shows the model state as `ml=loaded|pending|unusable|off`. See [LightGBM model](/en/lightgbm/).',
   },
   {
     name: 'collect_data',
@@ -192,8 +192,8 @@ export const lightgbmFields: Field[] = [
     name: 'auto_update',
     type: 'bool',
     default: 'false',
-    zh: '开启后，模型缺失时立即下载，之后每隔 `update_interval` 借助 ETag / Last-Modified 检查更新，下载成功后热加载。关闭时，模型文件缺失也会在后台下载一次；文件已存在则不再更新。',
-    en: 'When on, a missing model is downloaded at once, then updates are checked every `update_interval` using ETag / Last-Modified, and a new model is hot-reloaded. When off, a missing model is still downloaded once in the background; an existing file is never updated.',
+    zh: '开启后，模型缺失时立即下载，之后每隔 `update_interval` 借助 ETag / Last-Modified 检查更新，下载成功后热加载。关闭时，模型文件缺失也会在后台下载一次；文件已存在则不再下载，即使它无法使用。',
+    en: 'When on, a missing model is downloaded at once, then updates are checked every `update_interval` using ETag / Last-Modified, and a new model is hot-reloaded. When off, a missing model is still downloaded once in the background; an existing file is never downloaded again, even if it cannot be used.',
   },
   {
     name: 'update_interval',
@@ -205,14 +205,14 @@ export const lightgbmFields: Field[] = [
   {
     name: 'http_client',
     type: 'string | object',
-    zh: '下载使用的 HTTP 客户端，可写客户端标签或内联对象。**只有其中的出站（detour）会被采用**，TLS、请求头等其他设置会被忽略。',
-    en: 'HTTP client for the download, as a client tag or an inline object. **Only its detour is used**; TLS, headers and other settings are ignored.',
+    zh: '下载使用的 HTTP 客户端，可写 `http_clients` 中的标签或内联对象，其中的全部设置都会生效：出站与其他拨号选项、TLS、请求头、HTTP 版本。未设置时使用 `download_detour`，两者都没有则使用默认 HTTP 客户端（`route.default_http_client`）。',
+    en: 'HTTP client for the download, as a tag from `http_clients` or an inline object. All of its settings apply: the outbound and other dial options, TLS, headers and HTTP version. Without it, `download_detour` is used, and without either, the default HTTP client (`route.default_http_client`).',
   },
   {
     name: 'download_detour',
     type: 'string',
-    zh: '`http_client` 未指定出站时使用的下载出站。标签不存在时记录 `lightgbm: detour=[X] not found; using direct` 并改用直连。',
-    en: 'Download outbound used when `http_client` gives no detour. An unknown tag logs `lightgbm: detour=[X] not found; using direct` and falls back to a direct connection.',
+    zh: '旧字段：未设置 `http_client` 时，经这个出站下载。同时设置时忽略它并记录一条 WARN。出站不存在时下载失败，日志记录 `outbound detour not found`。',
+    en: 'Legacy field: without `http_client`, downloads go through this outbound. When both are set, it is ignored with a WARN. If the outbound does not exist, the download fails and the log shows `outbound detour not found`.',
   },
 ];
 
@@ -238,8 +238,8 @@ export const geoxFields: Field[] = [
     name: 'enabled',
     type: 'bool',
     default: 'false',
-    zh: '总开关。关闭时不下载任何文件，Smart 也不会从这里取得数据库路径。',
-    en: 'Master switch. When off, nothing is downloaded and Smart gets no database paths from here.',
+    zh: '总开关。关闭时不下载 `url` 中的文件，Smart 也不会从这里取得数据库路径。Smart 需要的默认 ASN、国家数据库不受此开关影响，仍由 GeoX 按本节的下载设置下载。',
+    en: 'Master switch. When off, the files under `url` are not downloaded and Smart gets no database paths from here. The default ASN and country databases Smart needs are not affected: GeoX still downloads them with the download settings in this section.',
   },
   {
     name: 'url.asn',
@@ -269,8 +269,8 @@ export const geoxFields: Field[] = [
     name: 'auto_update',
     type: 'bool',
     default: 'false',
-    zh: '开启后按 `update_interval` 定期更新每个已配置地址的文件；关闭时只在文件缺失时下载一次。',
-    en: 'When on, every configured file is refreshed every `update_interval`; when off, a file is downloaded once only if it is missing.',
+    zh: '开启后按 `update_interval` 定期更新每个文件；关闭时只在文件缺失时下载，已有的文件不再更新。缺失文件下载失败时，按 30 秒起、逐次翻倍、最长 30 分钟的间隔重试。mmdb 更新后立即重新加载，无需重启。',
+    en: 'When on, every file is refreshed every `update_interval`; when off, a file is downloaded only while it is missing, and an existing file is never updated. A failed download of a missing file is retried after 30 seconds, doubling up to 30 minutes. An updated mmdb is reloaded at once, with no restart.',
   },
   {
     name: 'update_interval',
@@ -282,8 +282,8 @@ export const geoxFields: Field[] = [
   {
     name: 'http_client / download_detour',
     type: 'string | object',
-    zh: '下载使用的出站，规则与 `experimental.smart.lightgbm` 相同：只采用 `http_client` 的出站，未指定时使用 `download_detour`。',
-    en: 'Download outbound, with the same rules as `experimental.smart.lightgbm`: only the `http_client` detour is used, falling back to `download_detour`.',
+    zh: '下载使用的 HTTP 客户端，规则与 `experimental.smart.lightgbm` 相同：`http_client` 的全部设置都会生效，未设置时使用 `download_detour`，都没有则使用默认 HTTP 客户端。`http_client` 引用的标签不存在时，GeoX 启用则启动失败，未启用则只有默认数据库无法下载并记录 WARN。',
+    en: 'HTTP client for downloads, with the same rules as `experimental.smart.lightgbm`: all `http_client` settings apply; without it `download_detour` is used, and without either the default HTTP client. An `http_client` tag that does not exist fails startup when GeoX is enabled; otherwise only the default databases cannot be downloaded, with a WARN.',
   },
 ];
 

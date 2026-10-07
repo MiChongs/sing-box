@@ -79,6 +79,7 @@ smart[auto] started: 42 outbounds, 12 background tasks, testURL=https://www.gsta
 |---|---|
 | `ml=off` | 本组没有设置 `use_lightgbm` |
 | `ml=pending` | 已启用，模型正在下载或尚未加载，暂时使用传统权重公式 |
+| `ml=unusable` | 已启用，但模型文件无法使用（格式或特征不受支持），使用传统权重公式，原因见 WARN 日志 |
 | `ml=loaded` | 模型已加载 |
 
 如果看到 `smart: no cache file available, using ephemeral store`，说明 Smart 没有拿到缓存文件，请检查 `experimental.cache_file`。

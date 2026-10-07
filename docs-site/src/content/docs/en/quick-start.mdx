@@ -79,6 +79,7 @@ Use this line to confirm the algorithm: a mistyped `algorithm` does not cause an
 |---|---|
 | `ml=off` | `use_lightgbm` is not set for this group |
 | `ml=pending` | Enabled, but the model is still downloading or not yet loaded. The traditional weight formula is used in the meantime |
+| `ml=unusable` | Enabled, but the model file cannot be used (unsupported format or features). The traditional weight formula is used; a WARN log gives the reason |
 | `ml=loaded` | The model is loaded |
 
 If you see `smart: no cache file available, using ephemeral store`, Smart did not get a cache file. Check `experimental.cache_file`.

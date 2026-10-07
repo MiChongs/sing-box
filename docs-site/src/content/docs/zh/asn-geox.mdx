@@ -3,7 +3,6 @@ title: ASN 与 GeoX
 description: 开启 use_asn 后 Smart 如何按目标所属自治系统汇总学习结果，ASN 与国家数据库从哪里来，以及 experimental.geox 的下载与生效时机。
 ---
 
-import Callout from '../../../components/Callout.astro';
 import CodeBlock from '../../../components/CodeBlock.astro';
 import example from '../../../examples/04-asn-geox.json?raw';
 
@@ -32,21 +31,19 @@ import example from '../../../examples/04-asn-geox.json?raw';
 
 1. 本组的 `asn_database`：路径按原样使用，不拼接数据目录。图形客户端中相对路径相对于进程工作目录，请写绝对路径。
 2. `experimental.geox.url.asn` 下载到数据目录的文件（需要 `geox.enabled: true`）。
-3. 都没有时，自动下载 `https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb` 到数据目录下的 `GeoLite2-ASN.mmdb`。
+3. 都没有时，使用默认数据库 `https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb`，由 GeoX 下载到数据目录下的 `GeoLite2-ASN.mmdb`。
 
 列出多个数据库时全部打开，查询时依次尝试，取第一个非零结果；打开失败的会被跳过。数据库需要是 MaxMind GeoLite2-ASN 格式（记录中有 `autonomous_system_number` 字段），字段不同的数据库（例如 IPinfo 的 ASN 库）查不到结果。
 
-<Callout type="warn" title="不要依赖第 3 种方式">
-  自动下载在启动过程中**同步**进行，总是走直连，最长等待 90 秒，而且**每次启动都会重新下载**。下载失败时，即使磁盘上有旧文件，本次运行也会禁用 ASN。建议用 `asn_database` 或 `geox.url.asn` 显式提供数据库。
-</Callout>
+第 2、3 种数据库都由 GeoX 下载，使用 `experimental.geox` 中的 `http_client`、`auto_update` 与 `update_interval`（默认数据库在 GeoX 未启用时同样如此）。下载在后台进行，不阻塞启动；已有的文件会直接使用，不会在每次启动时重新下载。
 
-数据库读取器在多个组之间共享，但每个组只在启动时打开一次：数据库更新后要重启才会生效。
+数据库读取器在多个组之间共享。GeoX 下载或更新数据库后立即重新加载，所有组随即使用新数据，无需重启；启动时还没下载好的数据库，下载完成后也会自动启用，启动日志中此时显示 `asn=on(downloading)`。`asn_database` 指定的本地文件只在启动时读取，替换后需要重启。
 
 ## 国家数据库
 
-LightGBM 的国家特征（第 17、26 维）需要国家数据库。Smart 优先使用 `experimental.geox.url.mmdb` 下载的 `country.mmdb`；没有配置时，启动时检查数据目录下的 `country.mmdb`，缺失则从 P3TERX 的发布页下载 GeoLite2-Country。
+LightGBM 的国家特征（第 17、26 维）需要国家数据库。Smart 优先使用 `experimental.geox.url.mmdb` 下载的 `country.mmdb`；没有配置时使用默认的 GeoLite2-Country（来自 P3TERX 的发布页），由 GeoX 下载到数据目录下的 `country.mmdb`。与 ASN 数据库一样，下载或更新后立即生效。
 
-只有开启了 `use_lightgbm` 或 `collect_data` 的组才会查询国家。
+只有开启了 `use_lightgbm` 或 `collect_data` 的组才会打开国家数据库并查询国家。
 
 ## experimental.geox
 
@@ -54,22 +51,21 @@ GeoX 统一管理地理数据文件的下载与更新，目前唯一的使用者
 
 <CodeBlock code={example} filename="04-asn-geox.json" locale="zh" />
 
-- `enabled: false` 时不下载任何文件，Smart 也拿不到这里的路径。
-- 没有默认下载地址，只下载填写了 URL 的文件。
+- `enabled: false` 时不下载 `url` 中的文件，Smart 也拿不到这里的路径；Smart 需要的默认数据库仍按本节的下载设置下载。
+- `url` 没有默认值，只下载填写了地址的文件。
 - 文件名固定：`GeoLite2-ASN.mmdb`（填写多个 ASN 地址时，第一个仍为 `GeoLite2-ASN.mmdb`，之后依次为 `GeoLite2-ASN-1.mmdb`、`GeoLite2-ASN-2.mmdb`……）、`country.mmdb`、`geoip.dat`、`geosite.dat`。`geoip.dat` 与 `geosite.dat` 目前没有组件使用。
-- `auto_update: true` 时每个文件按 `update_interval` 定期更新；否则只在文件缺失时下载一次。
-
-<Callout type="note" title="第一次运行要重启一次">
-  GeoX 在启动时异步下载，而 Smart 在启动完成时打开数据库。全新安装时文件通常还没下载好，日志会出现 `smart: use_asn is true but no ASN database available; ASN features disabled`。等下载完成后重启一次即可。
-</Callout>
+- `auto_update: true` 时每个文件按 `update_interval` 定期更新；否则只在文件缺失时下载，已有的文件不再更新。
+- 缺失文件下载失败时（例如开机时网络尚未就绪），按 30 秒起、逐次翻倍、最长 30 分钟的间隔重试，直到成功。
+- 下载使用 `http_client` 的全部设置：出站与其他拨号选项、TLS、请求头、HTTP 版本。没有 `http_client` 时使用 `download_detour`，都没有则使用默认 HTTP 客户端（`route.default_http_client`）。
 
 ## 相关日志
 
 | 日志 | 含义 |
 |---|---|
 | `smart: ASN database loaded from <path>` | 数据库已打开 |
-| `smart: ASN database not configured per-group; using ...` | 使用 GeoX 提供的数据库 |
-| `smart: no ASN database configured; auto-downloading default` | 正在自动下载默认数据库 |
+| `smart: ASN database not configured per-group; using ...` | 使用 GeoX 下载的 `url.asn` 数据库 |
+| `smart: no ASN database configured; using the default database GeoX keeps at <path>` | 使用默认数据库 |
+| `smart: ASN database <path> is downloading; it is used once the download completes` | 数据库还在下载，完成后自动启用 |
 | `smart: failed to open ASN database [<path>] ...` | 某个数据库打开失败，其余继续尝试 |
-| `smart: all configured ASN databases failed to open; ASN features disabled` | 全部打开失败 |
-| `smart: use_asn is true but no ASN database available; ASN features disabled` | 没有可用数据库 |
+| `geox: reloaded <name> from <path>` | 下载或更新完成，数据库已重新加载 |
+| `assetdl[<name>]: download failed, retrying in <间隔>: ...` | 缺失文件下载失败，稍后重试 |
