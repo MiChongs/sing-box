@@ -1,9 +1,9 @@
 {
   "name": "sing-box-xiaobaf14g-docs",
   "type": "module",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "GitHub Pages site for the sing-box xiaobaf14g fork's Smart outbound feature",
+  "description": "Bilingual docs site for the Smart outbound group of the sing-box xiaobaf14g fork",
   "scripts": {
     "dev": "astro dev",
     "build": "astro build",

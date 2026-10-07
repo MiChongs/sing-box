@@ -1,118 +1,60 @@
 ---
 import { codeToHtml } from 'shiki';
+import { ui } from '../i18n/ui';
+import type { Lang } from '../data/nav';
 
-// Build-time syntax highlighting via Shiki. The component owns the
-// outer chrome (filename header, lang chip, copy button, scroll frame);
-// global.css strips Shiki's own padding/background so nothing fights.
-//
-// Visual anatomy (top to bottom):
-//
-//   ┌─ figure.code-block (bg-ivory, rounded-14, shadow-ring-1) ────────┐
-//   │  ┌ figcaption ─ traffic dots · LANG chip · filename? · Copy btn ┐│
-//   │  ├──────────────────────────────────────────────────────────────┤│
-//   │  │ div.code-scroll (max-h + auto, custom warm scrollbar)        ││
-//   │  │   <pre class="astro-code"> Shiki HTML </pre>                 ││
-//   │  └──────────────────────────────────────────────────────────────┘│
-//   └──────────────────────────────────────────────────────────────────┘
+// Build-time highlighted block with a file-name header and copy button.
+// Used for whole example files; inline Markdown fences get a lighter
+// frame from DocsLayout instead.
 
 export interface Props {
   code: string;
   lang?: string;
   filename?: string;
-  copy?: boolean;
-  /**
-   * Clamp overly long snippets to a max height with inner scroll.
-   * Pass false for short (~≤ 20 line) blocks so they don't show a
-   * pointless "scrollable" affordance.
-   */
-  scroll?: boolean;
+  locale: Lang;
 }
 
-const { code, lang = 'json', filename, copy = true, scroll = true } = Astro.props;
-
-const html = await codeToHtml(code, {
+const { code, lang = 'json', filename, locale } = Astro.props;
+const t = ui[locale];
+const html = await codeToHtml(code.trimEnd(), {
   lang,
-  theme: 'github-light',
+  themes: { light: 'github-light', dark: 'github-dark' },
 });
-
-// Short languages (json, bash) read better uppercase; longer ones
-// (typescript, plaintext) get title-case so they don't scream.
-const langLabel =
-  lang.length <= 4 ? lang.toUpperCase() : lang.charAt(0).toUpperCase() + lang.slice(1);
 ---
 
-<figure class="code-block my-7 rounded-[14px] overflow-hidden bg-ivory shadow-ring-1 transition-shadow hover:shadow-ring-2">
-  <figcaption class="flex items-center gap-3 px-4 py-2.5 bg-warm-sand/60 border-b border-border-cream">
-    <!-- macOS-esque traffic-light dots, purely decorative, warm-tinted -->
-    <div class="flex gap-1.5" aria-hidden="true">
-      <span class="h-2.5 w-2.5 rounded-full bg-border-warm"></span>
-      <span class="h-2.5 w-2.5 rounded-full bg-ring-warm"></span>
-      <span class="h-2.5 w-2.5 rounded-full bg-warm-silver"></span>
-    </div>
-
-    <!-- Language chip: always visible so readers can tell JSON from bash at a glance -->
-    <span class="inline-flex items-center h-[22px] px-2 rounded-md bg-ivory shadow-ring-1 font-mono text-[10px] font-medium uppercase tracking-[0.08em] text-charcoal-warm">
-      {langLabel}
-    </span>
-
-    {filename ? (
-      <span class="font-mono text-caption-14 text-olive-gray truncate flex-1 min-w-0">
-        {filename}
-      </span>
-    ) : (
-      <span class="flex-1"></span>
-    )}
-
-    {copy && (
-      <button
-        type="button"
-        data-code={code}
-        class="copy-btn inline-flex items-center gap-1.5 h-7 px-2.5 rounded-md text-label-12 font-medium text-stone-gray hover:bg-ivory hover:text-terracotta transition-colors focus-ring"
-        aria-label="Copy code"
-      >
-        <svg aria-hidden="true" class="copy-icon h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="5" y="5" width="9" height="9" rx="1.5" />
-          <path d="M11 5V3.5A1.5 1.5 0 0 0 9.5 2H3.5A1.5 1.5 0 0 0 2 3.5v6A1.5 1.5 0 0 0 3.5 11H5" />
-        </svg>
-        <svg aria-hidden="true" class="check-icon hidden h-3.5 w-3.5" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M3 8.5 L6.5 12 L13 4" />
-        </svg>
-        <span class="copy-label">Copy</span>
-      </button>
-    )}
+<figure class="not-prose my-6 overflow-hidden rounded-card bg-surface shadow-ring">
+  <figcaption class="flex items-center gap-3 border-b border-line-soft bg-surface-2/50 px-4 py-2">
+    <span class="rounded bg-surface px-1.5 py-0.5 font-mono text-[0.68rem] font-medium uppercase tracking-wider text-muted shadow-ring">{lang}</span>
+    <span class="min-w-0 flex-1 truncate font-mono text-[0.82rem] text-muted">{filename}</span>
+    <button
+      type="button"
+      data-copy-block
+      data-label={t.copy}
+      data-done={t.copied}
+      data-fail={t.copyFailed}
+      class="rounded-md px-2 py-1 text-[0.78rem] text-muted hover:bg-surface hover:text-fg"
+    >
+      {t.copy}
+    </button>
   </figcaption>
-
-  <div class:list={['code-scroll relative', scroll && 'max-h-[40rem] overflow-auto']}>
+  <div class="scroll-thin max-h-[36rem] overflow-auto" data-code-src>
     <Fragment set:html={html} />
   </div>
 </figure>
 
 <script>
-  document.querySelectorAll<HTMLButtonElement>('.copy-btn').forEach((btn) => {
-    if (btn.dataset.wired === '1') return;
+  document.querySelectorAll<HTMLButtonElement>('[data-copy-block]').forEach((btn) => {
+    if (btn.dataset.wired) return;
     btn.dataset.wired = '1';
-    const labelEl = btn.querySelector<HTMLSpanElement>('.copy-label');
-    const copyIcon = btn.querySelector<SVGElement>('.copy-icon');
-    const checkIcon = btn.querySelector<SVGElement>('.check-icon');
-    if (!labelEl || !copyIcon || !checkIcon) return;
-    const original = labelEl.textContent ?? 'Copy';
     btn.addEventListener('click', async () => {
-      const code = btn.dataset.code ?? '';
+      const src = btn.closest('figure')?.querySelector<HTMLElement>('[data-code-src]');
       try {
-        await navigator.clipboard.writeText(code);
-        labelEl.textContent = 'Copied';
-        copyIcon.classList.add('hidden');
-        checkIcon.classList.remove('hidden');
-        btn.classList.add('text-terracotta');
+        await navigator.clipboard.writeText(src?.innerText ?? '');
+        btn.textContent = btn.dataset.done ?? 'Copied';
       } catch {
-        labelEl.textContent = 'Failed';
+        btn.textContent = btn.dataset.fail ?? 'Failed';
       }
-      setTimeout(() => {
-        labelEl.textContent = original;
-        copyIcon.classList.remove('hidden');
-        checkIcon.classList.add('hidden');
-        btn.classList.remove('text-terracotta');
-      }, 1400);
+      setTimeout(() => (btn.textContent = btn.dataset.label ?? 'Copy'), 1400);
     });
   });
 </script>

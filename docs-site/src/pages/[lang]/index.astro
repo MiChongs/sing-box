@@ -1,0 +1,102 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import CodeBlock from '../../components/CodeBlock.astro';
+import { landing } from '../../i18n/landing';
+import { href, langs } from '../../i18n/ui';
+import { inline } from '../../lib/inline';
+import type { Lang } from '../../data/nav';
+import minimal from '../../examples/01-minimal.json?raw';
+
+export function getStaticPaths() {
+  return langs.map((lang) => ({ params: { lang }, props: { lang } }));
+}
+
+const { lang } = Astro.props as { lang: Lang };
+const t = landing[lang];
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+
+const mark = (v: string) =>
+  v === '✓' ? 'text-ok font-semibold' : v === '—' ? 'text-subtle' : v === '△' ? 'text-muted' : 'text-fg-2';
+---
+
+<BaseLayout lang={lang} description={t.hero.subtitle}>
+  <div class="mx-auto max-w-page px-4 sm:px-6">
+    <!-- Hero -->
+    <section class="grid items-center gap-10 py-14 md:py-20 lg:grid-cols-[1.05fr_1fr]">
+      <div>
+        <p class="mb-4 text-[0.78rem] font-semibold uppercase tracking-[0.12em] text-accent">{t.hero.eyebrow}</p>
+        <h1 class="text-[2.3rem] leading-[1.12] sm:text-[3rem] lg:text-[3.4rem]">{t.hero.title}</h1>
+        <p class="mt-6 max-w-[38rem] text-[1.12rem] leading-relaxed text-muted" set:html={inline(t.hero.subtitle, base)} />
+        <div class="mt-8 flex flex-wrap gap-3">
+          <a href={href(lang, 'quick-start')} class="inline-flex items-center gap-2 rounded-card bg-accent-fill px-5 py-2.5 font-medium text-on-accent shadow-ring-2 hover:opacity-90">
+            {t.hero.primary} <span aria-hidden="true">→</span>
+          </a>
+          <a href={href(lang, 'how-it-works')} class="inline-flex items-center rounded-card bg-surface px-5 py-2.5 font-medium text-fg shadow-ring hover:shadow-ring-2">
+            {t.hero.secondary}
+          </a>
+        </div>
+      </div>
+      <div class="min-w-0">
+        <CodeBlock code={minimal} filename={t.hero.codeCaption} locale={lang} />
+      </div>
+    </section>
+
+    <!-- Capabilities -->
+    <section class="py-10">
+      <h2 class="text-[1.8rem] sm:text-[2.1rem]">{t.features.title}</h2>
+      <p class="mt-3 max-w-[44rem] text-muted">{t.features.lead}</p>
+      <div class="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+        {t.features.items.map((f) => (
+          <a href={href(lang, f.to)} class="group rounded-card bg-surface p-5 shadow-ring transition-shadow hover:shadow-lift">
+            <p class="font-serif text-[1.15rem] text-fg group-hover:text-accent">{f.title}</p>
+            <p class="mt-2 text-[0.93rem] leading-relaxed text-muted" set:html={inline(f.body, base)} />
+          </a>
+        ))}
+      </div>
+    </section>
+
+    <!-- Comparison -->
+    <section class="py-10">
+      <h2 class="text-[1.8rem] sm:text-[2.1rem]">{t.comparison.title}</h2>
+      <p class="mt-3 max-w-[44rem] text-muted">{t.comparison.lead}</p>
+      <div class="scroll-thin mt-8 overflow-x-auto rounded-card bg-surface shadow-ring">
+        <table class="w-full min-w-[40rem] text-[0.92rem]">
+          <thead>
+            <tr class="text-left">
+              {t.comparison.headers.map((h, i) => (
+                <th class:list={['px-4 py-3 font-semibold', i === 4 ? 'text-accent' : 'text-fg']}>{h}</th>
+              ))}
+            </tr>
+          </thead>
+          <tbody>
+            {t.comparison.rows.map((r) => (
+              <tr class="border-t border-line-soft align-top">
+                <td class="px-4 py-3 text-fg">{r[0]}</td>
+                {r.slice(1).map((v) => <td class={`px-4 py-3 ${mark(v)}`}>{v}</td>)}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-3 text-[0.82rem] text-subtle">{t.comparison.legend}</p>
+    </section>
+
+    <!-- Paths into the docs -->
+    <section class="py-10">
+      <h2 class="text-[1.8rem] sm:text-[2.1rem]">{t.paths.title}</h2>
+      <div class="mt-8 grid gap-4 md:grid-cols-3">
+        {t.paths.items.map((p) => (
+          <div class="rounded-card bg-surface p-5 shadow-ring">
+            <p class="font-serif text-[1.15rem] text-fg">{p.title}</p>
+            <p class="mt-2 text-[0.93rem] text-muted">{p.body}</p>
+            <ul class="mt-4 space-y-1.5 text-[0.93rem]">
+              {p.links.map((l) => (
+                <li><a href={href(lang, l.to)} class="hover:underline">{l.label} →</a></li>
+              ))}
+            </ul>
+          </div>
+        ))}
+      </div>
+    </section>
+  </div>
+</BaseLayout>

@@ -1,0 +1,37 @@
+{
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "HK",
+      "providers": ["my-subscription"],
+      "include": "香港|HK"
+    },
+    {
+      "type": "urltest",
+      "tag": "JP",
+      "providers": ["my-subscription"],
+      "include": "日本|JP"
+    },
+    {
+      "type": "urltest",
+      "tag": "US",
+      "providers": ["my-subscription"],
+      "include": "美国|US"
+    },
+    {
+      "type": "smart",
+      "tag": "auto",
+      "outbounds": ["HK", "JP", "US"],
+      "policy_priority": "=HK:1.2"
+    },
+    {
+      "type": "selector",
+      "tag": "proxy",
+      "outbounds": ["auto", "HK", "JP", "US"],
+      "default": "auto"
+    }
+  ],
+  "route": {
+    "final": "proxy"
+  }
+}

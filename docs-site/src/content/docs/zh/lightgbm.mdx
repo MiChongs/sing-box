@@ -1,0 +1,105 @@
+---
+title: LightGBM 模型
+description: 用预训练的 LightGBM 模型代替传统公式为节点评分：模型下载与加载、35 维特征、推理缓存、训练数据采集与自行训练。
+---
+
+import Callout from '../../../components/Callout.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import FeatureTable from '../../../components/FeatureTable.astro';
+import { csvColumns } from '../../../data/lightgbm';
+import example from '../../../examples/03-lightgbm.json?raw';
+
+## 启用
+
+在需要的 Smart 组上设置 `use_lightgbm: true` 即可。模型由所有组共享，相关设置在 `experimental.smart.lightgbm` 中，全部可以省略。
+
+<CodeBlock code={example} filename="03-lightgbm.json" locale="zh" />
+
+- 第一次启用时，模型文件不存在，Smart 在后台下载默认模型 `Model-large.bin`（来自 vernesong/mihomo 的发布页）到数据目录下的 `smart_lgbm_model.bin`。即使 `auto_update` 为 `false`，缺失的模型也会下载一次。
+- `auto_update: true` 时每隔 `update_interval`（默认 72 小时）借助 ETag / Last-Modified 检查更新，下载成功后热加载，无需重启。
+- 下载的出站由 `http_client` 的出站或 `download_detour` 决定，建议指向 `direct` 或一个稳定节点。`http_client` 中除出站以外的设置会被忽略。
+- 模型下载完成之前，启动日志显示 `ml=pending`，权重继续由传统公式计算。
+
+没有任何组设置 `use_lightgbm` 时，模型不会被加载或下载。
+
+## 模型如何参与选路
+
+模型不与传统公式混合，而是**直接替代**它：
+
+1. 连接关闭后，Smart 为该（目标, 节点）组装 35 维特征向量，交给模型预测；
+2. 预测值乘以优先级系数（`policy_priority`、手动指定学习加成、手动指定期间的 1.15）作为本次权重；
+3. 与旧权重平滑合并后保存，此后的选路流程与传统公式完全相同：权重低于 0.4 的节点不会被选中。
+
+以下情况退回传统公式：模型未加载、特征为空、预测出错、结果为 NaN 或不大于 0。同一（目标, 节点）样本少于 2 个时不预测。
+
+预测结果按 `节点|目标`（UDP 再加 `|u`）缓存 30 秒，高并发时同一组合不会重复推理。缓存保存的是乘系数之前的值，所以修改 `policy_priority` 立即生效。
+
+模型输出的“置信度”（全部树与前一半树预测值之差的倒数）只写入训练数据，不参与选路。
+
+## 特征
+
+特征顺序是模型的输入约定，与 mihomo 的 27 维特征完全一致，并在其后追加了 8 维。旧的 27 维模型仍可使用：向量会被截断到模型声明的特征数。
+
+<FeatureTable lang="zh" />
+
+第 0–26 维与 mihomo 相同，第 27–34 维为本分支新增。几点说明：
+
+- 第 16、23 维依赖 `use_asn`；第 17、26 维依赖国家数据库（`experimental.geox.url.mmdb`，或自动下载的 `country.mmdb`）。
+- 第 29、30 维来自内存中的滑动平均，重启后需要重新积累。
+- 第 32、34 维来自最近一次健康检查探测；TCP 重传次数只在 Linux 与 Android 上可读。
+
+## 采集训练数据
+
+在 Smart 组上设置 `collect_data: true`，每条连接结束（或拨号失败）时会向 CSV 追加一行。可以用 `sample_rate` 降低采样比例。
+
+- 文件：`experimental.smart.collector.path`，默认数据目录下的 `smart_weight_data.csv`。
+- 写入：每 100 行或每 30 秒刷新一次。统计队列繁忙时样本可能被丢弃。
+- 上限：`size_limit_mb`（默认 100 MB），达到后停止写入并记录一次 WARN，不会轮转；删除或截短文件后 30 秒内自动恢复。
+- 旧格式：没有 `history_upload_mb` 列的旧文件会被改名为 `.bak.<时间戳>` 备份。
+
+每行 60 列：
+
+<div class="not-prose my-6 overflow-hidden rounded-card bg-surface shadow-ring">
+  {csvColumns.map((c) => (
+    <div class="grid grid-cols-[4.5rem_1fr] gap-3 border-t border-line-soft px-4 py-2.5 text-[0.9rem] first:border-0">
+      <span class="font-mono text-subtle">{c.range}</span>
+      <div>
+        <code class="font-mono text-[0.82rem] text-accent">{c.name}</code>
+        <p class="mt-0.5 text-fg-2" set:html={c.zh.replace(/`([^`]+)`/g, '<code>$1</code>')} />
+      </div>
+    </div>
+  ))}
+</div>
+
+<Callout type="warn" title="请按列序号读取">
+  当前版本 CSV 首行的表头只命名了 37 列，与 60 列的数据行不对齐。解析时请跳过首行，按上表的列序号取值。
+</Callout>
+
+## 自行训练
+
+仓库没有附带训练脚本。下面是一个最小流程，使用 Python 的 pandas 与 lightgbm 包：
+
+```python
+import pandas as pd
+import lightgbm as lgb
+
+df = pd.read_csv("smart_weight_data.csv", header=None, skiprows=1)
+X = df.iloc[:, 0:35].astype(float)   # 第 0–34 列：特征
+y = df.iloc[:, 42].astype(float)     # 第 42 列：权重标签
+
+booster = lgb.train(
+    {"objective": "regression", "learning_rate": 0.05, "num_leaves": 31, "verbose": -1},
+    lgb.Dataset(X, y),
+    num_boost_round=300,
+)
+booster.save_model("smart_lgbm_model.bin")   # LightGBM 文本格式
+```
+
+把生成的文件放到 `model_path`，并关闭 `auto_update`，以免被默认模型覆盖。
+
+需要注意：
+
+- **标签就是当时的权重**。直接用采集到的 `weight` 训练，模型学到的只是现有公式（或现有模型）的输出。要让模型更好，需要自己构造标签，例如结合连接是否成功、吞吐与时长。
+- 预测值会被直接当作权重使用，低于 0.4 的节点不会被选中，所以标签的数值范围应与传统权重相近（大多在 0.1–2 之间）。
+- 模型文件末尾可以附带 mihomo 格式的 `[transforms]` 块（StandardScaler 或 RobustScaler），在推理前对特征做缩放；校验失败时忽略该块，模型照常加载。
+- 训练 35 维以外的特征需要修改源码中的特征提取与 `MaxFeatureSize`，并重新编译。

@@ -1,0 +1,75 @@
+---
+title: ASN and GeoX
+description: How Smart aggregates what it learns by the destination's autonomous system when use_asn is on, where the ASN and country databases come from, and when experimental.geox downloads files and when they take effect.
+---
+
+import Callout from '../../../components/Callout.astro';
+import CodeBlock from '../../../components/CodeBlock.astro';
+import example from '../../../examples/04-asn-geox.json?raw';
+
+## What ASN is for
+
+One company's services are often spread across many domains but sit in the same autonomous system (ASN). For example, Google's `*.google.com`, `*.youtube.com` and `*.gstatic.com` all belong to AS15169. With `use_asn` on, how a node performs for one of these domains is also used to choose nodes for the other domains in the same ASN.
+
+## What happens when it is on
+
+- **Lookup**: at dial time, Smart looks up the ASN of the destination's public IP. The lookup only works if the IP is known before dialing (for example, an already resolved address or a FakeIP mapping). Private and loopback addresses are skipped. For a connection that only has a domain, Smart runs an extra DNS query of up to 200 ms when the connection closes, to fill in the ASN.
+- **Recording**: the weight is written to the `tcp_asn:<ASN>` / `udp_asn:<ASN>` slot, and the generic `tcp` / `udp` slot is set to the minimum of the ASN slots. Success rate, latency and other counters are still recorded per (destination, node).
+- **Selection**: when the weight tier is queried and the destination has an ASN, Smart aggregates the weights of **all destinations in that ASN**. For each node it takes the maximum, but if any one of them is below 0.4 it takes the minimum. If the ASN has no data yet, this tier returns nothing and selection falls straight through to the latency tier. The destination's own weight is not used.
+- **Prefetch**: prefetch results are also referenced by ASN, so a new destination in the same ASN can hit them directly.
+- **Bonus**: on a non-CDN ASN, once successes reach 10 and the success rate is above 90%, up to 0.08 is added to the weight.
+- **Model**: LightGBM features 16 and 23 need the ASN. They are 0 when it is off.
+
+### Ignored ASNs
+
+The following 33 ASNs belong to CDN and cloud providers such as Cloudflare, Akamai, Fastly and Amazon, and to backbone carriers such as Cogent and Level 3. They host large numbers of unrelated websites. Grouping by them would mix unrelated sites together, so they take no part in ASN grouping or prefetch:
+
+13335, 12222, 16625, 20940, 31110, 35994, 54113, 22822, 15133, 19551, 20446, 60068, 16509, 36408, 4809, 199524, 212238, 55933, 43260, 43317, 43996, 52320, 396982, 16276, 30081, 12389, 37888, 45090, 174, 3356, 3209, 14061, 8452.
+
+## Where the ASN database comes from
+
+Each group with `use_asn` on picks its database in this order:
+
+1. The group's own `asn_database`. The path is used as is and is not joined with the data directory. In GUI clients a relative path is relative to the process working directory, so use an absolute path.
+2. The file that `experimental.geox.url.asn` downloads into the data directory (requires `geox.enabled: true`).
+3. If neither is available, Smart automatically downloads `https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb` to `GeoLite2-ASN.mmdb` in the data directory.
+
+When several databases are listed, all of them are opened. Lookups try them in order and take the first non-zero result. Databases that fail to open are skipped. A database must use the MaxMind GeoLite2-ASN format (records have an `autonomous_system_number` field). Databases with different fields (for example, IPinfo's ASN database) return no results.
+
+<Callout type="warn" title="Do not rely on option 3">
+  The automatic download runs **synchronously** during startup, always goes direct, waits up to 90 seconds, and **downloads again on every startup**. If the download fails, ASN is disabled for that run, even if an old file is on disk. Provide the database explicitly with `asn_database` or `geox.url.asn`.
+</Callout>
+
+Database readers are shared between groups, but each group opens them only once, at startup. An updated database takes effect only after a restart.
+
+## Country database
+
+The LightGBM country features (17 and 26) need a country database. Smart prefers the `country.mmdb` downloaded via `experimental.geox.url.mmdb`. If that is not configured, Smart checks for `country.mmdb` in the data directory at startup and, if it is missing, downloads GeoLite2-Country from the P3TERX releases page.
+
+Only groups with `use_lightgbm` or `collect_data` on look up the country.
+
+## experimental.geox
+
+GeoX manages downloading and updating geographic data files in one place. Smart is currently its only user.
+
+<CodeBlock code={example} filename="04-asn-geox.json" locale="en" />
+
+- With `enabled: false`, no files are downloaded, and Smart does not get the paths from here either.
+- There are no default download URLs. Only files that have a URL set are downloaded.
+- File names are fixed: `GeoLite2-ASN.mmdb` (with several ASN URLs, the first is still `GeoLite2-ASN.mmdb` and the rest are `GeoLite2-ASN-1.mmdb`, `GeoLite2-ASN-2.mmdb` and so on), `country.mmdb`, `geoip.dat` and `geosite.dat`. No component uses `geoip.dat` or `geosite.dat` yet.
+- With `auto_update: true`, each file is updated every `update_interval`. Otherwise a file is downloaded only once, when it is missing.
+
+<Callout type="note" title="Restart once after the first run">
+  GeoX downloads asynchronously at startup, while Smart opens the database when startup completes. On a fresh install the files are usually not downloaded yet, and the log shows `smart: use_asn is true but no ASN database available; ASN features disabled`. Restart once after the download finishes.
+</Callout>
+
+## Log messages
+
+| Log message | Meaning |
+|---|---|
+| `smart: ASN database loaded from <path>` | The database was opened |
+| `smart: ASN database not configured per-group; using ...` | Using the database provided by GeoX |
+| `smart: no ASN database configured; auto-downloading default` | Downloading the default database automatically |
+| `smart: failed to open ASN database [<path>] ...` | One database failed to open; the others are still tried |
+| `smart: all configured ASN databases failed to open; ASN features disabled` | All databases failed to open |
+| `smart: use_asn is true but no ASN database available; ASN features disabled` | No database is available |

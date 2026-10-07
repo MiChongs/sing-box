@@ -1,0 +1,27 @@
+---
+import type { ErrorFamily } from '../data/errors';
+import type { Lang } from '../data/nav';
+
+export interface Props {
+  lang: Lang;
+  families: ErrorFamily[];
+}
+
+const { lang, families } = Astro.props;
+---
+
+<div class="not-prose my-6 grid gap-3 sm:grid-cols-2">
+  {families.map((f) => (
+    <div class="rounded-card bg-surface p-4 shadow-ring">
+      <p class="mb-2 flex items-baseline justify-between gap-2 text-[0.92rem] font-semibold text-fg">
+        {f[lang]}
+        <span class="font-mono text-[0.75rem] font-normal text-subtle">{f.patterns.length}</span>
+      </p>
+      <ul class="space-y-1">
+        {f.patterns.map((p) => (
+          <li><code class="whitespace-pre font-mono text-[0.8rem] text-fg-2">{p}</code></li>
+        ))}
+      </ul>
+    </div>
+  ))}
+</div>

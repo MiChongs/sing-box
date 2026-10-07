@@ -1,0 +1,25 @@
+{
+  "outbounds": [
+    {
+      "type": "smart",
+      "tag": "auto",
+      "providers": ["my-subscription"],
+      "use_asn": true,
+      "use_lightgbm": true
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "experimental": {
+    "cache_file": { "enabled": true },
+    "geox": {
+      "enabled": true,
+      "auto_update": true,
+      "update_interval": "168h",
+      "download_detour": "direct",
+      "url": {
+        "asn": "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb",
+        "mmdb": "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"
+      }
+    }
+  }
+}

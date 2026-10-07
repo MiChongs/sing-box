@@ -48,7 +48,7 @@
 
 ## Smart 出站组
 
-`smart` 出站组根据各节点对不同目标的历史表现选择出站。节点评分基于 EWMA 短窗口与长窗口统计，并可选择启用 LightGBM 模型。统计数据保存在缓存文件（`experimental.cache_file`）中，进程重启后恢复；未启用缓存文件时仅保存在内存中。
+`smart` 出站组根据各节点对不同目标的历史表现选择出站。节点评分基于 EWMA 短窗口与长窗口统计，并可选择启用 LightGBM 模型。统计数据保存在缓存文件（`experimental.cache_file`）中，进程重启后恢复；未启用缓存文件时不记录统计，仅按 URL 测速延迟选路。
 
 主要特性如下：
 
@@ -92,7 +92,7 @@
 | `include` / `exclude` | 正则表达式 | | 按名称筛选节点 |
 | `url` | 字符串 | `https://www.gstatic.com/generate_204` | 探测地址 |
 | `interval` | 时长 | `3m` | 探测间隔 |
-| `expected_status` | 字符串 | | 视为探测成功的 HTTP 状态码 |
+| `expected_status` | 字符串 | | 视为探测成功的 HTTP 状态码；留空时任何状态码均视为成功 |
 | `algorithm` | 字符串 | `strict-best` | 选路算法 |
 | `hysteresis` | 时长 | `0` | 防抖窗口，大于 0 时同一目标优先沿用上次选择的节点；`0` 表示关闭 |
 | `policy_priority` | 字符串 | | 节点优先级规则 |

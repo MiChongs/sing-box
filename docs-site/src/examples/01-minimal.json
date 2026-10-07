@@ -1,12 +1,25 @@
 {
+  "providers": [
+    {
+      "type": "remote",
+      "tag": "my-subscription",
+      "url": "https://example.com/subscription",
+      "update_interval": "12h"
+    }
+  ],
   "outbounds": [
     {
       "type": "smart",
       "tag": "auto",
-      "url": "https://www.cloudflare.com/cdn-cgi/trace",
-      "interval": "3m",
-      "providers": ["my-subscription"],
-      "use_all_providers": false
-    }
-  ]
+      "providers": ["my-subscription"]
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "final": "auto"
+  },
+  "experimental": {
+    "cache_file": { "enabled": true },
+    "clash_api": { "external_controller": "127.0.0.1:9090" }
+  }
 }

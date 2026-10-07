@@ -1,0 +1,33 @@
+---
+import { getCollection } from 'astro:content';
+import { orderedSlugs, type Lang } from '../data/nav';
+import { ui, href } from '../i18n/ui';
+
+export interface Props {
+  lang: Lang;
+  slug: string;
+}
+
+const { lang, slug } = Astro.props;
+const t = ui[lang];
+const entries = await getCollection('docs', (e) => e.slug.startsWith(`${lang}/`));
+const titleOf = (s: string) => entries.find((e) => e.slug === `${lang}/${s}`)?.data.title ?? s;
+const i = orderedSlugs.indexOf(slug);
+const prev = i > 0 ? orderedSlugs[i - 1] : undefined;
+const next = i >= 0 && i < orderedSlugs.length - 1 ? orderedSlugs[i + 1] : undefined;
+---
+
+<nav class="mt-6 grid gap-3 border-t border-line-soft pt-6 sm:grid-cols-2" aria-label="Pagination">
+  {prev ? (
+    <a href={href(lang, prev)} class="group rounded-card bg-surface px-4 py-3 shadow-ring hover:shadow-ring-2">
+      <span class="block text-[0.78rem] text-subtle">← {t.prev}</span>
+      <span class="block text-fg group-hover:text-accent">{titleOf(prev)}</span>
+    </a>
+  ) : <span />}
+  {next && (
+    <a href={href(lang, next)} class="group rounded-card bg-surface px-4 py-3 text-right shadow-ring hover:shadow-ring-2">
+      <span class="block text-[0.78rem] text-subtle">{t.next} →</span>
+      <span class="block text-fg group-hover:text-accent">{titleOf(next)}</span>
+    </a>
+  )}
+</nav>

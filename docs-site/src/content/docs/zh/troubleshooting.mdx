@@ -1,0 +1,116 @@
+---
+title: 故障排查
+description: 配置报错、Smart 不学习、节点不被选中、手动指定不生效、连接被断开、ASN 与模型不生效等常见问题的定位方法。
+---
+
+import Callout from '../../../components/Callout.astro';
+
+## 先收集这些信息
+
+1. 启动日志中每个组的摘要行：`smart[<tag>] started: ... algorithm=... ml=... collect=...`。
+2. `GET /smart/groups` 与 `GET /smart/groups/{name}/diag` 的输出。
+3. `GET /proxies/{name}/weights?full=1`，查看按目标的明细。
+4. 需要逐条连接的细节时，把 `log.level` 设为 `debug`：每条连接的选路结果、Watchdog 判定都以 Debug 级别输出。
+
+## 配置报错
+
+**`json: unknown field "tolerance"` 或 `"idle_timeout"`**：这两个是 `urltest` 的字段，Smart 不支持。早期文档曾错误列出，删除即可。
+
+**`urltest: invalid expected-status: ...`**：`expected_status` 格式错误。合法写法为 `204`、`200-299`、`204/300-399`，状态码范围 100–599。
+
+**`missing outbound and provider tags`**：`outbounds` 和 `providers` 都为空。
+
+**`dependency[<tag>] not found for outbound[<smart>]`**：`outbounds` 中引用了不存在的出站。
+
+**`algorithm` 写错没有报错**：这是预期行为，Smart 会回退到 `strict-best` 并记录 WARN。以启动日志中的 `algorithm=` 为准。
+
+**`policy_priority` 部分规则没生效**：无效规则只会被忽略并记录 `policy_priority: ignored invalid rule [...]`。常见原因：系数写成 1、大小写不一致（匹配区分大小写）、正则没有加 `~` 前缀。用 `GET /smart/groups` 的 `policyPriority` 字段检查解析结果。
+
+## Smart 似乎没有在学习
+
+- **日志出现 `smart: no cache file available, using ephemeral store`**：Smart 没有拿到缓存文件，不会记录任何统计。命令行版本请设置 `experimental.cache_file.enabled: true`。
+- **刚启动、还没有流量**：Smart 在第一次成功拨号之前不会探测，也不会计算排名。
+- **权重为空**：同一（目标, 节点）至少要有 2 个样本才会计算权重。
+- **`targetCount` 为 1、`sampleCount` 为 0**：接口返回的是按测速延迟生成的排名，说明还没有统计数据。
+
+## 某个节点从不被选中
+
+依次检查：
+
+1. **是否在组内**：`include` / `exclude` 只过滤订阅节点；`GET /proxies/{name}` 的 `all` 列出全部成员。
+2. **是否可用**：最近一次测速失败、3 分钟内失败过、熔断器打开、测速记录早于 3 × `interval`，都会让节点不可用。
+3. **是否被屏蔽**：失败累计 30 次后会被屏蔽 93 分钟起；通过 API 屏蔽的默认 30 分钟。
+4. **是否只对这个目标被软屏蔽**：一次 RST 或卡死就会让节点对该目标软屏蔽 10 分钟。
+5. **权重是否低于 0.4**：超出场景延迟上限（如实时类 150 ms）的节点权重会被封顶在 0.38。
+6. **是否被 `policy_priority` 压到后面**：系数大于 1 的节点总是排在前面。
+
+想重新开始时，用 `DELETE /proxies/{name}/weights` 清空本组数据。
+
+## 面板显示的节点和实际不一样
+
+`now` 是“最近一次成功拨号的节点”。Smart 按目标选节点，同一时刻不同网站可能走不同节点。要看每条连接实际使用的节点，查看 `/connections` 中的 `chains`，最终节点在第一位。
+
+## 手动指定后流量仍走其他节点
+
+- 被指定的节点拨号失败时，Smart 临时改用其他节点，`fixedSuspended` 变为 `true`。被指定节点下一次拨号或探测成功后自动切回。
+- 被指定节点的熔断器打开时，指定会被暂时绕过。
+- 指定只影响新连接；已有连接要等它自然结束，或开启 `interrupt_exist_connections`。
+
+## 取消手动指定后仍偏向原来的节点
+
+这是手动指定学习的效果：曾被指定的节点会获得最高约 1.63 倍的加成，最长持续 14 天。用 `DELETE /proxies/{name}/weights` 可以立即清除。
+
+## 能用的节点被判为不可用
+
+- **`interval` 小于 100 秒**：会出现节点在 3 × `interval` 到 5 分钟之间被判不可用、却不会重测的空档。改回 3 分钟或更长。
+- **探测地址在部分节点上不稳定**：探测经由节点发出，个别节点的出口可能无法访问默认地址。换成各节点都能稳定访问的 204 地址，例如 `https://cp.cloudflare.com/generate_204`。
+- **网络刚切换**：切换后的 2 秒内，进行中的拨号会被取消，属于正常现象。
+
+## 节点明明不通却显示可用
+
+`expected_status` 留空时任何 HTTP 响应都算探测成功，包括强制门户（Wi-Fi 登录页）返回的 3xx。设置 `"expected_status": "204"`。
+
+## 连接被断开
+
+- **2026-10-05 之前的版本**：经过 Smart 的长连接会在第 30 秒被切断。请升级。
+- **Watchdog**：客户端写出后 60 秒没有任何回应，或首字节超时，连接会被关闭。正常空闲的长连接不受影响。
+- **网络切换**：sing-box 会关闭所有连接。
+- **`interrupt_exist_connections`**：开启后，手动指定变化会中断本组的 TCP 连接。
+
+## ASN 没有生效
+
+查看启动日志中的 ASN 相关行（见 [ASN 与 GeoX](../asn-geox/#相关日志)）：
+
+- 使用 GeoX 的全新安装，首次运行时数据库还没下载好，需要下载完成后重启一次；
+- 数据库格式需要是 MaxMind GeoLite2-ASN；
+- `asn_database` 中的相对路径不会拼接数据目录；
+- 只有拨号时已经知道目标 IP 才能查到 ASN；CDN 与骨干网 ASN 被有意忽略。
+
+## 模型一直是 ml=pending
+
+模型还没下载成功。检查 `download_detour` 或 `http_client` 指定的出站能否访问 GitHub；也可以手动下载 `Model-large.bin` 放到 `model_path`（默认数据目录下的 `smart_lgbm_model.bin`）后重启。
+
+## 训练数据不再增长
+
+- 文件达到 `size_limit_mb`（默认 100 MB）后停止写入，删除或截短后 30 秒内恢复；
+- `sample_rate` 小于 1 时只采集部分连接；
+- 统计队列繁忙时会丢弃样本。
+
+## 手机耗电或发热
+
+- `interval` 设为 5 分钟或更长；
+- 用 `exclude` 去掉不需要的节点；
+- 避免多个 Smart 组引用同一批节点；
+- 内存紧张时调低 `SMART_CACHE_BUDGET_MB`（仅命令行版本）。
+
+## 重置 Smart 的全部数据
+
+| 方法 | 影响范围 |
+|---|---|
+| `DELETE /proxies/{name}/weights` | 一个组 |
+| `POST /cache/smart/flush` | 当前配置中的所有 Smart 组 |
+| 停止 sing-box 后删除缓存文件 | 所有数据，**包括**规则集、FakeIP、选择器状态等其他缓存 |
+
+<Callout type="note" title="提交问题">
+  在 [GitHub Issues](https://github.com/MiChongs/sing-box/issues) 提交时，请附上版本号（`sing-box version`）、去掉敏感信息的配置、启动日志中的 Smart 摘要行，以及 `diag` 接口的输出。
+</Callout>

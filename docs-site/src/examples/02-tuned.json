@@ -1,0 +1,17 @@
+{
+  "outbounds": [
+    {
+      "type": "smart",
+      "tag": "auto",
+      "providers": ["my-subscription"],
+      "exclude": "(?i)剩余|到期|官网|expire",
+      "url": "https://www.gstatic.com/generate_204",
+      "expected_status": "204",
+      "interval": "5m",
+      "algorithm": "strict-best",
+      "hysteresis": "30s",
+      "policy_priority": "HK:1.3;JP:1.15;~[2-9][xX×]:0.8",
+      "max_host_failed_times": 10
+    }
+  ]
+}

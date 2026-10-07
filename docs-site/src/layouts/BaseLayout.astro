@@ -1,0 +1,111 @@
+---
+import '../styles/global.css';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+import Sidebar from '../components/Sidebar.astro';
+import { ui } from '../i18n/ui';
+import type { Lang } from '../data/nav';
+
+export interface Props {
+  lang: Lang;
+  title?: string;
+  description?: string;
+  /** Slug of the current doc page, used to highlight the sidebar. */
+  current?: string;
+}
+
+const { lang, title, description, current } = Astro.props;
+const t = ui[lang];
+const fullTitle = title ? `${title} · ${t.siteName}` : t.siteName;
+const desc = description ?? t.siteDesc;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+---
+
+<!doctype html>
+<html lang={t.htmlLang}>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={desc} />
+    <meta name="color-scheme" content="light dark" />
+    <meta property="og:title" content={fullTitle} />
+    <meta property="og:description" content={desc} />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content={canonical.href} />
+    <link rel="canonical" href={canonical.href} />
+    <link rel="alternate" hreflang="zh-CN" href={new URL(Astro.url.pathname.replace(/\/en(\/|$)/, '/zh$1'), Astro.site).href} />
+    <link rel="alternate" hreflang="en" href={new URL(Astro.url.pathname.replace(/\/zh(\/|$)/, '/en$1'), Astro.site).href} />
+    <link rel="icon" href={`${import.meta.env.BASE_URL}favicon.svg`} />
+    <title>{fullTitle}</title>
+    <script is:inline>
+      // Apply the theme before first paint. Storage may be unavailable
+      // (private mode, blocked site data) — fall back to the OS setting.
+      (function () {
+        var stored = null;
+        try { stored = localStorage.getItem('theme'); } catch (e) {}
+        var dark = stored ? stored === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+        if (dark) document.documentElement.classList.add('dark');
+      })();
+    </script>
+  </head>
+  <body class="min-h-screen flex flex-col">
+    <a href="#main" class="sr-only focus:not-sr-only focus:fixed focus:top-3 focus:left-3 focus:z-50 rounded-md bg-surface px-3 py-2 shadow-lift">{t.skip}</a>
+    <Header lang={lang} />
+
+    <!-- Mobile drawer: the same sidebar, opened from the header menu button. -->
+    <div id="drawer" class="fixed inset-0 z-40 hidden lg:hidden" aria-hidden="true">
+      <div data-drawer-close class="absolute inset-0 bg-black/40"></div>
+      <nav
+        class="absolute inset-y-0 left-0 w-[min(20rem,85vw)] overflow-y-auto scroll-thin bg-surface shadow-lift px-5 pb-10 pt-4"
+        aria-label={t.menu}
+      >
+        <div class="flex items-center justify-between mb-4">
+          <span class="font-serif text-lg text-fg">{t.siteName}</span>
+          <button
+            type="button"
+            data-drawer-close
+            class="inline-flex h-9 w-9 items-center justify-center rounded-md text-muted hover:bg-surface-2 hover:text-fg"
+            aria-label={t.closeMenu}
+          >
+            <svg viewBox="0 0 20 20" class="h-5 w-5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" aria-hidden="true"><path d="M5 5l10 10M15 5L5 15" /></svg>
+          </button>
+        </div>
+        <Sidebar lang={lang} current={current} />
+      </nav>
+    </div>
+
+    <main id="main" class="flex-1">
+      <slot />
+    </main>
+    <Footer lang={lang} />
+
+    <script>
+      const drawer = document.getElementById('drawer');
+      const openers = document.querySelectorAll<HTMLButtonElement>('[data-drawer-open]');
+      const setOpen = (open: boolean) => {
+        if (!drawer) return;
+        drawer.classList.toggle('hidden', !open);
+        drawer.setAttribute('aria-hidden', String(!open));
+        document.body.style.overflow = open ? 'hidden' : '';
+        openers.forEach((b) => b.setAttribute('aria-expanded', String(open)));
+      };
+      openers.forEach((b) => b.addEventListener('click', () => setOpen(true)));
+      drawer?.querySelectorAll('[data-drawer-close]').forEach((el) => el.addEventListener('click', () => setOpen(false)));
+      drawer?.querySelectorAll('a').forEach((a) => a.addEventListener('click', () => setOpen(false)));
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') setOpen(false);
+      });
+
+      document.querySelectorAll<HTMLButtonElement>('[data-theme-toggle]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const dark = document.documentElement.classList.toggle('dark');
+          try {
+            localStorage.setItem('theme', dark ? 'dark' : 'light');
+          } catch {
+            // Storage unavailable: the choice lasts for this page view only.
+          }
+        });
+      });
+    </script>
+  </body>
+</html>

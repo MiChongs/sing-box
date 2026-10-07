@@ -1,0 +1,76 @@
+---
+title: 示例配置
+description: 六份可直接使用的 Smart 配置：最小配置、调参、LightGBM、ASN、按流量类型分组与嵌套策略组。
+---
+
+import CodeBlock from '../../../components/CodeBlock.astro';
+import Callout from '../../../components/Callout.astro';
+import ex1 from '../../../examples/01-minimal.json?raw';
+import ex2 from '../../../examples/02-tuned.json?raw';
+import ex3 from '../../../examples/03-lightgbm.json?raw';
+import ex4 from '../../../examples/04-asn-geox.json?raw';
+import ex5 from '../../../examples/05-algorithms.json?raw';
+import ex6 from '../../../examples/06-nested.json?raw';
+
+以下示例都经过 `sing-box check` 验证。除第一份外，示例只列出与 Smart 相关的部分；订阅 `my-subscription`、`direct` 出站与 `cache_file` 的写法见第一份。
+
+## 最小配置
+
+<CodeBlock code={ex1} filename="01-minimal.json" locale="zh" />
+
+- 引用一个订阅的全部节点，其余字段使用默认值。
+- `cache_file` 不可省略，否则 Smart 不会学习。
+- `clash_api` 用于查看权重和手动指定，不需要时可以删除。
+
+## 调整探测与选路
+
+<CodeBlock code={ex2} filename="02-tuned.json" locale="zh" />
+
+- `exclude` 去掉订阅里的流量、到期提示等非节点条目；`(?i)` 表示忽略大小写。
+- `expected_status: "204"` 要求探测地址必须返回 204。留空时任何 HTTP 响应都算成功，在有强制门户的网络里容易误判。
+- `interval: "5m"` 减少探测次数，适合手机。
+- `hysteresis: "30s"` 让同一网站在有持续流量时停留在同一节点。
+- `policy_priority` 提高名称含 `HK`、`JP` 的节点的优先级，并用正则把名称里带 2–9 倍率标记（如 `2x`、`3×`）的节点降为 0.8。注意系数大于 1 的节点会排在所有其他节点之前，见 [节点偏好](../priority-and-pinning/#生效位置)。
+
+## 启用 LightGBM
+
+<CodeBlock code={ex3} filename="03-lightgbm.json" locale="zh" />
+
+- 首次启动在后台下载默认模型，下载完成前使用传统公式。
+- `download_detour: "direct"` 避免用尚未就绪的 Smart 组下载模型。
+- `collect_data` 与 `sample_rate: 0.3` 以 30% 的比例采集训练数据，文件达到 100 MB 后停止写入。不打算自己训练模型时，删掉这两项。
+
+## 按 ASN 学习
+
+<CodeBlock code={ex4} filename="04-asn-geox.json" locale="zh" />
+
+- GeoX 下载 ASN 与国家数据库，每周更新一次；ASN 数据库被 `use_asn` 使用，国家数据库被 LightGBM 使用。
+- 全新安装时首次下载需要时间，**下载完成后重启一次** ASN 才会生效，见 [ASN 与 GeoX](../asn-geox/#experimentalgeox)。
+- 只想用本地文件时，去掉 `geox`，在组内写 `"asn_database": "/path/to/GeoLite2-ASN.mmdb"`。
+
+## 按流量类型分组
+
+<CodeBlock code={ex5} filename="05-algorithms.json" locale="zh" />
+
+四个 Smart 组引用同一个订阅，用路由规则按流量类型分配：
+
+| 组 | 算法 | 用途 |
+|---|---|---|
+| `smart-interactive` | `latency-banded` + 1 分钟 `hysteresis` | SSH、远程桌面，优先低延迟且尽量不换节点 |
+| `smart-bulk` | `least-loaded`，仅 TCP | 下载，分散到连接最少的节点 |
+| `smart-sticky` | `sticky-session` | 登录态与出口 IP 绑定的服务 |
+| `smart-default` | `p2c` | 其余流量 |
+
+<Callout type="note" title="多组的代价">
+  统计按组分别保存，四个组意味着同一批节点要分别学习四次，内存与磁盘占用也相应增加。只在不同流量确实需要不同算法时才拆分。
+</Callout>
+
+## 嵌套策略组
+
+<CodeBlock code={ex6} filename="06-nested.json" locale="zh" />
+
+- 三个 `urltest` 组各自从订阅中挑出一个地区的最快节点，Smart 在三个地区之间学习选择。
+- Smart 把成员组当作普通节点：统计记在 `HK`、`JP`、`US` 名下，反映的是该组当时选中的节点。
+- `policy_priority: "=HK:1.2"` 用 `=` 精确匹配，只作用于名为 `HK` 的成员。
+- 最外层的 `selector` 默认使用 `auto`，需要时可以在面板中切到固定地区。
+- 这种结构候选少、学习快，适合节点很多但只关心地区的场景；代价是 Smart 看不到地区内具体节点的差异。

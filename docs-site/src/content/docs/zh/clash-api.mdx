@@ -1,0 +1,241 @@
+---
+title: Clash API
+description: Smart 组在 Clash API 中的表示，以及查询权重、诊断、手动指定、屏蔽节点、切换算法、清空数据的全部接口。
+---
+
+import Callout from '../../../components/Callout.astro';
+
+Smart 复用 sing-box 的 Clash API（`experimental.clash_api`）。以下示例假设 `external_controller` 为 `127.0.0.1:9090`；设置了 `secret` 时，每个请求都要带上 `Authorization: Bearer <secret>`。错误统一返回 `{"message": "..."}`，个别接口另有说明。
+
+<Callout type="warn" title="组名包含 / 时">
+  `/smart/*` 与 `/cache/smart/flush/{name}` 不会对路径中的组名做 URL 解码，组名含 `/` 时这些接口返回 404。`/proxies/{name}` 系列接口不受影响。
+</Callout>
+
+## 面板中的 Smart 组
+
+### `GET /proxies/{name}`
+
+Smart 组的 `type` 为 `Smart`，在标准字段之外附带 Smart 的状态：
+
+```json
+{
+  "type": "Smart",
+  "name": "auto",
+  "udp": true,
+  "now": "HK-01",
+  "all": ["HK-01", "HK-02", "JP-01"],
+  "history": [{ "time": "2026-10-07T08:00:00Z", "delay": 123 }],
+  "alive": true,
+  "hidden": false,
+  "icon": "",
+  "testUrl": "https://www.gstatic.com/generate_204",
+  "useASN": false,
+  "useLightGBM": true,
+  "collectData": false,
+  "fixed": "",
+  "fixedSuspended": false,
+  "fixedActive": "",
+  "algorithm": "strict-best",
+  "hysteresis": "0s",
+  "policyPriority": null,
+  "pinEndorsements": null,
+  "lgbmModelAge": "2h3m0s"
+}
+```
+
+- `udp` 为 `!disable_udp`。
+- `now` 的确定顺序见 [当前节点](../how-it-works/#当前节点)；`history`、`alive` 都是 `now` 这个节点的测速数据。
+- `fixed` 为手动指定的节点；`fixedSuspended` 表示指定因故障暂停，此时 `fixedActive` 是实际使用的节点。
+- `lgbmModelAge` 只在模型已加载时出现。
+
+`GET /group/{name}` 返回同样的结构，`GET /group` 返回由所有组构成的 `{"proxies": [...]}`。
+
+### `PUT /proxies/{name}`
+
+手动指定节点，`PATCH` 等价。请求体 `{"name": "HK-01"}`，传空字符串取消指定。成功返回 204；节点不是本组成员时返回 400 `Smart update error: not found`。
+
+指定会保存到缓存文件，并清除本组的 unwrap 缓存；只有开启了 `interrupt_exist_connections` 才中断已有连接。行为细节见 [手动指定节点](../priority-and-pinning/#手动指定节点)。
+
+### `DELETE /proxies/{name}`
+
+取消手动指定并清空选择状态，随后后台重新计算预取与排名。
+
+```json
+{ "group": "auto", "previous_pin": "HK-01", "now": "JP-01", "interrupted_mux": true, "unwrap_cleared": true }
+```
+
+`interrupted_mux` 只表示调用了中断，并不代表有连接被关闭。`urltest` 组也支持这个接口，返回 `{"group", "previous_pin", "now"}`；其他类型返回 400。
+
+### `GET /proxies/{name}/delay`
+
+参数 `timeout`（必填，毫秒）与 `url`（可选）。测速经过 Smart 自身的选路，不会解除手动指定。最多测 3 次取中位数，第一次低于 50 ms 即停止；以 `http://` 开头的 `url` 会被忽略，改用默认探测地址。成功返回 `{"delay": 120}`，超时 504，其他失败 503。结果记在 `now` 节点名下，不一定是实际测到的节点。
+
+### `GET /group/{name}/delay`
+
+逐个测试组内所有成员（每次 4 个并发），返回成功的结果，如 `{"HK-01": 120, "JP-01": 85}`，并更新共享的测速记录。
+
+## 权重与诊断
+
+### `GET /proxies/{name}/weights`
+
+本组的节点排名。参数：
+
+- `refresh=true`：用现有的预取结果重新计算排名（不会重新预取）；
+- `full=1`：附带按（目标, 节点）的明细 `per_target`。节点很多时明细是随机抽样，最多 `MaxTargets / 2` 行。
+
+```json
+{
+  "weights": [
+    { "name": "HK-01", "rank": "MostUsed", "weight": 1.4231, "score": 100,
+      "targetCount": 37, "sampleCount": 412, "lastUpdated": 1759800000 }
+  ],
+  "per_target": [
+    { "target": "*.example.com", "node": "HK-01", "weight_tcp": 1.42,
+      "success": 12, "failure": 1, "connect_time_ms": 85, "latency_ms": 140,
+      "last_used": 1759800000, "upload_mb": 0.53, "download_mb": 12.8 }
+  ]
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `rank` | `MostUsed`（前 20%）、`OccasionalUsed`（接下来 50%）、`RarelyUsed` |
+| `weight` | 节点在各活跃目标上的平均权重，与内部选路使用的刻度相同 |
+| `score` | `weight` 相对最高者的百分比，用于显示进度条 |
+| `targetCount` | 参与平均的目标数 |
+| `sampleCount` | 这些目标上的拨号样本总数 |
+
+没有数据时额外返回 `"message": "no weight data available for this group"`。没有统计数据（例如未开启缓存文件）时，按测速延迟生成排名，`targetCount` 为 1、`sampleCount` 为 0。不是 Smart 组时返回 400 `{"weights": [], "error": "not a Smart group"}`。
+
+### `DELETE /proxies/{name}/weights`
+
+清空本组在缓存文件中的全部数据（统计、节点状态、排名、预取、目标失败计数、写入队列、手动指定、不可用标记、熔断器、手动指定认可记录），然后重新计算。
+
+```json
+{
+  "group": "auto",
+  "deleted": { "stats": 1203, "nodes": 42, "ranking": 1, "prefetch": 380, "failures": 12,
+               "queue": 3, "manual_pin": 1, "known_dead": 2, "breakers": 1, "pin_endorsement": 1 },
+  "total": 1646,
+  "recomputed": true
+}
+```
+
+### `GET /smart/weights`
+
+所有 Smart 组的排名，最多 5 个组并发计算，支持 `refresh=true`。
+
+```json
+{ "weights": { "auto": [ { "name": "HK-01", "rank": "MostUsed", "weight": 1.42, "score": 100, "targetCount": 37, "sampleCount": 412, "lastUpdated": 1759800000 } ] }, "errors": {} }
+```
+
+没有 Smart 组时返回 `{"weights": {}, "message": "no Smart groups configured"}`。
+
+### `GET /smart/groups`
+
+列出所有 Smart 组及其设置：
+
+```json
+{
+  "groups": [
+    {
+      "name": "auto", "testUrl": "https://www.gstatic.com/generate_204",
+      "useASN": false, "useLightGBM": true, "collectData": false,
+      "fixed": "", "now": "HK-01", "members": 42,
+      "algorithm": "strict-best", "pinSuspended": false, "http3FallbackNodes": 0,
+      "lgbmModelAge": "2h3m0s",
+      "policyPriority": [ { "raw": "香港:1.3", "pattern": "香港", "kind": "substring", "negate": false, "factor": 1.3 } ]
+    }
+  ]
+}
+```
+
+`lgbmModelAge`、`policyPriority`、`pinEndorsements`、`hysteresis` 为空时省略。`policyPriority` 列出每条规则解析后的模式、匹配方式（`substring`、`exact`、`regex`、`glob`）、是否取反与系数，用来确认规则是否按预期解析。`http3FallbackNodes` 目前始终为 0。
+
+### `GET /smart/groups/{name}/diag`
+
+单个组的内部状态，只读：
+
+```json
+{
+  "name": "auto", "algorithm": "strict-best", "hysteresis": "0s",
+  "policy_priority": null, "members": 42, "now": "HK-01", "fixed": "",
+  "test_url": "https://www.gstatic.com/generate_204",
+  "snapshot_entries": 42, "snapshot_age": "42s",
+  "live_coverage": { "HK-01": { "target_count": 37, "sample_count": 412 } }
+}
+```
+
+`snapshot_*` 是内存中排名快照的条目数与年龄，没有快照时 `snapshot_age` 为 `(none)`。`live_coverage` 直接从统计库读取，绕过所有缓存，只在缓存文件可用时出现。组不存在返回 404，不是 Smart 组返回 400。
+
+## 控制
+
+### `PUT /smart/groups/{name}/algorithm`
+
+运行时切换算法。请求体必须是 JSON 对象：
+
+```bash
+curl -X PUT http://127.0.0.1:9090/smart/groups/auto/algorithm -d '{"algorithm":"p2c"}'
+```
+
+```json
+{ "group": "auto", "requested": "p2c", "applied": "p2c", "previous": "strict-best" }
+```
+
+取值与别名见 [选路算法](../algorithms/)。无法识别的值不会报错，`applied` 为 `strict-best`。切换不写回配置，重启后恢复。
+
+### `POST /smart/groups/{name}/block/{node}`
+
+手动屏蔽一个节点，参数 `duration`（如 `15m`），默认 30 分钟，无效值忽略。屏蔽期间节点被视为失败 100 次、劣化系数 0.1。
+
+```json
+{ "group": "auto", "node": "HK-01", "blocked_until": "2026-10-07T09:30:00+08:00" }
+```
+
+- 没有解除屏蔽的接口，到期自动解除，或用清空数据的接口清除。屏蔽集合有 300 秒缓存，解除后最多延迟 5 分钟生效。
+- 手动指定的节点不受屏蔽影响；所有候选都不可用时的兜底选择也不检查屏蔽。
+- 组或节点不存在返回 404；没有缓存文件时返回 500 `smart: store unavailable`。
+
+### `POST /smart/groups/{name}/recompute`
+
+后台重新计算预取与排名，并立即返回一份重算后的排名 `{"group", "ranking": [...]}`。由于预取是异步的，返回的排名可能比最终结果晚一个周期。出错时一律返回 404。
+
+### `POST /smart/groups/{name}/clear-selection`
+
+与 `DELETE /proxies/{name}` 相同，返回 `{"group": "auto", "cleared": true}`。
+
+## 清空缓存
+
+### `POST /cache/smart/flush`
+
+`DELETE` 等价。对当前配置中的每个 Smart 组执行一次清空（内容同 `DELETE /proxies/{name}/weights`），并清空进程内的 Smart 内存缓存。
+
+```json
+{
+  "flushed_groups": 2, "errors": 0,
+  "total": { "stats": 2406, "nodes": 84, "ranking": 2, "prefetch": 760, "failures": 24, "queue": 0 },
+  "groups": [ { "group": "auto", "deleted": { "stats": 1203 }, "recomputed": true } ]
+}
+```
+
+`total` 不统计手动指定、不可用标记、熔断器与认可记录，它们在各组的 `deleted` 中。只有全部组都失败时才返回 500。
+
+### `POST /cache/smart/flush/{name}`
+
+只清空一个组，`DELETE` 等价，返回 `{"group", "deleted", "total", "recomputed": true}`。
+
+## 连接
+
+### `GET /connections`
+
+经过 Smart 的连接，`chains` 会补全到实际拨通的节点，顺序与 mihomo 相同，最终节点在前：
+
+```json
+{ "chains": ["HK-01", "auto", "proxy"] }
+```
+
+Smart 的成员是 `urltest`、`selector` 等组时，链会逐级展开到真实节点。
+
+### `DELETE /connections/smart/{id}`
+
+关闭一条连接，并把它**实际使用的** Smart 成员屏蔽 30 分钟。成功返回 `{"group": "auto", "node": "HK-01"}`；连接没有经过 Smart 组或屏蔽失败时返回 `{}`。`id` 不是合法 UUID 返回 400，连接不存在返回 404。

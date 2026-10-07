@@ -1,0 +1,76 @@
+---
+import type { MarkdownHeading } from 'astro';
+
+export interface Props {
+  headings: MarkdownHeading[];
+  label: string;
+}
+
+const { headings, label } = Astro.props;
+const items = headings.filter((h) => h.depth === 2 || h.depth === 3);
+---
+
+{items.length > 0 && (
+  <nav aria-label={label} class="text-[0.85rem]">
+    <p class="mb-3 text-[0.72rem] font-semibold uppercase tracking-[0.08em] text-subtle">{label}</p>
+    <ul class="space-y-1.5 border-l border-line-soft" data-toc>
+      {items.map((h) => (
+        <li>
+          <a
+            href={`#${h.slug}`}
+            data-toc-link={h.slug}
+            class:list={[
+              '-ml-px block border-l border-transparent leading-snug text-muted hover:text-fg',
+              h.depth === 2 ? 'pl-3' : 'pl-6 text-[0.82rem]',
+            ]}
+          >
+            {h.text}
+          </a>
+        </li>
+      ))}
+    </ul>
+  </nav>
+)}
+
+<script>
+  // Highlight the section being read: the last heading above the top band.
+  const links = new Map<string, HTMLAnchorElement>();
+  document.querySelectorAll<HTMLAnchorElement>('[data-toc-link]').forEach((a) => {
+    links.set(a.dataset.tocLink!, a);
+  });
+  const headings = [...links.keys()]
+    .map((id) => document.getElementById(id))
+    .filter((el): el is HTMLElement => el !== null);
+  let current = '';
+  const update = () => {
+    let id = headings[0]?.id ?? '';
+    for (const h of headings) {
+      if (h.getBoundingClientRect().top <= 96) id = h.id;
+      else break;
+    }
+    if (id === current) return;
+    current = id;
+    links.forEach((a, key) => {
+      const on = key === id;
+      a.classList.toggle('text-accent', on);
+      a.classList.toggle('border-accent', on);
+      a.classList.toggle('text-muted', !on);
+    });
+  };
+  if (headings.length > 0) {
+    let queued = false;
+    window.addEventListener(
+      'scroll',
+      () => {
+        if (queued) return;
+        queued = true;
+        requestAnimationFrame(() => {
+          queued = false;
+          update();
+        });
+      },
+      { passive: true },
+    );
+    update();
+  }
+</script>

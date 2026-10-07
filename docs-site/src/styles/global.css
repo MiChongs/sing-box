@@ -3,15 +3,10 @@
 @tailwind utilities;
 
 /*
- * Anthropic* faces are commercial and cannot be self-hosted. We declare
- * them via @font-face with `local()` only — if the visitor has them
- * installed (Anthropic employees / Claude.ai regulars), they get the
- * authentic typography. Everyone else transparently cascades down to
- * the self-hosted OFL fonts (Inter / JetBrains Mono) or the platform
- * Georgia serif.
- *
- * No `url(...)` is supplied, so there's no network fetch for the
- * Anthropic faces and zero risk of licensing violation.
+ * Anthropic* faces are commercial and cannot be self-hosted, so they are
+ * declared with local() only: visitors who have them installed get them,
+ * everyone else falls through to Georgia / system UI fonts. No url() means
+ * no network fetch and no licensing exposure.
  */
 @font-face {
   font-family: 'Anthropic Serif';
@@ -29,125 +24,254 @@
   font-display: swap;
 }
 
-/*
- * Inter / JetBrains Mono are NOT self-hosted in v0.1 — we rely on the
- * local() probe plus platform fallbacks (Georgia for serif, system-ui
- * for sans, ui-monospace for mono). Dropping the CDN avoids both the
- * great-firewall latency tax and the CSP noise for a negligible
- * visual compromise on this editorial-feel site. If authentic Inter
- * becomes required, self-host woff2 in public/fonts/ and uncomment
- * explicit @font-face blocks here.
- */
+/* ── Theme tokens (RGB triplets, consumed by tailwind.config.mjs) ───────── */
+:root {
+  color-scheme: light;
+  --bg: 245 244 237;
+  --surface: 250 249 245;
+  --surface-2: 237 235 226;
+  --line: 225 222 210;
+  --line-soft: 236 233 223;
+  --fg: 20 20 19;
+  --fg-2: 61 61 58;
+  --muted: 94 93 89;
+  --subtle: 111 110 104;
+  --accent: 168 80 47;
+  --accent-fill: 180 84 47;
+  --accent-soft: 243 227 218;
+  --on-accent: 255 255 255;
+  --danger: 165 42 42;
+  --danger-soft: 247 225 222;
+  --ok: 47 110 66;
+  --ok-soft: 223 238 225;
+  --info: 46 94 140;
+  --info-soft: 222 233 243;
+  --focus: 56 152 236;
+  --sh-ring: 0 0 0 1px rgb(20 20 19 / 0.09);
+  --sh-ring-2: 0 0 0 1px rgb(20 20 19 / 0.14), 0 1px 2px rgb(20 20 19 / 0.05);
+  --sh-lift: 0 0 0 1px rgb(20 20 19 / 0.10), 0 10px 30px -12px rgb(20 20 19 / 0.25);
+}
 
+html.dark {
+  color-scheme: dark;
+  --bg: 26 25 23;
+  --surface: 34 33 31;
+  --surface-2: 44 43 40;
+  --line: 58 57 53;
+  --line-soft: 46 45 42;
+  --fg: 240 238 230;
+  --fg-2: 214 211 200;
+  --muted: 176 174 165;
+  --subtle: 146 144 136;
+  --accent: 228 140 106;
+  --accent-fill: 217 119 87;
+  --accent-soft: 61 40 32;
+  --on-accent: 26 25 23;
+  --danger: 236 128 118;
+  --danger-soft: 64 30 28;
+  --ok: 126 199 146;
+  --ok-soft: 28 52 36;
+  --info: 128 176 224;
+  --info-soft: 26 42 60;
+  --focus: 96 170 240;
+  --sh-ring: 0 0 0 1px rgb(255 255 255 / 0.08);
+  --sh-ring-2: 0 0 0 1px rgb(255 255 255 / 0.12);
+  --sh-lift: 0 0 0 1px rgb(255 255 255 / 0.10), 0 10px 30px -12px rgb(0 0 0 / 0.6);
+}
+
+/* ── Base ──────────────────────────────────────────────────────────────── */
+html {
+  scroll-padding-top: 5rem;
+}
 html,
 body {
-  background-color: #f5f4ed;          /* parchment */
-  color: #141413;                     /* ink */
-  font-family: 'Anthropic Sans', Inter, system-ui, sans-serif;
-  font-size: 1.06rem;
-  line-height: 1.60;
+  background-color: rgb(var(--bg));
+  color: rgb(var(--fg));
+  font-family: theme('fontFamily.sans');
+  font-size: 16px;
+  line-height: 1.7;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
 }
-
-/* Serif headings carry medium weight across all sizes (DESIGN.md §3). */
-h1, h2, h3, h4, h5, h6 {
-  font-family: 'Anthropic Serif', Georgia, 'Times New Roman', serif;
+h1, h2, h3, h4 {
+  font-family: theme('fontFamily.serif');
   font-weight: 500;
-  color: #141413;
+  color: rgb(var(--fg));
+  text-wrap: balance;
 }
-
 code, pre, kbd {
-  font-family: 'Anthropic Mono', 'JetBrains Mono', ui-monospace, monospace;
-  font-size: 0.94rem;
-  letter-spacing: -0.32px;
+  font-family: theme('fontFamily.mono');
 }
-
 a {
-  color: #c96442;                     /* terracotta brand */
+  color: rgb(var(--accent));
   text-decoration: none;
-  transition: color 0.12s ease;
 }
-a:hover {
-  color: #d97757;                     /* coral hover */
-}
-
 ::selection {
-  background: rgba(201, 100, 66, 0.18);
+  background: rgb(var(--accent-fill) / 0.22);
+}
+:focus-visible {
+  outline: 2px solid rgb(var(--focus));
+  outline-offset: 2px;
+  border-radius: 4px;
 }
 
-/*
- * Shiki outputs `<pre class="astro-code">` with its own bg/padding.
- * The `<CodeBlock>` component wraps it with a figure that owns
- * background, rounding, ring and overflow — so here we strip the
- * pre's own chrome (no rounded corners, no inline background, no
- * extra shadow) and just keep the typography + padding tuned for
- * reading. Without this override the pre would stack its own ring
- * inside the figure's ring, which looked like a double outline.
- */
-.astro-code {
+/* ── Shiki (dual theme: light by default, dark via CSS variables) ─────── */
+.astro-code,
+.astro-code span,
+.shiki,
+.shiki span {
+  background-color: transparent !important;
+}
+html.dark .astro-code,
+html.dark .astro-code span,
+html.dark .shiki,
+html.dark .shiki span {
+  color: var(--shiki-dark) !important;
+  font-style: var(--shiki-dark-font-style) !important;
+  font-weight: var(--shiki-dark-font-weight) !important;
+}
+.astro-code,
+.shiki {
   margin: 0 !important;
-  padding: 1.4rem 1.6rem !important;
-  background: transparent !important;
+  padding: 1.1rem 1.25rem !important;
   border-radius: 0 !important;
-  box-shadow: none !important;
-  overflow: visible !important;
-  font-size: 0.9rem;
-  line-height: 1.72;
+  overflow-x: auto;
+  font-size: 0.86rem;
+  line-height: 1.7;
   tab-size: 2;
 }
-.astro-code code {
-  background: transparent !important;
-}
 
-/*
- * Custom scrollbar for code blocks — thin warm-toned rail that
- * blends into the parchment rather than WebKit's default slate gray.
- * Applied to .code-scroll inside CodeBlock.astro.
- */
-.code-scroll::-webkit-scrollbar {
-  width: 10px;
-  height: 10px;
-}
-.code-scroll::-webkit-scrollbar-track {
-  background: transparent;
-}
-.code-scroll::-webkit-scrollbar-thumb {
-  background: #d1cfc5;                    /* ring-warm */
-  border: 2px solid #faf9f5;              /* ivory inset — gives thumb air on both sides */
-  border-radius: 999px;
-  background-clip: padding-box;
-}
-.code-scroll::-webkit-scrollbar-thumb:hover {
-  background: #b0aea5;                    /* warm-silver */
-  background-clip: padding-box;
-}
-.code-scroll::-webkit-scrollbar-corner {
-  background: transparent;
-}
-/* Firefox */
-.code-scroll {
+/* Thin warm scrollbars for code and wide tables. */
+.scroll-thin {
   scrollbar-width: thin;
-  scrollbar-color: #d1cfc5 transparent;
+  scrollbar-color: rgb(var(--line)) transparent;
+}
+.scroll-thin::-webkit-scrollbar { width: 8px; height: 8px; }
+.scroll-thin::-webkit-scrollbar-thumb {
+  background: rgb(var(--line));
+  border-radius: 999px;
 }
 
+/* ── Prose (doc body) ──────────────────────────────────────────────────── */
 /*
- * Inline <code> inside prose (not a child of <pre>) gets a subtle
- * warm chip so code-in-text reads as code without shouting. Skips
- * nodes that already have an author-defined class — those carry
- * their own intentional styling (see ConfigSchema / EndpointRow).
+ * Every rule is wrapped in :where() and skips .not-prose subtrees, so
+ * components embedded in MDX (field lists, endpoint cards, callouts)
+ * keep their own Tailwind styling.
  */
-:not(pre) > code:not([class]) {
-  background: #f0eee6;                     /* border-cream */
-  color: #4d4c48;                          /* charcoal-warm */
-  padding: 0.12em 0.4em;
-  border-radius: 6px;
-  font-size: 0.88em;
-  letter-spacing: -0.2px;
+.prose-doc {
+  color: rgb(var(--fg-2));
+  font-size: 1rem;
+  line-height: 1.8;
+  overflow-wrap: break-word;
 }
+.prose-doc > :first-child { margin-top: 0; }
+.prose-doc :where(h2):not(:where(.not-prose, .not-prose *)) {
+  font-size: 1.6rem;
+  line-height: 1.3;
+  margin: 3rem 0 1rem;
+  padding-top: 1.25rem;
+  border-top: 1px solid rgb(var(--line-soft));
+}
+.prose-doc :where(h3):not(:where(.not-prose, .not-prose *)) {
+  font-size: 1.22rem;
+  line-height: 1.35;
+  margin: 2.2rem 0 0.75rem;
+}
+.prose-doc :where(h4):not(:where(.not-prose, .not-prose *)) {
+  font-family: theme('fontFamily.sans');
+  font-weight: 600;
+  font-size: 1rem;
+  margin: 1.6rem 0 0.5rem;
+}
+.prose-doc :where(p):not(:where(.not-prose, .not-prose *)) { margin: 0.9rem 0; }
+.prose-doc :where(strong):not(:where(.not-prose, .not-prose *)) { color: rgb(var(--fg)); font-weight: 600; }
+.prose-doc :where(a):not(:where(.not-prose, .not-prose *)) {
+  text-decoration: underline;
+  text-decoration-color: rgb(var(--accent) / 0.35);
+  text-underline-offset: 3px;
+}
+.prose-doc :where(a):not(:where(.not-prose, .not-prose *)):hover { text-decoration-color: rgb(var(--accent)); }
+.prose-doc :where(ul, ol):not(:where(.not-prose, .not-prose *)) { margin: 0.9rem 0; padding-left: 1.4rem; }
+.prose-doc :where(ul):not(:where(.not-prose, .not-prose *)) { list-style: disc; }
+.prose-doc :where(ol):not(:where(.not-prose, .not-prose *)) { list-style: decimal; }
+.prose-doc :where(li):not(:where(.not-prose, .not-prose *)) { margin: 0.35rem 0; }
+.prose-doc :where(li):not(:where(.not-prose, .not-prose *))::marker { color: rgb(var(--subtle)); }
+.prose-doc :where(blockquote):not(:where(.not-prose, .not-prose *)) {
+  margin: 1.2rem 0;
+  padding: 0.2rem 1rem;
+  border-left: 3px solid rgb(var(--line));
+  color: rgb(var(--muted));
+}
+.prose-doc :where(hr):not(:where(.not-prose, .not-prose *)) {
+  margin: 2.5rem 0;
+  border: 0;
+  border-top: 1px solid rgb(var(--line-soft));
+}
+/* Inline code chip — anywhere in the body, unless the element brings its own classes. */
+.prose-doc :where(:not(pre) > code:not([class])) {
+  background: rgb(var(--surface-2));
+  color: rgb(var(--fg));
+  padding: 0.1em 0.38em;
+  border-radius: 5px;
+  font-size: 0.86em;
+  overflow-wrap: anywhere;
+}
+.prose-doc :where(pre.astro-code):not(:where(.not-prose *)) {
+  margin: 1.25rem 0 !important;
+  border-radius: 10px !important;
+  background: rgb(var(--surface)) !important;
+  box-shadow: var(--sh-ring);
+}
+.prose-doc :where(.table-wrap) {
+  margin: 1.25rem 0;
+  overflow-x: auto;
+  border-radius: 10px;
+  box-shadow: var(--sh-ring);
+  background: rgb(var(--surface));
+}
+.prose-doc :where(.table-wrap table) {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+.prose-doc :where(.table-wrap th) {
+  text-align: left;
+  font-weight: 600;
+  color: rgb(var(--fg));
+  background: rgb(var(--surface-2) / 0.6);
+  padding: 0.6rem 0.85rem;
+  white-space: nowrap;
+}
+.prose-doc :where(.table-wrap td) {
+  padding: 0.6rem 0.85rem;
+  border-top: 1px solid rgb(var(--line-soft));
+  vertical-align: top;
+}
+.prose-doc :where(.table-wrap td:first-child code) { white-space: nowrap; }
+.prose-doc :where(img) { max-width: 100%; border-radius: 10px; }
 
-/* Utility: warm ring on focus for a11y (matches focus-blue token). */
-.focus-ring:focus-visible {
-  outline: 2px solid #3898ec;
-  outline-offset: 2px;
+/* Copy button injected next to every rendered code fence. */
+.code-frame { position: relative; }
+.code-frame .copy-fab {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.5rem;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.code-frame:hover .copy-fab,
+.code-frame .copy-fab:focus-visible { opacity: 1; }
+@media (hover: none) {
+  .code-frame .copy-fab { opacity: 1; }
+}
+.code-frame { margin: 1.25rem 0; }
+.prose-doc .code-frame > pre.astro-code { margin: 0 !important; }
+
+/* Highlighted blocks inside components carry their own frame. */
+.not-prose pre.astro-code,
+.not-prose pre.shiki {
+  margin: 0 !important;
+  background: transparent !important;
+  box-shadow: none !important;
 }

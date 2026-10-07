@@ -1,0 +1,76 @@
+---
+title: Examples
+description: Six ready-to-use Smart configurations covering a minimal setup, tuning, LightGBM, ASN, groups per traffic type and nested groups.
+---
+
+import CodeBlock from '../../../components/CodeBlock.astro';
+import Callout from '../../../components/Callout.astro';
+import ex1 from '../../../examples/01-minimal.json?raw';
+import ex2 from '../../../examples/02-tuned.json?raw';
+import ex3 from '../../../examples/03-lightgbm.json?raw';
+import ex4 from '../../../examples/04-asn-geox.json?raw';
+import ex5 from '../../../examples/05-algorithms.json?raw';
+import ex6 from '../../../examples/06-nested.json?raw';
+
+All examples below pass `sing-box check`. Except for the first one, each example lists only the Smart-related parts; see the first one for how to write the `my-subscription` subscription, the `direct` outbound and `cache_file`.
+
+## Minimal configuration
+
+<CodeBlock code={ex1} filename="01-minimal.json" locale="en" />
+
+- References all nodes of one subscription. All other fields use their defaults.
+- `cache_file` cannot be omitted, otherwise Smart does not learn.
+- `clash_api` is used to view weights and pin nodes. You can remove it if you don't need it.
+
+## Tuning probes and selection
+
+<CodeBlock code={ex2} filename="02-tuned.json" locale="en" />
+
+- `exclude` removes non-node entries from the subscription, such as traffic and expiry notices. `(?i)` makes the match case-insensitive.
+- `expected_status: "204"` requires the probe URL to return 204. When it is empty, any HTTP response counts as success, which easily leads to false results on networks with a captive portal.
+- `interval: "5m"` reduces the number of probes, which suits phones.
+- `hysteresis: "30s"` keeps the same website on the same node while it has sustained traffic.
+- `policy_priority` raises the priority of nodes whose names contain `HK` or `JP`, and uses a regex to lower nodes whose names carry a 2–9 multiplier tag (such as `2x`, `3×`) to 0.8. Note that nodes with a factor greater than 1 rank ahead of all other nodes; see [Node preference](../priority-and-pinning/#where-the-factor-applies).
+
+## Enabling LightGBM
+
+<CodeBlock code={ex3} filename="03-lightgbm.json" locale="en" />
+
+- On first start, the default model is downloaded in the background. The traditional formula is used until the download finishes.
+- `download_detour: "direct"` avoids downloading the model through the Smart group, which is not ready yet.
+- `collect_data` with `sample_rate: 0.3` collects training data at a 30% rate, and writing stops once the file reaches 100 MB. If you don't plan to train your own model, remove these two fields.
+
+## Learning by ASN
+
+<CodeBlock code={ex4} filename="04-asn-geox.json" locale="en" />
+
+- GeoX downloads the ASN and country databases and updates them once a week. The ASN database is used by `use_asn`, and the country database is used by LightGBM.
+- On a fresh install, the first download takes time. ASN takes effect only **after you restart once when the download finishes**; see [ASN and GeoX](../asn-geox/#experimentalgeox).
+- To use only a local file, remove `geox` and write `"asn_database": "/path/to/GeoLite2-ASN.mmdb"` in the group.
+
+## Groups per traffic type
+
+<CodeBlock code={ex5} filename="05-algorithms.json" locale="en" />
+
+Four Smart groups reference the same subscription, and route rules assign traffic to them by type:
+
+| Group | Algorithm | Use |
+|---|---|---|
+| `smart-interactive` | `latency-banded` + 1-minute `hysteresis` | SSH and remote desktop; prefers low latency and avoids switching nodes where possible |
+| `smart-bulk` | `least-loaded`, TCP only | Downloads, spread across the nodes with the fewest connections |
+| `smart-sticky` | `sticky-session` | Services that tie the login session to the exit IP |
+| `smart-default` | `p2c` | All other traffic |
+
+<Callout type="note" title="The cost of multiple groups">
+  Stats are stored per group. Four groups mean the same set of nodes is learned four separate times, and memory and disk usage grow accordingly. Split groups only when different traffic really needs different algorithms.
+</Callout>
+
+## Nested groups
+
+<CodeBlock code={ex6} filename="06-nested.json" locale="en" />
+
+- Three `urltest` groups each pick the fastest node of one region from the subscription, and Smart learns to choose among the three regions.
+- Smart treats member groups as ordinary nodes: stats are recorded under `HK`, `JP` and `US`, and reflect whichever node that group had selected at the time.
+- `policy_priority: "=HK:1.2"` uses `=` for an exact match, so it applies only to the member named `HK`.
+- The outermost `selector` uses `auto` by default. You can switch to a fixed region in the dashboard when needed.
+- This structure has few candidates and learns fast, which suits setups with many nodes where you only care about the region. The cost is that Smart cannot see differences between individual nodes within a region.

@@ -1,0 +1,241 @@
+---
+title: Clash API
+description: How Smart groups appear in the Clash API, and every endpoint for querying weights, diagnostics, pinning, blocking nodes, switching algorithms and clearing data.
+---
+
+import Callout from '../../../components/Callout.astro';
+
+Smart reuses the sing-box Clash API (`experimental.clash_api`). The examples below assume `external_controller` is `127.0.0.1:9090`. When `secret` is set, every request must carry `Authorization: Bearer <secret>`. Errors are always returned as `{"message": "..."}`, except where an endpoint notes otherwise.
+
+<Callout type="warn" title="Group names containing /">
+  `/smart/*` and `/cache/smart/flush/{name}` do not URL-decode the group name in the path, so these endpoints return 404 when the group name contains `/`. The `/proxies/{name}` endpoints are not affected.
+</Callout>
+
+## Smart groups in the dashboard
+
+### `GET /proxies/{name}`
+
+A Smart group's `type` is `Smart`. Besides the standard fields, it carries Smart's state:
+
+```json
+{
+  "type": "Smart",
+  "name": "auto",
+  "udp": true,
+  "now": "HK-01",
+  "all": ["HK-01", "HK-02", "JP-01"],
+  "history": [{ "time": "2026-10-07T08:00:00Z", "delay": 123 }],
+  "alive": true,
+  "hidden": false,
+  "icon": "",
+  "testUrl": "https://www.gstatic.com/generate_204",
+  "useASN": false,
+  "useLightGBM": true,
+  "collectData": false,
+  "fixed": "",
+  "fixedSuspended": false,
+  "fixedActive": "",
+  "algorithm": "strict-best",
+  "hysteresis": "0s",
+  "policyPriority": null,
+  "pinEndorsements": null,
+  "lgbmModelAge": "2h3m0s"
+}
+```
+
+- `udp` is `!disable_udp`.
+- For how `now` is determined, see [Current node](../how-it-works/#current-node). `history` and `alive` are both latency test data for the `now` node.
+- `fixed` is the pinned node. `fixedSuspended` means the pin is suspended because of a failure; in that case `fixedActive` is the node actually in use.
+- `lgbmModelAge` appears only when the model is loaded.
+
+`GET /group/{name}` returns the same structure; `GET /group` returns all groups as `{"proxies": [...]}`.
+
+### `PUT /proxies/{name}`
+
+Pins a node. `PATCH` is equivalent. The request body is `{"name": "HK-01"}`; pass an empty string to unpin. Returns 204 on success. Returns 400 `Smart update error: not found` when the node is not a member of this group.
+
+The pin is saved to the cache file and clears this group's unwrap cache. Existing connections are interrupted only when `interrupt_exist_connections` is enabled. For behavior details, see [Pinning a node](../priority-and-pinning/#pinning-a-node).
+
+### `DELETE /proxies/{name}`
+
+Unpins and clears the selection state, then recomputes prefetch and ranking in the background.
+
+```json
+{ "group": "auto", "previous_pin": "HK-01", "now": "JP-01", "interrupted_mux": true, "unwrap_cleared": true }
+```
+
+`interrupted_mux` only means the interrupt was called; it does not mean any connection was closed. `urltest` groups also support this endpoint and return `{"group", "previous_pin", "now"}`. Other types return 400.
+
+### `GET /proxies/{name}/delay`
+
+Parameters: `timeout` (required, in milliseconds) and `url` (optional). The test goes through Smart's own selection and does not remove the pin. It tests at most 3 times and takes the median, and stops if the first result is below 50 ms. A `url` starting with `http://` is ignored and the default probe URL is used. Returns `{"delay": 120}` on success, 504 on timeout and 503 on other failures. The result is recorded under the `now` node, which is not necessarily the node actually tested.
+
+### `GET /group/{name}/delay`
+
+Tests every member of the group one by one (4 concurrently), returns the successful results, such as `{"HK-01": 120, "JP-01": 85}`, and updates the shared latency test records.
+
+## Weights and diagnostics
+
+### `GET /proxies/{name}/weights`
+
+This group's node ranking. Parameters:
+
+- `refresh=true`: recompute the ranking from the existing prefetch results (does not prefetch again);
+- `full=1`: include the per-(destination, node) breakdown `per_target`. With many nodes, the breakdown is a random sample of at most `MaxTargets / 2` rows.
+
+```json
+{
+  "weights": [
+    { "name": "HK-01", "rank": "MostUsed", "weight": 1.4231, "score": 100,
+      "targetCount": 37, "sampleCount": 412, "lastUpdated": 1759800000 }
+  ],
+  "per_target": [
+    { "target": "*.example.com", "node": "HK-01", "weight_tcp": 1.42,
+      "success": 12, "failure": 1, "connect_time_ms": 85, "latency_ms": 140,
+      "last_used": 1759800000, "upload_mb": 0.53, "download_mb": 12.8 }
+  ]
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `rank` | `MostUsed` (top 20%), `OccasionalUsed` (next 50%), `RarelyUsed` |
+| `weight` | The node's average weight across active destinations, on the same scale used by internal selection |
+| `score` | `weight` as a percentage of the highest one, used to draw the progress bar |
+| `targetCount` | Number of destinations included in the average |
+| `sampleCount` | Total dial samples on those destinations |
+
+When there is no data, the response also includes `"message": "no weight data available for this group"`. When there are no stats (for example, the cache file is not enabled), the ranking is generated from test latency, with `targetCount` 1 and `sampleCount` 0. For a group that is not a Smart group, returns 400 `{"weights": [], "error": "not a Smart group"}`.
+
+### `DELETE /proxies/{name}/weights`
+
+Clears all of this group's data in the cache file (stats, node state, ranking, prefetch, destination failure counts, write queue, pin, unavailable markers, circuit breakers, pin endorsements), then recomputes.
+
+```json
+{
+  "group": "auto",
+  "deleted": { "stats": 1203, "nodes": 42, "ranking": 1, "prefetch": 380, "failures": 12,
+               "queue": 3, "manual_pin": 1, "known_dead": 2, "breakers": 1, "pin_endorsement": 1 },
+  "total": 1646,
+  "recomputed": true
+}
+```
+
+### `GET /smart/weights`
+
+Rankings of all Smart groups, computed for up to 5 groups concurrently. Supports `refresh=true`.
+
+```json
+{ "weights": { "auto": [ { "name": "HK-01", "rank": "MostUsed", "weight": 1.42, "score": 100, "targetCount": 37, "sampleCount": 412, "lastUpdated": 1759800000 } ] }, "errors": {} }
+```
+
+When there are no Smart groups, returns `{"weights": {}, "message": "no Smart groups configured"}`.
+
+### `GET /smart/groups`
+
+Lists all Smart groups and their settings:
+
+```json
+{
+  "groups": [
+    {
+      "name": "auto", "testUrl": "https://www.gstatic.com/generate_204",
+      "useASN": false, "useLightGBM": true, "collectData": false,
+      "fixed": "", "now": "HK-01", "members": 42,
+      "algorithm": "strict-best", "pinSuspended": false, "http3FallbackNodes": 0,
+      "lgbmModelAge": "2h3m0s",
+      "policyPriority": [ { "raw": "HK:1.3", "pattern": "HK", "kind": "substring", "negate": false, "factor": 1.3 } ]
+    }
+  ]
+}
+```
+
+`lgbmModelAge`, `policyPriority`, `pinEndorsements` and `hysteresis` are omitted when empty. `policyPriority` lists, for each rule, the parsed pattern, the match kind (`substring`, `exact`, `regex`, `glob`), whether it is negated, and the factor, so you can confirm that the rules are parsed as intended. `http3FallbackNodes` is currently always 0.
+
+### `GET /smart/groups/{name}/diag`
+
+Internal state of a single group, read-only:
+
+```json
+{
+  "name": "auto", "algorithm": "strict-best", "hysteresis": "0s",
+  "policy_priority": null, "members": 42, "now": "HK-01", "fixed": "",
+  "test_url": "https://www.gstatic.com/generate_204",
+  "snapshot_entries": 42, "snapshot_age": "42s",
+  "live_coverage": { "HK-01": { "target_count": 37, "sample_count": 412 } }
+}
+```
+
+`snapshot_*` are the entry count and age of the in-memory ranking snapshot. When there is no snapshot, `snapshot_age` is `(none)`. `live_coverage` is read directly from the stats store, bypassing all caches, and appears only when the cache file is available. Returns 404 if the group does not exist, and 400 if it is not a Smart group.
+
+## Control
+
+### `PUT /smart/groups/{name}/algorithm`
+
+Switches the algorithm at runtime. The request body must be a JSON object:
+
+```bash
+curl -X PUT http://127.0.0.1:9090/smart/groups/auto/algorithm -d '{"algorithm":"p2c"}'
+```
+
+```json
+{ "group": "auto", "requested": "p2c", "applied": "p2c", "previous": "strict-best" }
+```
+
+For values and aliases, see [Selection algorithms](../algorithms/). An unrecognized value does not cause an error; `applied` is `strict-best`. The switch is not written back to the config and is reverted on restart.
+
+### `POST /smart/groups/{name}/block/{node}`
+
+Manually blocks a node. The `duration` parameter (such as `15m`) defaults to 30 minutes; invalid values are ignored. While blocked, the node is treated as having failed 100 times, with a degradation factor of 0.1.
+
+```json
+{ "group": "auto", "node": "HK-01", "blocked_until": "2026-10-07T09:30:00+08:00" }
+```
+
+- There is no endpoint to unblock. A block expires on its own, or you can clear it with the data-clearing endpoints. The block set is cached for 300 seconds, so an unblock can take up to 5 minutes to take effect.
+- A pinned node is not affected by blocks. The fallback choice used when all candidates are unavailable does not check blocks either.
+- Returns 404 if the group or node does not exist. Returns 500 `smart: store unavailable` when there is no cache file.
+
+### `POST /smart/groups/{name}/recompute`
+
+Recomputes prefetch and ranking in the background, and immediately returns a recomputed ranking `{"group", "ranking": [...]}`. Because prefetch is asynchronous, the returned ranking may lag the final result by one cycle. All errors return 404.
+
+### `POST /smart/groups/{name}/clear-selection`
+
+Same as `DELETE /proxies/{name}`. Returns `{"group": "auto", "cleared": true}`.
+
+## Clearing the cache
+
+### `POST /cache/smart/flush`
+
+`DELETE` is equivalent. Runs one clear for every Smart group in the current config (the same contents as `DELETE /proxies/{name}/weights`), and clears Smart's in-process memory caches.
+
+```json
+{
+  "flushed_groups": 2, "errors": 0,
+  "total": { "stats": 2406, "nodes": 84, "ranking": 2, "prefetch": 760, "failures": 24, "queue": 0 },
+  "groups": [ { "group": "auto", "deleted": { "stats": 1203 }, "recomputed": true } ]
+}
+```
+
+`total` does not count pins, unavailable markers, circuit breakers and pin endorsements; those are in each group's `deleted`. Returns 500 only when all groups fail.
+
+### `POST /cache/smart/flush/{name}`
+
+Clears a single group. `DELETE` is equivalent. Returns `{"group", "deleted", "total", "recomputed": true}`.
+
+## Connections
+
+### `GET /connections`
+
+For connections that go through Smart, `chains` is completed down to the node that was actually dialed. The order is the same as mihomo, with the final node first:
+
+```json
+{ "chains": ["HK-01", "auto", "proxy"] }
+```
+
+When Smart's members are groups such as `urltest` or `selector`, the chain is expanded level by level down to the real node.
+
+### `DELETE /connections/smart/{id}`
+
+Closes a connection and blocks the Smart member it **actually used** for 30 minutes. Returns `{"group": "auto", "node": "HK-01"}` on success. Returns `{}` if the connection did not go through a Smart group or the block failed. Returns 400 if `id` is not a valid UUID, and 404 if the connection does not exist.

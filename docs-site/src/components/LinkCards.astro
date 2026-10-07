@@ -1,0 +1,42 @@
+---
+import { inline } from '../lib/inline';
+import { href } from '../i18n/ui';
+import type { Lang } from '../data/nav';
+
+export interface Card {
+  title: string;
+  body: string;
+  /** Doc slug (internal) or absolute URL. */
+  to?: string;
+}
+
+export interface Props {
+  lang: Lang;
+  cards: Card[];
+  cols?: 2 | 3;
+}
+
+const { lang, cards, cols = 2 } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+const link = (to: string) => (/^https?:/.test(to) || to.startsWith('#') ? to : href(lang, to));
+---
+
+<div class:list={['not-prose my-6 grid gap-4', cols === 3 ? 'sm:grid-cols-2 lg:grid-cols-3' : 'sm:grid-cols-2']}>
+  {cards.map((c) => {
+    const Tag = c.to ? 'a' : 'div';
+    return (
+      <Tag
+        href={c.to ? link(c.to) : undefined}
+        class:list={[
+          'group block rounded-card bg-surface p-5 shadow-ring transition-shadow',
+          c.to && 'hover:shadow-lift',
+        ]}
+      >
+        <p class="font-serif text-[1.12rem] text-fg group-hover:text-accent">
+          {c.title}{c.to && <span class="ml-1 text-subtle transition-transform group-hover:translate-x-0.5 inline-block" aria-hidden="true">→</span>}
+        </p>
+        <p class="mt-2 text-[0.92rem] leading-relaxed text-muted" set:html={inline(c.body, base)} />
+      </Tag>
+    );
+  })}
+</div>

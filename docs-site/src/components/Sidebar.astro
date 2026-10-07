@@ -1,0 +1,40 @@
+---
+import { getCollection } from 'astro:content';
+import { sidebar, type Lang } from '../data/nav';
+import { href } from '../i18n/ui';
+
+export interface Props {
+  lang: Lang;
+  current?: string;
+}
+
+const { lang, current } = Astro.props;
+const entries = await getCollection('docs', (e) => e.slug.startsWith(`${lang}/`));
+const titleOf = (slug: string) => entries.find((e) => e.slug === `${lang}/${slug}`)?.data.title ?? slug;
+---
+
+<div class="space-y-7 text-[0.92rem]">
+  {sidebar.map((section) => (
+    <div>
+      <p class="mb-2 px-2 text-[0.72rem] font-semibold uppercase tracking-[0.08em] text-subtle">{section[lang]}</p>
+      <ul class="space-y-0.5">
+        {section.slugs.map((slug) => (
+          <li>
+            <a
+              href={href(lang, slug)}
+              class:list={[
+                'block rounded-md px-2 py-1.5 leading-snug transition-colors',
+                slug === current
+                  ? 'bg-accent-soft font-medium text-accent'
+                  : 'text-muted hover:bg-surface-2 hover:text-fg',
+              ]}
+              aria-current={slug === current ? 'page' : undefined}
+            >
+              {titleOf(slug)}
+            </a>
+          </li>
+        ))}
+      </ul>
+    </div>
+  ))}
+</div>

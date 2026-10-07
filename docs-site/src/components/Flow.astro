@@ -1,0 +1,33 @@
+---
+import { inline } from '../lib/inline';
+
+// Numbered vertical flow with a connecting rail: used for pipelines
+// (dial flow, quick-start steps). Bodies accept the inline syntax.
+
+export interface Props {
+  items: { title: string; body: string; tag?: string }[];
+}
+
+const { items } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<ol class="not-prose my-8 space-y-0">
+  {items.map((it, i) => (
+    <li class="relative grid grid-cols-[2rem_1fr] gap-x-4 pb-6 last:pb-0">
+      {i < items.length - 1 && (
+        <span class="absolute left-[0.95rem] top-8 bottom-0 w-px bg-line" aria-hidden="true"></span>
+      )}
+      <span class="relative z-10 flex h-8 w-8 items-center justify-center rounded-full bg-accent-soft font-mono text-[0.8rem] font-semibold text-accent ring-4 ring-bg">
+        {i + 1}
+      </span>
+      <div class="pt-1">
+        <p class="flex flex-wrap items-baseline gap-2 font-medium text-fg">
+          {it.title}
+          {it.tag && <span class="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[0.72rem] font-normal text-muted">{it.tag}</span>}
+        </p>
+        <p class="mt-1 text-[0.93rem] leading-relaxed text-muted" set:html={inline(it.body, base)} />
+      </div>
+    </li>
+  ))}
+</ol>

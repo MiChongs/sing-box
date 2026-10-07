@@ -1,23 +1,22 @@
 ---
 export interface Props {
-  type?: 'info' | 'warn' | 'note';
+  type?: 'note' | 'tip' | 'warn' | 'danger';
   title?: string;
 }
 
-const { type = 'info', title } = Astro.props;
+const { type = 'note', title } = Astro.props;
 
-const palette = {
-  info: 'bg-ivory border-terracotta text-charcoal-warm',
-  warn: 'bg-ivory border-error-crimson text-charcoal-warm',
-  note: 'bg-warm-sand border-stone-gray text-charcoal-warm',
+const tone = {
+  note: { box: 'bg-info-soft/60 border-info', title: 'text-info' },
+  tip: { box: 'bg-ok-soft/60 border-ok', title: 'text-ok' },
+  warn: { box: 'bg-accent-soft/70 border-accent', title: 'text-accent' },
+  danger: { box: 'bg-danger-soft/70 border-danger', title: 'text-danger' },
 }[type];
 ---
 
-<aside class={`border-l-4 rounded-card px-5 py-4 my-6 shadow-ring-1 ${palette}`}>
-  {title && (
-    <p class="font-serif text-feat-20 text-ink mb-2">{title}</p>
-  )}
-  <div class="font-sans text-body-16 prose-sm">
+<aside class={`not-prose my-6 rounded-r-card border-l-[3px] px-4 py-3 text-[0.95rem] leading-relaxed text-fg-2 ${tone.box}`}>
+  {title && <p class={`mb-1 font-semibold ${tone.title}`}>{title}</p>}
+  <div class="callout-body [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&_p]:my-2">
     <slot />
   </div>
 </aside>

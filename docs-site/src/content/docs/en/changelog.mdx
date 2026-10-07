@@ -1,0 +1,74 @@
+---
+title: Changelog
+description: Changes in Smart group behavior since the docs site launched in April 2026, and the corrections made in this documentation rewrite.
+---
+
+Only changes that affect usage are listed, newest first. For the full commit history, see [GitHub](https://github.com/MiChongs/sing-box/commits/xiaobaf14g-testing).
+
+## 2026-10
+
+**Connection chains extended to the actual node** (Oct 6)
+
+- For connections through Smart in `/connections`, `chains` now includes the node that was actually dialed, with the final node first, such as `["HK-01", "auto", "proxy"]`. When members are nested groups, the chain is expanded level by level.
+- `DELETE /connections/smart/{id}` blocks the node this connection **actually used**, rather than the group's current `now`.
+- The connection lists in SFA / SFW / SFL also show the actual node.
+
+**Fixed long-lived connections being cut at 30 seconds** (Oct 5)
+
+- The first-byte timeout now starts at the client's first write and is cleared when the first byte arrives. A stall is recognized only as "no response at all for 60 seconds after a write". Previously, long-lived connections through Smart were cut at the 30th second, and healthy nodes were wrongly counted as failed.
+- The probe timeout now counts from when the probe starts running, so time spent queued is no longer counted as a node failure.
+- Probes and stats now use dedicated queues: probes of the same node are merged across groups, and when the stats queue is full, samples are dropped instead of blocking connection close.
+- After device sleep or a clock jump, periodic tasks continue from the current time instead of running back to back to catch up.
+- Per-connection Info logs are lowered to Debug. Country lookup runs only when LightGBM or data collection is enabled.
+
+**Storage layer rewrite** (Oct 5)
+
+- Prefetch and per-destination selection now use an incremental stats index: prefetching 800 destinations dropped from about 745 ms to about 32 ms, and per-destination selection from about 530 µs to about 0.6 µs.
+- Removed the t-digest of about 22 KB per record. Old data still loads as usual.
+- Fixed: deleting `node-1` also deleted `node-10`; scanning group `HK` also matched `HK-Auto`; reads could return stale values for up to 300 seconds after a write; nodes with `/` in their names had their stats wrongly deleted during cleanup.
+
+## 2026-06
+
+**Lower resource usage with many nodes** (Jun 12)
+
+- Health checks now use "top 16 always probed + rotating budget + exponential backoff on failure". With 500 nodes, probes per round dropped from about 500 to about 66.
+- The minimum interval between ranking recomputations widens with the number of nodes.
+- In-memory caches are now measured in real bytes, so `SMART_CACHE_BUDGET_MB` is a real memory cap.
+- LightGBM inference results are cached for 30 seconds. The event counter table is capped at 4096.
+
+**Missing files downloaded automatically at startup** (Jun 8)
+
+- When `use_lightgbm` is enabled and the model file does not exist, the model is downloaded once even if `auto_update` is not enabled.
+- When `use_asn` is enabled and there is no ASN database, GeoLite2-ASN is downloaded automatically. When the country database is missing, GeoLite2-Country is downloaded automatically.
+
+**LightGBM features expanded to 35 dimensions** (Jun 8)
+
+- Added 8 dimensions: standard deviation of latency and of connect time, the difference between short-term and long-term RTT, short-term success rate, active connection count, TLS handshake time, hour, and TCP retransmissions. Old 27-dimension models still work.
+- The training data format is upgraded to version 4.
+- Added `POST /smart/groups/{name}/recompute` and `POST /smart/groups/{name}/clear-selection`. `/smart/groups` gains a `pinSuspended` field.
+
+## 2026-04
+
+- **Network changes and memory**: fixed CPU saturation and memory spikes during network changes and interruptions. Added a failure-storm gate. On a network change, dials in progress are canceled and the pinned node is warmed up first.
+- **Fast switching**: added hedged dialing and concurrent recovery, so traffic moves away faster after a node disconnects. A single failure marks a node unavailable. Connections of the losing side in a race are closed.
+- **Pinning**: the pin is bypassed temporarily only when a real dial fails, and the fallback after a failure also follows the selection algorithm (TCP and UDP). The state is synced to the Clash API. Fixed pins not taking effect and not respecting `interrupt_exist_connections`.
+- **Destination suspicion**: "falsely alive" nodes are filtered per destination. Added a TLS handshake probe.
+- **New capabilities**: the `consistent-hashing` algorithm; request scenario reordering and adaptive parallel dialing; a bandwidth bonus for streaming and download scenarios; `expected_status`; `http_client` support for LightGBM and GeoX.
+
+## Corrections in this documentation rewrite
+
+Content in the old documentation that did not match the source code:
+
+| Old documentation | Actual |
+|---|---|
+| Fields `tolerance`, `idle_timeout` | Not supported by Smart; setting them causes a config error |
+| 11 sorting algorithms | 10 |
+| LightGBM uses 27+ features, combined with the traditional weights | 35 dimensions; the model output replaces the traditional formula directly |
+| Recognizes 22 kinds of fatal errors | 7 reset substrings + system error codes; after the first byte, another 26 substrings and GOAWAY rules |
+| A stall is declared after 30 seconds without data after the first byte | A stall is declared only after 60 seconds with no response at all after a write; idle connections are not affected |
+| Linear weight reduction + a cooldown of 30 minutes or more | A single failure makes the node unavailable for 3 minutes; the circuit breaker starts at 15 seconds; a block of 93 minutes or more only after 30 accumulated failures |
+| Learns independently per (destination ASN, node) | Stats are per (destination, node); ASN only decides the weight slot, and selection aggregates all destinations with the same ASN |
+| Once `max_host_failed_times` is exceeded, the node for that host is no longer demoted | The count is per (group, destination): +1 on degradation, −1 when normal |
+| The request body of `PUT /smart/groups/{name}/algorithm` is a string | Must be `{"algorithm": "..."}` |
+| The block duration follows the circuit breaker config | Fixed at 30 minutes by default; can be set with the `duration` parameter |
+| GeoX's `geoip` and `geosite` are used by other features | No component currently reads these two files |

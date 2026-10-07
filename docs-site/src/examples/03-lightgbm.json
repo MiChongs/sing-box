@@ -1,0 +1,27 @@
+{
+  "outbounds": [
+    {
+      "type": "smart",
+      "tag": "auto",
+      "providers": ["my-subscription"],
+      "use_lightgbm": true,
+      "collect_data": true,
+      "sample_rate": 0.3
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "experimental": {
+    "cache_file": { "enabled": true },
+    "smart": {
+      "lightgbm": {
+        "auto_update": true,
+        "update_interval": "72h",
+        "download_detour": "direct"
+      },
+      "collector": {
+        "path": "smart_weight_data.csv",
+        "size_limit_mb": 100
+      }
+    }
+  }
+}

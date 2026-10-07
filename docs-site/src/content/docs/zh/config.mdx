@@ -1,0 +1,152 @@
+---
+title: 配置字段
+description: Smart 出站组、experimental.smart、experimental.geox 的全部字段，以及影响 Smart 的环境变量。默认值与校验规则均以源码为准。
+---
+
+import FieldList from '../../../components/FieldList.astro';
+import Callout from '../../../components/Callout.astro';
+import {
+  membershipFields, probeFields, selectionFields, learningFields, asnFields, displayFields,
+  lightgbmFields, collectorFields, geoxFields, envVars,
+} from '../../../data/fields';
+
+Smart 的配置分三处：出站组本身（`type: "smart"`）、全局的 `experimental.smart`（LightGBM 模型与训练数据），以及全局的 `experimental.geox`（ASN 与国家数据库下载）。另外，Smart 的学习数据保存在 `experimental.cache_file` 中。
+
+## 结构总览
+
+```json
+{
+  "outbounds": [
+    {
+      "type": "smart",
+      "tag": "auto",
+
+      "outbounds": [],
+      "providers": [],
+      "use_all_providers": false,
+      "include": "",
+      "exclude": "",
+
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "3m",
+      "expected_status": "",
+
+      "algorithm": "strict-best",
+      "hysteresis": "0s",
+      "policy_priority": "",
+      "interrupt_exist_connections": false,
+      "disable_udp": false,
+
+      "use_lightgbm": false,
+      "collect_data": false,
+      "sample_rate": 1.0,
+      "max_host_failed_times": 10,
+
+      "use_asn": false,
+      "asn_database": [],
+
+      "hidden": false,
+      "icon": ""
+    }
+  ],
+  "experimental": {
+    "cache_file": { "enabled": true },
+    "smart": {
+      "lightgbm": {
+        "model_path": "smart_lgbm_model.bin",
+        "url": "",
+        "auto_update": false,
+        "update_interval": "72h",
+        "http_client": "",
+        "download_detour": ""
+      },
+      "collector": {
+        "path": "smart_weight_data.csv",
+        "size_limit_mb": 100
+      }
+    },
+    "geox": {
+      "enabled": false,
+      "auto_update": false,
+      "update_interval": "24h",
+      "download_detour": "",
+      "url": { "asn": [], "mmdb": "", "geoip": "", "geosite": "" }
+    }
+  }
+}
+```
+
+<Callout type="warn" title="必须开启 cache_file">
+  Smart 的统计、权重、排名、手动指定、熔断状态都保存在缓存文件的 `smart_stats` bucket 中。没有缓存文件时，Smart 不记录任何统计，只按 URL 测速延迟选路。命令行版本需要设置 `experimental.cache_file.enabled: true`；SFA / SFW / SFL 图形客户端始终启用缓存文件。
+</Callout>
+
+<Callout type="danger" title="不支持的字段">
+  `tolerance` 与 `idle_timeout` 是 `urltest` 的字段，Smart 从未支持。配置中出现未知字段会直接报错：`outbounds[0].tolerance: json: unknown field "tolerance"`。早期文档曾错误列出这两个字段，请从配置中删除。
+</Callout>
+
+## 出站组字段
+
+### 成员
+
+<FieldList lang="zh" fields={membershipFields} prefix="field-" />
+
+### 健康检查
+
+<FieldList lang="zh" fields={probeFields} prefix="field-" />
+
+### 选路
+
+<FieldList lang="zh" fields={selectionFields} prefix="field-" />
+
+### 学习与模型
+
+<FieldList lang="zh" fields={learningFields} prefix="field-" />
+
+### ASN
+
+<FieldList lang="zh" fields={asnFields} prefix="field-" />
+
+### 面板显示
+
+<FieldList lang="zh" fields={displayFields} prefix="field-" />
+
+## experimental.smart
+
+所有 Smart 组共享的模型与训练数据采集器。这一块没有 `enabled` 开关，也不需要显式填写：只有当某个组设置了 `use_lightgbm` 才会加载、下载模型；只有当某个组设置了 `collect_data` 才会创建 CSV。
+
+### lightgbm
+
+<FieldList lang="zh" fields={lightgbmFields} prefix="lightgbm-" />
+
+### collector
+
+<FieldList lang="zh" fields={collectorFields} prefix="collector-" />
+
+## experimental.geox
+
+全局地理数据下载。目前**唯一的使用者是 Smart**：`url.asn` 为未设置 `asn_database` 的组提供 ASN 数据库，`url.mmdb` 提供国家数据库。各项没有默认下载地址，只有填写了 URL 的文件才会下载。文件名固定，保存在数据目录下。
+
+<FieldList lang="zh" fields={geoxFields} prefix="geox-" />
+
+<Callout type="note" title="首次下载与生效时机">
+  GeoX 在启动阶段异步下载，而 Smart 在启动完成时打开数据库。首次运行时文件往往还没下载完，此时 ASN 功能会被关闭，**下载完成后需要重启一次才会生效**；之后的自动更新同样要到下次启动才会被 Smart 读到。
+</Callout>
+
+## 环境变量
+
+以下环境变量在进程启动时读取一次，超出范围的值按默认值处理。
+
+<div class="not-prose my-6 overflow-hidden rounded-card bg-surface shadow-ring">
+  {envVars.map((v) => (
+    <div class="border-t border-line-soft px-4 py-3 first:border-0 sm:px-5">
+      <p class="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <code class="font-mono text-[0.9rem] font-semibold text-accent">{v.name}</code>
+        <span class="text-[0.8rem] text-subtle">默认 <code class="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[0.76rem] text-fg-2">{v.default.zh}</code></span>
+        <span class="text-[0.8rem] text-subtle">范围 <code class="rounded bg-surface-2 px-1.5 py-0.5 font-mono text-[0.76rem] text-fg-2">{v.range.zh}</code></span>
+      </p>
+      <p class="mt-1.5 text-[0.93rem] text-fg-2">{v.zh}</p>
+    </div>
+  ))}
+</div>
+
+`SMART_CACHE_BUDGET_MB` 的具体作用见 [存储与性能](../storage-performance/)，三个衰减相关变量见 [工作原理](../how-it-works/#时间衰减)。

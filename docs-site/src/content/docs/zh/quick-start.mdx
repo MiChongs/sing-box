@@ -1,0 +1,96 @@
+---
+title: 快速开始
+description: 用一段最小配置运行 Smart 出站组，并通过日志和 Clash API 确认它正在学习。
+---
+
+import CodeBlock from '../../../components/CodeBlock.astro';
+import Callout from '../../../components/Callout.astro';
+import Flow from '../../../components/Flow.astro';
+import LinkCards from '../../../components/LinkCards.astro';
+import minimal from '../../../examples/01-minimal.json?raw';
+
+## 准备
+
+Smart 出站组只存在于 xiaobaf14g 分支。从 [Releases](https://github.com/MiChongs/sing-box/releases) 下载命令行程序，或使用同一页面发布的 SFA（Android）、SFW（Windows）、SFL（Linux）图形客户端。上游 sing-box 与 reF1nd 分支都无法识别 `"type": "smart"`。
+
+## 最小配置
+
+<CodeBlock code={minimal} filename="01-minimal.json" locale="zh" />
+
+这份配置做了四件事：
+
+- `providers` 定义一个远程订阅，Smart 通过 `"providers": ["my-subscription"]` 引用其中的全部节点。也可以改用 `outbounds` 直接列出节点标签。
+- `outbounds` 中的 `smart` 组除标签和成员外全部使用默认值：每 3 分钟探测一次 `https://www.gstatic.com/generate_204`，算法为 `strict-best`。
+- `route.final` 把未命中任何规则的流量交给 Smart。
+- `experimental.cache_file` 保存 Smart 的统计数据，`clash_api` 用于后面的检查步骤。
+
+<Callout type="warn" title="不要省略 cache_file">
+  Smart 的全部学习数据都存放在缓存文件里。命令行版本不开启 `cache_file` 时，Smart 不记录统计，只按测速延迟选路，相当于一个更复杂的 `urltest`。图形客户端始终启用缓存文件，无需配置。
+</Callout>
+
+## 运行并确认
+
+<Flow
+  items={[
+    {
+      title: '检查配置',
+      tag: 'sing-box check -c config.json',
+      body: '字段写错会直接报错并指出位置，例如 `outbounds[0].tolerance: json: unknown field "tolerance"`。',
+    },
+    {
+      title: '启动并产生流量',
+      tag: 'sing-box run -c config.json',
+      body: 'Smart 在**第一次成功拨号之前**不会做后台探测，也不会计算排名。打开几个网站即可；第一次成功拨号 2 秒后会计算一次排名。',
+    },
+    {
+      title: '查看组状态',
+      tag: 'GET /smart/groups',
+      body: '返回每个 Smart 组的成员、当前节点 `now`、算法以及是否启用 LightGBM / ASN。',
+    },
+    {
+      title: '查看节点权重',
+      tag: 'GET /proxies/auto/weights',
+      body: '同一个（目标, 节点）至少要有 2 个样本才会算出权重；没有权重数据时，接口按测速延迟给出排名。',
+    },
+  ]}
+/>
+
+```bash
+curl -s http://127.0.0.1:9090/smart/groups
+curl -s http://127.0.0.1:9090/proxies/auto/weights
+curl -s 'http://127.0.0.1:9090/proxies/auto/weights?full=1'   # 附带按目标的明细
+```
+
+设置了 `secret` 时，为每个请求加上 `-H 'Authorization: Bearer <secret>'`。
+
+在 [metacubexd](https://github.com/MetaCubeX/metacubexd)、[zashboard](https://github.com/Zephyruso/zashboard) 等 Clash 面板中，Smart 组显示为 `Smart` 类型，可以像 `selector` 一样点击节点来手动指定，详见 [节点偏好与手动指定](../priority-and-pinning/)。
+
+## 启动日志
+
+正常启动时，每个 Smart 组会打印一行摘要，列出成员数、探测地址、生效的算法与各项开关：
+
+```text
+smart[auto] started: 42 outbounds, 12 background tasks, testURL=https://www.gstatic.com/generate_204 interval=3m0s asn=off algorithm=strict-best hysteresis=off ml=off collect=off
+```
+
+算法以这一行为准：`algorithm` 写错时不会报错，而是回退为 `strict-best`。其中 `ml=` 表示 LightGBM 模型状态：
+
+| 值 | 含义 |
+|---|---|
+| `ml=off` | 本组没有设置 `use_lightgbm` |
+| `ml=pending` | 已启用，模型正在下载或尚未加载，暂时使用传统权重公式 |
+| `ml=loaded` | 模型已加载 |
+
+如果看到 `smart: no cache file available, using ephemeral store`，说明 Smart 没有拿到缓存文件，请检查 `experimental.cache_file`。
+
+## 下一步
+
+<LinkCards
+  lang="zh"
+  cards={[
+    { title: '工作原理', body: '目标如何识别、候选如何分层获取、拨号如何竞速，以及权重公式。', to: 'how-it-works' },
+    { title: '选路算法', body: '10 种算法的行为差异与选择建议。', to: 'algorithms' },
+    { title: '示例配置', body: '调参、LightGBM、ASN、多组分流与嵌套组的完整示例。', to: 'examples' },
+    { title: '配置字段', body: '每个字段的默认值、取值范围与副作用。', to: 'config' },
+  ]}
+/>

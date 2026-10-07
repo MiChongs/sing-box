@@ -5,29 +5,34 @@
       "tag": "smart-interactive",
       "providers": ["my-subscription"],
       "algorithm": "latency-banded",
-      "hysteresis": "3s",
-      "interrupt_exist_connections": false
+      "hysteresis": "1m"
     },
     {
       "type": "smart",
       "tag": "smart-bulk",
       "providers": ["my-subscription"],
       "algorithm": "least-loaded",
-      "include": "^(US|JP|SG)"
-    },
-    {
-      "type": "smart",
-      "tag": "smart-balanced",
-      "providers": ["my-subscription"],
-      "algorithm": "p2c",
-      "policy_priority": "HK:1.3;JP:1.1"
+      "disable_udp": true
     },
     {
       "type": "smart",
       "tag": "smart-sticky",
       "providers": ["my-subscription"],
-      "algorithm": "sticky-session",
-      "hysteresis": "5s"
+      "algorithm": "sticky-session"
+    },
+    {
+      "type": "smart",
+      "tag": "smart-default",
+      "providers": ["my-subscription"],
+      "algorithm": "p2c"
     }
-  ]
+  ],
+  "route": {
+    "rules": [
+      { "port": [22, 3389], "outbound": "smart-interactive" },
+      { "domain_suffix": ["steamcontent.com", "githubusercontent.com"], "outbound": "smart-bulk" },
+      { "domain_suffix": ["openai.com", "claude.ai"], "outbound": "smart-sticky" }
+    ],
+    "final": "smart-default"
+  }
 }
