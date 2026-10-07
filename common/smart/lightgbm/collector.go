@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -27,15 +28,34 @@ const DefaultCollectorSizeMB = 100
 // parsing in downstream tools.
 const collectorSchemaVersion = "4"
 
-// collectorV2ExtraColumns is the xiaobaf14g phase-A column count: 9
-// ModelInput dimensions appended after the original 10 metadata columns.
-const collectorV2ExtraColumns = 9
+// collectorHeader names every column AddSample writes, in order: the
+// MaxFeatureSize model features (named as in the model's feature order),
+// 10 metadata columns, the xiaobaf14g phase-A block (9 raw ModelInput
+// dimensions) and the phase-B block (5 more + schema_version, which must
+// stay last). Raw columns that share a name with a transformed feature
+// carry a "_raw" suffix so every name is unique.
+var collectorHeader = buildCollectorHeader()
 
-// collectorV3ExtraColumns is the xiaobaf14g phase-B column count: 5
-// additional ModelInput dimensions (TCPRetransmissions, TCPLosses,
-// PathMTU, LongRTT, LongSuccessRate) + 1 schema_version tag column,
-// appended after the phase-A block. See AddSample for the layout.
-const collectorV3ExtraColumns = 6
+func buildCollectorHeader() []string {
+	order := getDefaultFeatureOrder()
+	header := make([]string, 0, MaxFeatureSize+25)
+	for i := 0; i < MaxFeatureSize; i++ {
+		header = append(header, order[i])
+	}
+	return append(header,
+		// metadata
+		"group_name", "node_name",
+		"asn_raw", "host_raw", "ip_raw", "port_raw", "geoip_raw",
+		"weight", "weight_source", "timestamp",
+		// phase A
+		"latency_stddev_delta", "connect_time_stddev_delta", "active_conns_raw",
+		"tls_session_resumed", "dns_resolve_time", "tls_handshake_time_raw",
+		"http3_fallback_count", "lightgbm_confidence", "hour_bucket_raw",
+		// phase B
+		"tcp_retransmissions_raw", "tcp_losses", "path_mtu",
+		"long_rtt", "long_success_rate", "schema_version",
+	)
+}
 
 // flushInterval caps how long buffered rows may sit in memory without being
 // written to disk. Prevents data loss if the process is killed right after
@@ -243,10 +263,10 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, meta *CollectorMeta, 
 		time.Now().Format(time.RFC3339),
 	)
 
-	// xiaobaf14g phase-A extension columns — appended to the tail so v1
-	// parsers reading the first 37 columns still work. Keep this list
-	// synchronised with ModelInput's v2 block comment — column order is
-	// the training contract and must not be reshuffled.
+	// xiaobaf14g phase-A extension columns — appended to the tail so
+	// parsers reading only the features and metadata still work. Keep
+	// this list and collectorHeader in sync — column order is the
+	// training contract and must not be reshuffled.
 	sample = append(sample,
 		fmt.Sprintf("%.6f", input.LatencyStdDevDelta),
 		fmt.Sprintf("%.6f", input.ConnectTimeStdDevDelta),
@@ -272,8 +292,7 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, meta *CollectorMeta, 
 		collectorSchemaVersion,
 	)
 
-	expectedColumns := MaxFeatureSize + 10 + collectorV2ExtraColumns + collectorV3ExtraColumns
-	if len(sample) != expectedColumns {
+	if expectedColumns := len(collectorHeader); len(sample) != expectedColumns {
 		c.droppedRows.Add(1)
 		c.logger.Warn("smart collector: column count mismatch (got ", len(sample), ", expected ", expectedColumns, ")")
 		return
@@ -298,42 +317,42 @@ func (c *DataCollector) AddSample(input *smart.ModelInput, meta *CollectorMeta, 
 	}
 }
 
+// headerMatchesLocked reports whether the existing CSV starts with
+// collectorHeader. Unreadable files count as matching so they are
+// appended to rather than moved aside.
+func (c *DataCollector) headerMatchesLocked() bool {
+	f, err := os.Open(c.dataPath)
+	if err != nil {
+		return true
+	}
+	defer f.Close()
+	header, err := csv.NewReader(f).Read()
+	if err != nil {
+		return true
+	}
+	return slices.Equal(header, collectorHeader)
+}
+
 func (c *DataCollector) initWriterLocked() error {
 	// Double-check parent dir (may have been deleted at runtime).
 	if err := os.MkdirAll(filepath.Dir(c.dataPath), 0o755); err != nil {
 		return fmt.Errorf("mkdir parent: %v", err)
 	}
 
+	// An empty file (e.g. truncated by the user) still needs a header.
 	fileExists := false
-	if _, err := os.Stat(c.dataPath); err == nil {
+	if stat, err := os.Stat(c.dataPath); err == nil && stat.Size() > 0 {
 		fileExists = true
 	}
 
-	needUpgrade := false
-	if fileExists {
-		if f, err := os.Open(c.dataPath); err == nil {
-			reader := csv.NewReader(f)
-			headers, err := reader.Read()
-			_ = f.Close()
-			if err == nil {
-				hasMax := false
-				for _, h := range headers {
-					if h == "history_upload_mb" {
-						hasMax = true
-						break
-					}
-				}
-				if !hasMax {
-					needUpgrade = true
-				}
-			}
-		}
-	}
-
-	if needUpgrade {
+	// A file whose header differs from collectorHeader was written by an
+	// older schema (or under the old 37-column header that mislabelled
+	// every column from the 28th on); start a new file rather than mix
+	// layouts under one header.
+	if fileExists && !c.headerMatchesLocked() {
 		backupPath := c.dataPath + ".bak." + time.Now().Format("20060102150405")
 		if err := os.Rename(c.dataPath, backupPath); err == nil {
-			c.logger.Info("smart collector: schema upgrade — old file backed up to ", backupPath)
+			c.logger.Info("smart collector: CSV header differs from the current schema — old file backed up to ", backupPath)
 			fileExists = false
 		}
 	}
@@ -346,19 +365,7 @@ func (c *DataCollector) initWriterLocked() error {
 	c.writer = csv.NewWriter(file)
 
 	if !fileExists {
-		headers := []string{
-			"success", "failure", "connect_time", "latency",
-			"upload_mb", "history_upload_mb", "maxuploadrate_kb", "history_maxuploadrate_kb",
-			"download_mb", "history_download_mb", "maxdownloadrate_kb", "history_maxdownloadrate_kb",
-			"duration_minutes", "last_used_seconds", "is_udp", "is_tcp",
-			"asn_feature", "country_feature", "address_feature", "port_feature",
-			"traffic_ratio", "traffic_density", "connection_type_feature",
-			"asn_hash", "host_hash", "ip_hash", "geoip_hash",
-			"group_name", "node_name",
-			"asn_raw", "host_raw", "ip_raw", "port_raw", "geoip_raw",
-			"weight", "weight_source", "timestamp",
-		}
-		if err := c.writer.Write(headers); err != nil {
+		if err := c.writer.Write(collectorHeader); err != nil {
 			_ = c.file.Close()
 			c.file = nil
 			c.writer = nil
