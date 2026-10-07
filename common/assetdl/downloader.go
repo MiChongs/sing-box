@@ -9,7 +9,6 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -21,17 +20,20 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing/common/logger"
-	M "github.com/sagernet/sing/common/metadata"
 	"github.com/sagernet/sing/common/ntp"
 )
 
 // DownloadTimeout caps a single HTTP request.
 const DownloadTimeout = 90 * time.Second
 
-// Dialer abstracts the network dialer used for downloads (optional detour).
-type Dialer interface {
-	DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error)
-}
+// While the file is missing, failed downloads are retried after
+// missingRetryMin, doubling up to missingRetryMax, so a download that
+// failed at boot (network not up yet) does not wait a full update
+// interval or a restart. Variables so tests can shorten them.
+var (
+	missingRetryMin = 30 * time.Second
+	missingRetryMax = 30 * time.Minute
+)
 
 // Downloader periodically fetches a single asset to a local path and triggers
 // a hook on successful refresh.
@@ -42,7 +44,6 @@ type Downloader struct {
 	url          string
 	interval     time.Duration
 	path         string
-	dialer       Dialer
 	onUpdate     func(path string) error
 	httpClient   *http.Client
 	lastEtag     atomic.Value // string
@@ -60,8 +61,10 @@ type Options struct {
 	URL      string        // remote URL (required)
 	Interval time.Duration // periodic refresh cadence (required)
 	Path     string        // absolute on-disk path (required)
-	Dialer   Dialer        // optional; nil = use plain net dialer
-	OnUpdate func(path string) error
+	// Transport carries the requests, normally one resolved from an
+	// http_client field by ResolveTransport. nil uses a direct transport.
+	Transport adapter.HTTPTransport
+	OnUpdate  func(path string) error
 }
 
 // New constructs a Downloader. Does NOT start the loop — call Start().
@@ -85,23 +88,16 @@ func New(opts Options) (*Downloader, error) {
 		opts.Context = context.Background()
 	}
 
-	client := &http.Client{
-		Timeout: DownloadTimeout,
-		Transport: &http.Transport{
+	var transport http.RoundTripper = opts.Transport
+	if opts.Transport == nil {
+		transport = &http.Transport{
 			ForceAttemptHTTP2:   true,
 			TLSHandshakeTimeout: C.TCPTimeout,
-			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				if opts.Dialer != nil {
-					return opts.Dialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
-				}
-				var d net.Dialer
-				return d.DialContext(ctx, network, addr)
-			},
 			TLSClientConfig: &tls.Config{
 				Time:    ntp.TimeFuncFromContext(opts.Context),
 				RootCAs: adapter.RootPoolFromContext(opts.Context),
 			},
-		},
+		}
 	}
 
 	return &Downloader{
@@ -111,9 +107,8 @@ func New(opts Options) (*Downloader, error) {
 		url:        opts.URL,
 		interval:   opts.Interval,
 		path:       opts.Path,
-		dialer:     opts.Dialer,
 		onUpdate:   opts.OnUpdate,
-		httpClient: client,
+		httpClient: &http.Client{Transport: transport, Timeout: DownloadTimeout},
 	}, nil
 }
 
@@ -136,6 +131,44 @@ func (d *Downloader) Start() {
 	go d.loop(ctx)
 }
 
+// StartMissing downloads the file in the background if it does not exist,
+// retrying until the download succeeds, without refreshing it afterwards.
+// Close stops it.
+func (d *Downloader) StartMissing() {
+	ctx, cancel := context.WithCancel(d.ctx)
+	d.cancel = cancel
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		d.fetchMissing(ctx, missingRetryMax)
+	}()
+}
+
+// fetchMissing downloads the file if it does not exist, retrying failures
+// with backoff capped at maxDelay.
+func (d *Downloader) fetchMissing(ctx context.Context, maxDelay time.Duration) {
+	delay := missingRetryMin
+	for {
+		if _, err := os.Stat(d.path); !os.IsNotExist(err) {
+			return
+		}
+		err := d.FetchOnce(ctx)
+		if err == nil {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		d.logger.Warn("assetdl[", d.name, "]: download failed, retrying in ", delay, ": ", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+		delay = min(delay*2, maxDelay)
+	}
+}
+
 // Close stops the periodic loop and waits for it to exit.
 func (d *Downloader) Close() error {
 	if d == nil {
@@ -151,12 +184,9 @@ func (d *Downloader) Close() error {
 func (d *Downloader) loop(ctx context.Context) {
 	defer d.wg.Done()
 
-	// First-run: if no local file, download immediately.
-	if _, err := os.Stat(d.path); os.IsNotExist(err) {
-		if err := d.FetchOnce(ctx); err != nil {
-			d.logger.Warn("assetdl[", d.name, "]: initial download failed: ", err)
-		}
-	}
+	// First run: download a missing file now, retrying sooner than the
+	// update interval.
+	d.fetchMissing(ctx, min(missingRetryMax, d.interval))
 
 	ticker := time.NewTicker(d.interval)
 	defer ticker.Stop()
@@ -181,6 +211,11 @@ func (d *Downloader) FetchOnce(ctx context.Context) error {
 		return nil // another fetch in progress
 	}
 	defer d.updating.Store(false)
+	// Downloads are hours apart; keep no idle connection between them.
+	defer d.httpClient.CloseIdleConnections()
+	if err := os.MkdirAll(filepath.Dir(d.path), 0o755); err != nil {
+		return fmt.Errorf("create directory: %v", err)
+	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, DownloadTimeout)
 	defer cancel()

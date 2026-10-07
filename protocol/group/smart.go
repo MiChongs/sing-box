@@ -5,11 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"math"
 	"math/rand"
 	"net"
 	"net/netip"
-	"os"
 	"regexp"
 	"slices"
 	"sort"
@@ -19,11 +19,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/oschwald/maxminddb-golang"
 	"github.com/puzpuzpuz/xsync/v3"
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
-	"github.com/sagernet/sing-box/common/assetdl"
+	"github.com/sagernet/sing-box/common/geodb"
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/smart"
 	"github.com/sagernet/sing-box/common/smart/lightgbm"
@@ -37,7 +36,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
-	"github.com/sagernet/sing/service/filemanager"
 )
 
 const (
@@ -240,10 +238,10 @@ type Smart struct {
 	// least one rule survives parsing.
 	priorityFactorCache *xsync.MapOf[string, float64]
 	useASN              bool
-	asnDBPaths          []string            // per-group configured paths; empty → fall back to geox service
-	asnDBs              []*maxminddb.Reader // multi-source: tried in order until one returns a hit
-	countryDB           *maxminddb.Reader   // country.mmdb from GeoX, optional
-	maxHostFailedTimes  int                 // mihomo parity; 0 = default 10
+	asnDBPaths          []string          // per-group configured paths; empty → fall back to geox service
+	asnDBs              []*geodb.Database // multi-source: tried in order until one returns a hit
+	countryDB           *geodb.Database   // country.mmdb, only for LightGBM features and the collector
+	maxHostFailedTimes  int               // mihomo parity; 0 = default 10
 
 	store *smart.Store
 
@@ -384,11 +382,6 @@ type Smart struct {
 	// instead of scanning + unmarshalling the whole node-state table. The
 	// common steady state (no degraded nodes) thus costs nothing.
 	hasDegraded atomic.Bool
-
-	// countryDBRetryAt throttles re-opening country.mmdb when the GeoX
-	// download finishes after PostStart (first open was a no-op because
-	// the file didn't exist yet).
-	countryDBRetryAt atomic.Int64
 
 	// shortLife tracks "user gave up quickly" closes per (target, node)
 	// pair. When the user reaches the threshold within the window we
@@ -798,96 +791,56 @@ func (s *Smart) postStart() error {
 	}
 
 	// Resolve ASN mmdb paths: per-group list wins (in order); fall back to
-	// the global experimental.geox.url.asn list. Multi-source lookup tries
-	// each opened reader in order until a hit is found, so users can stack
-	// providers (MaxMind / IPInfo / DBIP / Cloudflare) for better coverage.
+	// the global experimental.geox.url.asn list, then to the default
+	// database GeoX downloads on request. Multi-source lookup tries each
+	// database in order until a hit is found, so users can stack providers
+	// (MaxMind / IPInfo / DBIP / Cloudflare) for better coverage. GeoX
+	// reloads its databases in place after every download, including the
+	// first one when the file did not exist yet.
+	geoSvc := service.FromContext[adapter.GeoXService](s.ctx)
 	if s.useASN {
-		paths := s.asnDBPaths
-		if len(paths) == 0 {
-			if geoSvc := service.FromContext[adapter.GeoXService](s.ctx); geoSvc != nil {
-				paths = geoSvc.ASNPaths()
-				if len(paths) > 0 {
-					s.logger.Info("smart: ASN database not configured per-group; using ",
-						len(paths), " global source(s) from experimental.geox.url.asn")
-				}
+		paths, downloaded := s.asnDBPaths, false
+		if len(paths) == 0 && geoSvc != nil {
+			paths, downloaded = geoSvc.ASNPaths(), true
+			if len(paths) > 0 {
+				s.logger.Info("smart: ASN database not configured per-group; using ",
+					len(paths), " global source(s) from experimental.geox.url.asn")
+			} else {
+				paths = []string{geoSvc.RequireDefaultASN()}
+				s.logger.Info("smart: no ASN database configured; using the default database GeoX keeps at ", paths[0])
 			}
 		}
-		if len(paths) == 0 {
-			s.logger.Info("smart: no ASN database configured; auto-downloading default")
-			defaultPath := filemanager.BasePath(s.ctx, "GeoLite2-ASN.mmdb")
-			const defaultASNURL = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb"
-			dl, dlErr := assetdl.New(assetdl.Options{
-				Context:  s.ctx,
-				Logger:   s.logger,
-				Name:     "smart/asn",
-				URL:      defaultASNURL,
-				Interval: 24 * time.Hour,
-				Path:     defaultPath,
-			})
-			if dlErr == nil {
-				if fetchErr := dl.FetchOnce(s.ctx); fetchErr == nil {
-					paths = []string{defaultPath}
-				} else {
-					s.logger.Warn("smart: auto-download ASN failed: ", fetchErr)
-				}
-			}
-			if len(paths) == 0 {
-				s.logger.Warn("smart: use_asn is true but no ASN database available; ASN features disabled")
+		for _, p := range paths {
+			db, err := geodb.Open(p)
+			s.asnDBs = append(s.asnDBs, db)
+			switch {
+			case err == nil:
+				s.logger.Info("smart: ASN database loaded from ", p)
+			case downloaded && errors.Is(err, fs.ErrNotExist):
+				s.logger.Info("smart: ASN database ", p, " is downloading; it is used once the download completes")
+			default:
+				s.logger.Warn("smart: failed to open ASN database [", p, "]: ", err, " (skipping; other sources still tried)")
 			}
 		}
-		if len(paths) > 0 {
-			for _, p := range paths {
-				db, err := getSharedMMDB(p)
-				if err != nil {
-					s.logger.Warn("smart: failed to open ASN database [", p, "]: ", err, " (skipping; other sources still tried)")
-					continue
-				}
-				s.asnDBs = append(s.asnDBs, db)
-				s.logger.Info("smart: ASN database loaded from ", p, " (shared across groups via mmdbPool)")
-			}
-			if len(s.asnDBs) == 0 {
-				s.logger.Warn("smart: all configured ASN databases failed to open; ASN features disabled")
-			}
+		if len(s.asnDBs) == 0 {
+			s.logger.Warn("smart: use_asn is true but no ASN database available; ASN features disabled")
 		}
 	}
 
-	// Optional country mmdb — feeds ModelInput.DestGeoIP (LightGBM features
-	// 17 and 26). When the GeoX service has downloaded country.mmdb we use
-	// it; otherwise DestGeoIP stays nil and those features fall back to 0.
-	{
-		mmdbPath := ""
-		if geoSvc := service.FromContext[adapter.GeoXService](s.ctx); geoSvc != nil {
-			mmdbPath = geoSvc.MMDBPath()
-		}
+	// Country mmdb — feeds ModelInput.DestGeoIP (LightGBM features 17 and
+	// 26), so only groups that predict or collect samples open it: the one
+	// from experimental.geox.url.mmdb, else the default GeoX downloads.
+	if (s.useLightGBM || s.collectData) && geoSvc != nil {
+		mmdbPath := geoSvc.MMDBPath()
 		if mmdbPath == "" {
-			mmdbPath = filemanager.BasePath(s.ctx, "country.mmdb")
-			const defaultMMDBURL = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"
-			if _, statErr := os.Stat(mmdbPath); os.IsNotExist(statErr) {
-				dl, dlErr := assetdl.New(assetdl.Options{
-					Context:  s.ctx,
-					Logger:   s.logger,
-					Name:     "smart/country",
-					URL:      defaultMMDBURL,
-					Interval: 24 * time.Hour,
-					Path:     mmdbPath,
-				})
-				if dlErr == nil {
-					if fetchErr := dl.FetchOnce(s.ctx); fetchErr != nil {
-						s.logger.Debug("smart: country mmdb auto-download failed: ", fetchErr)
-						mmdbPath = ""
-					}
-				} else {
-					mmdbPath = ""
-				}
-			}
+			mmdbPath = geoSvc.RequireDefaultMMDB()
 		}
-		if mmdbPath != "" {
-			if db, err := getSharedMMDB(mmdbPath); err == nil {
-				s.countryDB = db
-				s.logger.Info("smart: country mmdb loaded from ", mmdbPath)
-			} else {
-				s.logger.Debug("smart: country mmdb not yet available: ", err)
-			}
+		db, err := geodb.Open(mmdbPath)
+		s.countryDB = db
+		if err == nil {
+			s.logger.Info("smart: country mmdb loaded from ", mmdbPath)
+		} else {
+			s.logger.Debug("smart: country mmdb not yet available (", err, "); used once it is downloaded")
 		}
 	}
 
@@ -1018,9 +971,17 @@ func (s *Smart) postStart() error {
 	}
 	asnStatus := "off"
 	if s.useASN {
+		loaded := 0
+		for _, db := range s.asnDBs {
+			if db.Loaded() {
+				loaded++
+			}
+		}
 		switch n := len(s.asnDBs); {
 		case n == 0:
 			asnStatus = "on(no-db)"
+		case loaded == 0:
+			asnStatus = "on(downloading)"
 		case n == 1:
 			asnStatus = "on"
 		default:
@@ -1146,11 +1107,11 @@ func (s *Smart) close() error {
 		_ = s.store.StoreFlushNow()
 	}
 	for _, db := range s.asnDBs {
-		releaseSharedMMDB(db)
+		_ = db.Close()
 	}
 	s.asnDBs = nil
 	if s.countryDB != nil {
-		releaseSharedMMDB(s.countryDB)
+		_ = s.countryDB.Close()
 		s.countryDB = nil
 	}
 	return nil
@@ -6296,12 +6257,11 @@ func (s *Smart) lookupASN(ips []netip.Addr) string {
 		if !ip.IsValid() || ip.IsPrivate() || ip.IsLoopback() {
 			continue
 		}
-		ipBytes := ip.AsSlice()
 		for _, db := range s.asnDBs {
 			var record struct {
 				AutonomousSystemNumber uint `maxminddb:"autonomous_system_number"`
 			}
-			if err := db.Lookup(ipBytes, &record); err == nil && record.AutonomousSystemNumber != 0 {
+			if err := db.Lookup(ip, &record); err == nil && record.AutonomousSystemNumber != 0 {
 				return strconv.FormatUint(uint64(record.AutonomousSystemNumber), 10)
 			}
 		}
@@ -6312,22 +6272,12 @@ func (s *Smart) lookupASN(ips []netip.Addr) string {
 // lookupCountry returns a single-element ISO country code slice from the GeoX
 // country mmdb for the first valid non-private destination IP, or nil.
 // Format matches mihomo's ModelInput.DestGeoIP ([]string); LightGBM
-// extractGeoIPFeature + FNV hash bucket consume it.
-//
-// Lazy-retry: if countryDB is nil, attempt to re-open via the GeoX service
-// at most once per 60s. This handles the common case where Smart started
-// before GeoX finished downloading country.mmdb.
+// extractGeoIPFeature + FNV hash bucket consume it. Only groups using
+// LightGBM or the collector open the database; until its download
+// completes lookups find nothing.
 func (s *Smart) lookupCountry(ips []netip.Addr) []string {
-	// Only LightGBM features and the training collector read the
-	// country; skip the per-connection mmdb read otherwise.
-	if !s.useLightGBM && !s.collectData {
-		return nil
-	}
 	if s.countryDB == nil {
-		s.maybeOpenCountryDB()
-		if s.countryDB == nil {
-			return nil
-		}
+		return nil
 	}
 	for _, ip := range ips {
 		if !ip.IsValid() || ip.IsPrivate() || ip.IsLoopback() {
@@ -6338,44 +6288,11 @@ func (s *Smart) lookupCountry(ips []netip.Addr) []string {
 				ISOCode string `maxminddb:"iso_code"`
 			} `maxminddb:"country"`
 		}
-		if err := s.countryDB.Lookup(ip.AsSlice(), &record); err == nil && record.Country.ISOCode != "" {
+		if err := s.countryDB.Lookup(ip, &record); err == nil && record.Country.ISOCode != "" {
 			return []string{record.Country.ISOCode}
 		}
 	}
 	return nil
-}
-
-// maybeOpenCountryDB attempts to open the GeoX country mmdb if we don't
-// already have a reader. Rate-limited to once per 60 seconds to avoid
-// hammering Stat() on a path that doesn't exist yet.
-func (s *Smart) maybeOpenCountryDB() {
-	if s.countryDB != nil {
-		return
-	}
-	now := time.Now().Unix()
-	last := s.countryDBRetryAt.Load()
-	if now-last < 60 {
-		return
-	}
-	if !s.countryDBRetryAt.CompareAndSwap(last, now) {
-		return // another goroutine raced us
-	}
-
-	geoSvc := service.FromContext[adapter.GeoXService](s.ctx)
-	if geoSvc == nil {
-		return
-	}
-	mmdbPath := geoSvc.MMDBPath()
-	if mmdbPath == "" {
-		return
-	}
-	db, err := getSharedMMDB(mmdbPath)
-	if err != nil {
-		return // file still not present; try again next time
-	}
-	s.countryDB = db
-	s.logger.Info("smart[", s.Tag(), "] country mmdb lazily opened from ",
-		mmdbPath, " (shared via mmdbPool)")
 }
 
 func (s *Smart) onProviderUpdated(tag string) error {

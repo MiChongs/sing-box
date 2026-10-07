@@ -1,42 +1,27 @@
 // Package geox hosts the global GeoX service: downloads geoip.dat /
-// geosite.dat / country.mmdb / GeoLite2-ASN.mmdb periodically and exposes
-// the local file paths to other sing-box components.
+// geosite.dat / country.mmdb / GeoLite2-ASN.mmdb and exposes the local
+// file paths to other sing-box components.
 //
-// Currently the only consumer is the Smart outbound group (ASN mmdb via
-// use_asn: true). Other files are still downloaded for manual use or
-// future consumers; absent URLs are simply skipped.
+// Currently the only consumer is the Smart outbound group (ASN and country
+// mmdb). Other files are still downloaded for manual use or future
+// consumers; absent URLs are simply skipped. Every download goes through
+// the configured http client, and a downloaded mmdb is reloaded in place
+// for the components that have it open.
 package geox
 
 import (
 	"context"
-	"os"
 	"sync"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/assetdl"
-	"github.com/sagernet/sing-box/common/httpclient"
+	"github.com/sagernet/sing-box/common/geodb"
 	"github.com/sagernet/sing-box/option"
+	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/logger"
-	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 )
-
-// resolveHTTPClientDetour mirrors smart.resolveHTTPClientDetour: lift an
-// outbound tag out of http_client (tag ref → Manager lookup, or inline .Detour).
-func resolveHTTPClientDetour(ctx context.Context, opts *option.HTTPClientOptions) string {
-	if opts == nil {
-		return ""
-	}
-	if opts.Tag == "" {
-		return opts.Detour
-	}
-	mgr := service.FromContext[adapter.HTTPClientManager](ctx)
-	if m, ok := mgr.(*httpclient.Manager); ok {
-		return m.LookupDetour(opts.Tag)
-	}
-	return ""
-}
 
 var _ adapter.GeoXService = (*Service)(nil)
 
@@ -51,10 +36,26 @@ const (
 	DefaultASNFilename     = "GeoLite2-ASN.mmdb"
 )
 
+// Download sources of the built-in default databases; variables so tests
+// can point them at a local server.
+var (
+	defaultASNURL  = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb"
+	defaultMMDBURL = "https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-Country.mmdb"
+)
+
+// asset is one file GeoX keeps on disk.
+type asset struct {
+	name string
+	url  string
+	path string
+	// mmdb marks files opened through geodb, reloaded after each download.
+	mmdb bool
+}
+
 // Service implements adapter.GeoXService.
 type Service struct {
 	ctx     context.Context
-	logger  logger.Logger
+	logger  logger.ContextLogger
 	options option.GeoXOptions
 
 	// Resolved absolute paths. Populated from URL set at construction time;
@@ -68,18 +69,24 @@ type Service struct {
 	// preserving back-compat with the original ASN field.
 	asnPaths []string
 
-	dlMu  sync.Mutex
-	dls   []*assetdl.Downloader
-	ready bool
+	access      sync.Mutex
+	started     bool
+	closed      bool
+	pending     []asset // requested before Start
+	transport   adapter.HTTPTransport
+	resolved    bool
+	downloaders map[string]*assetdl.Downloader // by path
 }
 
 // NewService constructs but does not start the service. Zero-value options
-// (Enabled=false) results in a no-op service: paths return "", no downloads.
-func NewService(ctx context.Context, logger logger.Logger, options option.GeoXOptions) *Service {
+// (Enabled=false) results in a service that only provides the default
+// databases consumers request.
+func NewService(ctx context.Context, logger logger.ContextLogger, options option.GeoXOptions) *Service {
 	s := &Service{
-		ctx:     ctx,
-		logger:  logger,
-		options: options,
+		ctx:         ctx,
+		logger:      logger,
+		options:     options,
+		downloaders: make(map[string]*assetdl.Downloader),
 	}
 	if options.Enabled {
 		if options.URL.GeoIP != "" {
@@ -130,41 +137,43 @@ func (s *Service) Name() string { return "geox" }
 // Dependencies declares startup ordering — none.
 func (s *Service) Dependencies() []string { return nil }
 
-// Start brings up the service. When AutoUpdate is enabled, downloaders are
-// spawned for every configured URL. When AutoUpdate is disabled, a single
-// best-effort fetch is attempted for any missing file.
+// Start begins downloading the configured files and any default database
+// requested earlier. With auto_update each file is fetched when missing
+// and refreshed every update_interval; without it a missing file is
+// fetched once.
 func (s *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
 	}
-	if !s.options.Enabled {
-		return nil
-	}
 	scope.Add(s.close)
 
-	interval := time.Duration(s.options.UpdateInterval)
-	if interval <= 0 {
-		interval = DefaultUpdateInterval
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.started = true
+	assets := s.pending
+	s.pending = nil
+	if s.options.Enabled {
+		assets = append(assets, s.configuredAssets()...)
+		// Configuration errors in http_client surface at startup.
+		if err := s.resolveTransportLocked(); err != nil {
+			return err
+		}
+		s.logger.Info("geox: enabled (auto_update=", s.options.AutoUpdate, ", interval=", s.updateInterval(), ", via=", s.via(), ")")
 	}
+	for _, a := range assets {
+		s.ensureLocked(a)
+	}
+	return nil
+}
 
-	// Resolve download_detour tag → adapter.Outbound. adapter.Outbound's
-	// DialContext signature satisfies assetdl.Dialer. An empty tag (or
-	// an unresolvable one) falls back to direct connection via net.Dialer
-	// inside assetdl.
-	dialer := s.resolveDetour()
-
-	type spec struct {
-		name string
-		url  string
-		path string
+func (s *Service) configuredAssets() []asset {
+	assets := []asset{
+		{"geox/geoip", s.options.URL.GeoIP, s.geoipPath, false},
+		{"geox/geosite", s.options.URL.GeoSite, s.geositePath, false},
+		{"geox/mmdb", s.options.URL.MMDB, s.mmdbPath, true},
 	}
-	specs := []spec{
-		{"geox/geoip", s.options.URL.GeoIP, s.geoipPath},
-		{"geox/geosite", s.options.URL.GeoSite, s.geositePath},
-		{"geox/mmdb", s.options.URL.MMDB, s.mmdbPath},
-	}
-	// Fan out one downloader per ASN URL. Logger name encodes the index
-	// so users can see which provider failed when multiple are configured.
+	// One downloader per ASN URL. The name encodes the index so users can
+	// see which provider failed when multiple are configured.
 	for i, u := range s.options.URL.ASN {
 		if i >= len(s.asnPaths) || u == "" {
 			continue
@@ -173,103 +182,129 @@ func (s *Service) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 		if i > 0 {
 			name = "geox/asn#" + indexSuffix(i)
 		}
-		specs = append(specs, spec{name, u, s.asnPaths[i]})
+		assets = append(assets, asset{name, u, s.asnPaths[i], true})
 	}
+	return assets
+}
 
-	s.dlMu.Lock()
-	defer s.dlMu.Unlock()
-
-	for _, sp := range specs {
-		if sp.url == "" || sp.path == "" {
-			continue
-		}
-		if s.options.AutoUpdate {
-			dl, err := assetdl.New(assetdl.Options{
-				Context:  s.ctx,
-				Logger:   s.logger,
-				Name:     sp.name,
-				URL:      sp.url,
-				Interval: interval,
-				Path:     sp.path,
-				Dialer:   dialer,
-			})
-			if err != nil {
-				s.logger.Warn("geox: downloader init for ", sp.name, " failed: ", err)
-				continue
-			}
-			s.dls = append(s.dls, dl)
-			dl.Start()
-		} else {
-			// One-shot fetch only when the file is missing (best-effort).
-			if _, err := os.Stat(sp.path); os.IsNotExist(err) {
-				dl, err := assetdl.New(assetdl.Options{
-					Context:  s.ctx,
-					Logger:   s.logger,
-					Name:     sp.name,
-					URL:      sp.url,
-					Interval: interval, // unused (no Start)
-					Path:     sp.path,
-					Dialer:   dialer,
-				})
-				if err != nil {
-					s.logger.Warn("geox: downloader init for ", sp.name, " failed: ", err)
-					continue
-				}
-				go func(d *assetdl.Downloader, n string) {
-					if err := d.FetchOnce(s.ctx); err != nil {
-						s.logger.Warn("geox: one-shot fetch ", n, " failed: ", err)
-					}
-				}(dl, sp.name)
-			}
-		}
+func (s *Service) updateInterval() time.Duration {
+	if interval := time.Duration(s.options.UpdateInterval); interval > 0 {
+		return interval
 	}
+	return DefaultUpdateInterval
+}
 
-	s.ready = true
-	via := "direct"
-	if tag := s.detourTag(); tag != "" {
-		via = tag
+// via describes the http client downloads go through, for logs.
+func (s *Service) via() string {
+	switch {
+	case s.options.HTTPClient != nil && s.options.HTTPClient.Tag != "":
+		return "http_client " + s.options.HTTPClient.Tag
+	case s.options.HTTPClient != nil && !s.options.HTTPClient.IsEmpty():
+		return "inline http_client"
+	case s.options.DownloadDetour != "": //nolint:staticcheck
+		return "download_detour " + s.options.DownloadDetour //nolint:staticcheck
+	default:
+		return "default http client"
 	}
-	s.logger.Info("geox: enabled (auto_update=", s.options.AutoUpdate, ", interval=", interval, ", via=", via, ")")
+}
+
+func (s *Service) resolveTransportLocked() error {
+	if s.resolved {
+		return nil
+	}
+	transport, err := assetdl.ResolveTransport(s.ctx, s.logger, s.options.HTTPClient, s.options.DownloadDetour) //nolint:staticcheck
+	if err != nil {
+		return E.Cause(err, "geox: resolve http client")
+	}
+	s.transport = transport
+	s.resolved = true
 	return nil
 }
 
-// detourTag returns the effective outbound tag for downloads.
-// Preferred: http_client (tag ref or inline .Detour). Legacy: download_detour.
-func (s *Service) detourTag() string {
-	if tag := resolveHTTPClientDetour(s.ctx, s.options.HTTPClient); tag != "" {
-		return tag
+// ensureLocked starts keeping a on disk unless it already is.
+func (s *Service) ensureLocked(a asset) {
+	if a.url == "" || a.path == "" || s.closed {
+		return
 	}
-	return s.options.DownloadDetour //nolint:staticcheck
+	if _, exists := s.downloaders[a.path]; exists {
+		return
+	}
+	if err := s.resolveTransportLocked(); err != nil {
+		s.logger.Warn("cannot download ", a.name, ": ", err)
+		return
+	}
+	options := assetdl.Options{
+		Context:   s.ctx,
+		Logger:    s.logger,
+		Name:      a.name,
+		URL:       a.url,
+		Interval:  s.updateInterval(),
+		Path:      a.path,
+		Transport: s.transport,
+	}
+	if a.mmdb {
+		options.OnUpdate = func(path string) error {
+			return s.reloadDatabase(a.name, path)
+		}
+	}
+	dl, err := assetdl.New(options)
+	if err != nil {
+		s.logger.Warn("geox: downloader init for ", a.name, " failed: ", err)
+		return
+	}
+	s.downloaders[a.path] = dl
+	if s.options.AutoUpdate {
+		dl.Start()
+	} else {
+		dl.StartMissing()
+	}
 }
 
-// resolveDetour looks up the download_detour outbound tag. Returns nil on
-// empty tag or resolution failure — assetdl then falls back to direct net dial.
-func (s *Service) resolveDetour() assetdl.Dialer {
-	tag := s.detourTag()
-	if tag == "" {
-		return nil
+// reloadDatabase swaps a freshly downloaded mmdb into every component
+// that has it open.
+func (s *Service) reloadDatabase(name, path string) error {
+	loaded, err := geodb.Reload(path)
+	if err != nil {
+		return E.Cause(err, "reload ", path)
 	}
-	mgr := service.FromContext[adapter.OutboundManager](s.ctx)
-	if mgr == nil {
-		s.logger.Warn("geox: detour=[", tag, "] requested but outbound manager unavailable; using direct")
-		return nil
+	if loaded {
+		s.logger.Info("geox: reloaded ", name, " from ", path)
 	}
-	ob, loaded := mgr.Outbound(tag)
-	if !loaded {
-		s.logger.Warn("geox: detour=[", tag, "] not found; using direct")
-		return nil
+	return nil
+}
+
+func (s *Service) require(a asset) string {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.started {
+		s.ensureLocked(a)
+	} else {
+		s.pending = append(s.pending, a)
 	}
-	return ob
+	return a.path
+}
+
+// RequireDefaultASN returns the path of the default GeoLite2-ASN database
+// and starts keeping it downloaded.
+func (s *Service) RequireDefaultASN() string {
+	return s.require(asset{"geox/asn (default)", defaultASNURL, filemanager.BasePath(s.ctx, DefaultASNFilename), true})
+}
+
+// RequireDefaultMMDB returns the path of the default GeoLite2-Country
+// database and starts keeping it downloaded.
+func (s *Service) RequireDefaultMMDB() string {
+	return s.require(asset{"geox/mmdb (default)", defaultMMDBURL, filemanager.BasePath(s.ctx, DefaultMMDBFilename), true})
 }
 
 // Close stops all downloaders.
 func (s *Service) close() error {
-	s.dlMu.Lock()
-	defer s.dlMu.Unlock()
-	for _, dl := range s.dls {
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.closed = true
+	for _, dl := range s.downloaders {
 		_ = dl.Close()
 	}
-	s.dls = nil
+	clear(s.downloaders)
 	return nil
 }
 
@@ -286,7 +321,6 @@ func (s *Service) GeoSitePath() string { return s.geositePath }
 // MMDBPath returns the local country.mmdb path.
 func (s *Service) MMDBPath() string { return s.mmdbPath }
 
-// ASNPath returns the local GeoLite2-ASN.mmdb path.
 // ASNPath returns the FIRST configured ASN mmdb path. Empty when no ASN URL
 // is configured. Single-source compat shim — multi-source consumers should
 // use ASNPaths().

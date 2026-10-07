@@ -11,33 +11,11 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/assetdl"
-	"github.com/sagernet/sing-box/common/httpclient"
 	"github.com/sagernet/sing-box/common/smart/lightgbm"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/logger"
-	"github.com/sagernet/sing/service"
 	"github.com/sagernet/sing/service/filemanager"
 )
-
-// resolveHTTPClientDetour extracts an outbound tag from an http_client option:
-//   - inline form with dialer.detour set → returns the detour tag directly
-//   - tag form (`"http_client": "foo"`) → looks up foo's detour via Manager
-//
-// Returns "" when no detour is derivable. Caller should then fall back to
-// legacy download_detour.
-func resolveHTTPClientDetour(ctx context.Context, opts *option.HTTPClientOptions) string {
-	if opts == nil {
-		return ""
-	}
-	if opts.Tag == "" {
-		return opts.Detour
-	}
-	mgr := service.FromContext[adapter.HTTPClientManager](ctx)
-	if m, ok := mgr.(*httpclient.Manager); ok {
-		return m.LookupDetour(opts.Tag)
-	}
-	return ""
-}
 
 var _ adapter.SmartService = (*Service)(nil)
 
@@ -45,7 +23,7 @@ var _ adapter.SmartService = (*Service)(nil)
 // type-assert to *Service to access WeightModel() / DataCollector().
 type Service struct {
 	ctx     context.Context
-	logger  logger.Logger
+	logger  logger.ContextLogger
 	options option.SmartOptions
 
 	lightgbmEnabled  bool
@@ -72,7 +50,7 @@ type Service struct {
 // This is a behavioural change from earlier versions where a missing
 // experimental.smart.lightgbm / experimental.smart.collector block silently
 // disabled the feature; now sensible defaults kick in.
-func NewService(ctx context.Context, logger logger.Logger, options option.SmartOptions) *Service {
+func NewService(ctx context.Context, logger logger.ContextLogger, options option.SmartOptions) *Service {
 	return &Service{
 		ctx:              ctx,
 		logger:           logger,
@@ -164,31 +142,25 @@ func (s *Service) initModel() error {
 	}
 	interval := defaultDuration(opts.UpdateInterval, lightgbm.DefaultUpdateInterval)
 
-	detourTag := resolveHTTPClientDetour(s.ctx, opts.HTTPClient)
-	if detourTag == "" {
-		detourTag = opts.DownloadDetour //nolint:staticcheck
+	transport, err := assetdl.ResolveTransport(s.ctx, s.logger, opts.HTTPClient, opts.DownloadDetour) //nolint:staticcheck
+	if err != nil {
+		s.logger.Warn("lightgbm: cannot download the model: resolve http client: ", err)
+		return err
 	}
-	var dialer assetdl.Dialer
-	if detourTag != "" {
-		if mgr := service.FromContext[adapter.OutboundManager](s.ctx); mgr != nil {
-			if ob, loaded := mgr.Outbound(detourTag); loaded {
-				dialer = ob
-			} else {
-				s.logger.Warn("lightgbm: detour=[", detourTag, "] not found; using direct")
-			}
-		}
-	}
-
 	dl, err := assetdl.New(assetdl.Options{
-		Context:  s.ctx,
-		Logger:   s.logger,
-		Name:     "lightgbm",
-		URL:      url,
-		Interval: interval,
-		Path:     modelPath,
-		Dialer:   dialer,
+		Context:   s.ctx,
+		Logger:    s.logger,
+		Name:      "lightgbm",
+		URL:       url,
+		Interval:  interval,
+		Path:      modelPath,
+		Transport: transport,
 		OnUpdate: func(path string) error {
-			return s.model.Reload()
+			if err := s.model.Reload(); err != nil {
+				return err
+			}
+			s.logger.Info("lightgbm: model reloaded from ", path)
+			return nil
 		},
 	})
 	if err != nil {
@@ -198,22 +170,14 @@ func (s *Service) initModel() error {
 	s.dl = dl
 
 	if opts.AutoUpdate {
-		via := "direct"
-		if detourTag != "" && dialer != nil {
-			via = detourTag
-		}
-		s.logger.Info("lightgbm: auto-update enabled (interval=", interval, ", via=", via, ")")
+		s.logger.Info("lightgbm: auto-update enabled (interval=", interval, ")")
 		s.dl.Start()
 	} else if modelMissing {
 		// Only a missing file is fetched. Downloads replace the file
 		// atomically, so one that exists is complete, and fetching the
 		// same release again on every start cannot make it loadable.
 		s.logger.Info("lightgbm: model file missing, fetching once from ", url)
-		go func() {
-			if fetchErr := s.dl.FetchOnce(s.ctx); fetchErr != nil {
-				s.logger.Warn("lightgbm: initial download failed: ", fetchErr)
-			}
-		}()
+		s.dl.StartMissing()
 	}
 	return nil
 }
