@@ -1,62 +1,85 @@
 ---
 title: ASN and GeoX
-description: How Smart aggregates what it learns by the destination's autonomous system when use_asn is on, where the ASN and country databases come from, and when experimental.geox downloads files and when they take effect.
+description: What an ASN is, why pooling what Smart learns by ASN helps it pick the right node sooner, what changes with use_asn, where the ASN and country databases come from and who uses them, and when experimental.geox downloads files and when they take effect.
 ---
 
+import Callout from '../../../components/Callout.astro';
 import CodeBlock from '../../../components/CodeBlock.astro';
 import example from '../../../examples/04-asn-geox.json?raw';
 
+This page covers two related topics: how `use_asn` lets Smart share experience between different sites on the same network, and where Smart's two geo databases (ASN and country) are downloaded from and when they take effect. With the default configuration you do not need it; read it when you turn on `use_asn`, LightGBM, or the `destination` mode of `smart-loadbalance`.
+
 ## What ASN is for
 
-One company's services are often spread across many domains but sit in the same autonomous system (ASN). For example, Google's `*.google.com`, `*.youtube.com` and `*.gstatic.com` all belong to AS15169. With `use_asn` on, how a node performs for one of these domains is also used to choose nodes for the other domains in the same ASN.
+An **ASN** (autonomous system number) identifies one organisation's block of the internet. A company's servers usually sit on its own network, so many of its domains share one ASN. For example, Google's `*.google.com`, `*.youtube.com`, `*.googlevideo.com` and `*.gstatic.com` all belong to AS15169.
+
+By default Smart learns how each node performs per **destination** (a folded domain such as `*.youtube.com`). That is precise, but every new domain starts from scratch. With `use_asn`, Smart pools the weights learned for all destinations in the same ASN:
+
+- If a node has served YouTube well, the first visit to `*.googlevideo.com` already knows the node suits Google's network, with no trial and error.
+- If a node's route to Google's network degrades, every Google domain avoids it together instead of each one getting burned separately.
+
+This pays off when most traffic goes to a few large providers. The cost is some precision: sites in one ASN are assumed to share the same best node.
+
+<Callout type="note" title="The destination IP must be known before the dial">
+  The ASN is looked up from an IP. Selection can only use it when the destination IP is known before dialing (resolved locally, or mapped through FakeIP). Connections dialed by domain with remote resolution are still selected per destination; their ASN is only looked up when they close, for the statistics.
+</Callout>
 
 ## What happens when it is on
 
-- **Lookup**: at dial time, Smart looks up the ASN of the destination's public IP. The lookup only works if the IP is known before dialing (for example, an already resolved address or a FakeIP mapping). Private and loopback addresses are skipped. For a connection that only has a domain, Smart runs an extra DNS query of up to 200 ms when the connection closes, to fill in the ASN.
-- **Recording**: the weight is written to the `tcp_asn:<ASN>` / `udp_asn:<ASN>` slot, and the generic `tcp` / `udp` slot is set to the minimum of the ASN slots. Success rate, latency and other counters are still recorded per (destination, node).
-- **Selection**: when the weight tier is queried and the destination has an ASN, Smart aggregates the weights of **all destinations in that ASN**. For each node it takes the maximum, but if any one of them is below 0.4 it takes the minimum. If the ASN has no data yet, this tier returns nothing and selection falls straight through to the latency tier. The destination's own weight is not used.
-- **Prefetch**: prefetch results are also referenced by ASN, so a new destination in the same ASN can hit them directly.
-- **Bonus**: on a non-CDN ASN, once successes reach 10 and the success rate is above 90%, up to 0.08 is added to the weight.
-- **Model**: LightGBM features 16 and 23 need the ASN. They are 0 when it is off.
+- **Lookup**: when dialing, the ASN is looked up from the destination's public IP; private and loopback addresses are skipped. A connection that only has a domain gets an extra DNS lookup of up to 200 ms when it closes, to fill in the ASN (the same happens with LightGBM or data collection on).
+- **Recording**: the weight is written to the `tcp_asn:<ASN>` / `udp_asn:<ASN>` slot, and the generic `tcp` / `udp` slot is set to the lowest of the ASN slots for lookups without an ASN. Success counts, latency and other counters are still kept per (destination, node).
+- **Selection**: when the destination has an ASN, the weight lookup pools the weights of **every destination in that ASN**: per node it takes the highest value, but the lowest as soon as any value is below 0.4, so poor results on one site are not hidden by good ones elsewhere. While the ASN has no data at all, this step returns nothing and selection falls through to the probe-delay step; the destination's own weight is not used.
+- **Prefetch**: prefetch results are also stored as a reference under the ASN, so new destinations in the same ASN get a hit right away.
+- **Bonus**: in a non-CDN ASN, once a (destination, node) pair has at least 10 successes and a success rate above 90%, its weight is raised by up to 8%. The bonus is 0.02 × log10(successes): 2% at 10 successes, 4% at 100, and the 8% cap only at 10,000.
+- **Model**: LightGBM features 16 and 23 need the ASN and are 0 without it.
+
+Each group's summary line in the startup log has an `asn=` field: `off` (not enabled), `on` (one database available), `on(N sources)` (N databases), `on(downloading)` (still downloading) or `on(no-db)` (no database available).
 
 ### Ignored ASNs
 
-The following 33 ASNs belong to CDN and cloud providers such as Cloudflare, Akamai, Fastly and Amazon, and to backbone carriers such as Cogent and Level 3. They host large numbers of unrelated websites. Grouping by them would mix unrelated sites together, so they take no part in ASN grouping or prefetch:
+These 33 ASNs belong to CDNs and cloud providers such as Cloudflare, Akamai, Fastly and Amazon, and to backbone carriers such as Cogent and Level 3. They host huge numbers of unrelated sites, so pooling by them would lump unrelated sites together. They take no part in pooling, prefetch or the bonus, and destinations in them are learned per destination as usual:
 
 13335, 12222, 16625, 20940, 31110, 35994, 54113, 22822, 15133, 19551, 20446, 60068, 16509, 36408, 4809, 199524, 212238, 55933, 43260, 43317, 43996, 52320, 396982, 16276, 30081, 12389, 37888, 45090, 174, 3356, 3209, 14061, 8452.
 
 ## Where the ASN database comes from
 
-Each group with `use_asn` on picks its database in this order:
+The ASN database is an mmdb file that maps IP ranges to ASNs. Each group with `use_asn` picks its databases in this order:
 
-1. The group's own `asn_database`. The path is used as is and is not joined with the data directory. In GUI clients a relative path is relative to the process working directory, so use an absolute path.
-2. The file that `experimental.geox.url.asn` downloads into the data directory (requires `geox.enabled: true`).
-3. If neither is available, the default database `https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb`, which GeoX downloads to `GeoLite2-ASN.mmdb` in the data directory.
+1. The group's `asn_database`. Paths are used as written, not joined with the data directory. In GUI clients a relative path resolves against the process working directory, so use absolute paths.
+2. The files downloaded to the data directory through `experimental.geox.url.asn` (requires `geox.enabled: true`).
+3. If neither exists, the default database `https://github.com/P3TERX/GeoLite.mmdb/releases/latest/download/GeoLite2-ASN.mmdb`, which GeoX downloads to `GeoLite2-ASN.mmdb` in the data directory.
 
-When several databases are listed, all of them are opened. Lookups try them in order and take the first non-zero result. Databases that fail to open are skipped. A database must use the MaxMind GeoLite2-ASN format (records have an `autonomous_system_number` field). Databases with different fields (for example, IPinfo's ASN database) return no results.
+When several databases are listed, all of them are opened and tried in order, and the first non-zero result wins; databases that fail to open are skipped. They must use the MaxMind GeoLite2-ASN layout (records with an `autonomous_system_number` field). Databases with other fields, such as IPinfo's ASN database, return nothing.
 
-GeoX downloads the databases of options 2 and 3 with the `http_client`, `auto_update` and `update_interval` from `experimental.geox`; for the default database this holds even when GeoX is not enabled. Downloads run in the background and do not block startup. An existing file is used as is and is not downloaded again on every start.
+Both the second and third kinds are downloaded by GeoX with the `http_client`, `auto_update` and `update_interval` from `experimental.geox` (the default database uses these settings even when GeoX is not enabled). Downloads run in the background and do not block startup. An existing file is used as is and is not downloaded again on every start.
 
-Database readers are shared between groups. When GeoX downloads or updates a database, it is reloaded at once and every group uses the new data, with no restart. A database that is still downloading at startup is picked up automatically when the download completes; until then the startup log shows `asn=on(downloading)`. Local files set with `asn_database` are read only at startup, so replacing one requires a restart.
+Database readers are shared between groups. When GeoX downloads or updates a database, it is reloaded at once and every group uses the new data, with no restart. A database still downloading at startup is picked up automatically when the download completes; until then the startup log shows `asn=on(downloading)`. Local files set with `asn_database` are read only at startup, so replacing one requires a restart.
 
 ## Country database
 
-The LightGBM country features (17 and 26) need a country database. Smart prefers the `country.mmdb` downloaded via `experimental.geox.url.mmdb`. If that is not configured, it uses the default GeoLite2-Country from the P3TERX releases page, which GeoX downloads to `country.mmdb` in the data directory. As with the ASN database, a download or update takes effect at once.
+The country database (`country.mmdb`) maps IP ranges to countries and regions. These features use it; when none of them is in use, it is neither opened nor downloaded:
 
-Only groups with `use_lightgbm` or `collect_data` on, and `smart-loadbalance` groups in the `destination` region mode (or with `destination.map` set), open the country database and look up countries; a `smart-loadbalance` group switched to `destination` at runtime starts the download then. See [Smart load balancing](../smart-loadbalance/#destination).
+| User | Purpose | When it is opened |
+|---|---|---|
+| LightGBM (`use_lightgbm`) | Country features 17 and 26 | At startup |
+| Training-data collection (`collect_data`) | The country column of the CSV and the features above | At startup |
+| `destination` mode of `smart-loadbalance` | Finding the destination's country; see [Smart load balancing](../smart-loadbalance/#destination) | At startup when configured with the `destination` mode or `destination.map`; when switched to that mode at runtime, the download starts then |
+| Exit probes of `smart-loadbalance` | Finding the country when the probe URL answers with an IP only | The first time it is needed |
+
+Smart prefers the `country.mmdb` downloaded through `experimental.geox.url.mmdb`. Without it, it uses the default GeoLite2-Country from the P3TERX releases page, which GeoX downloads to the same file name in the data directory. As with the ASN database, a download or update takes effect at once, with no restart.
 
 ## experimental.geox
 
-GeoX manages downloading and updating geographic data files in one place. Smart is currently its only user.
+GeoX manages downloading and updating geographic data files in one place; Smart is currently its only user. This example turns on both ASN and LightGBM and has GeoX refresh both databases weekly:
 
 <CodeBlock code={example} filename="04-asn-geox.json" locale="en" />
 
-- With `enabled: false`, the files under `url` are not downloaded, and Smart does not get their paths from here. The default databases Smart needs are still downloaded with the download settings in this section.
-- `url` has no defaults. Only files that have a URL set are downloaded.
+- With `enabled: false`, the files under `url` are not downloaded and Smart does not get their paths. The default databases Smart needs are still downloaded, with the download settings in this section.
+- `url` has no defaults. Only files with a URL set are downloaded.
 - File names are fixed: `GeoLite2-ASN.mmdb` (with several ASN URLs, the first is still `GeoLite2-ASN.mmdb` and the rest are `GeoLite2-ASN-1.mmdb`, `GeoLite2-ASN-2.mmdb` and so on), `country.mmdb`, `geoip.dat` and `geosite.dat`. No component uses `geoip.dat` or `geosite.dat` yet.
-- With `auto_update: true`, each file is updated every `update_interval`. Otherwise a file is downloaded only while it is missing, and an existing file is never updated.
+- With `auto_update: true`, each file is refreshed every `update_interval` (default 24 hours). Otherwise a file is downloaded only while it is missing, and an existing file is never updated.
 - When the download of a missing file fails (for example, because the network is not up yet at boot), it is retried after 30 seconds, doubling up to 30 minutes, until it succeeds.
-- Downloads use all `http_client` settings: the outbound and other dial options, TLS, headers and HTTP version. Without `http_client`, `download_detour` is used, and without either, the default HTTP client (`route.default_http_client`).
+- Downloads use all `http_client` settings: the outbound and other dial options, TLS, headers and HTTP version. Without `http_client`, `download_detour` is used; without either, the default HTTP client (`route.default_http_client`). Download through `direct` or a stable node. With GeoX enabled, an `http_client` that references a missing tag fails startup.
 
 ## Log messages
 
@@ -67,5 +90,6 @@ GeoX manages downloading and updating geographic data files in one place. Smart 
 | `smart: no ASN database configured; using the default database GeoX keeps at <path>` | Using the default database |
 | `smart: ASN database <path> is downloading; it is used once the download completes` | The database is still downloading and is picked up when it finishes |
 | `smart: failed to open ASN database [<path>] ...` | One database failed to open; the others are still tried |
+| `smart: country mmdb loaded from <path>` | The country database was opened |
 | `geox: reloaded <name> from <path>` | A download or update finished and the database was reloaded |
 | `assetdl[<name>]: download failed, retrying in <delay>: ...` | The download of a missing file failed and will be retried |

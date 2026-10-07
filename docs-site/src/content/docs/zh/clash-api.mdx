@@ -1,21 +1,71 @@
 ---
 title: Clash API
-description: Smart 组在 Clash API 中的表示，以及查询权重、诊断、手动指定、屏蔽节点、切换算法、清空数据，和 smart-loadbalance 地区与分配控制的全部接口。
+description: 用 Clash API 查看 Smart 组的状态与节点排名、手动指定或屏蔽节点、切换算法、清空学习数据，以及控制 smart-loadbalance 的地区与分配方式。每个接口都给出用途、请求与返回示例。
 ---
 
 import Callout from '../../../components/Callout.astro';
 
-Smart 复用 sing-box 的 Clash API（`experimental.clash_api`）。以下示例假设 `external_controller` 为 `127.0.0.1:9090`；设置了 `secret` 时，每个请求都要带上 `Authorization: Bearer <secret>`。错误统一返回 `{"message": "..."}`，个别接口另有说明。
+Smart 组（以及 `smart-loadbalance` 组）通过 sing-box 自带的 Clash API 提供状态与控制接口。面板（metacubexd、zashboard、Yacd 等）上显示的组信息、你在面板里点选节点，背后调用的都是这些接口；想用脚本查看权重、屏蔽节点或清空数据，也可以直接调用它们。
+
+这一页先说明怎样调用，再按用途分为 [查看状态](#查看状态)、[手动控制](#手动控制)、[清空数据](#清空数据) 和 [Smart 负载均衡](#smart-负载均衡) 四部分。文中的“目标”“权重”“熔断”等术语见 [术语表](../glossary/)。
+
+## 开始之前
+
+### 开启 Clash API
+
+在配置中设置监听地址。设置了 `secret` 后，每个请求都要带上它：
+
+```json
+{
+  "experimental": {
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090",
+      "secret": "change-me"
+    }
+  }
+}
+```
+
+### 调用方式
+
+本页示例假设监听地址为 `127.0.0.1:9090`。设置了 `secret` 时，在请求头中加上 `Authorization: Bearer <secret>`；浏览器发起的 WebSocket 连接不能自定义请求头，可以改用 URL 参数 `?token=<secret>`。
+
+```bash
+curl -H 'Authorization: Bearer change-me' http://127.0.0.1:9090/smart/groups
+```
+
+缺少或写错密钥时返回 401 `{"message": "Unauthorized"}`。其他错误也都是 `{"message": "..."}` 的形式，常见的有 404 `Resource not found`（组或节点不存在）和 400 `Body invalid`（请求体或参数格式错误）。个别接口的错误格式不同，会在该接口下单独说明。
+
+### 组名的写法
+
+组名包含中文、emoji 或空格时，在 URL 中按 UTF-8 百分号编码，例如 `香港 自动` 写成 `%E9%A6%99%E6%B8%AF%20%E8%87%AA%E5%8A%A8`。用 curl 时需要自己编码，面板会自动处理。
 
 <Callout type="warn" title="组名包含 / 时">
-  `/smart/*` 与 `/cache/smart/flush/{name}` 不会对路径中的组名做 URL 解码，组名含 `/` 时这些接口返回 404。`/proxies/{name}` 系列接口不受影响。
+  `/smart/*` 与 `/cache/smart/flush/{name}` 不会解码路径中的 `%2F`，组名含 `/` 时这些接口返回 404。`/proxies/{name}` 与 `/group/{name}` 系列接口不受影响。
 </Callout>
 
-## 面板中的 Smart 组
+### 接口一览
+
+| 用途 | 接口 |
+|---|---|
+| 组的当前状态（面板读取的就是它） | `GET /proxies/{name}`、`GET /group/{name}` |
+| 节点排名与权重 | `GET /proxies/{name}/weights`、`GET /smart/weights` |
+| 列出所有 Smart 组 | `GET /smart/groups` |
+| 内部诊断 | `GET /smart/groups/{name}/diag` |
+| 测速 | `GET /proxies/{name}/delay`、`GET /group/{name}/delay` |
+| 每条连接实际使用的节点 | `GET /connections` |
+| 手动指定、取消指定 | `PUT /proxies/{name}`、`DELETE /proxies/{name}`、`POST /smart/groups/{name}/clear-selection` |
+| 切换选路算法 | `PUT /smart/groups/{name}/algorithm` |
+| 屏蔽节点 | `POST /smart/groups/{name}/block/{node}`、`DELETE /connections/smart/{id}` |
+| 立即重算排名 | `POST /smart/groups/{name}/recompute` |
+| 清空学习数据 | `DELETE /proxies/{name}/weights`、`POST /cache/smart/flush`、`POST /cache/smart/flush/{name}` |
+| smart-loadbalance 的地区与分配方式 | `/smart/groups/{name}/regions`、`/smart/groups/{name}/balance` |
+
+## 查看状态
 
 ### `GET /proxies/{name}`
 
-Smart 组的 `type` 为 `Smart`，在标准字段之外附带 Smart 的状态：
+查看一个组此刻的状态：当前节点、成员、有没有手动指定、用的是哪种算法。面板上显示的 Smart 组信息就来自这里。Smart 组的 `type` 是 `Smart`，除了 Clash 的标准字段，还带有 Smart 自己的字段：
 
 ```json
 {
@@ -26,6 +76,7 @@ Smart 组的 `type` 为 `Smart`，在标准字段之外附带 Smart 的状态：
   "all": ["HK-01", "HK-02", "JP-01"],
   "history": [{ "time": "2026-10-07T08:00:00Z", "delay": 123 }],
   "alive": true,
+  "delay": 123,
   "hidden": false,
   "icon": "",
   "testUrl": "https://www.gstatic.com/generate_204",
@@ -43,45 +94,31 @@ Smart 组的 `type` 为 `Smart`，在标准字段之外附带 Smart 的状态：
 }
 ```
 
-- `udp` 为 `!disable_udp`。
-- `now` 的确定顺序见 [当前节点](../how-it-works/#当前节点)；`history`、`alive` 都是 `now` 这个节点的测速数据。
-- `fixed` 为手动指定的节点；`fixedSuspended` 表示指定因故障暂停，此时 `fixedActive` 是实际使用的节点。
-- `lgbmModelAge` 只在模型已加载时出现。
+| 字段 | 含义 |
+|---|---|
+| `udp` | 本组是否处理 UDP，即 `!disable_udp` |
+| `now` | 面板显示的“当前节点”。Smart 为每条连接单独选节点，`now` 只是一个代表：有手动指定时是被指定的节点，否则是最近一次成功拨号的节点，详见 [当前节点](../how-it-works/#当前节点) |
+| `history`、`delay`、`alive` | `now` 这个节点的测速记录。`alive` 只表示最近一次测速在 10 分钟以内，与 Smart 内部判断节点是否可用的规则不同 |
+| `fixed` | 手动指定的节点，没有时为空字符串 |
+| `fixedSuspended` | 被指定的节点拨号失败、Smart 暂时改用其他节点时为 `true` |
+| `fixedActive` | 实际承载流量的节点：暂停期间是 `now`，否则等于 `fixed` |
+| `algorithm`、`hysteresis` | 当前生效的算法与防抖窗口，运行时切换后立即更新 |
+| `policyPriority` | `policy_priority` 解析后的规则，没有配置时为 `null`，格式见 [`GET /smart/groups`](#get-smartgroups) |
+| `pinEndorsements` | 手动指定学习记录，没有时为 `null`，格式同上 |
+| `lgbmModelAge` | LightGBM 模型距上次加载的时长，只在模型已加载时出现 |
 
-`GET /group/{name}` 返回同样的结构，`GET /group` 返回由所有组构成的 `{"proxies": [...]}`。
-
-### `PUT /proxies/{name}`
-
-手动指定节点，`PATCH` 等价。请求体 `{"name": "HK-01"}`，传空字符串取消指定。成功返回 204；节点不是本组成员时返回 400 `Smart update error: not found`。
-
-指定会保存到缓存文件，并清除本组的 unwrap 缓存；只有开启了 `interrupt_exist_connections` 才中断已有连接。行为细节见 [手动指定节点](../priority-and-pinning/#手动指定节点)。
-
-### `DELETE /proxies/{name}`
-
-取消手动指定并清空选择状态，随后后台重新计算预取与排名。
-
-```json
-{ "group": "auto", "previous_pin": "HK-01", "now": "JP-01", "interrupted_mux": true, "unwrap_cleared": true }
-```
-
-`interrupted_mux` 只表示调用了中断，并不代表有连接被关闭。`urltest` 组也支持这个接口，返回 `{"group", "previous_pin", "now"}`；其他类型返回 400。
-
-### `GET /proxies/{name}/delay`
-
-参数 `timeout`（必填，毫秒）与 `url`（可选）。测速经过 Smart 自身的选路，不会解除手动指定。最多测 3 次取中位数，第一次低于 50 ms 即停止；以 `http://` 开头的 `url` 会被忽略，改用默认探测地址。成功返回 `{"delay": 120}`，超时 504，其他失败 503。结果记在 `now` 节点名下，不一定是实际测到的节点。
-
-### `GET /group/{name}/delay`
-
-逐个测试组内所有成员（每次 4 个并发），返回成功的结果，如 `{"HK-01": 120, "JP-01": 85}`，并更新共享的测速记录。
-
-## 权重与诊断
+`GET /group/{name}` 返回同样的结构（对象不是策略组时返回 404）；`GET /group` 返回所有策略组：`{"proxies": [...]}`。
 
 ### `GET /proxies/{name}/weights`
 
-本组的节点排名。参数：
+查看本组给各个节点打的分：哪些节点常用，学习数据够不够多。参数：
 
-- `refresh=true`：用现有的预取结果重新计算排名（不会重新预取）；
-- `full=1`：附带按（目标, 节点）的明细 `per_target`。节点很多时明细是随机抽样，最多 `MaxTargets / 2` 行。
+- `refresh=true`：用已有的预取结果重新计算排名，而不是返回缓存。它不会重新预取；要连预取一起重算，用 [`POST /smart/groups/{name}/recompute`](#post-smartgroupsnamerecompute)。
+- `full=1`（或 `full=true`）：附带按（目标, 节点）展开的明细 `per_target`。这份明细与选路时读取的数据完全一致，可以用来核对“为什么这个网站走了这个节点”。数据很多时随机抽样，最多 `MaxTargets / 2` 行。
+
+```bash
+curl 'http://127.0.0.1:9090/proxies/auto/weights?full=1'
+```
 
 ```json
 {
@@ -91,6 +128,7 @@ Smart 组的 `type` 为 `Smart`，在标准字段之外附带 Smart 的状态：
   ],
   "per_target": [
     { "target": "*.example.com", "node": "HK-01", "weight_tcp": 1.42,
+      "weights_by_type": { "tcp": 1.42 },
       "success": 12, "failure": 1, "connect_time_ms": 85, "latency_ms": 140,
       "last_used": 1759800000, "upload_mb": 0.53, "download_mb": 12.8 }
   ]
@@ -99,17 +137,184 @@ Smart 组的 `type` 为 `Smart`，在标准字段之外附带 Smart 的状态：
 
 | 字段 | 含义 |
 |---|---|
-| `rank` | `MostUsed`（前 20%）、`OccasionalUsed`（接下来 50%）、`RarelyUsed` |
-| `weight` | 节点在各活跃目标上的平均权重，与内部选路使用的刻度相同 |
-| `score` | `weight` 相对最高者的百分比，用于显示进度条 |
-| `targetCount` | 参与平均的目标数 |
-| `sampleCount` | 这些目标上的拨号样本总数 |
+| `rank` | 可用节点按权重排序后，前 20% 为 `MostUsed`，接下来 50% 为 `OccasionalUsed`，其余为 `RarelyUsed`；不可用的节点一律为 `RarelyUsed` |
+| `weight` | 节点在各个活跃目标上的平均权重，与内部选路使用的数值是同一刻度 |
+| `score` | `weight` 相对最高者的百分比，适合画进度条 |
+| `targetCount` | 参与平均的目标数，越多越可信 |
+| `sampleCount` | 这些目标上的拨号次数总和 |
+| `per_target[].weight_tcp`、`weight_udp`、`weights_by_type` | 该（目标, 节点）的 TCP 权重、UDP 权重，以及包括 ASN 维度在内的全部权重 |
 
-没有数据时额外返回 `"message": "no weight data available for this group"`。没有统计数据（例如未开启缓存文件）时，按测速延迟生成排名，`targetCount` 为 1、`sampleCount` 为 0。不是 Smart 组时返回 400 `{"weights": [], "error": "not a Smart group"}`。
+还没有任何数据时，返回空列表并附加 `"message": "no weight data available for this group"`。没有统计数据（例如没有开启缓存文件）时，排名按测速延迟生成，此时 `targetCount` 为 1、`sampleCount` 为 0。对象不是 Smart 组时返回 400 `{"weights": [], "error": "not a Smart group"}`。
+
+### `GET /smart/weights`
+
+一次取回所有 Smart 组的排名（最多 5 个组同时计算），支持 `refresh=true`，适合在面板上汇总展示。
+
+```json
+{
+  "weights": { "auto": [ { "name": "HK-01", "rank": "MostUsed", "weight": 1.42, "score": 100, "targetCount": 37, "sampleCount": 412, "lastUpdated": 1759800000 } ] },
+  "errors": {}
+}
+```
+
+某个组计算失败时，错误记在 `errors` 中该组名下，其他组照常返回。没有 Smart 组时返回 `{"weights": {}, "message": "no Smart groups configured"}`。
+
+### `GET /smart/groups`
+
+列出所有 Smart 组及主要设置，用来确认配置有没有按预期生效：
+
+```json
+{
+  "groups": [
+    {
+      "name": "auto", "type": "smart", "testUrl": "https://www.gstatic.com/generate_204",
+      "useASN": false, "useLightGBM": true, "collectData": false,
+      "fixed": "", "now": "HK-01", "members": 42,
+      "algorithm": "strict-best", "pinSuspended": false, "http3FallbackNodes": 0,
+      "lgbmModelAge": "2h3m0s",
+      "policyPriority": [ { "raw": "香港", "pattern": "香港", "kind": "substring", "negate": false, "factor": 1.3 } ],
+      "pinEndorsements": [ { "node": "HK-01", "boost": 1.12, "count": 18, "success": 17, "failure": 1,
+                             "first_pinned": 1759000000, "last_pinned": 1759800000,
+                             "top_targets": { "*.example.com": 9 }, "age_seconds": 3600 } ]
+    }
+  ]
+}
+```
+
+- `type` 为 `smart` 或 `smart-loadbalance`；后者还带有与 `/proxies` 相同的 [`loadBalance` 块](#get-proxiesname-1)。
+- `members` 始终是成员节点数。`fixed` 是手动指定的节点；`smart-loadbalance` 组没有手动指定而锁定了地区时，`fixed` 是该地区。
+- `policyPriority` 列出每条规则的解析结果：`raw` 是去掉系数后的原文（保留 `=`、`~`、`!` 前缀），`pattern` 是实际用于匹配的内容，`kind` 为 `substring`、`exact`、`regex` 或 `glob`，`negate` 表示是否取反，`factor` 是系数。用它确认规则是否按你的意图解析。
+- `pinEndorsements` 是手动指定学习记录，按当前加成从高到低排列：`boost` 是加成倍数，`count`、`success`、`failure` 是被指定期间的拨号次数，`top_targets` 是常访问的目标，`age_seconds` 是距上次指定的秒数。
+- `http3FallbackNodes` 目前始终为 0。
+- `lgbmModelAge`、`policyPriority`、`pinEndorsements`、`hysteresis`、`loadBalance` 为空时省略。
+
+### `GET /smart/groups/{name}/diag`
+
+一个组的内部状态，用来排查“排名看起来不对”“目标数为什么是 0”这类问题。只读，可以频繁调用：
+
+```json
+{
+  "name": "auto", "algorithm": "strict-best", "hysteresis": "0s",
+  "policy_priority": null, "members": 42, "now": "HK-01", "fixed": "",
+  "test_url": "https://www.gstatic.com/generate_204",
+  "snapshot_entries": 42, "snapshot_age": "42s",
+  "live_coverage": { "HK-01": { "target_count": 37, "sample_count": 412 } }
+}
+```
+
+- `snapshot_entries`、`snapshot_age`：内存中排名快照的条目数与年龄；没有快照时 `snapshot_age` 为 `(none)`。
+- `live_coverage`：绕过所有缓存，直接从统计库读出每个节点实际有数据的目标数与样本数。只在缓存文件可用时出现。
+- `members` 是组的 `all` 列表长度。对列出地区出站的 `smart-loadbalance` 组，它是列表中的条目数，不是节点数。
+- `fixed` 只显示手动指定的节点，不包括地区锁定。
+
+组不存在返回 404，不是 Smart 组返回 400 `not a Smart group`。
+
+### `GET /proxies/{name}/delay`
+
+测量经过这个组访问探测地址的延迟。参数 `timeout`（必填，毫秒）与 `url`（可选）。测速同样经过 Smart 的选路，不会解除手动指定。
+
+- 最多测 3 次取中位数；第一次低于 50 ms 时直接返回；
+- 以 `http://` 开头的 `url` 会被忽略，改用默认探测地址；
+- 成功返回 `{"delay": 120}`。全部失败时，超时返回 504 `{"message": "Timeout"}`，其他原因返回 503 `{"message": "An error occurred in the delay test"}`；缺少 `timeout` 返回 400；
+- 结果记在 `now` 节点名下，不一定是这次实际测到的节点。
+
+### `GET /group/{name}/delay`
+
+逐个测试组内的每个成员（同时最多 4 个），参数与上一个接口相同。只返回成功的结果，例如 `{"HK-01": 120, "JP-01": 85}`，并更新共享的测速记录。成员是其他策略组时，测的是它当前选中的节点。
+
+### `GET /connections`
+
+查看每条连接实际走的节点。经过 Smart 的连接，`chains` 会补全到真正拨通的节点，顺序与 mihomo 相同，最终节点在前：
+
+```json
+{ "chains": ["HK-01", "auto", "proxy"] }
+```
+
+Smart 的成员是 `urltest`、`selector` 等策略组时，链会逐级展开到真实节点。SFA / SFW / SFL 图形客户端的连接列表显示的也是这个节点。
+
+## 手动控制
+
+### `PUT /proxies/{name}`
+
+手动指定节点：之后的新连接都走这个节点。在面板里点选节点就是调用这个接口。`PATCH` 与它等价。
+
+```bash
+curl -X PUT http://127.0.0.1:9090/proxies/auto -d '{"name":"HK-01"}'
+```
+
+- 成功返回 204；请求体不是合法 JSON 返回 400 `Body invalid`；节点不是本组成员时返回 400 `Smart update error: not found`。
+- `{"name": ""}` 取消指定。
+- 指定会保存到缓存文件，重启后仍然有效；同时清空本组的 unwrap 缓存（“目标 → 节点”的短期记忆）。
+- 已经建立的连接默认不受影响，只有开启了 `interrupt_exist_connections` 才会被中断。
+- 被指定的节点出故障时，Smart 会临时改用其他节点，恢复后自动切回，详见 [手动指定节点](../priority-and-pinning/#手动指定节点)。
+
+### `DELETE /proxies/{name}`
+
+取消手动指定，让 Smart 恢复自动选路，然后在后台重新计算预取与排名。面板上“取消固定”一类的按钮调用的就是它。
+
+```json
+{ "group": "auto", "previous_pin": "HK-01", "now": "JP-01", "interrupted_mux": true, "unwrap_cleared": true }
+```
+
+- `previous_pin` 是原来指定的节点，没有指定时省略；`now` 是取消后的当前节点。
+- `interrupted_mux` 只表示发出了中断请求：只有开启了 `interrupt_exist_connections`，本组已有的连接才会真的被关闭。
+- `urltest` 组也支持这个接口，返回 `{"group", "previous_pin", "now"}`；其他类型的组返回 400。
+
+### `POST /smart/groups/{name}/clear-selection`
+
+与 `DELETE /proxies/{name}` 效果相同，返回 `{"group": "auto", "cleared": true}`。组不存在或不是 Smart 组时返回 404。
+
+### `PUT /smart/groups/{name}/algorithm`
+
+不重启就切换选路算法，方便试用不同的算法。请求体必须是 JSON 对象：
+
+```bash
+curl -X PUT http://127.0.0.1:9090/smart/groups/auto/algorithm -d '{"algorithm":"p2c"}'
+```
+
+```json
+{ "group": "auto", "requested": "p2c", "applied": "p2c", "previous": "strict-best" }
+```
+
+- 取值与别名见 [选路算法](../algorithms/)。无法识别的值不会报错，而是按 `strict-best` 处理，所以请以 `applied` 为准。
+- 切换只在本次运行有效，不会写回配置，重启后恢复配置中的值。
+- 请求体格式错误返回 400 `invalid JSON body: ...`；组不存在返回 404；不是 Smart 组返回 400 `not a Smart group`；对 `smart-loadbalance` 组返回 400，请改用 [`PUT /smart/groups/{name}/balance`](#put-smartgroupsnamebalance)。
+
+### `POST /smart/groups/{name}/block/{node}`
+
+暂时不让本组使用某个节点，例如你知道它今晚线路有问题。参数 `duration`（Go 时长格式，如 `15m`、`2h`）设置屏蔽时长，默认 30 分钟，写错时按默认值处理。
+
+```bash
+curl -X POST 'http://127.0.0.1:9090/smart/groups/auto/block/HK-01?duration=2h'
+```
+
+```json
+{ "group": "auto", "node": "HK-01", "blocked_until": "2026-10-07T09:30:00+08:00" }
+```
+
+- 屏蔽期间，节点按“失败 100 次、劣化系数 0.1”记录；到期后由恢复检查逐步恢复。
+- 没有“解除屏蔽”的接口：等它到期，或用 [清空数据](#清空数据) 的接口清除。屏蔽名单有 5 分钟缓存，所以到期或清除后最多还要 5 分钟才完全生效。
+- 屏蔽不影响手动指定：被指定的节点即使被屏蔽也照常使用。所有候选都不可用时的最后兜底也不检查屏蔽。
+- 组不存在返回 404；节点不在本组时返回 404 `node not a member of this group`；没有缓存文件时返回 500 `smart: store unavailable`。
+
+### `DELETE /connections/smart/{id}`
+
+关闭一条连接，并把它**实际使用的** Smart 成员屏蔽 30 分钟。适合在连接列表里发现某条连接特别卡时一键处理。`id` 是 `GET /connections` 返回的连接 ID。
+
+- 成功返回 `{"group": "auto", "node": "HK-01"}`；连接没有经过 Smart 组或屏蔽失败时返回 `{}`，但连接仍会被关闭。
+- `id` 不是合法 UUID 返回 400，连接不存在返回 404。
+
+### `POST /smart/groups/{name}/recompute`
+
+立即在后台重新计算预取与排名，不必等下一个周期，并马上返回一份重算后的排名 `{"group": "auto", "ranking": [...]}`。预取在后台异步进行，所以这份排名可能比最终结果晚一个周期。组不存在或不是 Smart 组时返回 404。
+
+## 清空数据
+
+清空会删除 Smart 在缓存文件中为这个组积累的全部学习数据，相当于让它从头学起。适合节点大换血之后，或者怀疑数据被异常情况污染的时候。清空后会自动在后台重新计算。
 
 ### `DELETE /proxies/{name}/weights`
 
-清空本组在缓存文件中的全部数据（统计、节点状态、排名、预取、目标失败计数、写入队列、手动指定、不可用标记、熔断器、手动指定认可记录，以及 `smart-loadbalance` 的地区锁定与运行时设置、出口探测结果），然后重新计算。
+清空一个组的全部数据：统计、节点状态、排名、预取、目标失败计数、写入队列中尚未落盘的数据、手动指定、不可用标记、熔断器、手动指定学习记录，以及 `smart-loadbalance` 的地区锁定、运行时设置与出口探测结果。内存中的状态也一并重置，例如手动指定被取消、熔断器复位。
 
 ```json
 {
@@ -122,100 +327,33 @@ Smart 组的 `type` 为 `Smart`，在标准字段之外附带 Smart 的状态：
 }
 ```
 
-对 `smart-loadbalance` 组，内存中的状态也一并重置：解除地区锁定，模式、策略与亲和恢复配置值，清空出口结果、地区记忆、亲和绑定与地区探测结果，随后重新识别地区并重新探测出口。
+`deleted` 是每类数据删除的条目数，其中 `queue` 是丢弃的待写入条目。对 `smart-loadbalance` 组，内存中的地区锁定也会解除，模式、策略与亲和恢复为配置值，出口结果、地区记忆、亲和绑定与地区探测结果被清空，随后重新识别地区并重新探测出口。
 
-### `GET /smart/weights`
+### `POST /cache/smart/flush`
 
-所有 Smart 组的排名，最多 5 个组并发计算，支持 `refresh=true`。
-
-```json
-{ "weights": { "auto": [ { "name": "HK-01", "rank": "MostUsed", "weight": 1.42, "score": 100, "targetCount": 37, "sampleCount": 412, "lastUpdated": 1759800000 } ] }, "errors": {} }
-```
-
-没有 Smart 组时返回 `{"weights": {}, "message": "no Smart groups configured"}`。
-
-### `GET /smart/groups`
-
-列出所有 Smart 组及其设置：
+一次清空当前配置中的所有 Smart 组（内容同上），并清空进程内的 Smart 内存缓存。`DELETE` 与它等价。
 
 ```json
 {
-  "groups": [
-    {
-      "name": "auto", "testUrl": "https://www.gstatic.com/generate_204",
-      "useASN": false, "useLightGBM": true, "collectData": false,
-      "fixed": "", "now": "HK-01", "members": 42,
-      "algorithm": "strict-best", "pinSuspended": false, "http3FallbackNodes": 0,
-      "lgbmModelAge": "2h3m0s",
-      "policyPriority": [ { "raw": "香港:1.3", "pattern": "香港", "kind": "substring", "negate": false, "factor": 1.3 } ]
-    }
-  ]
+  "flushed_groups": 2, "errors": 0,
+  "total": { "stats": 2406, "nodes": 84, "ranking": 2, "prefetch": 760, "failures": 24, "queue": 0 },
+  "groups": [ { "group": "auto", "deleted": { "stats": 1203 }, "recomputed": true } ]
 }
 ```
 
-`smart-loadbalance` 组也在列表中，`type` 为 `smart-loadbalance`（普通组为 `smart`），并带有与 `/proxies` 相同的 `loadBalance` 块；`members` 始终是节点数，`fixed` 是手动指定的节点或锁定的地区。
+`total` 只汇总统计、节点状态、排名、预取、失败计数与队列这六类；手动指定、不可用标记、熔断器等其余类别只出现在各组的 `deleted` 中。只有所有组都失败时才返回 500。
 
-`lgbmModelAge`、`policyPriority`、`pinEndorsements`、`hysteresis`、`loadBalance` 为空时省略。`policyPriority` 列出每条规则解析后的模式、匹配方式（`substring`、`exact`、`regex`、`glob`）、是否取反与系数，用来确认规则是否按预期解析。`http3FallbackNodes` 目前始终为 0。
+### `POST /cache/smart/flush/{name}`
 
-### `GET /smart/groups/{name}/diag`
-
-单个组的内部状态，只读：
-
-```json
-{
-  "name": "auto", "algorithm": "strict-best", "hysteresis": "0s",
-  "policy_priority": null, "members": 42, "now": "HK-01", "fixed": "",
-  "test_url": "https://www.gstatic.com/generate_204",
-  "snapshot_entries": 42, "snapshot_age": "42s",
-  "live_coverage": { "HK-01": { "target_count": 37, "sample_count": 412 } }
-}
-```
-
-`snapshot_*` 是内存中排名快照的条目数与年龄，没有快照时 `snapshot_age` 为 `(none)`。`live_coverage` 直接从统计库读取，绕过所有缓存，只在缓存文件可用时出现。组不存在返回 404，不是 Smart 组返回 400。
-
-## 控制
-
-### `PUT /smart/groups/{name}/algorithm`
-
-运行时切换算法。请求体必须是 JSON 对象：
-
-```bash
-curl -X PUT http://127.0.0.1:9090/smart/groups/auto/algorithm -d '{"algorithm":"p2c"}'
-```
-
-```json
-{ "group": "auto", "requested": "p2c", "applied": "p2c", "previous": "strict-best" }
-```
-
-取值与别名见 [选路算法](../algorithms/)。无法识别的值不会报错，`applied` 为 `strict-best`。切换不写回配置，重启后恢复。对 `smart-loadbalance` 组返回 400，请改用 `PUT /smart/groups/{name}/balance`。
-
-### `POST /smart/groups/{name}/block/{node}`
-
-手动屏蔽一个节点，参数 `duration`（如 `15m`），默认 30 分钟，无效值忽略。屏蔽期间节点被视为失败 100 次、劣化系数 0.1。
-
-```json
-{ "group": "auto", "node": "HK-01", "blocked_until": "2026-10-07T09:30:00+08:00" }
-```
-
-- 没有解除屏蔽的接口，到期自动解除，或用清空数据的接口清除。屏蔽集合有 300 秒缓存，解除后最多延迟 5 分钟生效。
-- 手动指定的节点不受屏蔽影响；所有候选都不可用时的兜底选择也不检查屏蔽。
-- 组或节点不存在返回 404；没有缓存文件时返回 500 `smart: store unavailable`。
-
-### `POST /smart/groups/{name}/recompute`
-
-后台重新计算预取与排名，并立即返回一份重算后的排名 `{"group", "ranking": [...]}`。由于预取是异步的，返回的排名可能比最终结果晚一个周期。出错时一律返回 404。
-
-### `POST /smart/groups/{name}/clear-selection`
-
-与 `DELETE /proxies/{name}` 相同，返回 `{"group": "auto", "cleared": true}`。
+只清空一个组，效果与 `DELETE /proxies/{name}/weights` 相同，`DELETE` 与它等价。返回 `{"group", "deleted", "total", "recomputed": true}`。组不存在返回 404，不是 Smart 组返回 400 `not a Smart group`。
 
 ## Smart 负载均衡
 
-`smart-loadbalance` 组与它的地区出站（`smart-region`）在面板中的 `type` 都是 `Smart`，上文所有 Smart 接口对它们同样有效。下面是额外的字段与接口，概念见 [Smart 负载均衡](../smart-loadbalance/)。
+`smart-loadbalance` 组与它的地区出站（`smart-region`）在面板中的 `type` 都是 `Smart`，上面的所有 Smart 接口对它们同样有效。下面是额外的字段与接口；“地区”“地区出站”“锁定”等概念见 [Smart 负载均衡](../smart-loadbalance/)。
 
 ### `GET /proxies/{name}`
 
-`smart-loadbalance` 组额外带有 `loadBalance` 块：
+`smart-loadbalance` 组额外带有 `loadBalance` 块，汇总当前的分配方式和各地区的节点数：
 
 ```json
 {
@@ -234,31 +372,35 @@ curl -X PUT http://127.0.0.1:9090/smart/groups/auto/algorithm -d '{"algorithm":"
 }
 ```
 
-- `region.outbounds.members` 为 `regions`（默认）且生成了地区出站时，`all` 依次列出地区出站、尚无节点的已声明地区出站，以及没有地区出站的地区里的节点；`now` 是锁定地区的出站，否则是最近一条连接所在地区的出站。`members` 为 `nodes` 时，`all` 与 `now` 与普通 Smart 组相同。
-- `fixed` 是手动指定的节点；没有手动指定而锁定了地区时，是该地区的出站（不列地区出站时为地区代码）。
-- `regions` 中的 `healthy` 是 TCP 意义下的健康节点数；`icon`、`outbound` 只在存在时出现。
+- `region.outbounds.members` 为 `regions`（默认）且生成了地区出站时，`all` 依次列出地区出站、还没有节点的已声明地区出站，以及没有地区出站的地区里的节点；`now` 是锁定地区的出站，否则是最近一条连接所在地区的出站。`members` 为 `nodes` 时，`all` 与 `now` 与普通 Smart 组相同。
+- `fixed` 是手动指定的节点；没有手动指定而锁定了地区时，是该地区的出站（不列出地区出站时是地区代码）。
+- `regions[].name` 是中文显示名（或 `region.rules` 中设置的名称），`nameEn` 是英文名；`healthy` 是按 TCP 统计的可用节点数；`icon`、`outbound` 只在存在时出现。
 
-地区出站额外带有 `group`、`region`、`fallback`、`generated`（是否由组自动生成），`all` 为该地区的节点，`now` 依次为单独指定的节点、经它的最近一条连接所用节点、该地区最近使用的节点、该地区质量最高的健康节点。`fixed` 为单独指定的节点。
+地区出站额外带有 `group`（所属组）、`region`、`fallback`、`generated`（是否由组自动生成）。它的 `all` 是该地区的节点；`now` 依次取：在这个出站上单独指定的节点、经它的最近一条连接所用的节点、该地区最近使用的节点、该地区质量最高的可用节点。`fixed` 是在这个出站上单独指定的节点。
 
 ### `PUT /proxies/{name}`
 
-对 `smart-loadbalance` 组：
+对 `smart-loadbalance` 组，请求体中的 `name` 可以是三类值：
 
-- `{"name": "<地区出站标签>"}` 或 `{"name": "JP"}`（地区代码、名称）锁定该地区，同时取消手动指定的节点；
-- `{"name": "<节点>"}` 手动指定节点，与 Smart 组相同，地区锁定保留但被手动指定覆盖；
-- `{"name": ""}` 同时取消手动指定与地区锁定。
+| 请求体 | 效果 |
+|---|---|
+| `{"name": "🇯🇵 日本负载"}` 或 `{"name": "JP"}` | 锁定该地区（地区出站标签、地区代码或名称都可以），同时取消手动指定的节点 |
+| `{"name": "HK-01"}` | 手动指定节点，与普通 Smart 组相同；地区锁定保留，但手动指定优先 |
+| `{"name": ""}` | 同时取消手动指定与地区锁定 |
 
-节点名与地区名相同时按节点处理。对地区出站，`{"name": "<本地区节点>"}` 在该出站内单独指定节点，传其他地区的节点返回 400 `smart-region update error: not a member of the region`，`""` 取消。`DELETE /proxies/{name}` 同样有效：对组同时清除手动指定与地区锁定（没有手动指定时 `previous_pin` 显示原锁定），对地区出站清除单独指定，返回 `{"group", "previous_pin", "now"}`。
+节点名与地区名相同时，按节点处理。对地区出站，`{"name": "<本地区的节点>"}` 只在这个出站上指定节点；传入其他地区的节点返回 400 `smart-region update error: not a member of the region`；`""` 取消。
 
-SFA / SFW / SFL 图形客户端的选择操作走同样的逻辑。
+`DELETE /proxies/{name}` 同样适用：对组，同时清除手动指定与地区锁定（没有手动指定时，`previous_pin` 显示原来锁定的地区）；对地区出站，清除它单独指定的节点，返回 `{"group", "previous_pin", "now"}`，其中 `group` 是地区出站自己的标签。SFA / SFW / SFL 图形客户端的选择操作遵循同样的规则。
 
-### `GET /proxies/{name}/weights`
+### `GET /proxies/{name}/weights` 与组测速
 
-对地区出站返回所属组的排名中属于该地区的部分，并带上 `group` 与 `region`：`{"weights": [...], "group": "balance", "region": "HK"}`。
+对地区出站调用 `weights`，返回所属组排名中属于该地区的部分，并带上 `group` 与 `region`：`{"weights": [...], "group": "balance", "region": "HK"}`。
+
+对列出地区出站的组调用 `GET /group/{name}/delay`，测的是每个地区出站当前的节点，结果以地区出站的标签为键。
 
 ### `GET /smart/groups/{name}/regions`
 
-地区明细与当前设置：
+查看地区划分的全部细节：每个节点分到了哪个地区、依据是什么、是否可用、当前负载，以及正在生效的模式、策略与锁定。节点分错了地区，或者想知道“为什么连接都落在某个地区”，先看这里。
 
 ```json
 {
@@ -289,20 +431,23 @@ SFA / SFW / SFL 图形客户端的选择操作走同样的逻辑。
 
 | 字段 | 含义 |
 |---|---|
-| `mode` / `strategy` / `affinity` | 当前生效的值；`config*` 是配置中的值 |
-| `members[].source` | 地区来源：`rule`、`name`、`exit`、`unknown` |
-| `members[].quality` | 不针对具体目标的节点质量（总体权重或测速换算），已乘 `policy_priority` |
-| `load` | 经本组的活跃连接数（TCP 与 UDP）加正在拨号数 |
-| `score` | 不针对具体目标的地区评分，不含地区探测系数 |
+| `mode`、`strategy`、`affinity` | 当前生效的值；带 `config` 前缀的是配置文件中的值，两者不同说明运行时切换过 |
+| `members[].source` | 地区的来源：`rule`（自定义规则）、`name`（节点名称）、`exit`（出口探测）、`unknown`（未识别） |
+| `members[].exit`、`exitIp` | 出口探测得到的国家与 IP，只在探测成功时出现 |
+| `members[].quality` | 不针对具体目标的节点质量（总体权重或由测速换算的值），已乘以 `policy_priority` 系数 |
+| `load` | 经本组的活跃连接数（TCP 与 UDP），加上正在拨号的连接数 |
+| `score` | 不针对具体目标的地区评分，不含地区探测的系数 |
+| `allowed` | 是否被 `allow` / `deny` 允许 |
 | `last` | 该地区最近一条连接所用的节点 |
+| `probe.tracked`、`probe.results` | 正在跟踪的探测候选网站数，以及现存的探测结果数 |
 | `excluded` | `unknown: exclude` 时被排除的节点 |
-| `memory` | 记住地区的目标数、亲和绑定数 |
+| `memory` | 记住了地区的目标数，以及会话亲和的绑定数 |
 
-组不存在返回 404，不是 `smart-loadbalance` 组返回 400 `not a smart-loadbalance group: <name>`。下面几个接口相同。
+组不存在返回 404；不是 `smart-loadbalance` 组返回 400 `not a smart-loadbalance group: <name>`。下面几个接口也一样。
 
 ### `PUT /smart/groups/{name}/regions`
 
-锁定地区和 / 或切换地区模式，未出现的字段不改变：
+锁定地区和 / 或切换地区模式，没有写的字段不变：
 
 ```bash
 curl -X PUT http://127.0.0.1:9090/smart/groups/balance/regions -d '{"lock":"JP"}'
@@ -313,21 +458,23 @@ curl -X PUT http://127.0.0.1:9090/smart/groups/balance/regions -d '{"mode":"dest
 { "group": "balance", "mode": "destination", "lock": "JP", "now": "🇯🇵 日本负载" }
 ```
 
-- `lock` 可写地区代码、名称、旗帜或地区出站标签，地区必须有成员，否则 400 `unknown region: ...`；`""` 解锁。
-- `mode` 写 `""` 恢复配置中的模式；没有配置 `priority` 时不能切到 `priority`。切换模式会清空各目标记住的地区。
-- 两者都没有时返回 400。锁定与模式会保存到缓存文件，重启后恢复。开启了 `interrupt_exist_connections` 时，锁定变化会中断已有连接。
+- `lock` 可以写地区代码、名称、旗帜或地区出站标签，该地区必须有成员，否则返回 400 `unknown region: ...`；写 `""` 解锁。
+- `mode` 写 `""` 恢复配置中的模式；配置里没有 `priority` 列表时，不能切换到 `priority`。切换模式会清空各目标记住的地区。
+- 两个字段都没有时返回 400。锁定与模式都会保存到缓存文件，重启后恢复。开启了 `interrupt_exist_connections` 时，锁定变化会中断已有连接。
 
 ### `DELETE /smart/groups/{name}/regions/lock`
 
-解除锁定，返回 `{"group", "previous", "now"}`。
+解除地区锁定，返回 `{"group", "previous", "now"}`，其中 `previous` 是原来锁定的地区。
 
 ### `POST /smart/groups/{name}/regions/detect`
 
-重新识别全部成员的地区，并为需要的节点启动出口探测；`?force=true` 对全部节点重新探测。返回 `{"group": "balance", "exitProbes": 3}`，探测在后台进行，完成后地区自动更新。
+重新识别所有成员的地区，并为需要的节点启动出口探测；加上 `?force=true` 则对所有节点重新探测。修改了节点名称规则、或怀疑探测结果已经过时，就调用它。
+
+返回 `{"group": "balance", "exitProbes": 3}`，`exitProbes` 是本次启动的探测数。探测在后台进行，完成后地区自动更新。
 
 ### `PUT /smart/groups/{name}/balance`
 
-切换分配策略和 / 或会话亲和，空字段不改变，`"default"` 恢复配置值：
+切换分配策略和 / 或会话亲和。空字段不变，`"default"` 恢复配置中的值：
 
 ```bash
 curl -X PUT http://127.0.0.1:9090/smart/groups/balance/balance -d '{"strategy":"least-connections","affinity":"site"}'
@@ -337,40 +484,4 @@ curl -X PUT http://127.0.0.1:9090/smart/groups/balance/balance -d '{"strategy":"
 { "group": "balance", "strategy": "least-connections", "affinity": "site" }
 ```
 
-无法识别的值返回 400。切换会保存到缓存文件；更换亲和会清空已有绑定。
-
-## 清空缓存
-
-### `POST /cache/smart/flush`
-
-`DELETE` 等价。对当前配置中的每个 Smart 组执行一次清空（内容同 `DELETE /proxies/{name}/weights`），并清空进程内的 Smart 内存缓存。
-
-```json
-{
-  "flushed_groups": 2, "errors": 0,
-  "total": { "stats": 2406, "nodes": 84, "ranking": 2, "prefetch": 760, "failures": 24, "queue": 0 },
-  "groups": [ { "group": "auto", "deleted": { "stats": 1203 }, "recomputed": true } ]
-}
-```
-
-`total` 不统计手动指定、不可用标记、熔断器与认可记录，它们在各组的 `deleted` 中。只有全部组都失败时才返回 500。
-
-### `POST /cache/smart/flush/{name}`
-
-只清空一个组，`DELETE` 等价，返回 `{"group", "deleted", "total", "recomputed": true}`。
-
-## 连接
-
-### `GET /connections`
-
-经过 Smart 的连接，`chains` 会补全到实际拨通的节点，顺序与 mihomo 相同，最终节点在前：
-
-```json
-{ "chains": ["HK-01", "auto", "proxy"] }
-```
-
-Smart 的成员是 `urltest`、`selector` 等组时，链会逐级展开到真实节点。
-
-### `DELETE /connections/smart/{id}`
-
-关闭一条连接，并把它**实际使用的** Smart 成员屏蔽 30 分钟。成功返回 `{"group": "auto", "node": "HK-01"}`；连接没有经过 Smart 组或屏蔽失败时返回 `{}`。`id` 不是合法 UUID 返回 400，连接不存在返回 404。
+无法识别的值返回 400。切换会保存到缓存文件，重启后恢复；更换亲和会清空已有的绑定。

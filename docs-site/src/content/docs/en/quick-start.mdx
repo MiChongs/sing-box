@@ -1,6 +1,6 @@
 ---
 title: Quick start
-description: Run a Smart group with a minimal configuration, then use the logs and the Clash API to confirm that it is learning.
+description: Get a Smart outbound group running from scratch — the binary, a minimal configuration, the first start — and confirm through the log and the Clash API that it is learning.
 ---
 
 import CodeBlock from '../../../components/CodeBlock.astro';
@@ -9,23 +9,34 @@ import Flow from '../../../components/Flow.astro';
 import LinkCards from '../../../components/LinkCards.astro';
 import minimal from '../../../examples/01-minimal.json?raw';
 
-## Prerequisites
+This page gets a Smart group running with the smallest possible configuration and shows you how to tell whether it is working. Afterwards, [How it works](../how-it-works/) explains why it picks the nodes it picks. Unfamiliar terms are defined in the [Glossary](../glossary/).
 
-The Smart group exists only in the xiaobaf14g branch. Download the command-line binary from [Releases](https://github.com/MiChongs/sing-box/releases), or use the SFA (Android), SFW (Windows) or SFL (Linux) graphical clients published on the same page. Neither upstream sing-box nor the reF1nd branch recognizes `"type": "smart"`.
+## What Smart is
+
+Smart is an outbound group: you give it a set of nodes and it chooses one for each connection. Unlike `urltest`, which picks by probe latency, Smart **remembers how each node actually performed for each website** — whether it connected, how fast it connected, how soon the first byte arrived, how much data moved — and scores nodes from that record. If a node is fast for site A but slow for site B, Smart keeps the two apart and uses a different node for B next time.
+
+If you would rather spread connections over several nodes of one region than concentrate them on the single best node, see [Smart load balancing](../smart-loadbalance/).
+
+## What you need
+
+- **The binary**: Smart exists only in the xiaobaf14g branch. Download the command-line binary from [Releases](https://github.com/MiChongs/sing-box/releases), or the GUI clients published on the same page: SFA (Android), SFW (Windows), SFL (Linux). Upstream sing-box and the reF1nd branch do not know `"type": "smart"` and fail with `unknown outbound type: smart`.
+- **Nodes**: a subscription URL, or outbounds already defined in your configuration.
+- **(Optional) a dashboard**: to inspect and switch nodes in a browser, enable the Clash API and use a dashboard such as [metacubexd](https://github.com/MetaCubeX/metacubexd) or [zashboard](https://github.com/Zephyruso/zashboard).
 
 ## Minimal configuration
 
 <CodeBlock code={minimal} filename="01-minimal.json" locale="en" />
 
-This configuration does four things:
+Section by section:
 
-- `providers` defines a remote subscription. Smart references all of its nodes through `"providers": ["my-subscription"]`. You can also use `outbounds` to list node tags directly.
-- The `smart` group in `outbounds` uses default values for everything except its tag and members: it probes `https://www.gstatic.com/generate_204` every 3 minutes, and the algorithm is `strict-best`.
-- `route.final` sends traffic that matches no rule to Smart.
-- `experimental.cache_file` stores Smart's statistics, and `clash_api` is used in the checks below.
+- **`providers`** defines a remote subscription, `my-subscription`, refreshed every 12 hours. The Smart group uses all of its nodes through `"providers": ["my-subscription"]`. Without a subscription, list node tags directly with `"outbounds": ["node-a", "node-b"]`.
+- **The `smart` group** uses defaults for everything except its tag and members: it probes every node with `https://www.gstatic.com/generate_204` every 3 minutes, and its selection algorithm is `strict-best` (always try the highest-scoring node first).
+- **`route.final`** sends all traffic that matches no route rule to Smart.
+- **`experimental.cache_file`** is where everything Smart learns is stored. It is **required** — see the note below.
+- **`experimental.clash_api`** is used by the checks below and by dashboards; remove it if you do not need it.
 
 <Callout type="warn" title="Do not omit cache_file">
-  All of Smart's learned data is stored in the cache file. In the command-line version, if `cache_file` is not enabled, Smart records no statistics and selects nodes only by URL test latency, which makes it a more complicated `urltest`. The graphical clients always enable the cache file, so no configuration is needed.
+  Smart keeps its statistics, weights, pins and circuit-breaker state in the cache file. Without `cache_file` in the command-line version, Smart has nowhere to record anything and picks nodes by probe latency only — little more than a complicated `urltest` — and the startup log says `smart: no cache file available, using ephemeral store`. The GUI clients always enable the cache file, so there is nothing to configure there.
 </Callout>
 
 ## Run and verify
@@ -35,63 +46,84 @@ This configuration does four things:
     {
       title: 'Check the configuration',
       tag: 'sing-box check -c config.json',
-      body: 'A mistyped field fails with an error that points to its location, for example `outbounds[0].tolerance: json: unknown field "tolerance"`.',
+      body: 'A mistyped field fails with an error that points to it, for example `outbounds[0].tolerance: json: unknown field "tolerance"`. No output means the configuration is valid.',
     },
     {
       title: 'Start and generate traffic',
       tag: 'sing-box run -c config.json',
-      body: 'Smart runs no background probes and computes no ranking **before the first successful dial**. Opening a few websites is enough. A ranking is computed once, 2 seconds after the first successful dial.',
+      body: 'Smart runs no background probes and computes no ranking **until its first successful dial**, so an unused group costs no battery. Open a few websites; 2 seconds after the first successful dial, a ranking is computed.',
     },
     {
       title: 'View group status',
       tag: 'GET /smart/groups',
-      body: 'Returns the members, current node `now` and algorithm of each Smart group, and whether LightGBM / ASN is enabled.',
+      body: 'Lists each Smart group with its member count, current node `now`, algorithm, and whether LightGBM and ASN are on.',
     },
     {
       title: 'View node weights',
       tag: 'GET /proxies/auto/weights',
-      body: 'A weight is computed only after the same (destination, node) pair has at least 2 samples. Without weight data, the endpoint ranks nodes by URL test latency.',
+      body: 'A weight appears once the same (destination, node) pair has at least 2 recorded connections. Until then the endpoint ranks nodes by probe latency, with `targetCount` 1 and `sampleCount` 0.',
     },
   ]}
 />
 
+The matching commands:
+
 ```bash
 curl -s http://127.0.0.1:9090/smart/groups
 curl -s http://127.0.0.1:9090/proxies/auto/weights
-curl -s 'http://127.0.0.1:9090/proxies/auto/weights?full=1'   # include per-destination details
+curl -s 'http://127.0.0.1:9090/proxies/auto/weights?full=1'   # with per-destination detail
 ```
 
-If `secret` is set, add `-H 'Authorization: Bearer <secret>'` to each request.
+If you set a `secret`, add `-H 'Authorization: Bearer <secret>'` to every request.
 
-In Clash dashboards such as [metacubexd](https://github.com/MetaCubeX/metacubexd) and [zashboard](https://github.com/Zephyruso/zashboard), a Smart group shows as type `Smart`. You can click a node to pin it, as with a `selector`. See [Priority and pinning](../priority-and-pinning/).
+### What "learning" looks like
 
-## Startup log
+After some use, `sampleCount` (connections counted) and `targetCount` (websites involved) in `/proxies/auto/weights` keep growing, and the `weight` values start to differ. With `?full=1` you see, per website and node, the successes, failures and latencies Smart bases its choices on.
 
-On a normal start, each Smart group prints a one-line summary with the member count, the probe URL, the algorithm in effect and each switch:
+In a dashboard, the Smart group shows as type `Smart`. Click a node, as you would in a `selector`, to pin it: Smart then uses that node until you release it, switches to others temporarily while it is down, and returns to it once it recovers. See [Priority and pinning](../priority-and-pinning/).
+
+## Reading the startup log
+
+On a normal start, each Smart group logs one summary line:
 
 ```text
 smart[auto] started: 42 outbounds, 12 background tasks, testURL=https://www.gstatic.com/generate_204 interval=3m0s asn=off algorithm=strict-best hysteresis=off ml=off collect=off
 ```
 
-Use this line to confirm the algorithm: a mistyped `algorithm` does not cause an error, it falls back to `strict-best`. `ml=` shows the LightGBM model state:
-
-| Value | Meaning |
+| Field | Meaning |
 |---|---|
-| `ml=off` | `use_lightgbm` is not set for this group |
-| `ml=pending` | Enabled, but the model is still downloading or not yet loaded. The traditional weight formula is used in the meantime |
-| `ml=unusable` | Enabled, but the model file cannot be used (unsupported format or features). The traditional weight formula is used; a WARN log gives the reason |
-| `ml=loaded` | The model is loaded |
+| `42 outbounds` | Members of the group. Subscription nodes join once the subscription has loaded; before that, this can be just 1 (the built-in direct outbound `Compatible`) |
+| `testURL` / `interval` | Probe URL and probe period |
+| `asn` | ASN learning: `off`; `on`; `on(downloading)` while the database downloads; `on(no-db)` when no database is available |
+| `algorithm` | The selection algorithm **actually in effect**. A misspelled algorithm is not an error but falls back to `strict-best`, so trust this field |
+| `hysteresis` | Anti-flap window; `off` when disabled |
+| `ml` | LightGBM model state, see below |
+| `collect` | Training-data collection: `off`, or `on(sample rate)` |
 
-If you see `smart: no cache file available, using ephemeral store`, Smart did not get a cache file. Check `experimental.cache_file`.
+| `ml` value | Meaning |
+|---|---|
+| `off` | The group does not set `use_lightgbm` |
+| `pending` | Enabled, but the model is still downloading or not loaded yet; the classic formula scores nodes meanwhile |
+| `unusable` | Enabled, but the model file cannot be used (unsupported format or features); the classic formula is used, and a WARN log says why |
+| `loaded` | The model is loaded and scores nodes |
+
+## Common first-run problems
+
+- **`smart: no cache file available, using ephemeral store` in the log**: `experimental.cache_file` is not enabled, so Smart does not learn.
+- **`weights` stays a latency ranking**: not enough connections recorded yet. Check that traffic really goes through Smart (route rules may send it to another outbound), then give it more time.
+- **The dashboard shows only `Compatible` as a member**: neither `outbounds` nor the subscription provides any node — the subscription failed to download, say, or `include` / `exclude` filtered every node out. With no members Smart falls back to the built-in direct outbound `Compatible`, so traffic leaves without any proxy.
+- Everything else: [Troubleshooting](../troubleshooting/).
 
 ## Next steps
 
 <LinkCards
   lang="en"
   cards={[
-    { title: 'How it works', body: 'How destinations are identified, how candidates are fetched in tiers, how dials race, and the weight formula.', to: 'how-it-works' },
-    { title: 'Algorithms', body: 'How the 10 algorithms behave differently, and how to choose one.', to: 'algorithms' },
-    { title: 'Examples', body: 'Complete examples for tuning, LightGBM, ASN, splitting traffic across groups, and nested groups.', to: 'examples' },
-    { title: 'Configuration', body: 'The default value, valid range and side effects of every field.', to: 'config' },
+    { title: 'How it works', body: 'How destinations are identified, how candidates are gathered, how dials race, and the weight formula.', to: 'how-it-works' },
+    { title: 'Algorithms', body: 'How the 10 algorithms differ and which to choose.', to: 'algorithms' },
+    { title: 'Smart load balancing', body: 'Region pools and connections spread within a region, for large subscriptions and chained proxies.', to: 'smart-loadbalance' },
+    { title: 'Examples', body: 'Complete configurations for tuning, LightGBM, ASN, groups per traffic type, load balancing and chained proxies.', to: 'examples' },
+    { title: 'Configuration', body: 'Defaults, value ranges and side effects of every field.', to: 'config' },
+    { title: 'Glossary', body: 'The concepts that recur throughout these docs, each in a sentence or two.', to: 'glossary' },
   ]}
 />

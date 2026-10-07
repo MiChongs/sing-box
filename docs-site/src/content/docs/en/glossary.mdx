@@ -1,0 +1,116 @@
+---
+title: Glossary
+description: The concepts that recur throughout these docs — destination, weight, prefetch, circuit breaker, soft block, pin, region outbound, affinity, front and landing nodes and more — each explained in a sentence or two, with a pointer to the page that covers it.
+---
+
+This page explains the terms that keep coming up in these docs. Each entry says what the thing is, what it affects, and where it is covered in detail. Entries are grouped by topic, roughly in the order you meet them.
+
+## Basics
+
+**Outbound / node**: a sing-box configuration entry that sends traffic out, such as a `vless` or `shadowsocks` server. In these docs, "node" usually means a proxy server from a subscription.
+
+**Group**: an outbound that connects to nothing itself but picks one of several outbounds to use — `selector` (by hand), `urltest` (lowest latency), `loadbalance` (in turn), `smart` (by what it learned), `smart-loadbalance` (spread by region).
+
+**Member**: an outbound a group can pick: those listed in its `outbounds` field, plus the nodes of the subscriptions referenced in `providers`. Subscription nodes carry the subscription name as a tag prefix, such as `my-subscription/HK 01`. A member can also be another group. A group with no members at all falls back to the built-in direct outbound `Compatible`.
+
+**Subscription (provider)**: a node source defined in `providers` that downloads a node list from a URL periodically. After an update, the groups that reference it rebuild their member lists.
+
+**Destination / destination key**: the unit Smart keeps statistics by, folded from the domain being visited: `www.example.com` stays `www.example.com`, `a.b.example.com` becomes `*.b.example.com`, and the IP is used when there is no domain. How a node does for one destination is recorded and scored separately from how it does for another. See [How it works](../how-it-works/#destination).
+
+**Sample**: the outcome of one connection — success or failure, connect time, first-byte latency, traffic and so on. A weight is computed once a (destination, node) pair has at least 2 samples.
+
+## How Smart picks a node
+
+**Weight**: the score Smart gives a (destination, node) pair, roughly 0–1.2; higher is preferred, and nodes below 0.4 are not candidates. It is computed from success rate, latency, jitter and throughput, with old data discounted over time. See [How it works](../how-it-works/#weight-formula).
+
+**Time decay**: the older a statistic, the less it counts when read; the base half-life is 7 days. A node's recent behavior therefore matters more than how it did long ago. See [How it works](../how-it-works/#time-decay).
+
+**Ranking**: the overall order of nodes, averaging each node's weights across destinations, scaled to 0–100 and split into `MostUsed`, `OccasionalUsed` and `RarelyUsed`; see it with `GET /proxies/{name}/weights`. It reflects overall performance — actual selection still happens per destination.
+
+**Candidates**: the list of nodes a dial is going to try, at most 10; the first is dialed first. See [How it works](../how-it-works/#candidate-tiers).
+
+**Unwrap cache**: the previous candidate list for a destination, kept in memory so the next connection to the same site skips the computation. It has no expiry time and is cleared when a node fails, the pin changes, a connection degrades or the data is flushed.
+
+**Prefetch**: every 2 minutes, candidate lists are precomputed in the background for recently used destinations, ready for new connections.
+
+**Algorithm**: decides which candidate is dialed first — `strict-best` always tries the highest-scoring node, `p2c` compares two drawn from the top few. "Ranking-style" algorithms only reorder the top few (round 0 may dial two at once); "selection-style" ones commit to one node and dial only it. See [Algorithms](../algorithms/).
+
+**`hysteresis` (anti-flap window)**: within the window, a destination keeps the node it last used successfully, so traffic does not bounce between nodes with similar scores. See [Priority and pinning](../priority-and-pinning/).
+
+**`policy_priority` factor**: a multiplier applied to nodes by name — `HK:1.3` gives nodes whose name contains "HK" a factor of 1.3. Nodes with a factor above 1 go ahead of the others. See [Priority and pinning](../priority-and-pinning/).
+
+**Hedged dial**: when the first choice looks unreliable, the next candidate is dialed as well after 250 ms, and whichever connects first is used — a little extra traffic for faster failover.
+
+**Scene**: Smart's judgment of what a connection is for. When scoring, it classifies the connection by traffic shape — download, streaming, interactive, real-time, voice and so on — and applies different standards, real-time traffic caring more about latency, for example. When picking a node, it guesses the purpose from the port and domain and reorders the top candidates.
+
+## Health and failures
+
+**Probe / health check**: every `interval` (3 minutes by default), Smart requests `url` (by default `https://www.gstatic.com/generate_204`) through each node with a 5-second timeout and records the latency. No probing while the group is idle. See [Health and failures](../health/).
+
+**Idle**: the group has never dialed successfully, or not within the last 2 minutes. Probing, prefetch, ranking and similar tasks pause while idle, to save battery.
+
+**Unavailable mark**: after a failed dial or probe, a node is marked unavailable for 3 minutes and is not a candidate meanwhile. The mark survives a restart.
+
+**Circuit breaker**: two dial failures of the same node within 30 seconds "open" its breaker and exclude the node for a while: about 15 seconds the first time, doubling each time up to about 2 minutes, with ±20% randomness. When it expires, one trial dial is let through; success closes the breaker.
+
+**Soft block**: a block for one destination only. When a node's connection to a site stalls, is reset or hits a fatal error, that node is avoided for that site for 10 minutes; other sites are unaffected.
+
+**Watchdog**: per-connection monitoring that spots a request left without a first byte, writes left unanswered for 60 seconds, resets, and fatal TLS / HTTP/2 / QUIC errors, and triggers soft blocks.
+
+**Suspect node**: a node whose TLS probe to a destination failed recently, or whose recent success rate there is below 40%. It is not removed, only moved to the end of the candidate list.
+
+**Degradation / block**: as a node's failure count in the group grows, it is "degraded" and its weight is discounted; at 30 failures it is blocked for a while (93 minutes or more) and then recovers gradually. Nodes can also be blocked by hand through the Clash API. See [How it works](../how-it-works/#degradation-and-recovery).
+
+**Failure storm**: many connections failing in a short time — usually the local network is down. Smart pauses background probing so it does not waste resources or misjudge nodes before the network comes back.
+
+## Manual control
+
+**Pin**: clicking a node in a dashboard, or calling `PUT /proxies/{name}`, makes the group use only that node. Unlike `selector`, Smart switches to other nodes temporarily while the pinned node is down. See [Priority and pinning](../priority-and-pinning/).
+
+**Suspended pin**: the state where the pinned node failed to dial and Smart temporarily uses another. In the Clash API, `fixedSuspended` is `true` and `fixedActive` shows the node actually in use. Once the pinned node recovers, Smart returns to it without being pinned again.
+
+**Pin endorsement**: Smart remembers which nodes you pinned, for how long and how well they worked, and after you unpin still gives them a boost that fades over time (halving every 3 days, gone after 14 days).
+
+## Data, models and geo databases
+
+**Cache file**: the database file set by `experimental.cache_file`. Smart's stats, weights, pins, breaker state, region locks and so on live there and survive restarts. It is required in the command-line version, or Smart does not learn.
+
+**Clash API / dashboard**: the web API provided by `experimental.clash_api`. Dashboards such as metacubexd and zashboard use it to show and operate groups, and Smart's weights and regions are exposed through it as well. See [Clash API](../clash-api/).
+
+**ASN**: autonomous system number — roughly, the network operator or cloud provider a destination IP belongs to, such as AS13335 for Cloudflare. With `use_asn` on, Smart also aggregates experience per ASN, so a new site on the same network benefits right away (except for CDN ASNs, where the sites behind one CDN differ too much). See [ASN and GeoX](../asn-geox/).
+
+**GeoX**: the geo-data download service of `experimental.geox`, which downloads the ASN and country databases and keeps them updated; a download takes effect at once.
+
+**Country database**: a file mapping IPs to countries (`country.mmdb`), used by LightGBM, training data and the `destination` mode of `smart-loadbalance`.
+
+**LightGBM**: a machine-learning model. With `use_lightgbm` on, a pre-trained model scores nodes instead of the classic formula. See [LightGBM model](../lightgbm/).
+
+**Training data**: with `collect_data` on, Smart writes each connection's features and outcome to a CSV file, which you can use to train your own model.
+
+## smart-loadbalance
+
+**Region / region pool**: a `smart-loadbalance` group sorts its members by country or region; each group of members is a region pool, named by a code such as `HK` or `JP`, and members that cannot be placed go to `OTHER`. See [Smart load balancing](../smart-loadbalance/).
+
+**Exit probe**: fetching an IP-echo URL through a node to learn the country of the exit IP websites actually see, for members whose names do not tell the region.
+
+**Region mode**: decides which region serves each connection — `auto` learns the best region per destination, `destination` matches the destination's country, `priority` follows a fixed order, `off` ignores regions.
+
+**Region lock**: picking a region outbound in a dashboard, or a Clash API call, restricts the group to one region. The lock survives restarts.
+
+**Quality**: the score `smart-loadbalance` compares nodes by — the node's weight for the current destination, or else its overall weight, a value derived from its probe latency, or a default. Connections are distributed by quality and current connection count.
+
+**Strategy**: how connections are distributed over the nodes of the chosen region — with `smart`, a node twice as good carries about twice the connections; `round-robin` takes them in turn.
+
+**Affinity**: keeps a set of connections on one node — `site` sends every connection to one website through the same node, for example, so logins do not break when the exit IP changes. Off by default.
+
+**Region outbound**: an outbound generated by `smart-loadbalance` for one region (type `smart-region`). Route rules, `selector` groups and the `detour` of landing nodes can reference it to use only that region's nodes.
+
+## Networking and deployment
+
+**Front and landing nodes (chained proxies)**: the landing node is the exit you actually want, such as your own server. Instead of connecting to it directly, traffic first goes through a front node (usually a provider node), configured through the landing node's `detour`. The front can be a `smart-loadbalance` group or one of its region outbounds. See [Smart load balancing](../smart-loadbalance/).
+
+**`detour`**: an outbound field naming the outbound to connect through to reach the server — how front and landing nodes are chained.
+
+**FakeIP**: a sing-box DNS mode that answers with fake addresses from a range such as `198.18.0.0/15` and maps them back to the domain when a connection is made. Smart still identifies destinations by domain, but country and ASN lookups on fake addresses find nothing.
+
+**Sniffing**: sing-box reading the domain from a connection's first packets (the TLS SNI, for example), so Smart can record by domain even when the client connected by IP.

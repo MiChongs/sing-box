@@ -1,6 +1,6 @@
 ---
 title: 示例配置
-description: 八份可直接使用的 Smart 配置：最小配置、调参、LightGBM、ASN、按流量类型分组、嵌套策略组、Smart 负载均衡与嵌套代理前置。
+description: 八份可直接使用的 Smart 配置：最小配置、调整探测与选路、LightGBM、ASN、按流量类型分组、嵌套策略组、Smart 负载均衡与嵌套代理前置。每份都说明适合谁、做了什么、用之前要改哪里。
 ---
 
 import CodeBlock from '../../../components/CodeBlock.astro';
@@ -14,45 +14,68 @@ import ex6 from '../../../examples/06-nested.json?raw';
 import ex7 from '../../../examples/07-smart-loadbalance.json?raw';
 import ex8 from '../../../examples/08-chain.json?raw';
 
-以下示例都经过 `sing-box check` 验证。除第一份外，示例只列出与 Smart 相关的部分；订阅 `my-subscription`、`direct` 出站与 `cache_file` 的写法见第一份。
+这一页收集了八份常见场景的配置，可以直接复制后修改。不确定从哪份开始时，先用第一份跑起来，再按需要参考其他几份。每个字段的详细说明见 [配置字段](../config/)。
+
+所有示例都通过了 `sing-box check` 校验。除第一份外，示例只列出与 Smart 相关的部分；订阅 `my-subscription`、`direct` 出站与 `cache_file` 的写法见第一份，使用时要合并进你自己的配置。
+
+<Callout type="note" title="把示例用到自己的配置里">
+  示例中的 `my-subscription` 是订阅的标签，`https://example.com/subscription` 是占位地址，请换成你自己的订阅。节点名称的写法（如 `HK`、`香港`）因机场而异，用到名称的字段（`exclude`、`policy_priority`、地区规则）要按你订阅里的实际名称调整，匹配区分大小写。
+</Callout>
 
 ## 最小配置
 
 <CodeBlock code={ex1} filename="01-minimal.json" locale="zh" />
 
-- 引用一个订阅的全部节点，其余字段使用默认值。
-- `cache_file` 不可省略，否则 Smart 不会学习。
-- `clash_api` 用于查看权重和手动指定，不需要时可以删除。
+**适合**：第一次使用 Smart。
+
+- 引用一个订阅的全部节点，其余字段都用默认值。Smart 会自动探测节点，并为每个网站学习最好的节点。
+- `cache_file` 不能省略：Smart 学到的数据保存在缓存文件里，没有它就不会学习。
+- `clash_api` 用来在面板中查看权重、手动指定节点，不需要时可以删除。
+
+**使用前修改**：订阅的 `url`；按需修改 `update_interval`（订阅的更新周期）。
 
 ## 调整探测与选路
 
 <CodeBlock code={ex2} filename="02-tuned.json" locale="zh" />
 
-- `exclude` 去掉订阅里的流量、到期提示等非节点条目；`(?i)` 表示忽略大小写。
-- `expected_status: "204"` 要求探测地址必须返回 204。留空时任何 HTTP 响应都算成功，在有强制门户的网络里容易误判。
+**适合**：已经跑起来，想减少误判、在手机上省电，或者偏好某些地区的节点。
+
+- `exclude` 去掉订阅里的流量、到期提示等非节点条目，`(?i)` 表示忽略大小写。
+- `expected_status: "204"` 要求探测地址必须返回 204。留空时任何 HTTP 响应都算成功，在有登录页（强制门户）的网络里容易把不通的节点误判为可用。
 - `interval: "5m"` 减少探测次数，适合手机。
-- `hysteresis: "30s"` 让同一网站在有持续流量时停留在同一节点。
-- `policy_priority` 提高名称含 `HK`、`JP` 的节点的优先级，并用正则把名称里带 2–9 倍率标记（如 `2x`、`3×`）的节点降为 0.8。注意系数大于 1 的节点会排在所有其他节点之前，见 [节点偏好](../priority-and-pinning/#生效位置)。
+- `hysteresis: "30s"` 让同一网站在持续有流量时停留在同一节点，减少来回切换。
+- `policy_priority` 提高名称含 `HK`、`JP` 的节点的优先级，并用正则把名称带 2–9 倍率标记（如 `2x`、`3×`）的高倍率节点降为 0.8。注意系数大于 1 的节点会排在所有其他节点之前，见 [节点偏好](../priority-and-pinning/#生效位置)。
+
+**使用前修改**：`exclude` 里的关键词换成你订阅中提示条目的写法；`policy_priority` 里的 `HK`、`JP` 换成你订阅节点名称的实际写法。
 
 ## 启用 LightGBM
 
 <CodeBlock code={ex3} filename="03-lightgbm.json" locale="zh" />
 
-- 首次启动在后台下载默认模型，下载完成前使用传统公式。
-- `download_detour: "direct"` 避免用尚未就绪的 Smart 组下载模型。
-- `collect_data` 与 `sample_rate: 0.3` 以 30% 的比例采集训练数据，文件达到 100 MB 后停止写入。不打算自己训练模型时，删掉这两项。
+**适合**：想用预训练模型代替传统公式给节点评分，或想采集自己的数据训练模型。
+
+- 首次启动时在后台下载默认模型，下载完成前使用传统公式，不影响使用。`auto_update` 每 72 小时检查一次新模型。
+- `download_detour: "direct"` 直连下载模型，避免经过还没准备好的 Smart 组。也可以改用更新的 `http_client` 字段，见 [配置字段](../config/#lightgbm-http_client)。
+- `collect_data` 与 `sample_rate: 0.3` 以约 30% 的比例采集训练数据，文件达到 100 MB 后停止写入。
+
+**使用前修改**：不打算训练模型时，删掉 `collect_data`、`sample_rate` 和 `collector`；直连无法访问 GitHub 时，把 `download_detour` 换成能访问的出站，或把模型 `url` 换成可访问的镜像。
 
 ## 按 ASN 学习
 
 <CodeBlock code={ex4} filename="04-asn-geox.json" locale="zh" />
 
-- GeoX 下载 ASN 与国家数据库，每周更新一次；ASN 数据库被 `use_asn` 使用，国家数据库被 LightGBM 使用。
-- 全新安装时首次下载需要时间，下载完成后 ASN 自动生效，无需重启，见 [ASN 与 GeoX](../asn-geox/#experimentalgeox)。
-- 只想用本地文件时，去掉 `geox`，在组内写 `"asn_database": "/path/to/GeoLite2-ASN.mmdb"`。
+**适合**：常访问同一运营者（如 Google）的大量不同网站，希望新网站也能沿用已有经验。
+
+- GeoX 下载 ASN 与国家数据库，每周更新一次；ASN 数据库供 `use_asn` 使用，国家数据库供 LightGBM 使用。
+- 全新安装时首次下载需要一点时间，下载完成后 ASN 自动生效，无需重启，见 [ASN 与 GeoX](../asn-geox/#experimentalgeox)。
+
+**使用前修改**：只想用本地文件时，删掉 `geox`，在组内写 `"asn_database": "/path/to/GeoLite2-ASN.mmdb"`；不需要 LightGBM 时删掉 `use_lightgbm`。
 
 ## 按流量类型分组
 
 <CodeBlock code={ex5} filename="05-algorithms.json" locale="zh" />
+
+**适合**：不同类型的流量需要不同的选路方式，例如 SSH 要稳定低延迟、下载要分散。
 
 四个 Smart 组引用同一个订阅，用路由规则按流量类型分配：
 
@@ -60,8 +83,10 @@ import ex8 from '../../../examples/08-chain.json?raw';
 |---|---|---|
 | `smart-interactive` | `latency-banded` + 1 分钟 `hysteresis` | SSH、远程桌面，优先低延迟且尽量不换节点 |
 | `smart-bulk` | `least-loaded`，仅 TCP | 下载，分散到连接最少的节点 |
-| `smart-sticky` | `sticky-session` | 登录态与出口 IP 绑定的服务 |
+| `smart-sticky` | `sticky-session` | 登录状态与出口 IP 绑定的服务 |
 | `smart-default` | `p2c` | 其余流量 |
+
+**使用前修改**：路由规则中的端口和域名换成你自己需要区分的流量。
 
 <Callout type="note" title="多组的代价">
   统计按组分别保存，四个组意味着同一批节点要分别学习四次，内存与磁盘占用也相应增加。只在不同流量确实需要不同算法时才拆分。
@@ -71,28 +96,40 @@ import ex8 from '../../../examples/08-chain.json?raw';
 
 <CodeBlock code={ex6} filename="06-nested.json" locale="zh" />
 
+**适合**：节点很多，但只关心用哪个地区。
+
 - 三个 `urltest` 组各自从订阅中挑出一个地区的最快节点，Smart 在三个地区之间学习选择。
 - Smart 把成员组当作普通节点：统计记在 `HK`、`JP`、`US` 名下，反映的是该组当时选中的节点。
 - `policy_priority: "=HK:1.2"` 用 `=` 精确匹配，只作用于名为 `HK` 的成员。
 - 最外层的 `selector` 默认使用 `auto`，需要时可以在面板中切到固定地区。
-- 这种结构候选少、学习快，适合节点很多但只关心地区的场景；代价是 Smart 看不到地区内具体节点的差异。
+- 这种结构候选少、学习快；代价是 Smart 看不到地区内具体节点的差异。想让 Smart 直接管理所有节点并按地区分摊连接，用下面的 [Smart 负载均衡](#smart-负载均衡)。
+
+**使用前修改**：`include` 中的地区关键词换成你订阅中节点名称的写法。
 
 ## Smart 负载均衡
 
 <CodeBlock code={ex7} filename="07-smart-loadbalance.json" locale="zh" />
 
-- 订阅的全部节点交给一个 `smart-loadbalance` 组，按名称自动分地区；名称中带 `IPLC`、`IEPL` 的节点归入自定义地区“专线”，`deny` 排除中国大陆节点。
-- `mode: auto` 为每个网站学习最优地区，`weights` 让香港略占优势；`affinity: site` 让同一网站固定使用一个节点，避免登录态因出口 IP 变化失效。
-- `max_connections_per_node: 64` 防止单个节点并发过多。
+**适合**：大订阅，想把全部节点交给一个组、按地区自动分组，并把连接分摊到多个节点上，同时让同一网站的出口保持稳定。
+
+- 订阅的全部节点交给一个 `smart-loadbalance` 组，按名称自动分到各地区；名称中带 `IPLC`、`IEPL` 的节点归入自定义地区“专线”，`deny` 排除中国大陆节点。
+- `mode: auto` 为每个网站学习最优地区，`weights` 让香港略占优势；`affinity: site` 让同一网站固定使用一个节点，避免登录状态因出口 IP 变化而失效。
+- `max_connections_per_node: 64` 防止单个节点并发连接过多。
 - `region.outbounds` 为四个地区生成 `🇭🇰 香港负载` 等出站。组在面板中把它们列为成员，点选即锁定地区；它们也可以像 `proxy` 这样被 `selector` 直接引用。
 - 详细说明见 [Smart 负载均衡](../smart-loadbalance/)。
+
+**使用前修改**：`regions` 只写你订阅里确实有的地区（`selector` 引用的地区出站要与它对应）；不需要固定出口时把 `affinity` 改回 `none`，分摊效果更好。
 
 ## 嵌套代理前置
 
 <CodeBlock code={ex8} filename="08-chain.json" locale="zh" />
 
-- 两个落地节点经机场节点连接。`front` 把前置连接分摊到选中地区的多个机场节点上。
+**适合**：有自己的落地节点（VPS、静态住宅 IP 等），想经机场节点连接落地，并把前置连接分摊到多个机场节点上。
+
+- 两个落地节点经机场节点连接。`front` 把前置连接分摊到选中地区的多个机场节点上，避免单个机场节点限速或失效时影响全部连接。
 - `landing-us` 以 `front` 为前置：`destination` 模式按落地服务器所在国家选地区，`map` 让美国落地优先用美国、其次日本的前置，英国落地用德国、荷兰的前置。落地服务器以域名填写时，组会先解析域名再判断国家。
-- `landing-hk` 固定用 `front-HK`（香港前置）。`fallback: true` 让香港前置全部不可用时改用其他地区，而不是直接失败。
+- `landing-hk` 固定用 `front-HK`（香港前置）。`fallback: true` 让香港前置全部不可用时改用其他地区；不开启时，始终只会尝试香港的节点。
 - `members: "nodes"` 让 `front` 在面板中仍列出节点。
-- 前置组保持默认的 `affinity: none`；设置 `site` 或 `target` 会让到同一落地服务器的所有连接落在同一个前置节点上。
+- 前置组保持默认的 `affinity: none`；设置 `site` 或 `target` 会让到同一落地服务器的所有连接落在同一个前置节点上，失去分摊的意义。
+
+**使用前修改**：把两个 `shadowsocks` 落地节点换成你自己的落地节点（协议、地址、端口、密码），保留 `detour`；`regions` 与 `map` 按你订阅中的地区和落地所在国家调整。

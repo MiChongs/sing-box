@@ -1,81 +1,104 @@
 ---
-title: Algorithms
-description: The 10 values of the algorithm field, their aliases, actual behavior and use cases, and how to switch algorithms at runtime.
+title: Selection algorithms
+description: The algorithm field decides which of the ranked candidate nodes Smart dials first. This page explains how each of the 10 algorithms picks, what data it needs, when to use it, and how to switch at runtime.
 ---
 
 import Callout from '../../../components/Callout.astro';
 
-`algorithm` decides which candidate Smart dials first from the already sorted candidate list. Every algorithm does only one thing: **move one candidate to the first position**. It does not add or remove candidates, and it does not change the weights themselves. For how the candidate list is produced, see [How it works](../how-it-works/#candidate-tiers).
+`algorithm` decides **which node a Smart group dials first** out of an already ranked candidate list. Most users can keep the default, `strict-best`. Come here when you want traffic spread over several nodes, a fixed exit for a site, or the lowest possible latency.
+
+This page applies to `smart` groups only. A `smart-loadbalance` group has no `algorithm`; it spreads connections over a whole region with `balance.strategy`. See [Smart load balancing](../smart-loadbalance/).
+
+## What an algorithm does, and what it does not
+
+When a connection arrives, Smart first ranks candidate nodes for its destination by learned weight (up to 10 nodes; see [How it works](../how-it-works/#candidate-tiers)). Only then does the algorithm run, and it does one thing: **move one node of that list to the front**. It never adds or removes candidates and never changes a weight.
+
+For example, say the candidates for a site are `[HK-01, HK-02, JP-01, SG-01, US-01]`:
+
+- `strict-best` changes nothing and dials `HK-01` first;
+- `round-robin` may put `JP-01` first this time and another node next time;
+- `sticky-session` puts `HK-02` first if that is the node used last time.
+
+If the node moved to the front fails to connect, Smart moves on through the rest of the list as usual. So no algorithm makes the group less available; it only changes who goes first.
 
 ## Overview
 
-| Algorithm | Aliases | Type | How the first position is chosen |
+| Algorithm | Aliases | Kind | How the first node is chosen |
 |---|---|---|---|
-| `strict-best` (default) | `auto`, `best`, `strict` | Sort-based | No change. The top-ranked node is used directly |
-| `weighted-random` | `random`, `weighted` | Pick-based | Random among the top 5, weighted by rank |
-| `least-loaded` | `least-load`, `load` | Sort-based | Fewest active TCP connections among the top 3 |
-| `fastest-recent` | `fastest`, `recent` | Sort-based | Lowest recent RTT among the top 5 |
-| `sticky-session` | `sticky`, `session` | Pick-based | The node last used successfully for this destination |
-| `round-robin` | `rr` | Pick-based | In turn, by a group-wide counter |
-| `weighted-rr` | `wrr`, `weighted-round-robin` | Pick-based | The top 5 in turn, in a 5:4:3:2:1 ratio of turns |
-| `p2c` | `power-of-two`, `two-choices` | Pick-based | 2 random picks from the top 5, the faster one wins |
-| `latency-banded` | `banded`, `latency-bands` | Sort-based | The top 5 are grouped into latency bands, random within the lowest band |
-| `consistent-hashing` | `consistent-hash`, `chash`, `ch`, `consistent`, `jump-hash` | Pick-based | Hashes the destination to a fixed position |
+| `strict-best` (default) | `auto`, `best`, `strict` | Ranking | No change; the top-ranked node goes first |
+| `weighted-random` | `random`, `weighted` | Selection | Random among the top 5, weighted by rank |
+| `least-loaded` | `least-load`, `load` | Ranking | The node with the fewest active TCP connections among the top 3 |
+| `fastest-recent` | `fastest`, `recent` | Ranking | The node with the lowest recent first-byte latency among the top 5 |
+| `sticky-session` | `sticky`, `session` | Selection | The node that last succeeded for this destination |
+| `round-robin` | `rr` | Selection | Takes turns using a group-wide counter |
+| `weighted-rr` | `wrr`, `weighted-round-robin` | Selection | Takes turns among the top 5 in a 5:4:3:2:1 ratio |
+| `p2c` | `power-of-two`, `two-choices` | Selection | Draws 2 of the top 5 and keeps the faster one |
+| `latency-banded` | `banded`, `latency-bands` | Ranking | Sorts the top 5 into latency bands and picks at random in the fastest band |
+| `consistent-hashing` | `consistent-hash`, `chash`, `ch`, `consistent`, `jump-hash` | Selection | Hashes the destination to a fixed position |
 
-Values are case-insensitive, and underscores and spaces count as hyphens, so `Least_Loaded` is also valid. An unrecognized value does not cause an error. It falls back to `strict-best` and logs a WARN that lists all valid values. `algorithm=` in the startup log is the algorithm actually in effect.
+Spelling is forgiving: case does not matter, and underscores, spaces and hyphens are interchangeable, so `Least_Loaded` works too. A misspelled value **does not fail the config**; Smart falls back to `strict-best` and logs a WARN listing every valid value. The startup log shows what is in effect:
 
-### Sort-based and pick-based
+```
+smart[auto] started: 42 outbounds, ... algorithm=p2c hysteresis=off ml=off collect=off
+smart[auto] algorithm: p2c (confirmed in PostStart)
+```
 
-The two types differ in more than how the first position is chosen:
+The second line is printed only for non-default algorithms, so it is easy to `grep` for.
 
-- **Round 0 dial width**: sort-based algorithms dial the first 2 candidates at once (only 1 when the first-choice node's recent success rate is ≥ 95%). Pick-based algorithms dial only 1.
-- **Scenario reordering**: applies only to sort-based algorithms. The first 5 are reordered by peak download speed for downloads and streaming, and by recent RTT for interactive, realtime and voice traffic.
+### Ranking versus selection
 
-So pick-based algorithms make a more "deterministic" choice, while sort-based algorithms switch to the second node faster when the first choice is slow.
+The two kinds differ in whether they still race after choosing:
+
+- **Ranking** algorithms only move better nodes forward and treat the top few as roughly equal. Round 0 **dials the top 2 candidates at once** and keeps whichever connects first; when the first candidate's recent success rate is at least 95%, it dials just that one to save a needless connection. Requests that look like downloads or streaming also have their top 5 candidates re-sorted by peak download speed, and SSH, remote desktop, games and voice by recent latency.
+- **Selection** algorithms have already picked one node for this connection, so round 0 **dials only that node**; racing a second one would undo round-robin, stickiness and the like. To keep this from being slow, when the picked node looks suspect (recent dial failures, marked unavailable, or no successful dial or probe yet), the next-ranked node is dialed as a hedge after 250 ms and whichever connects first wins.
+
+So selection algorithms give more predictable results, while ranking algorithms move away from a slow first choice faster.
 
 ## Algorithm details
 
 ### strict-best
 
-Makes no adjustment and dials in weight ranking order. It suits most cases and is the default. Combine it with `hysteresis` to reduce switching back and forth between similar nodes.
+No adjustment: dial in weight order. Fits most situations and is the default. If the group keeps switching between a few similar nodes, add `hysteresis`.
 
 ### weighted-random
 
-Picks one of the top 5 at random, with probabilities assigned by **rank**, not by weight: 5/15 for 1st place, 4/15 for 2nd, down to 1/15 for 5th. It suits cases where you want to spread traffic over a few good nodes, but not too evenly.
+Picks one of the top 5 at random, with probability by **rank** rather than weight: 5/15 for the first, 4/15 for the second, down to 1/15 for the fifth. Use it to spread traffic over several good nodes without spreading it evenly.
 
 ### least-loaded
 
-Picks the node with the fewest active TCP connections among the top 3. On a tie, the higher-ranked node is kept. UDP connections do not count toward load. It suits downloads and many concurrent connections.
+Picks the node with the fewest active TCP connections among the top 3, keeping the higher-ranked node on a tie. Only TCP connections made through this group count; UDP does not. Good for downloads and many concurrent connections.
 
 ### fastest-recent
 
-Picks the node with the lowest recent RTT among the top 5. Recent RTT is a moving average of first-byte latency over roughly the last 30 samples, cached for 250 ms. Nodes without data are left out of the comparison. It suits latency-sensitive traffic when node quality changes quickly.
+Picks the node with the lowest recent first-byte latency among the top 5. Recent latency is a moving average over roughly the node's last 30 samples; it has no value until the node has at least 11 samples, and readings are cached for 250 ms. Nodes without data are left out of the comparison, and if none has data the order is unchanged. Good when latency matters and node quality changes quickly.
 
 ### sticky-session
 
-Prefers the node last used successfully for the same destination (TCP and UDP are recorded separately). As long as that node is still available, is not judged suspicious, and no node is pinned, Smart takes the fast path and dials it directly, skipping the whole candidate process. When the records exceed 8192 entries, all of them are cleared.
+The same destination prefers the node that last succeeded for it (TCP and UDP are tracked separately). As long as that node is still usable, not flagged as suspect, and no node is pinned, Smart takes a fast path and dials it directly, skipping the whole candidate process — the quickest way to connect.
 
-It suits sites that bind the login session to the IP, such as AI services, banks and some streaming services.
+Records do not expire: when the node becomes unusable another node is used, and the record follows the new successful node. When there are more than 8192 records they are all cleared (checked every 5 minutes).
+
+Good for sites that tie a login to the exit IP, such as AI services, banks and some streaming services.
 
 ### round-robin
 
-Each dial increments the group counter by 1, and the counter modulo the number of candidates picks the first position. The counter is shared by the whole group and does not distinguish destinations. It suits cases where traffic must be spread evenly.
+Each dial increments a group-wide counter and takes it modulo the number of candidates for this dial. The counter is shared across destinations while the candidate list differs per destination, so this is "roughly taking turns", not a strict rotation over node names. Good for spreading traffic evenly.
 
 ### weighted-rr
 
-Round robin weighted by rank: among the first K candidates (K is at most 5), 1st place appears 5 times in a row, 2nd place 4 times, and so on. It favors good nodes more than `round-robin` does, and spreads traffic more than `strict-best` does.
+Round-robin weighted by rank: among the top K candidates (K at most 5), the first goes first 5 times in a row, the second 4 times, and so on, then it starts over. Favours good nodes more than `round-robin` while spreading more than `strict-best`.
 
 ### p2c
 
-"Power of two choices": picks two different nodes at random from the top 5. If the recent RTTs of both are known and differ, the lower one wins. Otherwise the one with fewer active connections wins. If they are still tied, the first one drawn wins. It balances load and latency, and suits a general-purpose default.
+"Power of two choices": draws two different nodes from the top 5. If both have a known, different recent first-byte latency, the lower one wins; otherwise the one with fewer active connections wins; if still tied, the first drawn wins. Balances load against latency and makes a good general default.
 
 ### latency-banded
 
-Splits the top 5 into three bands by recent RTT: below 50 ms, below 150 ms, and 150 ms or above or unknown. It picks uniformly at random within the lowest non-empty band. This avoids always crowding onto the single fastest node, without using nodes that are clearly slower. It suits interactive traffic.
+Sorts the top 5 by recent first-byte latency into three bands — under 50 ms, 50–150 ms, and 150 ms or more (nodes without latency data also go here) — and picks uniformly at random within the fastest non-empty band. It avoids crowding onto the single fastest node without ever using a clearly slower one. Good for interactive traffic such as browsing.
 
 ### consistent-hashing
 
-Hashes `t|destination` or `u|destination` with xxhash, then maps the hash to a position in the candidate list with jump hash. While the candidate list does not change, the same destination always lands on the same node. It suits destinations that need a fixed egress IP.
+Hashes `t|destination` or `u|destination` (xxhash) and maps it onto a position in the candidate list with jump hash. While the candidate list stays the same, a destination always lands on the same node, and different destinations spread evenly over the candidates. Without a destination (a bare IP with no sniffed domain) nothing changes. Good for destinations that need a fixed exit IP.
 
 <Callout type="note" title="What consistency depends on">
   The mapping is based on the length and order of the candidate list. When node failures or weight changes alter the candidate list, the destination may map to a different node. For stronger stickiness, use `sticky-session`.
@@ -95,21 +118,30 @@ curl -X PUT http://127.0.0.1:9090/smart/groups/auto/algorithm \
 { "group": "auto", "requested": "p2c", "applied": "p2c", "previous": "strict-best" }
 ```
 
-The request body must be a JSON object. `applied` is the algorithm actually in effect: if you pass an unrecognized value, it is `strict-best`. The switch lasts only for the current run. After a restart, the value from the configuration file is used again.
+- The request body must be a JSON object. `applied` is the algorithm actually in effect: for an unrecognized value it is `strict-best`.
+- The switch applies to new connections right away; existing connections are not touched.
+- It lasts only for the current run: it is not written back to the config, and the configured value returns after a restart.
+- On a `smart-loadbalance` group the call returns 400; use `PUT /smart/groups/{name}/balance` instead.
+
+The algorithm in effect is shown in the `algorithm` field of `GET /proxies/{name}` and `GET /smart/groups`.
 
 ## Interaction with other mechanisms
 
-- **`policy_priority`** applies before the algorithm: nodes with a factor above 1 are moved to the front first, and the algorithm then picks from the top few.
-- **`hysteresis`** applies after the algorithm: as long as the node last used for this destination within the window is still among the candidates, it is moved back to the first position, overriding the algorithm's choice. Unlike `sticky-session`, it does not take a fast path and still goes through the full filtering process.
-- **While a node is pinned**, the candidate list contains only the pinned node, and the algorithm has no effect.
+A connection's candidate list passes through these steps in order, and a later step can override an earlier one:
+
+1. **`policy_priority`** re-sorts by node-name factors first, moving nodes with a factor above 1 to the front; see [Priority and pinning](../priority-and-pinning/).
+2. **The algorithm** picks the first node from the top of the adjusted list.
+3. **`hysteresis`** applies last: as long as the node this destination last used successfully within the window is still a candidate, it goes back to the front, overriding the algorithm. Unlike `sticky-session`, it takes no fast path and still goes through all the filtering.
+
+And while a node is **pinned**, the candidate list contains only that node and the algorithm has no effect; only when the pinned node fails to connect or its circuit breaker is open does Smart temporarily choose other nodes with the algorithm.
 
 ## Choosing an algorithm
 
 | Scenario | Recommendation |
 |---|---|
 | General use, not sure what to pick | `strict-best`, or `p2c` |
-| Login session bound to the egress IP | `sticky-session` |
-| The same site needs a fixed egress, but occasional changes are acceptable | `consistent-hashing` |
+| Login session bound to the exit IP | `sticky-session` |
+| The same site needs a fixed exit, but occasional changes are acceptable | `consistent-hashing` |
 | SSH, remote desktop, interactive web pages | `latency-banded` or `fastest-recent`, plus `hysteresis` |
 | Downloads, updates, many concurrent connections | `least-loaded` |
 | Spread traffic evenly, avoid overloading a single node | `weighted-rr` or `round-robin` |

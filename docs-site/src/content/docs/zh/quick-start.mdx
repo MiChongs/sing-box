@@ -1,6 +1,6 @@
 ---
 title: 快速开始
-description: 用一段最小配置运行 Smart 出站组，并通过日志和 Clash API 确认它正在学习。
+description: 从零跑起一个 Smart 出站组：准备程序、写最小配置、启动，再用日志和 Clash API 确认它确实在学习。
 ---
 
 import CodeBlock from '../../../components/CodeBlock.astro';
@@ -9,23 +9,34 @@ import Flow from '../../../components/Flow.astro';
 import LinkCards from '../../../components/LinkCards.astro';
 import minimal from '../../../examples/01-minimal.json?raw';
 
+这一页带你用最少的配置跑起一个 Smart 组，并教你判断它是否在正常工作。读完后再看 [工作原理](../how-it-works/)，就能理解它为什么这样选节点。遇到不认识的词，可以查 [术语表](../glossary/)。
+
+## Smart 是什么
+
+Smart 是一种出站组（策略组）：你把一批节点交给它，它为每条连接挑一个节点。和按延迟选节点的 `urltest` 不同，Smart 会**记住每个节点访问每个网站的实际表现**——连得上没有、建连多快、首字节多快、传了多少数据——再根据这些记录给节点打分。同一个节点访问 A 网站很快、访问 B 网站很慢，Smart 会分开记下来，下次访问 B 时换别的节点。
+
+如果你想把连接分摊到同一地区的多个节点上，而不是集中到一个最好的节点，请看 [Smart 负载均衡](../smart-loadbalance/)。
+
 ## 准备
 
-Smart 出站组只存在于 xiaobaf14g 分支。从 [Releases](https://github.com/MiChongs/sing-box/releases) 下载命令行程序，或使用同一页面发布的 SFA（Android）、SFW（Windows）、SFL（Linux）图形客户端。上游 sing-box 与 reF1nd 分支都无法识别 `"type": "smart"`。
+- **程序**：Smart 只存在于 xiaobaf14g 分支。从 [Releases](https://github.com/MiChongs/sing-box/releases) 下载命令行程序，或下载同一页面发布的图形客户端 SFA（Android）、SFW（Windows）、SFL（Linux）。上游 sing-box 与 reF1nd 分支不认识 `"type": "smart"`，加载配置时会报 `unknown outbound type: smart`。
+- **节点**：一个订阅地址，或者配置文件中已有的若干出站。
+- **（可选）面板**：想在网页上查看和切换节点，需要开启 Clash API，并使用 [metacubexd](https://github.com/MetaCubeX/metacubexd)、[zashboard](https://github.com/Zephyruso/zashboard) 等面板。
 
 ## 最小配置
 
 <CodeBlock code={minimal} filename="01-minimal.json" locale="zh" />
 
-这份配置做了四件事：
+逐段说明：
 
-- `providers` 定义一个远程订阅，Smart 通过 `"providers": ["my-subscription"]` 引用其中的全部节点。也可以改用 `outbounds` 直接列出节点标签。
-- `outbounds` 中的 `smart` 组除标签和成员外全部使用默认值：每 3 分钟探测一次 `https://www.gstatic.com/generate_204`，算法为 `strict-best`。
-- `route.final` 把未命中任何规则的流量交给 Smart。
-- `experimental.cache_file` 保存 Smart 的统计数据，`clash_api` 用于后面的检查步骤。
+- **`providers`**：定义一个远程订阅 `my-subscription`，每 12 小时更新一次。Smart 组通过 `"providers": ["my-subscription"]` 使用其中的全部节点。不用订阅时，改用 `"outbounds": ["节点A", "节点B"]` 直接列出节点标签。
+- **`smart` 组**：除标签和成员外全部使用默认值——每 3 分钟用 `https://www.gstatic.com/generate_204` 测一次节点，选路算法为 `strict-best`（总是先用得分最高的节点）。
+- **`route.final`**：没有命中任何路由规则的流量都交给 Smart。
+- **`experimental.cache_file`**：Smart 学到的数据都保存在这里，**必须开启**，见下方提示。
+- **`experimental.clash_api`**：供后面的检查步骤和面板使用，不需要时可以删掉。
 
 <Callout type="warn" title="不要省略 cache_file">
-  Smart 的全部学习数据都存放在缓存文件里。命令行版本不开启 `cache_file` 时，Smart 不记录统计，只按测速延迟选路，相当于一个更复杂的 `urltest`。图形客户端始终启用缓存文件，无需配置。
+  Smart 的统计、权重、手动指定、熔断状态都存放在缓存文件里。命令行版本没有开启 `cache_file` 时，Smart 无处记录，只能按测速延迟选节点，效果和一个更复杂的 `urltest` 差不多；启动日志会出现 `smart: no cache file available, using ephemeral store`。图形客户端始终开启缓存文件，不需要配置。
 </Callout>
 
 ## 运行并确认
@@ -35,25 +46,27 @@ Smart 出站组只存在于 xiaobaf14g 分支。从 [Releases](https://github.co
     {
       title: '检查配置',
       tag: 'sing-box check -c config.json',
-      body: '字段写错会直接报错并指出位置，例如 `outbounds[0].tolerance: json: unknown field "tolerance"`。',
+      body: '字段写错会直接报错并指出位置，例如 `outbounds[0].tolerance: json: unknown field "tolerance"`。没有输出就是通过。',
     },
     {
       title: '启动并产生流量',
       tag: 'sing-box run -c config.json',
-      body: 'Smart 在**第一次成功拨号之前**不会做后台探测，也不会计算排名。打开几个网站即可；第一次成功拨号 2 秒后会计算一次排名。',
+      body: 'Smart 在**第一次成功拨号之前**不做后台测速，也不计算排名，这样没人用时不耗电。启动后随便打开几个网站即可；第一次成功拨号 2 秒后，它会计算一次排名。',
     },
     {
       title: '查看组状态',
       tag: 'GET /smart/groups',
-      body: '返回每个 Smart 组的成员、当前节点 `now`、算法以及是否启用 LightGBM / ASN。',
+      body: '列出每个 Smart 组的成员数、当前节点 `now`、算法，以及是否启用 LightGBM、ASN。',
     },
     {
       title: '查看节点权重',
       tag: 'GET /proxies/auto/weights',
-      body: '同一个（目标, 节点）至少要有 2 个样本才会算出权重；没有权重数据时，接口按测速延迟给出排名。',
+      body: '同一个（目标, 节点）至少有 2 次连接记录后才会算出权重。还没有权重时，接口按测速延迟给出排名，此时 `targetCount` 为 1、`sampleCount` 为 0。',
     },
   ]}
 />
+
+对应的命令：
 
 ```bash
 curl -s http://127.0.0.1:9090/smart/groups
@@ -61,37 +74,56 @@ curl -s http://127.0.0.1:9090/proxies/auto/weights
 curl -s 'http://127.0.0.1:9090/proxies/auto/weights?full=1'   # 附带按目标的明细
 ```
 
-设置了 `secret` 时，为每个请求加上 `-H 'Authorization: Bearer <secret>'`。
+设置了 `secret` 时，每个请求都要加上 `-H 'Authorization: Bearer <secret>'`。
 
-在 [metacubexd](https://github.com/MetaCubeX/metacubexd)、[zashboard](https://github.com/Zephyruso/zashboard) 等 Clash 面板中，Smart 组显示为 `Smart` 类型，可以像 `selector` 一样点击节点来手动指定，详见 [节点偏好与手动指定](../priority-and-pinning/)。
+### 怎样算“在学习”
 
-## 启动日志
+使用一段时间后，`/proxies/auto/weights` 里的 `sampleCount`（参与计算的连接数）和 `targetCount`（涉及的网站数）会持续增长，`weight` 开始出现差别。加上 `?full=1` 能看到每个网站各节点的成功、失败次数和延迟，这就是 Smart 选节点的依据。
 
-正常启动时，每个 Smart 组会打印一行摘要，列出成员数、探测地址、生效的算法与各项开关：
+在面板中，Smart 组显示为 `Smart` 类型。你可以像 `selector` 一样点击某个节点来手动指定它，Smart 会一直用这个节点，直到你取消；节点故障时会临时换用其他节点，恢复后自动切回。详见 [节点偏好与手动指定](../priority-and-pinning/)。
+
+## 读懂启动日志
+
+正常启动时，每个 Smart 组会打印一行摘要：
 
 ```text
 smart[auto] started: 42 outbounds, 12 background tasks, testURL=https://www.gstatic.com/generate_204 interval=3m0s asn=off algorithm=strict-best hysteresis=off ml=off collect=off
 ```
 
-算法以这一行为准：`algorithm` 写错时不会报错，而是回退为 `strict-best`。其中 `ml=` 表示 LightGBM 模型状态：
-
-| 值 | 含义 |
+| 字段 | 含义 |
 |---|---|
-| `ml=off` | 本组没有设置 `use_lightgbm` |
-| `ml=pending` | 已启用，模型正在下载或尚未加载，暂时使用传统权重公式 |
-| `ml=unusable` | 已启用，但模型文件无法使用（格式或特征不受支持），使用传统权重公式，原因见 WARN 日志 |
-| `ml=loaded` | 模型已加载 |
+| `42 outbounds` | 本组的成员数。订阅的节点在订阅加载后才加入；订阅还没加载完时，这里可能只有 1（内置的直连出站 `Compatible`） |
+| `testURL` / `interval` | 测速地址与测速周期 |
+| `asn` | ASN 学习：`off` 未开启；`on` 已开启；`on(downloading)` 数据库还在下载；`on(no-db)` 没有可用数据库 |
+| `algorithm` | **实际生效**的选路算法。写错算法名不会报错，而是回退到 `strict-best`，所以以这一项为准 |
+| `hysteresis` | 防抖窗口，`off` 表示关闭 |
+| `ml` | LightGBM 模型状态，见下表 |
+| `collect` | 训练数据采集：`off`，或 `on(采样比例)` |
 
-如果看到 `smart: no cache file available, using ephemeral store`，说明 Smart 没有拿到缓存文件，请检查 `experimental.cache_file`。
+| `ml` 的值 | 含义 |
+|---|---|
+| `off` | 本组没有开启 `use_lightgbm` |
+| `pending` | 已开启，模型还在下载或尚未加载，暂时用传统公式打分 |
+| `unusable` | 已开启，但模型文件无法使用（格式或特征不受支持），用传统公式打分，原因见 WARN 日志 |
+| `loaded` | 模型已加载，由模型打分 |
+
+## 常见的启动问题
+
+- **日志出现 `smart: no cache file available, using ephemeral store`**：没有开启 `experimental.cache_file`，Smart 不会学习。
+- **`weights` 一直是测速排名**：还没有足够的连接记录。确认流量确实经过 Smart（路由规则可能把流量交给了别的出站），再多用一会儿。
+- **面板中成员一直只有 `Compatible`**：`outbounds` 和订阅都没有提供节点，例如订阅下载失败，或节点被 `include` / `exclude` 全部过滤掉。没有成员时 Smart 会退回内置的直连出站 `Compatible`，流量将不经代理直接发出。
+- 其他问题见 [故障排查](../troubleshooting/)。
 
 ## 下一步
 
 <LinkCards
   lang="zh"
   cards={[
-    { title: '工作原理', body: '目标如何识别、候选如何分层获取、拨号如何竞速，以及权重公式。', to: 'how-it-works' },
+    { title: '工作原理', body: '目标如何识别、候选怎样分层获取、拨号如何竞速，以及权重公式。', to: 'how-it-works' },
     { title: '选路算法', body: '10 种算法的行为差异与选择建议。', to: 'algorithms' },
-    { title: '示例配置', body: '调参、LightGBM、ASN、多组分流与嵌套组的完整示例。', to: 'examples' },
+    { title: 'Smart 负载均衡', body: '按地区分池、在地区内分摊连接，适合大订阅与嵌套代理。', to: 'smart-loadbalance' },
+    { title: '示例配置', body: '调参、LightGBM、ASN、多组分流、负载均衡与嵌套代理的完整示例。', to: 'examples' },
     { title: '配置字段', body: '每个字段的默认值、取值范围与副作用。', to: 'config' },
+    { title: '术语表', body: '文档中反复出现的概念，一句话讲清楚。', to: 'glossary' },
   ]}
 />

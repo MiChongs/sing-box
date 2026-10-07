@@ -6,7 +6,7 @@ export const ui = {
   zh: {
     htmlLang: 'zh-CN',
     siteName: 'sing-box Smart',
-    siteDesc: 'sing-box xiaobaf14g 分支 Smart 出站策略组文档：按目标学习节点表现，自动选出当下最合适的节点。',
+    siteDesc: 'sing-box xiaobaf14g 分支 Smart 出站组文档：按网站学习节点表现，为每条连接自动选出当下最合适的节点，也能按地区分摊连接。',
     footerNote: 'xiaobaf14g 分支 · 基于 reF1nd/sing-box',
     nav: { docs: '文档', config: '配置', api: 'Clash API', examples: '示例' },
     menu: '目录',
@@ -26,7 +26,7 @@ export const ui = {
   en: {
     htmlLang: 'en',
     siteName: 'sing-box Smart',
-    siteDesc: 'Docs for the Smart outbound group in the sing-box xiaobaf14g fork: learns how each node performs per destination and picks the best one for every connection.',
+    siteDesc: 'Docs for the Smart outbound groups of the sing-box xiaobaf14g fork: they learn how each node performs for each site, pick the best node for every connection, and can spread connections by region.',
     footerNote: 'xiaobaf14g fork · built on reF1nd/sing-box',
     nav: { docs: 'Docs', config: 'Config', api: 'Clash API', examples: 'Examples' },
     menu: 'Menu',
@@ -40,7 +40,7 @@ export const ui = {
     themeToggle: 'Toggle dark / light',
     copy: 'Copy',
     copied: 'Copied',
-    copyFailed: 'Failed',
+    copyFailed: 'Copy failed',
     skip: 'Skip to content',
   },
 } as const satisfies Record<Lang, unknown>;

@@ -15,6 +15,8 @@ Only changes that affect usage are listed, newest first. For the full commit his
 - Strategies `smart`, `least-connections`, `round-robin`, `weighted-round-robin`, `weighted-random`, `random`, `consistent-hashing`; affinity `target`, `site`, `source`, `source-site`; plus a quality floor and caps on pool size and per-node connections.
 - New outbound type `smart-region`: the group can generate one outbound per region for route rules, the `detour` of landing nodes and `selector` groups; picking one in a dashboard locks the region. As the front of chained proxies, the group learns and picks regions per landing server rather than per website.
 - New Clash API endpoints: `GET/PUT /smart/groups/{name}/regions`, `DELETE /smart/groups/{name}/regions/lock`, `POST /smart/groups/{name}/regions/detect`, `PUT /smart/groups/{name}/balance`; `/proxies` gains a `loadBalance` block and `/smart/groups` a `type` field. The region lock and runtime settings are saved in the cache file and restored after a restart.
+- A stale probe result (normal after the group has been idle for a while) no longer makes a node count as unusable. When the allowed scope has no usable node at all, the group tries its unblocked members best quality first as a last resort instead of failing outright.
+- `smart-loadbalance` groups in the `destination` mode (or with `destination.map` set) open the country database too, which GeoX downloads in the background.
 
 **ASN and country databases reload without restart; downloads use the full http_client** (Oct 7)
 
@@ -40,7 +42,7 @@ Only changes that affect usage are listed, newest first. For the full commit his
 
 **Training-data CSV header matches the data columns** (Oct 7)
 
-- The header now holds the 60 column names of the data rows, so columns can be read by name.
+- The header now holds the 60 column names of the data rows (format version 4 at the time), so columns can be read by name.
 - An existing file whose header does not match the current format (including the old 37-column header) is renamed to `.bak.<timestamp>` and a new one is created. An empty file gets a header.
 
 **Connection chains extended to the actual node** (Oct 6)

@@ -1,6 +1,6 @@
 ---
 title: 配置字段
-description: Smart 出站组、smart-loadbalance 与 smart-region、experimental.smart、experimental.geox 的全部字段，以及影响 Smart 的环境变量。默认值与校验规则均以源码为准。
+description: Smart 出站组、smart-loadbalance 与 smart-region、experimental.smart、experimental.geox 的全部字段，以及影响 Smart 的环境变量。每个字段都写明作用、默认值、取值范围和写错时的表现，均以源码为准。
 ---
 
 import FieldList from '../../../components/FieldList.astro';
@@ -12,9 +12,75 @@ import {
   lbOutboundsFields, smartRegionFields,
 } from '../../../data/fields';
 
-Smart 的配置分三处：出站组本身（`type: "smart"`，或按地区分摊连接的 `type: "smart-loadbalance"`）、全局的 `experimental.smart`（LightGBM 模型与训练数据），以及全局的 `experimental.geox`（ASN 与国家数据库下载）。另外，Smart 的学习数据保存在 `experimental.cache_file` 中。
+这一页是 Smart 全部配置项的参考。想调整默认行为、查某个字段的默认值，或弄清启动报错的原因时来这里查。第一次使用请先看 [快速开始](../quick-start/)，不熟悉的词可以查 [术语表](../glossary/)。
 
-## 结构总览
+## 如何阅读这一页
+
+Smart 的配置分布在四处：
+
+- **出站组本身**：写在 `outbounds` 里，类型为 `smart`（集中使用最好的节点），或 `smart-loadbalance`（按地区分池、把连接分摊到多个节点）。
+- **`experimental.smart`**：所有组共用的 LightGBM 模型与训练数据采集，一般不用写。
+- **`experimental.geox`**：ASN 与国家数据库的下载设置，一般不用写。
+- **`experimental.cache_file`**：Smart 的学习数据保存在缓存文件里，**必须开启**。
+
+每个字段都标出了类型和默认值。没有标默认值的字段默认为空，即不启用。几种类型的写法：
+
+| 类型 | 写法 |
+|---|---|
+| `duration` | 时长字符串，如 `30s`、`5m`、`72h` |
+| `regex` | Go RE2 正则字符串，如 `(?i)香港\|HK`；写错时读取配置就会报错 |
+| `string \| string[]` | 可以写一个字符串，也可以写字符串数组 |
+| `object` | JSON 对象，如 `{"HK": 1.2}` |
+
+大多数字段都不需要写。配置中出现不认识的字段会直接报错，便于发现拼写错误；唯一的例外是 `smart` 组的 `algorithm`，写错只记录 WARN。
+
+## 从最小到常用
+
+### 最小配置
+
+只需要告诉 Smart 用哪些节点，再开启缓存文件：
+
+```json
+{
+  "outbounds": [
+    { "type": "smart", "tag": "auto", "providers": ["my-subscription"] }
+  ],
+  "experimental": {
+    "cache_file": { "enabled": true }
+  }
+}
+```
+
+其余字段全部使用默认值：每 3 分钟检查一次节点，并为每个网站选出学到的最好节点。
+
+### 常用配置
+
+在最小配置的基础上，多数人会加上这几项：
+
+```json
+{
+  "type": "smart",
+  "tag": "auto",
+  "providers": ["my-subscription"],
+  "exclude": "(?i)剩余|到期|官网",
+  "expected_status": "204",
+  "interval": "5m",
+  "algorithm": "p2c",
+  "policy_priority": "香港:1.2;日本:1.1"
+}
+```
+
+- `exclude` 去掉订阅里“剩余流量”“到期时间”之类的提示条目，它们不是真正的节点。
+- `expected_status: "204"` 要求探测地址必须返回 204，避免酒店、机场 Wi-Fi 的登录页把不通的节点误判为可用。
+- `interval: "5m"` 减少探测次数，手机上更省电。
+- `algorithm: "p2c"` 在排名靠前的几个节点之间兼顾延迟与负载做选择，避免所有连接挤在同一个节点上，见 [选路算法](../algorithms/)。
+- `policy_priority` 让名称含“香港”“日本”的节点更优先，见 [节点偏好与手动指定](../priority-and-pinning/)。
+
+完整的可用示例见 [示例配置](../examples/)。
+
+### 全部字段一览
+
+下面列出 `smart` 组和两个全局块的全部字段及默认值，便于对照。不需要照抄，只写要改的字段即可。
 
 ```json
 {
@@ -79,42 +145,66 @@ Smart 的配置分三处：出站组本身（`type: "smart"`，或按地区分�
 ```
 
 <Callout type="warn" title="必须开启 cache_file">
-  Smart 的统计、权重、排名、手动指定、熔断状态都保存在缓存文件的 `smart_stats` bucket 中。没有缓存文件时，Smart 不记录任何统计，只按 URL 测速延迟选路。命令行版本需要设置 `experimental.cache_file.enabled: true`；SFA / SFW / SFL 图形客户端始终启用缓存文件。
+  Smart 的统计、权重、排名、手动指定和熔断状态都保存在缓存文件中（`smart_stats` bucket）。没有缓存文件时，Smart 不记录任何统计，只能按测速延迟选路，也就谈不上“学习”。命令行版本需要设置 `experimental.cache_file.enabled: true`；SFA / SFW / SFL 图形客户端始终启用缓存文件。
 </Callout>
 
 <Callout type="danger" title="不支持的字段">
-  `tolerance` 与 `idle_timeout` 是 `urltest` 的字段，Smart 从未支持。配置中出现未知字段会直接报错：`outbounds[0].tolerance: json: unknown field "tolerance"`。早期文档曾错误列出这两个字段，请从配置中删除。
+  `tolerance` 和 `idle_timeout` 是 `urltest` 的字段，Smart 从未支持。写在 Smart 组里会导致启动报错：`outbounds[0].tolerance: json: unknown field "tolerance"`。早期文档曾错误列出这两个字段，请从配置中删除。
 </Callout>
 
 ## 出站组字段
 
+以下字段写在 `type` 为 `smart` 的出站中；`smart-loadbalance` 组同样接受（`algorithm`、`hysteresis` 除外）。
+
 ### 成员
+
+决定本组包含哪些节点。
 
 <FieldList lang="zh" fields={membershipFields} prefix="field-" />
 
 ### 健康检查
 
+Smart 定期经每个节点访问一个测试地址，判断节点是否可用、延迟多少。没有流量数据时（例如刚启动），Smart 就按这里测得的延迟选路。
+
 <FieldList lang="zh" fields={probeFields} prefix="field-" />
 
 ### 选路
+
+决定 Smart 怎样在候选节点之间做选择，以及选择变化时如何对待已有连接。
 
 <FieldList lang="zh" fields={selectionFields} prefix="field-" />
 
 ### 学习与模型
 
+决定节点权重的计算方式，以及是否采集数据训练自己的模型。
+
 <FieldList lang="zh" fields={learningFields} prefix="field-" />
 
 ### ASN
+
+按网络运营者汇总学习结果，见 [ASN 与 GeoX](../asn-geox/)。
 
 <FieldList lang="zh" fields={asnFields} prefix="field-" />
 
 ### 面板显示
 
+只影响 Clash API 面板中的显示，不影响路由。
+
 <FieldList lang="zh" fields={displayFields} prefix="field-" />
 
 ## smart-loadbalance
 
-`smart-loadbalance` 组接受上面 `smart` 组的全部字段，含义不变，只有 `algorithm` 与 `hysteresis` 被忽略（启动时记录 WARN），分别由 `balance` 与 `region` 取代。工作方式见 [Smart 负载均衡](../smart-loadbalance/)。与 `algorithm` 不同，`balance`、`region` 中的取值写错会直接报配置错误。
+`smart-loadbalance` 组适合想把连接分摊到多个节点、同时保持出口地区稳定的场景，例如大订阅按地区自动分组、多线程下载、嵌套代理的前置。工作方式见 [Smart 负载均衡](../smart-loadbalance/)。
+
+它接受上面 `smart` 组的全部字段，含义不变；只有 `algorithm` 与 `hysteresis` 被忽略（启动时记录 WARN），分别由 `balance` 和 `region` 取代。与 `algorithm` 不同，`balance`、`region` 中的取值写错会直接报配置错误。
+
+最简单的写法与 `smart` 组一样：
+
+```json
+{ "type": "smart-loadbalance", "tag": "balance", "providers": ["my-subscription"] }
+```
+
+需要调整时，可用的字段及默认值如下：
 
 ```json
 {
@@ -166,39 +256,60 @@ Smart 的配置分三处：出站组本身（`type: "smart"`，或按地区分�
 }
 ```
 
-地区可以写代码（`HK`、`GB`，`UK` 等同 `GB`）、中英文名称（`香港`、`Japan`）或旗帜（`🇯🇵`），不区分大小写；不认识的值按大写原样作为自定义地区。
+凡是要写地区的地方，都可以写地区代码（`HK`、`GB`，`UK` 等同于 `GB`）、中文或英文名称（`香港`、`Japan`）或旗帜（`🇯🇵`），不区分大小写；不认识的值会转成大写，作为自定义地区（如 `IPLC`）。
 
 ### balance
+
+决定在选中的地区内，把每条连接分给哪个节点。
 
 <FieldList lang="zh" fields={lbBalanceFields} prefix="balance-" />
 
 ### region
 
+决定每条连接由哪个地区承载，以及地区不可用时怎么办。
+
 <FieldList lang="zh" fields={lbRegionFields} prefix="region-" />
 
 ### region.rules
+
+自定义地区规则：纠正名称识别的错误，或定义自己的地区。例如：
+
+```json
+"rules": [
+  { "region": "IPLC", "name": "专线", "match": "(?i)IPLC|IEPL" },
+  { "region": "JP", "outbounds": ["mystery-node-7"] }
+]
+```
 
 <FieldList lang="zh" fields={lbRuleFields} prefix="rule-" />
 
 ### region.destination
 
+`destination` 模式如何判断目标所在国家。
+
 <FieldList lang="zh" fields={lbDestinationFields} prefix="destination-" />
 
 ### region.detect
+
+如何判断每个节点属于哪个地区。默认先看节点名称，名称看不出来的再用出口探测。
 
 <FieldList lang="zh" fields={lbDetectFields} prefix="detect-" />
 
 ### region.probe
 
+`auto` 模式的地区探测：为常访问的网站比较各地区的速度。
+
 <FieldList lang="zh" fields={lbProbeFields} prefix="probe-" />
 
 ### region.outbounds
+
+为地区生成可以单独引用的出站（`smart-region`），用于路由规则、落地节点的前置或 `selector`。
 
 <FieldList lang="zh" fields={lbOutboundsFields} prefix="outbounds-" />
 
 ## smart-region
 
-`smart-loadbalance` 组某个地区的出站。通常由 `region.outbounds` 自动生成，也可以手动声明。经它的连接走所属组的完整流程，地区固定。
+`smart-region` 是 `smart-loadbalance` 组中某个地区的出站，经它的连接只会从该地区的节点出去，学习、熔断与分摊仍由所属组统一处理。通常由 `region.outbounds` 自动生成；需要单独设置 `fallback`、`hidden` 时，也可以手动声明：
 
 ```json
 { "type": "smart-region", "tag": "日本前置", "group": "balance", "region": "JP", "fallback": false }
@@ -208,7 +319,7 @@ Smart 的配置分三处：出站组本身（`type: "smart"`，或按地区分�
 
 ## experimental.smart
 
-所有 Smart 组共享的模型与训练数据采集器。这一块没有 `enabled` 开关，也不需要显式填写：只有当某个组设置了 `use_lightgbm` 才会加载、下载模型；只有当某个组设置了 `collect_data` 才会创建 CSV。
+所有 Smart 组共用的 LightGBM 模型和训练数据采集器。这一块没有 `enabled` 开关，通常也不用写：只有某个组开启了 `use_lightgbm`，才会加载、下载模型；只有某个组开启了 `collect_data`，才会创建 CSV。只有想改模型路径、下载方式或 CSV 位置时才需要写它。
 
 ### lightgbm
 
@@ -220,17 +331,19 @@ Smart 的配置分三处：出站组本身（`type: "smart"`，或按地区分�
 
 ## experimental.geox
 
-全局地理数据下载。目前**唯一的使用者是 Smart**：`url.asn` 为未设置 `asn_database` 的组提供 ASN 数据库，`url.mmdb` 提供国家数据库（LightGBM、训练数据采集与 `smart-loadbalance` 的 `destination` 模式使用）。各项没有默认下载地址，只有填写了 URL 的文件才会下载。文件名固定，保存在数据目录下。
+全局的地理数据下载设置。目前**只有 Smart 使用这些数据**：`url.asn` 为没有设置 `asn_database` 的组提供 ASN 数据库；`url.mmdb` 提供国家数据库，供 LightGBM、训练数据采集和 `smart-loadbalance` 的 `destination` 模式使用。
+
+`url` 中的各项都没有默认地址，只下载填写了地址的文件，文件名固定，保存在数据目录下。不写 `geox` 也可以：需要 ASN 或国家数据库的组会自动下载默认的 GeoLite2 数据库。
 
 <FieldList lang="zh" fields={geoxFields} prefix="geox-" />
 
 <Callout type="note" title="首次下载与生效时机">
-  GeoX 在后台下载，不阻塞启动。Smart 启动时文件还没下载好也没关系：数据库下载或更新完成后立即重新加载，所有组随即使用新数据，**无需重启**。
+  GeoX 在后台下载，不会拖慢启动。Smart 启动时文件还没下载好也没关系：数据库下载或更新完成后立即生效，所有组随即使用新数据，**无需重启**。
 </Callout>
 
 ## 环境变量
 
-以下环境变量在进程启动时读取一次，超出范围的值按默认值处理。
+以下环境变量只在进程启动时读取一次，主要用于命令行版本的调优；超出范围的值按默认值处理。
 
 <div class="not-prose my-6 overflow-hidden rounded-card bg-surface shadow-ring">
   {envVars.map((v) => (
@@ -245,4 +358,4 @@ Smart 的配置分三处：出站组本身（`type: "smart"`，或按地区分�
   ))}
 </div>
 
-`SMART_CACHE_BUDGET_MB` 的具体作用见 [存储与性能](../storage-performance/)，三个衰减相关变量见 [工作原理](../how-it-works/#时间衰减)。
+`SMART_CACHE_BUDGET_MB` 的具体作用见 [存储与性能](../storage-performance/)，三个与时间衰减有关的变量见 [工作原理](../how-it-works/#时间衰减)。

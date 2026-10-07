@@ -1,6 +1,6 @@
 ---
 title: Examples
-description: Eight ready-to-use Smart configurations covering a minimal setup, tuning, LightGBM, ASN, groups per traffic type, nested groups, Smart load balancing and the front of chained proxies.
+description: Eight ready-to-use Smart configurations — a minimal setup, tuned probing and selection, LightGBM, ASN, groups per traffic type, nested groups, Smart load balancing and the front of chained proxies — each with who it is for, what it does and what to change before using it.
 ---
 
 import CodeBlock from '../../../components/CodeBlock.astro';
@@ -14,85 +14,122 @@ import ex6 from '../../../examples/06-nested.json?raw';
 import ex7 from '../../../examples/07-smart-loadbalance.json?raw';
 import ex8 from '../../../examples/08-chain.json?raw';
 
-All examples below pass `sing-box check`. Except for the first one, each example lists only the Smart-related parts; see the first one for how to write the `my-subscription` subscription, the `direct` outbound and `cache_file`.
+Eight configurations for common situations, ready to copy and adapt. If you are not sure where to start, get the first one running, then borrow from the others as needed. Every field is explained in [Configuration](../config/).
+
+All examples pass `sing-box check`. Apart from the first, each lists only the Smart-related parts; take the `my-subscription` subscription, the `direct` outbound and `cache_file` from the first one and merge everything into your own configuration.
+
+<Callout type="note" title="Adapting an example">
+  `my-subscription` is the subscription's tag and `https://example.com/subscription` is a placeholder; use your own subscription. Node naming (`HK`, `Hong Kong`, `香港`) differs between providers, so fields that match names (`exclude`, `policy_priority`, region rules) must follow the names in your subscription. Matching is case-sensitive.
+</Callout>
 
 ## Minimal configuration
 
 <CodeBlock code={ex1} filename="01-minimal.json" locale="en" />
 
-- References all nodes of one subscription. All other fields use their defaults.
-- `cache_file` cannot be omitted, otherwise Smart does not learn.
-- `clash_api` is used to view weights and pin nodes. You can remove it if you don't need it.
+**For**: your first Smart setup.
+
+- Uses every node of one subscription, with all other fields at their defaults. Smart probes the nodes on its own and learns the best node for each site.
+- `cache_file` cannot be left out: Smart keeps what it learns in the cache file and does not learn without it.
+- `clash_api` lets you view weights and pin nodes in a dashboard. Remove it if you do not need it.
+
+**Change before use**: the subscription `url`, and `update_interval` (how often the subscription refreshes) if you like.
 
 ## Tuning probes and selection
 
 <CodeBlock code={ex2} filename="02-tuned.json" locale="en" />
 
-- `exclude` removes non-node entries from the subscription, such as traffic and expiry notices. `(?i)` makes the match case-insensitive.
-- `expected_status: "204"` requires the probe URL to return 204. When it is empty, any HTTP response counts as success, which easily leads to false results on networks with a captive portal.
-- `interval: "5m"` reduces the number of probes, which suits phones.
-- `hysteresis: "30s"` keeps the same website on the same node while it has sustained traffic.
-- `policy_priority` raises the priority of nodes whose names contain `HK` or `JP`, and uses a regex to lower nodes whose names carry a 2–9 multiplier tag (such as `2x`, `3×`) to 0.8. Note that nodes with a factor greater than 1 rank ahead of all other nodes; see [Node preference](../priority-and-pinning/#where-the-factor-applies).
+**For**: a working setup where you want fewer false results, better battery life on phones, or a preference for certain regions.
+
+- `exclude` removes entries that are not nodes, such as traffic and expiry notices. `(?i)` makes the match case-insensitive.
+- `expected_status: "204"` requires the probe address to answer 204. When it is empty, any HTTP response counts as success, so on networks with a login page (a captive portal) dead nodes can look healthy.
+- `interval: "5m"` probes less often, which suits phones.
+- `hysteresis: "30s"` keeps a site on the same node while it has steady traffic, so it does not bounce between nodes.
+- `policy_priority` prefers nodes whose names contain `HK` or `JP`, and uses a regex to drop nodes carrying a 2–9 multiplier tag (such as `2x` or `3×`, the expensive ones) to 0.8. Nodes with a factor above 1 rank ahead of all other nodes; see [Priority and pinning](../priority-and-pinning/#where-the-factor-applies).
+
+**Change before use**: the keywords in `exclude` to match the notice entries of your subscription, and `HK` / `JP` in `policy_priority` to match how your nodes are named.
 
 ## Enabling LightGBM
 
 <CodeBlock code={ex3} filename="03-lightgbm.json" locale="en" />
 
-- On first start, the default model is downloaded in the background. The traditional formula is used until the download finishes.
-- `download_detour: "direct"` avoids downloading the model through the Smart group, which is not ready yet.
-- `collect_data` with `sample_rate: 0.3` collects training data at a 30% rate, and writing stops once the file reaches 100 MB. If you don't plan to train your own model, remove these two fields.
+**For**: scoring nodes with a pre-trained model instead of the classic formula, or collecting your own data to train a model.
+
+- On first start the default model downloads in the background; until it arrives the classic formula is used, so nothing breaks. `auto_update` checks for a new model every 72 hours.
+- `download_detour: "direct"` downloads the model without a proxy, so the download does not depend on a Smart group that is not ready yet. The newer `http_client` field works too; see [Configuration](../config/#lightgbm-http_client).
+- `collect_data` with `sample_rate: 0.3` records training data for about 30% of connections, and writing stops once the file reaches 100 MB.
+
+**Change before use**: if you do not plan to train a model, remove `collect_data`, `sample_rate` and `collector`. If GitHub is not reachable directly, set `download_detour` to an outbound that can reach it, or point the model `url` at a mirror you can reach.
 
 ## Learning by ASN
 
 <CodeBlock code={ex4} filename="04-asn-geox.json" locale="en" />
 
-- GeoX downloads the ASN and country databases and updates them once a week. The ASN database is used by `use_asn`, and the country database is used by LightGBM.
-- On a fresh install, the first download takes time. ASN takes effect automatically when the download finishes, with no restart; see [ASN and GeoX](../asn-geox/#experimentalgeox).
-- To use only a local file, remove `geox` and write `"asn_database": "/path/to/GeoLite2-ASN.mmdb"` in the group.
+**For**: visiting many different sites run by the same operator (Google, say), so new sites can benefit from what was already learned.
+
+- GeoX downloads the ASN and country databases and updates them once a week. The ASN database serves `use_asn`; the country database serves LightGBM.
+- On a fresh install the first download takes a moment. ASN takes effect on its own once the download finishes, with no restart; see [ASN and GeoX](../asn-geox/#experimentalgeox).
+
+**Change before use**: to use only a local file, remove `geox` and write `"asn_database": "/path/to/GeoLite2-ASN.mmdb"` in the group; remove `use_lightgbm` if you do not want the model.
 
 ## Groups per traffic type
 
 <CodeBlock code={ex5} filename="05-algorithms.json" locale="en" />
 
-Four Smart groups reference the same subscription, and route rules assign traffic to them by type:
+**For**: traffic that needs different handling, such as SSH that should stay on one fast node and downloads that should spread out.
+
+Four Smart groups use the same subscription, and route rules send each kind of traffic to one of them:
 
 | Group | Algorithm | Use |
 |---|---|---|
-| `smart-interactive` | `latency-banded` + 1-minute `hysteresis` | SSH and remote desktop; prefers low latency and avoids switching nodes where possible |
+| `smart-interactive` | `latency-banded` + 1-minute `hysteresis` | SSH and remote desktop; prefers low latency and avoids switching nodes |
 | `smart-bulk` | `least-loaded`, TCP only | Downloads, spread across the nodes with the fewest connections |
 | `smart-sticky` | `sticky-session` | Services that tie the login session to the exit IP |
 | `smart-default` | `p2c` | All other traffic |
 
+**Change before use**: the ports and domains in the route rules, to match the traffic you want to separate.
+
 <Callout type="note" title="The cost of multiple groups">
-  Stats are stored per group. Four groups mean the same set of nodes is learned four separate times, and memory and disk usage grow accordingly. Split groups only when different traffic really needs different algorithms.
+  Stats are stored per group, so four groups learn the same nodes four separate times, and memory and disk use grow accordingly. Split groups only when different traffic really needs different algorithms.
 </Callout>
 
 ## Nested groups
 
 <CodeBlock code={ex6} filename="06-nested.json" locale="en" />
 
-- Three `urltest` groups each pick the fastest node of one region from the subscription, and Smart learns to choose among the three regions.
-- Smart treats member groups as ordinary nodes: stats are recorded under `HK`, `JP` and `US`, and reflect whichever node that group had selected at the time.
-- `policy_priority: "=HK:1.2"` uses `=` for an exact match, so it applies only to the member named `HK`.
-- The outermost `selector` uses `auto` by default. You can switch to a fixed region in the dashboard when needed.
-- This structure has few candidates and learns fast, which suits setups with many nodes where you only care about the region. The cost is that Smart cannot see differences between individual nodes within a region.
+**For**: many nodes, when all you care about is which region to use.
+
+- Three `urltest` groups each pick the fastest node of one region from the subscription, and Smart learns which of the three regions to use.
+- Smart treats member groups like ordinary nodes: stats are recorded under `HK`, `JP` and `US`, and reflect whichever node that group had selected at the time.
+- `policy_priority: "=HK:1.2"` uses `=` for an exact match, so it only applies to the member named `HK`.
+- The outer `selector` uses `auto` by default; switch it to a fixed region in the dashboard when you need to.
+- With few candidates Smart learns fast; the cost is that it cannot see the differences between nodes inside a region. To let Smart manage every node directly and spread connections within regions, use [Smart load balancing](#smart-load-balancing) below.
+
+**Change before use**: the region keywords in `include`, to match how your nodes are named.
 
 ## Smart load balancing
 
 <CodeBlock code={ex7} filename="07-smart-loadbalance.json" locale="en" />
 
+**For**: a large subscription you want to hand to one group that sorts nodes by region and spreads connections across several nodes, while each site keeps a stable exit.
+
 - Every node of the subscription goes into one `smart-loadbalance` group and is sorted into regions by name; nodes whose names contain `IPLC` or `IEPL` go to a custom region named "专线" (private line), and `deny` leaves out mainland-China nodes.
-- `mode: auto` learns the best region per site, `weights` gives Hong Kong a slight edge, and `affinity: site` keeps each site on one node so logins do not break on exit-IP changes.
-- `max_connections_per_node: 64` keeps any single node from taking too many concurrent connections.
+- `mode: auto` learns the best region per site, `weights` gives Hong Kong a slight edge, and `affinity: site` keeps each site on one node so logins do not break when the exit IP changes.
+- `max_connections_per_node: 64` keeps any one node from taking too many concurrent connections.
 - `region.outbounds` generates outbounds such as `🇭🇰 香港负载` for four regions. The group lists them as its members in dashboards — picking one locks that region — and a `selector` such as `proxy` can reference them directly.
 - Details in [Smart load balancing](../smart-loadbalance/).
+
+**Change before use**: list in `regions` only the regions your subscription actually has (the region outbounds the `selector` references must match). If a stable exit per site does not matter to you, set `affinity` back to `none` to spread the load better.
 
 ## Front of chained proxies
 
 <CodeBlock code={ex8} filename="08-chain.json" locale="en" />
 
-- Two landing nodes connect through provider nodes. `front` spreads the front connections over several provider nodes of the chosen region.
+**For**: your own landing nodes (a VPS, a static residential IP and so on) reached through provider nodes, with the front connections spread over several provider nodes.
+
+- Two landing nodes connect through provider nodes. `front` spreads the front connections over several provider nodes of the chosen region, so one throttled or failing provider node does not take every connection down.
 - `landing-us` uses `front` itself: the `destination` mode picks the region by the landing server's country, and `map` sends US landing servers through US, then Japanese, fronts and UK ones through German or Dutch fronts. A landing server given by domain is resolved first.
-- `landing-hk` always uses `front-HK`, the Hong Kong front. `fallback: true` lets it move to another region when every Hong Kong front is down instead of failing.
+- `landing-hk` always uses `front-HK`, the Hong Kong front. `fallback: true` lets it move to another region when every Hong Kong front is down; without it, only Hong Kong nodes would ever be tried.
 - `members: "nodes"` keeps `front` listing nodes in dashboards.
-- The front group keeps the default `affinity: none`; `site` or `target` would put every connection to one landing server on a single front node.
+- The front group keeps the default `affinity: none`; `site` or `target` would put every connection to one landing server on a single front node, which defeats the spreading.
+
+**Change before use**: replace the two `shadowsocks` landing nodes with your own (protocol, address, port, password) and keep their `detour`; adjust `regions` and `map` to the regions in your subscription and the countries of your landing servers.

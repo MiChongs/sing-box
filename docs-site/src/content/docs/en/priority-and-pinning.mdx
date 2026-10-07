@@ -1,50 +1,79 @@
 ---
 title: Priority and pinning
-description: Weight nodes by name with policy_priority, pin a node from a dashboard, and see how Smart learns from manual choices.
+description: Express long-term preferences by node name with policy_priority, pin a node from a dashboard (or lock a region on smart-loadbalance groups), how Smart handles a pinned node that fails, and how it learns from manual choices.
 ---
 
 import Callout from '../../../components/Callout.astro';
 
-While Smart selects nodes automatically, it offers three ways to express a preference: `policy_priority` for long-term weighting, pinning to fix a node temporarily, and `hysteresis` and `sticky-session` to reduce switching.
+Smart picks nodes on its own by default. This page covers three ways to steer it — useful when you want some nodes used more, need to fix the group to one node for a while, or don't want a site hopping between nodes:
+
+- **`policy_priority`**: long-term preferences by node name in the config, such as "prefer Hong Kong, push down premium-rate nodes".
+- **Pinning**: pick a node in a dashboard and the group uses only that node for now; `smart-loadbalance` groups can also lock a region.
+- **`hysteresis` and `sticky-session`**: fewer switches between nodes for the same site.
+
+Terms such as destination, candidate and weight are explained in the [Glossary](../glossary/).
 
 ## policy_priority
 
 ### Syntax
 
-Rules are separated by `;`, and each rule is written as `pattern:factor`. The factor must be greater than 0 and not equal to 1: above 1 raises priority, below 1 lowers it.
+`policy_priority` is one string of rules separated by `;`. Each rule is `pattern:factor`. The factor must be positive and not 1: above 1 raises a node, below 1 lowers it.
 
 ```json
-"policy_priority": "HK:1.3;JP:1.15;=US-Backup:0.5;~^(SG|TW)-\\d+$:1.1;!IPLC:0.9"
+"policy_priority": "香港:1.3;IPLC:1.2;~(?i)\\d+(\\.\\d+)?x:0.8;=US-Backup:0.5"
 ```
 
-| Form | Match type | Example | Matches |
+A pattern can take five forms:
+
+| Form | Matches when | Example | Matches |
 |---|---|---|---|
-| `keyword` | Substring | `HK` | `HK 01`, `🇭🇰 HK IPLC` |
-| `=name` | Exact match | `=US-Backup` | Only `US-Backup` |
-| `~regex` | Go RE2 regular expression | `~^(SG\|TW)-\d+$` | `SG-01`, `TW-12` |
-| Contains `*` or `?` | Wildcard, matches the whole name | `HK-*` | `HK-01`, but not `My HK-01` |
-| `!` prefix | Negation, can be combined with the forms above | `!IPLC` | Nodes whose name does **not** contain `IPLC` |
+| `keyword` | The name contains the substring | `香港` | `香港 01`, `🇭🇰 香港 IPLC` |
+| `=name` | The name is exactly this | `=US-Backup` | Only `US-Backup`, not `US-Backup-2` |
+| `~regex` | A Go RE2 regex matches somewhere in the name | `~^(SG\|TW)-\d+$` | `SG-01`, `TW-12` |
+| Contains `*` or `?` | A wildcard matches the **whole** name | `HK-*` | `HK-01`, not `My HK-01` |
+| `!` prefix | Negation, combined with any form above | `!IPLC`, `!=US-Backup` | Nodes without `IPLC`; every node except `US-Backup` |
 
-- The pattern and the factor are split at the **last** `:`, so a pattern can contain `:` but not `;`.
-- Matching is **case-sensitive**. For a case-insensitive regex, write `~(?i)hk`.
-- When a node matches several rules, the factors are **multiplied**.
-- Malformed rules (invalid factor, regex that fails to compile, empty pattern) are ignored and logged as WARN. They do not affect startup. Spaces after a prefix are not trimmed: `! HK` matches the substring ` HK`.
+Details that trip people up:
 
-The parsed result is shown in the `policyPriority` field of `GET /smart/groups`.
+- Matching is **case-sensitive**. `hk` does not match `HK-01`; for a case-insensitive regex write `~(?i)hk`.
+- Pattern and factor are split at the **last** `:`, so a pattern may contain `:` but not `;`.
+- A regex matches if **any part** of the name matches; add `^` and `$` yourself to match the whole name. Wildcards always match the whole name.
+- Inside a JSON string, regex backslashes are doubled: `\d` becomes `\\d`.
+- Spaces after a prefix are kept: `! HK` matches the substring ` HK` (with the space), not `HK`.
+- When a node matches several rules, their factors **multiply**.
+- Invalid rules (factor not positive, factor equal to 1, regex that does not compile, empty pattern) are skipped with a WARN, `policy_priority: ignored invalid rule [...]`, and do not stop startup.
+
+### A worked example
+
+With the rule string above, the nodes get these factors:
+
+| Node | Matching rules | Factor |
+|---|---|---|
+| `🇭🇰 香港 IPLC 01` | `香港`, `IPLC` | 1.3 × 1.2 = **1.56** |
+| `🇭🇰 香港 02 2x` | `香港`, the rate regex | 1.3 × 0.8 = **1.04** |
+| `🇯🇵 日本 01` | none | **1** |
+| `US-Backup` | `=US-Backup` | **0.5** |
+| `US-Backup-2` | none (`=` needs an exact match) | **1** |
+
+Check how the rules were parsed in the `policyPriority` field of `GET /smart/groups`: each rule lists its parsed pattern, match kind (`substring`, `exact`, `regex`, `glob`), negation and factor.
 
 ### Where the factor applies
 
-The factor takes effect in three places:
+In a `smart` group the factor does three things:
 
-1. **Candidate ordering**: the candidates of every tier are first stably sorted by "factor × pin-endorsement boost", and only then handed to the selection algorithm. A node with a factor above 1 ranks ahead of all nodes with a factor of 1, **regardless of weight**, as long as it passes filtering.
-2. **Top-up order**: when there are fewer than 10 candidates, the list is topped up from the highest factor to the lowest.
-3. **Weight**: the computed weight is multiplied by the factor before it is saved. LightGBM output is also multiplied by the factor.
+1. **Candidate order**: on every selection the candidates are stably sorted by "factor × pin-learning boost", highest first, before the selection algorithm sees them. Any node with a factor above 1 is placed ahead of every node at 1, **regardless of weight**, as long as it passes the availability filters.
+2. **Top-up order**: when fewer than 10 candidates are left and the list is topped up from other nodes, higher factors go first.
+3. **Weights**: the weight computed after each connection is multiplied by the factor before it is stored, and so is LightGBM's output. The preference therefore also seeps into the learned weights over time.
 
-<Callout type="warn" title="The factor is a hard sort">
-  Because of point 1, even `HK:1.01` puts all available HK nodes ahead of every other node. If you only want a slight bias, point 3 alone would be enough, but it cannot be enabled on its own. Use factors close to 1 with care, or control membership directly with `include` / `exclude`.
+<Callout type="warn" title="A factor above 1 is a hard ordering">
+  Because of point 1, even `香港:1.01` puts every available Hong Kong node ahead of all others. In the example, `🇭🇰 香港 02 2x` was pushed down by the rate rule, yet at 1.04 it still sorts ahead of the Japanese node. If you only want a slight lean rather than "always first", be careful with factors above 1; to leave nodes out entirely, `include` / `exclude` are clearer.
 </Callout>
 
+In a `smart-loadbalance` group the factor is not a hard ordering: it multiplies node quality, so a higher factor gives a node a larger share of its region's connections and lifts its region's score. See [Smart load balancing](../smart-loadbalance/).
+
 ## Pinning a node
+
+Pinning (often called "fixing" in dashboards) makes the group use only the node you chose, for now. It helps when troubleshooting, or when a site only works through one particular node. A pin is saved and survives restarts.
 
 ### Pin and unpin
 
@@ -55,52 +84,79 @@ Click a node of the Smart group in a dashboard, or call the Clash API directly:
 curl -X PUT http://127.0.0.1:9090/proxies/auto -d '{"name":"HK-01"}'
 # unpin (lightweight): send an empty name
 curl -X PUT http://127.0.0.1:9090/proxies/auto -d '{"name":""}'
-# unpin, clear the selection state, and recompute prefetch and ranking
+# unpin, clear the selection state, then recompute prefetch and ranking
 curl -X DELETE http://127.0.0.1:9090/proxies/auto
 ```
 
-`PATCH` is equivalent to `PUT`. The pinned node must be a member of this group, otherwise the API returns 400 `Smart update error: not found`.
-
-After pinning, Smart clears this group's unwrap cache and saves the pin to the cache file, so the pin is restored after a restart. If the node is no longer in the group, the pin is dropped automatically. Existing connections are interrupted only when `interrupt_exist_connections` is enabled.
+- `PATCH` works like `PUT`. Selections in the SFA / SFW / SFL GUI clients follow the same logic.
+- The node must be a member of the group, otherwise the call returns 400 `Smart update error: not found`.
+- Pinning clears the group's unwrap cache (its short-term destination → node memory) and saves the pin to the cache file. If the node is no longer in the group after a restart, the pin is dropped.
+- By default only **new connections** are affected; established ones keep their node. Turn on [`interrupt_exist_connections`](#interrupt_exist_connections) to interrupt them.
 
 ### Selection while pinned
 
-- The candidate list contains **only** the pinned node. The selection algorithm and scenario reordering have no effect. Pinning also ignores block status.
-- Smart bypasses the pin and selects normally only when the pinned node's **circuit breaker is open**. Recent failures or failed URL tests do not bypass the pin.
-- When the pinned node **fails to dial**, Smart immediately bypasses the pin, selects again once, and marks the pin as "suspended" (`fixedSuspended` / `pinSuspended`). The pin itself is kept.
-- The next time the pinned node dials or probes successfully, the suspension is lifted automatically and traffic switches back to that node. After a network change, the pinned node is also warmed up first.
+- The candidate list holds **only** the pinned node: selection algorithms, `policy_priority` and request-scene reordering do nothing, and a manual block on the node does not stop it.
+- Smart bypasses the pin and selects normally only while the pinned node's **circuit breaker is open**. A single failure or a failed probe is not enough.
+- When a dial to the pinned node **fails**, that request is completed right away on a normally selected node, and the pin is marked "suspended". The pin itself stays in place.
 
-While the pin is suspended, `now` shows the node actually in use, and `fixedActive` points to it as well. `fixed` is still the pinned node.
+### An example of failure and recovery
+
+Say you pinned `HK-01` and it then breaks:
+
+1. **First dial fails**: that connection goes through a node picked by the algorithm. The pin is suspended and the log shows `pin [HK-01] suspended`. The circuit breaker counts 1 failure.
+2. **Next new connection**: `HK-01` is tried first again (the breaker is not open yet). Another failure within 30 seconds opens the breaker.
+3. **While the breaker is open**: new connections skip `HK-01` and select normally, without wasting time on it. The breaker stays open for about 15 seconds, then about 30, 60 and 120 seconds on consecutive trips (each with ±20% jitter); see [Circuit breaker](../health/#circuit-breaker).
+4. **Recovery**: once the breaker expires, the next connection tries `HK-01` again. A successful dial, a successful background probe or a successful warm-up after a network change all end the suspension at once; traffic returns to `HK-01` and the log shows `pin [HK-01] resumed`.
+
+While suspended, the Clash API keeps `fixed` at `HK-01`, sets `fixedSuspended` to `true`, and shows the node actually carrying traffic in `now` and `fixedActive`. Dashboards can then say "pinned to HK-01 (unavailable, traffic on JP-02)" instead of a misleading "pinned HK-01, current HK-01".
+
+### On smart-loadbalance groups
+
+Besides pinning a node, a `smart-loadbalance` group can **lock a region**:
+
+| Action | Result |
+|---|---|
+| Select a region outbound (such as `🇯🇵 Japan LB`) or a region code (such as `JP`) | Locks that region and clears any pinned node |
+| Select a node | Same as in a `smart` group: only that node is used; a region lock stays but the node pin takes precedence |
+| Send an empty name, or `DELETE /proxies/{name}` | Clears both the node pin and the region lock |
+
+A node whose name equals a region name is treated as a node. The region lock is also saved in the cache file and survives restarts; when the locked region has no available node, `region.fallback` decides whether another region is used.
+
+Each region outbound (`smart-region`) can also pin one node of its own region. That only affects connections through that region outbound, not the group. It differs from a group pin in two ways: it lives in memory only, so it has to be set again after a restart; and when it fails, the connection still moves to another node of the region, but no "suspended" state is shown.
 
 ### Learning from pins
 
-Smart treats a pin as a form of feedback:
+Smart treats a pin as feedback and uses it to adjust later automatic selection:
 
-- While a node is pinned, the weight of every connection is multiplied by 1.15. The factor is divided out again when training data is generated, so it does not pollute the model labels.
-- Each node that has ever been pinned keeps a "pin endorsement" record: usage count, success rate, baseline RTT, frequently visited destinations and ASNs, and usual hours of use. From this record Smart computes a boost factor of up to about 1.63, which decays with a time constant of 3 days.
-- The boost **stays in effect after you unpin**, for up to 14 days. It stops applying when the node's current RTT exceeds 2.5 × the baseline.
-- The boost is used in candidate ordering (multiplied with `policy_priority`) and in the weight calculation.
+- While pinned, the weight of each connection through the node is multiplied by an extra 1.15. This is divided back out when LightGBM training data is written, so your preference is not learned as node quality.
+- Every node that has been pinned keeps an "endorsement record": use count, success rate, baseline latency, frequent destinations and ASNs, and the hours of day it was used. From it Smart derives a boost of up to about 1.63 that decays over time (time constant 3 days).
+- The boost **outlives the pin** for up to 14 days, and is suspended while the node's current latency is more than 2.5 times its recorded baseline.
+- The boost takes part in candidate ordering (multiplied with `policy_priority`) and in weight computation.
 
-So a node that was pinned for a long time is still preferred for a while after you unpin it. To clear this immediately, call `DELETE /proxies/{name}/weights` or `POST /cache/smart/flush/{name}`.
+So a node you pinned for a long time keeps being favoured for a while after you unpin it. To clear these records right away, call `DELETE /proxies/{name}/weights` or `POST /cache/smart/flush/{name}` (both also clear the group's other learned data).
 
 ## Reducing switches: hysteresis and sticky-session
 
+When connections to one site hop between nodes, logins, resumed downloads and video buffering can suffer. `smart` groups offer two remedies:
+
 | | `hysteresis` | `sticky-session` algorithm |
 |---|---|---|
-| Effect | Within the window, moves the last-used node back to the first position | Prefers the last successful node |
-| When it stops applying | Outside the window, or when the node is not among the top 10 candidates after filtering | When the node is unavailable or judged suspicious |
-| Skips the selection process | No, it still goes through full filtering and the algorithm | Yes, it dials directly when the conditions are met |
-| Combines with other algorithms | Yes | It is itself an algorithm |
+| Effect | Within the window, moves the node last used for the destination back to the front | Prefers the node that last succeeded for the destination |
+| Stops applying when | The window has passed, or the node is not among the top 10 filtered candidates | The node is unavailable, is suspect for that destination, or the group has a pinned node |
+| Skips the selection pipeline | No, full filtering and algorithm still run | Yes, dials directly when the conditions hold (fastest) |
+| Combines with other algorithms | Yes | It is an algorithm itself |
 
-`hysteresis` refreshes its timestamp on every successful dial, so the window slides: as long as a destination keeps getting traffic, it stays on the same node. Records older than 2 × the window are cleaned up every 5 minutes.
+The `hysteresis` timestamp is refreshed on every successful dial, so the window slides: as long as a destination keeps seeing traffic, it stays on the same node. Records older than twice the window are cleaned up every 5 minutes. `sticky-session` records are cleared all at once when they exceed 8192 entries.
 
-Note: after `hysteresis`, scenario reordering, suspicious-node demotion and the two-node race in round 0 of sort-based algorithms can still let another node win. For stronger stickiness, use `sticky-session`.
+Note that request-scene reordering, moving suspect nodes back, and the two-node race in round 0 of ranking algorithms all run after `hysteresis` and can still let another node win. Use `sticky-session` when you need stronger stickiness.
+
+`smart-loadbalance` groups do not use either setting (they are ignored with a WARN); their counterparts are the region memory `region.sticky` and `balance.affinity`. See [Smart load balancing](../smart-loadbalance/#affinity).
 
 ## interrupt_exist_connections
 
-By default, changing the pin affects only new connections made afterward. With `interrupt_exist_connections` enabled:
+By default, changing the pin only affects new connections, so running downloads and streams are not cut off. With `interrupt_exist_connections` on:
 
-- Pinning, unpinning and `clear-selection` interrupt the TCP connections already established in this group.
-- When a connection is judged degraded, other connections to the same destination on the same node are also closed.
+- pinning, unpinning, `clear-selection`, and locking or unlocking a region on a `smart-loadbalance` group interrupt **all** existing connections through the group (TCP and UDP), and clients reconnect using the new selection;
+- when a connection is judged degraded, other **TCP** connections to the same destination on the same node are closed too. Degraded means: an HTTPS connection that never sent or received any data, a drop of more than 30% in the node's weight at once, or enough failures to get the node blocked (see [Degradation and recovery](../how-it-works/#degradation-and-recovery)). It does not apply when the destination itself has been judged unreachable.
 
-UDP connections are never affected. Whether or not it is enabled, connections that the Watchdog judges stalled are closed, and all connections are closed on a network change.
+Regardless of this setting, the watchdog closes stalled connections, and sing-box closes every connection on a network change; see [Health and failures](../health/).

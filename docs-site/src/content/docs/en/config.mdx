@@ -1,6 +1,6 @@
 ---
 title: Configuration
-description: All fields of the Smart group, smart-loadbalance and smart-region, experimental.smart and experimental.geox, plus the environment variables that affect Smart. Defaults and validation rules follow the source code.
+description: Every field of the Smart group, smart-loadbalance and smart-region, experimental.smart and experimental.geox, plus the environment variables that affect Smart. Each field states what it does, its default, its range and what happens when it is wrong, all checked against the source code.
 ---
 
 import FieldList from '../../../components/FieldList.astro';
@@ -12,9 +12,75 @@ import {
   lbOutboundsFields, smartRegionFields,
 } from '../../../data/fields';
 
-Smart is configured in three places: the group itself (`type: "smart"`, or `type: "smart-loadbalance"` to spread connections by region), the global `experimental.smart` (LightGBM model and training data), and the global `experimental.geox` (ASN and country database downloads). In addition, Smart's learned data is stored in `experimental.cache_file`.
+This page is the reference for every Smart setting. Come here to change a default, look up what a field does, or work out why startup failed. If you are new to Smart, start with [Quick start](../quick-start/); unfamiliar terms are explained in the [Glossary](../glossary/).
 
-## Structure overview
+## How to read this page
+
+Smart is configured in four places:
+
+- **The group itself**, in `outbounds`, with type `smart` (concentrates traffic on the best node) or `smart-loadbalance` (sorts nodes into region pools and spreads connections across several of them).
+- **`experimental.smart`**: the LightGBM model and training-data collection shared by all groups. Usually not needed.
+- **`experimental.geox`**: download settings for the ASN and country databases. Usually not needed.
+- **`experimental.cache_file`**: Smart keeps what it learns in the cache file, so it **must be enabled**.
+
+Each field shows its type and default. A field without a default is empty, which means off. The types are written like this:
+
+| Type | How to write it |
+|---|---|
+| `duration` | A duration string such as `30s`, `5m`, `72h` |
+| `regex` | A Go RE2 regular expression such as `(?i)hong kong\|HK`; an invalid pattern is a config error |
+| `string \| string[]` | Either one string or an array of strings |
+| `object` | A JSON object such as `{"HK": 1.2}` |
+
+Most fields can be left out. An unknown field in the config is an error, which catches typos; the one exception is the `algorithm` of a `smart` group, where a typo only logs a WARN.
+
+## From minimal to typical
+
+### Minimal configuration
+
+All Smart needs is the nodes to use and an enabled cache file:
+
+```json
+{
+  "outbounds": [
+    { "type": "smart", "tag": "auto", "providers": ["my-subscription"] }
+  ],
+  "experimental": {
+    "cache_file": { "enabled": true }
+  }
+}
+```
+
+Everything else keeps its default: nodes are checked every 3 minutes, and each site gets the best node Smart has learned for it.
+
+### A typical configuration
+
+On top of the minimal one, most people add a few fields:
+
+```json
+{
+  "type": "smart",
+  "tag": "auto",
+  "providers": ["my-subscription"],
+  "exclude": "(?i)traffic|expire|website",
+  "expected_status": "204",
+  "interval": "5m",
+  "algorithm": "p2c",
+  "policy_priority": "HK:1.2;JP:1.1"
+}
+```
+
+- `exclude` drops the "traffic left" and "expires on" entries some subscriptions include; they are not real nodes.
+- `expected_status: "204"` requires the probe address to answer 204, so the login page of hotel or airport Wi-Fi cannot make a dead node look healthy.
+- `interval: "5m"` probes less often, which saves battery on phones.
+- `algorithm: "p2c"` weighs latency and load among the top few nodes, so not every connection lands on the same one; see [Algorithms](../algorithms/).
+- `policy_priority` prefers nodes whose names contain `HK` or `JP`; see [Priority and pinning](../priority-and-pinning/).
+
+For complete, working configurations, see [Examples](../examples/).
+
+### All fields at a glance
+
+Every field of a `smart` group and of the two global blocks, with its default, for reference. Do not copy it wholesale; write only the fields you want to change.
 
 ```json
 {
@@ -79,42 +145,66 @@ Smart is configured in three places: the group itself (`type: "smart"`, or `type
 ```
 
 <Callout type="warn" title="cache_file must be enabled">
-  Smart's stats, weights, ranking, pins and circuit breaker state are all stored in the `smart_stats` bucket of the cache file. Without a cache file, Smart records no stats and selects nodes only by URL test latency. The command-line version needs `experimental.cache_file.enabled: true`; the SFA / SFW / SFL GUI clients always enable the cache file.
+  Smart stores its stats, weights, ranking, pins and circuit-breaker state in the cache file (the `smart_stats` bucket). Without a cache file Smart records no stats and can only pick nodes by probe latency, so it does not learn at all. The command-line version needs `experimental.cache_file.enabled: true`; the SFA / SFW / SFL GUI clients always enable the cache file.
 </Callout>
 
 <Callout type="danger" title="Unsupported fields">
-  `tolerance` and `idle_timeout` are `urltest` fields, and Smart has never supported them. An unknown field in the config causes an error: `outbounds[0].tolerance: json: unknown field "tolerance"`. Earlier documentation listed these two fields by mistake. Remove them from your config.
+  `tolerance` and `idle_timeout` belong to `urltest`; Smart has never supported them. In a Smart group they make startup fail: `outbounds[0].tolerance: json: unknown field "tolerance"`. Earlier documentation listed them by mistake. Remove them from your config.
 </Callout>
 
 ## Group fields
 
+These fields go in an outbound of type `smart`; `smart-loadbalance` groups accept them too (except `algorithm` and `hysteresis`).
+
 ### Members
+
+Which nodes belong to the group.
 
 <FieldList lang="en" fields={membershipFields} prefix="field-" />
 
 ### Health checks
 
+Smart regularly requests a test address through every node to find out whether it works and how fast it is. When there is no traffic data yet (right after start, say), Smart picks nodes by the latency measured here.
+
 <FieldList lang="en" fields={probeFields} prefix="field-" />
 
 ### Selection
+
+How Smart chooses among candidate nodes, and what happens to existing connections when the choice changes.
 
 <FieldList lang="en" fields={selectionFields} prefix="field-" />
 
 ### Learning and model
 
+How node weights are computed, and whether to collect data for training your own model.
+
 <FieldList lang="en" fields={learningFields} prefix="field-" />
 
 ### ASN
+
+Aggregates what Smart learns by network operator; see [ASN and GeoX](../asn-geox/).
 
 <FieldList lang="en" fields={asnFields} prefix="field-" />
 
 ### Dashboard display
 
+Only affects how the group appears in Clash API dashboards, never routing.
+
 <FieldList lang="en" fields={displayFields} prefix="field-" />
 
 ## smart-loadbalance
 
-A `smart-loadbalance` group accepts every field of the `smart` group above with the same meaning, except `algorithm` and `hysteresis`, which are ignored (with a WARN at startup) and replaced by `balance` and `region`. See [Smart load balancing](../smart-loadbalance/) for how it works. Unlike `algorithm`, an invalid value in `balance` or `region` is a config error.
+A `smart-loadbalance` group is for spreading connections across several nodes while keeping the exit region stable: a large subscription grouped by region on its own, multi-threaded downloads, or the front of chained proxies. See [Smart load balancing](../smart-loadbalance/) for how it works.
+
+It accepts every field of the `smart` group above with the same meaning, except `algorithm` and `hysteresis`, which are ignored (with a WARN at startup) and replaced by `balance` and `region`. Unlike `algorithm`, an invalid value in `balance` or `region` is a config error.
+
+The simplest form looks just like a `smart` group:
+
+```json
+{ "type": "smart-loadbalance", "tag": "balance", "providers": ["my-subscription"] }
+```
+
+When you need to tune it, these are the fields and their defaults:
 
 ```json
 {
@@ -166,39 +256,60 @@ A `smart-loadbalance` group accepts every field of the `smart` group above with 
 }
 ```
 
-Regions can be written as codes (`HK`, `GB`; `UK` means `GB`), Chinese or English names (`香港`, `Japan`) or flags (`🇯🇵`), case-insensitively; anything else is taken upper-cased as a custom region.
+Wherever a region is expected, you can write a region code (`HK`, `GB`; `UK` means `GB`), a Chinese or English name (`香港`, `Japan`) or a flag (`🇯🇵`), in any letter case. Anything else is upper-cased and treated as a custom region (such as `IPLC`).
 
 ### balance
+
+Within the chosen region, which node carries each connection.
 
 <FieldList lang="en" fields={lbBalanceFields} prefix="balance-" />
 
 ### region
 
+Which region carries each connection, and what happens when it cannot.
+
 <FieldList lang="en" fields={lbRegionFields} prefix="region-" />
 
 ### region.rules
+
+Custom region rules: correct name-detection mistakes or define your own regions. For example:
+
+```json
+"rules": [
+  { "region": "IPLC", "name": "Private line", "match": "(?i)IPLC|IEPL" },
+  { "region": "JP", "outbounds": ["mystery-node-7"] }
+]
+```
 
 <FieldList lang="en" fields={lbRuleFields} prefix="rule-" />
 
 ### region.destination
 
+How the `destination` mode finds the country of a connection's target.
+
 <FieldList lang="en" fields={lbDestinationFields} prefix="destination-" />
 
 ### region.detect
+
+How each member's region is found. By default the member name is used first, and members whose names say nothing get an exit probe.
 
 <FieldList lang="en" fields={lbDetectFields} prefix="detect-" />
 
 ### region.probe
 
+Region probes of the `auto` mode: comparing regions for frequently visited sites.
+
 <FieldList lang="en" fields={lbProbeFields} prefix="probe-" />
 
 ### region.outbounds
+
+Generates outbounds for regions (`smart-region`) that can be referenced on their own, by route rules, as the front of landing nodes or in a `selector`.
 
 <FieldList lang="en" fields={lbOutboundsFields} prefix="outbounds-" />
 
 ## smart-region
 
-The outbound of one region of a `smart-loadbalance` group, usually generated by `region.outbounds` but also declarable by hand. Connections through it run the group's full pipeline with the region fixed.
+A `smart-region` outbound is one region of a `smart-loadbalance` group: connections through it only leave from that region's nodes, while learning, breakers and spreading stay with the group. It is usually generated by `region.outbounds`; to set `fallback` or `hidden` for one region, you can also declare it by hand:
 
 ```json
 { "type": "smart-region", "tag": "japan-front", "group": "balance", "region": "JP", "fallback": false }
@@ -208,7 +319,7 @@ The outbound of one region of a `smart-loadbalance` group, usually generated by 
 
 ## experimental.smart
 
-The model and training data collector shared by all Smart groups. This block has no `enabled` switch and does not need to be written explicitly: the model is loaded and downloaded only when some group sets `use_lightgbm`, and the CSV is created only when some group sets `collect_data`.
+The LightGBM model and training-data collector shared by every Smart group. The block has no `enabled` switch and is usually unnecessary: the model is only loaded and downloaded when some group sets `use_lightgbm`, and the CSV is only created when some group sets `collect_data`. Write it only to change the model path, how it is downloaded, or where the CSV goes.
 
 ### lightgbm
 
@@ -220,17 +331,19 @@ The model and training data collector shared by all Smart groups. This block has
 
 ## experimental.geox
 
-Global geo data download. Currently **Smart is the only consumer**: `url.asn` provides the ASN database for groups that do not set `asn_database`, and `url.mmdb` provides the country database (used by LightGBM, data collection and the `destination` mode of `smart-loadbalance`). No entry has a default download URL; only files with a URL set are downloaded. File names are fixed, and the files are saved in the data directory.
+Global download settings for geo data. At the moment **only Smart uses this data**: `url.asn` provides the ASN database for groups without `asn_database`, and `url.mmdb` provides the country database used by LightGBM, training-data collection and the `destination` mode of `smart-loadbalance`.
+
+None of the `url` entries has a default address; only files with an address are downloaded. File names are fixed and the files are saved in the data directory. You can also leave `geox` out entirely: groups that need an ASN or country database download the default GeoLite2 databases on their own.
 
 <FieldList lang="en" fields={geoxFields} prefix="geox-" />
 
 <Callout type="note" title="First download and when it takes effect">
-  GeoX downloads in the background without blocking startup. It does not matter if the files are not downloaded yet when Smart starts: when a database is downloaded or updated, it is reloaded at once and every group uses the new data, **with no restart**.
+  GeoX downloads in the background and does not slow startup down. It does not matter if a file is not there yet when Smart starts: once a database is downloaded or updated it takes effect immediately and every group uses the new data, **with no restart**.
 </Callout>
 
 ## Environment variables
 
-The following environment variables are read once at process start. Out-of-range values fall back to the default.
+These environment variables are read once at process start and are mainly for tuning the command-line version. Out-of-range values fall back to the default.
 
 <div class="not-prose my-6 overflow-hidden rounded-card bg-surface shadow-ring">
   {envVars.map((v) => (

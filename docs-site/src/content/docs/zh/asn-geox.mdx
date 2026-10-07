@@ -1,33 +1,49 @@
 ---
 title: ASN 与 GeoX
-description: 开启 use_asn 后 Smart 如何按目标所属自治系统汇总学习结果，ASN 与国家数据库从哪里来，以及 experimental.geox 的下载与生效时机。
+description: 什么是 ASN、为什么按 ASN 汇总学习结果能让 Smart 更快选对节点，开启 use_asn 后的具体行为，ASN 与国家数据库从哪里来、被谁使用，以及 experimental.geox 的下载与生效时机。
 ---
 
+import Callout from '../../../components/Callout.astro';
 import CodeBlock from '../../../components/CodeBlock.astro';
 import example from '../../../examples/04-asn-geox.json?raw';
 
+这一页讲两件相关的事：`use_asn` 如何让 Smart 把同一网络里不同网站的经验共享，以及 Smart 用到的两个地理数据库（ASN 数据库、国家数据库）从哪里下载、何时生效。只用默认配置时不需要阅读本页；想开启 `use_asn`、LightGBM 或 `smart-loadbalance` 的 `destination` 模式时再来看。
+
 ## ASN 有什么用
 
-同一家公司的服务往往分布在多个域名下，但落在同一个自治系统（ASN）里，例如 Google 的 `*.google.com`、`*.youtube.com`、`*.gstatic.com` 都属于 AS15169。开启 `use_asn` 后，节点访问其中一个域名的表现，也会被用来为同 ASN 的其他域名选节点。
+**ASN**（自治系统编号）是互联网上给“一个机构管理的一整片网络”分配的编号。一家公司的服务器通常都在自己的网络里，所以它旗下的很多域名会落在同一个 ASN 中。例如 Google 的 `*.google.com`、`*.youtube.com`、`*.googlevideo.com`、`*.gstatic.com` 都属于 AS15169。
+
+Smart 默认按**目标**（归并后的域名，如 `*.youtube.com`）分别学习每个节点的表现。这样很精确，但每个新域名都要从零开始积累。开启 `use_asn` 后，Smart 把同一 ASN 下各个目标学到的权重汇总起来：
+
+- 你已经用某个节点顺畅地看过 YouTube，第一次打开 `*.googlevideo.com` 时，Smart 立即知道这个节点适合 Google 的网络，不用再试错；
+- 某个节点到 Google 网络的线路变差时，所有 Google 域名一起避开它，而不是逐个域名吃一次亏。
+
+适合经常访问少数几家大公司服务的场景。代价是失去一部分精度：同一 ASN 内不同网站的最佳节点被视为相同。
+
+<Callout type="note" title="拨号前要知道目标 IP">
+  ASN 由 IP 查出。只有拨号前已经知道目标 IP（例如本地已解析，或 FakeIP 有映射），选路时才能用上 ASN。使用远程解析、拨号时只有域名的连接，选路仍按目标进行；它们只会在连接关闭时补查 ASN，用于记录统计。
+</Callout>
 
 ## 开启后发生了什么
 
-- **查询**：拨号时用目标的公网 IP 查询 ASN。只有拨号前已经知道 IP 才能查到（例如已解析的地址或 FakeIP 映射）；私有地址与回环地址跳过。只有域名的连接会在关闭时额外做一次最长 200 ms 的 DNS 查询来补上 ASN。
-- **记录**：权重写入 `tcp_asn:<ASN>` / `udp_asn:<ASN>` 槽位，同时把通用的 `tcp` / `udp` 槽位设为各 ASN 槽位中的最小值。成功率、延迟等计数仍按（目标, 节点）记录。
-- **选路**：权重层查询时，如果目标有 ASN，就汇总**该 ASN 下所有目标**的权重：同一节点取最大值，但只要有一个低于 0.4 就取最小值。该 ASN 还没有数据时，这一层返回空，直接退到测速延迟层，不会再用该目标自己的权重。
+- **查询**：拨号时用目标的公网 IP 查询 ASN，私有地址与回环地址跳过。只有域名的连接会在关闭时额外做一次最长 200 ms 的 DNS 查询来补上 ASN（开启 LightGBM 或数据采集时也会这样做）。
+- **记录**：权重写入 `tcp_asn:<ASN>` / `udp_asn:<ASN>` 槽位，同时把通用的 `tcp` / `udp` 槽位设为各 ASN 槽位中的最小值，供没有 ASN 的查询使用。成功率、延迟等计数仍按（目标, 节点）记录。
+- **选路**：查询权重时，如果目标有 ASN，就汇总**该 ASN 下所有目标**的权重：同一节点取最大值，但只要有一个低于 0.4 就取最小值，以免一个网站上的坏表现被其他网站掩盖。该 ASN 还没有任何数据时，这一层返回空，直接退到测速延迟层，不会再用该目标自己的权重。
 - **预取**：预取结果额外按 ASN 保存一份引用，同 ASN 的新目标可以直接命中。
-- **加分**：非 CDN 的 ASN 上成功次数达到 10、成功率超过 90% 时，权重最多再加 0.08。
+- **加分**：在非 CDN 的 ASN 上，同一（目标, 节点）成功次数达到 10 次且成功率超过 90% 时，权重最多提高 8%。加成按 0.02 × log10(成功次数) 计算：成功 10 次为 2%，100 次为 4%，1 万次才达到 8% 的上限。
 - **模型**：LightGBM 的第 16、23 维特征需要 ASN，未开启时为 0。
+
+启动日志中每个组的摘要行有 `asn=` 字段：`off`（未开启）、`on`（一个数据库可用）、`on(N sources)`（N 个数据库）、`on(downloading)`（数据库还在下载）、`on(no-db)`（没有可用的数据库）。
 
 ### 被忽略的 ASN
 
-以下 33 个 ASN 属于 Cloudflare、Akamai、Fastly、Amazon 等 CDN 与云服务商，以及 Cogent、Level 3 等骨干网。它们承载了大量互不相关的网站，按它们分组反而会把无关站点混在一起，所以不参与 ASN 分组和预取：
+以下 33 个 ASN 属于 Cloudflare、Akamai、Fastly、Amazon 等 CDN 与云服务商，以及 Cogent、Level 3 等骨干网。它们承载了大量互不相关的网站，按它们汇总反而会把无关站点混在一起，所以这些 ASN 不参与汇总、预取与加分，落在其中的目标照常按目标学习：
 
 13335、12222、16625、20940、31110、35994、54113、22822、15133、19551、20446、60068、16509、36408、4809、199524、212238、55933、43260、43317、43996、52320、396982、16276、30081、12389、37888、45090、174、3356、3209、14061、8452。
 
 ## ASN 数据库从哪里来
 
-每个开启 `use_asn` 的组按以下顺序确定数据库：
+ASN 数据库是一个 mmdb 文件，记录每段 IP 属于哪个 ASN。每个开启 `use_asn` 的组按以下顺序确定数据库：
 
 1. 本组的 `asn_database`：路径按原样使用，不拼接数据目录。图形客户端中相对路径相对于进程工作目录，请写绝对路径。
 2. `experimental.geox.url.asn` 下载到数据目录的文件（需要 `geox.enabled: true`）。
@@ -35,28 +51,35 @@ import example from '../../../examples/04-asn-geox.json?raw';
 
 列出多个数据库时全部打开，查询时依次尝试，取第一个非零结果；打开失败的会被跳过。数据库需要是 MaxMind GeoLite2-ASN 格式（记录中有 `autonomous_system_number` 字段），字段不同的数据库（例如 IPinfo 的 ASN 库）查不到结果。
 
-第 2、3 种数据库都由 GeoX 下载，使用 `experimental.geox` 中的 `http_client`、`auto_update` 与 `update_interval`（默认数据库在 GeoX 未启用时同样如此）。下载在后台进行，不阻塞启动；已有的文件会直接使用，不会在每次启动时重新下载。
+第 2、3 种数据库都由 GeoX 下载，使用 `experimental.geox` 中的 `http_client`、`auto_update` 与 `update_interval`（GeoX 未启用时，默认数据库同样使用这些设置）。下载在后台进行，不阻塞启动；已有的文件会直接使用，不会在每次启动时重新下载。
 
-数据库读取器在多个组之间共享。GeoX 下载或更新数据库后立即重新加载，所有组随即使用新数据，无需重启；启动时还没下载好的数据库，下载完成后也会自动启用，启动日志中此时显示 `asn=on(downloading)`。`asn_database` 指定的本地文件只在启动时读取，替换后需要重启。
+数据库读取器在多个组之间共享。GeoX 下载或更新数据库后立即重新加载，所有组随即使用新数据，无需重启；启动时还没下载好的数据库，下载完成后也会自动启用，期间启动日志显示 `asn=on(downloading)`。`asn_database` 指定的本地文件只在启动时读取，替换后需要重启。
 
 ## 国家数据库
 
-LightGBM 的国家特征（第 17、26 维）需要国家数据库。Smart 优先使用 `experimental.geox.url.mmdb` 下载的 `country.mmdb`；没有配置时使用默认的 GeoLite2-Country（来自 P3TERX 的发布页），由 GeoX 下载到数据目录下的 `country.mmdb`。与 ASN 数据库一样，下载或更新后立即生效。
+国家数据库（`country.mmdb`）记录每段 IP 属于哪个国家或地区。以下功能会用到它，没有用到时不会打开或下载：
 
-只有开启了 `use_lightgbm` 或 `collect_data` 的组，以及使用 `destination` 地区模式（或设置了 `destination.map`）的 `smart-loadbalance` 组，才会打开国家数据库并查询国家；`smart-loadbalance` 运行中切换到 `destination` 模式时才开始下载。见 [Smart 负载均衡](../smart-loadbalance/#destination)。
+| 使用者 | 用途 | 何时打开 |
+|---|---|---|
+| LightGBM（`use_lightgbm`） | 第 17、26 维国家特征 | 启动时 |
+| 训练数据采集（`collect_data`） | CSV 中的国家列与上述特征 | 启动时 |
+| `smart-loadbalance` 的 `destination` 模式 | 判断目标所在国家，见 [Smart 负载均衡](../smart-loadbalance/#destination) | 配置为 `destination` 模式或设置了 `destination.map` 时在启动时打开；运行中切换到该模式时才开始下载 |
+| `smart-loadbalance` 的出口探测 | 探测地址只返回 IP、不返回国家时，用它查国家 | 首次需要时 |
+
+来源优先使用 `experimental.geox.url.mmdb` 下载的 `country.mmdb`；没有配置时使用默认的 GeoLite2-Country（来自 P3TERX 的发布页），由 GeoX 下载到数据目录下的同名文件。与 ASN 数据库一样，下载或更新后立即生效，无需重启。
 
 ## experimental.geox
 
-GeoX 统一管理地理数据文件的下载与更新，目前唯一的使用者是 Smart。
+GeoX 统一管理地理数据文件的下载与更新，目前唯一的使用者是 Smart。下面的例子同时开启 ASN 与 LightGBM，并让 GeoX 每周更新两个数据库：
 
 <CodeBlock code={example} filename="04-asn-geox.json" locale="zh" />
 
-- `enabled: false` 时不下载 `url` 中的文件，Smart 也拿不到这里的路径；Smart 需要的默认数据库仍按本节的下载设置下载。
+- `enabled: false` 时不下载 `url` 中的文件，Smart 也拿不到这些路径；Smart 需要的默认数据库仍会下载，并使用本节的下载设置。
 - `url` 没有默认值，只下载填写了地址的文件。
 - 文件名固定：`GeoLite2-ASN.mmdb`（填写多个 ASN 地址时，第一个仍为 `GeoLite2-ASN.mmdb`，之后依次为 `GeoLite2-ASN-1.mmdb`、`GeoLite2-ASN-2.mmdb`……）、`country.mmdb`、`geoip.dat`、`geosite.dat`。`geoip.dat` 与 `geosite.dat` 目前没有组件使用。
-- `auto_update: true` 时每个文件按 `update_interval` 定期更新；否则只在文件缺失时下载，已有的文件不再更新。
+- `auto_update: true` 时每个文件按 `update_interval`（默认 24 小时）定期更新；否则只在文件缺失时下载，已有的文件不再更新。
 - 缺失文件下载失败时（例如开机时网络尚未就绪），按 30 秒起、逐次翻倍、最长 30 分钟的间隔重试，直到成功。
-- 下载使用 `http_client` 的全部设置：出站与其他拨号选项、TLS、请求头、HTTP 版本。没有 `http_client` 时使用 `download_detour`，都没有则使用默认 HTTP 客户端（`route.default_http_client`）。
+- 下载使用 `http_client` 的全部设置：出站与其他拨号选项、TLS、请求头、HTTP 版本。没有 `http_client` 时使用 `download_detour`，都没有则使用默认 HTTP 客户端（`route.default_http_client`）。建议经 `direct` 或稳定节点下载。启用 GeoX 时，`http_client` 引用了不存在的标签会导致启动失败。
 
 ## 相关日志
 
@@ -67,5 +90,6 @@ GeoX 统一管理地理数据文件的下载与更新，目前唯一的使用者
 | `smart: no ASN database configured; using the default database GeoX keeps at <path>` | 使用默认数据库 |
 | `smart: ASN database <path> is downloading; it is used once the download completes` | 数据库还在下载，完成后自动启用 |
 | `smart: failed to open ASN database [<path>] ...` | 某个数据库打开失败，其余继续尝试 |
+| `smart: country mmdb loaded from <path>` | 国家数据库已打开 |
 | `geox: reloaded <name> from <path>` | 下载或更新完成，数据库已重新加载 |
 | `assetdl[<name>]: download failed, retrying in <间隔>: ...` | 缺失文件下载失败，稍后重试 |

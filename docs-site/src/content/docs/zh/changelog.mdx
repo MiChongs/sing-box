@@ -15,6 +15,8 @@ description: 2026 年 4 月文档站上线以来 Smart 出站组的行为变化�
 - 分配策略 `smart`、`least-connections`、`round-robin`、`weighted-round-robin`、`weighted-random`、`random`、`consistent-hashing`，会话亲和 `target`、`site`、`source`、`source-site`，以及质量下限、节点数与单节点连接数上限。
 - 新出站类型 `smart-region`：组可以为每个地区生成出站，供路由规则、落地节点的 `detour` 与 `selector` 引用；在面板中点选即锁定地区。作为嵌套代理前置时，组按落地服务器而不是网站学习和选地区。
 - 新增 Clash API：`GET/PUT /smart/groups/{name}/regions`、`DELETE /smart/groups/{name}/regions/lock`、`POST /smart/groups/{name}/regions/detect`、`PUT /smart/groups/{name}/balance`；`/proxies` 新增 `loadBalance` 块；`/smart/groups` 新增 `type` 字段。地区锁定与运行时设置保存在缓存文件中，重启后恢复。
+- 测速记录过期（组空闲一段时间后的常态）不再让节点被视为不可用；允许范围内一个可用节点都没有时，按质量顺序尝试未被屏蔽的成员作为兜底，而不是直接报错。
+- 使用 `destination` 模式（或设置了 `destination.map`）的 `smart-loadbalance` 组也会打开国家数据库，由 GeoX 在后台下载。
 
 **ASN 与国家数据库热重载，下载完整接入 http_client**（10-07）
 
@@ -40,7 +42,7 @@ description: 2026 年 4 月文档站上线以来 Smart 出站组的行为变化�
 
 **训练数据 CSV 表头与数据列对齐**（10-07）
 
-- 表头改为与数据行一致的 60 个列名，可以直接按列名读取。
+- 表头改为与数据行一致的 60 个列名（当时的第 4 版格式），可以直接按列名读取。
 - 表头与当前格式不一致的已有文件（包括旧的 37 列表头）会被改名为 `.bak.<时间戳>` 备份后新建；空文件会补写表头。
 
 **连接出站链补全到实际节点**（10-06）
