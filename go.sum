@@ -14,8 +14,8 @@ github.com/BanYeHanFeng/quic-go v0.0.0-20261003160627-9c196b0405dd/go.mod h1:hmL
 github.com/BanYeHanFeng/sing-quic v0.0.0-20260928145456-472d11e50138 h1:osSJs/DdbQrmEcrfFrtIXPxoAKX5a009rVZfIyoDFUI=
 github.com/BanYeHanFeng/sing-quic v0.0.0-20260928145456-472d11e50138/go.mod h1:1d7KaxCRBqCuF0tRgW8/Z+OcBS/NEn1dzy0/wK1tL5M=
 github.com/BurntSushi/toml v0.3.1/go.mod h1:xHWCNGjB5oqiDr8zfno3MHue2Ht5sIBksp03qcyfWMU=
-github.com/MiChongs/sing-ebpf v0.1.0-alpha.19 h1:hCQfdIGGbuEn1//h+wdAluXT3YEknakmFL3JAFs7OEE=
-github.com/MiChongs/sing-ebpf v0.1.0-alpha.19/go.mod h1:swwBAcOfGFH5R8n7yHwIrNRsaiE/didsG3gN9bqDLZM=
+github.com/MiChongs/sing-ebpf v0.1.0-alpha.20 h1:itQrxOv033VqFq0NFGHjXF7DbyLZK0jasbD+8jf2Xu0=
+github.com/MiChongs/sing-ebpf v0.1.0-alpha.20/go.mod h1:swwBAcOfGFH5R8n7yHwIrNRsaiE/didsG3gN9bqDLZM=
 github.com/RussellLuo/timingwheel v0.0.0-20220218152713-54845bda3108 h1:iPugyBI7oFtbDZXC4dnY093M1kZx6k/95sen92gafbY=
 github.com/RussellLuo/timingwheel v0.0.0-20220218152713-54845bda3108/go.mod h1:WAMLHwunr1hi3u7OjGV6/VWG9QbdMhGpEKjROiSFd10=
 github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=
