@@ -11,7 +11,7 @@ replace (
 	github.com/sagernet/sing-box => ../
 	github.com/sagernet/sing-quic => github.com/BanYeHanFeng/sing-quic v0.0.0-20260928145456-472d11e50138
 	github.com/sagernet/sing-snell => github.com/reF1nd/sing-snell v0.0.0-20260927103919-96ee7c6bc2e1
-	github.com/sagernet/sing-tun => github.com/reF1nd/sing-tun v0.9.6-0.20260927073404-ea0e670fb952
+	github.com/sagernet/sing-tun => github.com/reF1nd/sing-tun v0.9.7-0.20261009120252-3a38f1971879
 	github.com/sagernet/wireguard-go => github.com/reF1nd/wireguard-go v0.0.8-0.20260927094743-30d7940c3d1f
 )
 
@@ -28,7 +28,7 @@ require (
 	github.com/sagernet/sing-shadowsocks v0.2.9-0.20260929204512-65740e0f0e3e
 	github.com/sagernet/sing-shadowsocks2 v0.2.2-0.20260929152114-a69d1086332b
 	github.com/sagernet/sing-snell v0.0.0-20260904135315-bc5a12ac736f
-	github.com/sagernet/sing-tun v0.9.7-0.20261002083955-3f8acd9da65b
+	github.com/sagernet/sing-tun v0.9.7-0.20261009022811-5c2edb183cc9
 	github.com/sagernet/tailscale v1.102.1-sing-box-1.14-mod.5.0.20260925112514-35e61219dedd
 	github.com/spyzhov/ajson v0.9.4
 	github.com/stretchr/testify v1.12.0
@@ -40,7 +40,7 @@ require (
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/Azure/go-ansiterm v0.0.0-20210617225240-d185dfc1b5a1 // indirect
-	github.com/MiChongs/sing-ebpf v0.1.0-alpha.17 // indirect
+	github.com/MiChongs/sing-ebpf v0.1.0-alpha.21 // indirect
 	github.com/Microsoft/go-winio v0.6.1 // indirect
 	github.com/RussellLuo/timingwheel v0.0.0-20220218152713-54845bda3108 // indirect
 	github.com/RyuaNerin/go-krypto v1.3.0 // indirect
@@ -70,7 +70,6 @@ require (
 	github.com/dgryski/go-camellia v0.0.0-20191119043421-69a8a13fb23d // indirect
 	github.com/dgryski/go-metro v0.0.0-20180109044635-280f6062b5bc // indirect
 	github.com/distribution/reference v0.5.0 // indirect
-	github.com/dmitryikh/leaves v0.0.0-20230708180554-25d19a787328 // indirect
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dustin/go-humanize v1.0.1 // indirect
 	github.com/easytier/easytier/easytier-go v0.0.0-20261001013245-a017dc133c45 // indirect
@@ -205,6 +204,7 @@ require (
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
+	github.com/vernesong/leaves v0.0.0-20260629081247-2a1c022f37d0 // indirect
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect

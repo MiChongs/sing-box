@@ -51,7 +51,7 @@ func TestQUICDisabledAllowsTCPOnlyInbound(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = inbound.Close()
+	_ = inbound.(*Inbound).Close()
 }
 
 func TestQUICDisabledRejectsUDPInbound(t *testing.T) {

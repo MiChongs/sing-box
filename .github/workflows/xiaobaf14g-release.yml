@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号 (不含 v 前缀, 例如 1.15.0-alpha.10-xiaobaf14g.1)'
+        description: '版本号 (不含 v 前缀, 例如 1.15.0-alpha.11-xiaobaf14g.1)'
         required: true
         type: string
       prerelease:

@@ -42,7 +42,7 @@ func TestQUICDisabledTCPOnlyConstruction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("TCP-only inbound: %v", err)
 	}
-	if err := inbound.Close(); err != nil {
+	if err := inbound.(*Inbound).Close(); err != nil {
 		t.Fatal(err)
 	}
 }

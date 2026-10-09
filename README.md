@@ -603,7 +603,7 @@ wazero 仅在 amd64 与 arm64 架构上以编译方式执行，其他架构使�
 
 ## 发布产物
 
-推送 `v*` 标签或手动触发 `xiaobaf14g-release.yml` 工作流后，将构建全部产物并发布至 [Releases](https://github.com/MiChongs/sing-box/releases)。版本号格式为 `<上游版本>-xiaobaf14g.<序号>`（例如 `1.15.0-alpha.10-xiaobaf14g.1`），包含 `-alpha`、`-beta` 或 `-rc` 的版本标记为预发布版本。
+推送 `v*` 标签或手动触发 `xiaobaf14g-release.yml` 工作流后，将构建全部产物并发布至 [Releases](https://github.com/MiChongs/sing-box/releases)。版本号格式为 `<上游版本>-xiaobaf14g.<序号>`（例如 `1.15.0-alpha.11-xiaobaf14g.1`），包含 `-alpha`、`-beta` 或 `-rc` 的版本标记为预发布版本。
 
 命令行程序的文件名格式为 `sing-box-<版本>-<系统>-<架构>[<后缀>].tar.gz`。
 

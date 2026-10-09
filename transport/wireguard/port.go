@@ -18,6 +18,10 @@ func (e *Endpoint) PortMTU() uint32 {
 	return e.options.MTU
 }
 
+func (e *Endpoint) UpstreamPort() any {
+	return e.tunDevice
+}
+
 func (e *Endpoint) WritePackets(packets [][]byte) error {
 	// This runs in the shared TUN receive loop, so do not wait for network wake.
 	if err := e.startDevice(); err != nil {
