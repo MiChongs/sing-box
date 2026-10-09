@@ -1210,7 +1210,7 @@ jobs:
       - sfl
     if: always() && needs.desktop.result == 'success'
     steps:
-      - name: Checkout (全量历史用于 changelog)
+      - name: Checkout (全量历史与 tag 用于生成更新日志)
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -1256,43 +1256,13 @@ jobs:
           mv ../SHA256SUMS SHA256SUMS
           cat SHA256SUMS
 
-      # 引入 mikepenz/release-changelog-builder-action 做 commit 分类 + 美化；
-      # 配置见 .github/changelog-config.json。它只负责 "Changes since <PREV>"
-      # 那一段的美化（分类 + bullet + hash 链接），头尾元信息和 artifacts
-      # 表格仍由下面的 shell 拼接。
-      - name: Resolve previous tag
-        id: prevtag
-        env:
-          TAG: ${{ needs.prepare.outputs.tag }}
-        run: |
-          set -euo pipefail
-          # 取当前 tag 祖先链上最近的 xiaobaf14g tag。按创建时间取最新 tag 会
-          # 选中同步进来的上游 tag（历史被改写、与当前 tag 无共同近祖），
-          # changelog 会膨胀到数万个提交。
-          PREV=$(git describe --tags --abbrev=0 --match 'v*-xiaobaf14g*' "${TAG}^" 2>/dev/null || true)
-          echo "prev=$PREV" | tee -a "$GITHUB_OUTPUT"
-
-      - name: Build categorized changelog (external)
-        id: cl
-        uses: mikepenz/release-changelog-builder-action@v5
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          configuration: .github/changelog-config.json
-          fromTag: ${{ steps.prevtag.outputs.prev }}
-          toTag:   ${{ needs.prepare.outputs.tag }}
-          failOnError: false
-          # 写文件而不是经 env 传给下一步：changelog 很长时 env 会超过
-          # 单个参数 128KB 的上限（Argument list too long）。
-          outputFile: CHANGELOG_BODY.md
-          mode: COMMIT
-          fetchReleaseInformation: false
-          commitMode: true
-
+      # 正文由 .github/release_notes.py 生成：first-parent 提交按类型分组，上游
+      # 同步只显示版本，次要改动折叠；产物清单与校验值交给 Assets 区，正文只给
+      # 按平台汇总的下载指引，构建失败或跳过时才显示提示。
       - name: Assemble Release notes
         env:
           TAG:          ${{ needs.prepare.outputs.tag }}
-          PREV:         ${{ steps.prevtag.outputs.prev }}
+          IS_PRE:       ${{ needs.prepare.outputs.prerelease }}
           SKIP_ANDROID: ${{ needs.prepare.outputs.skip_android }}
           SKIP_GUI:     ${{ needs.prepare.outputs.skip_gui }}
           ANDROID_RES:  ${{ needs.android.result }}
@@ -1301,173 +1271,10 @@ jobs:
           REPO:         ${{ github.repository }}
           SERVER_URL:   ${{ github.server_url }}
           RUN_ID:       ${{ github.run_id }}
-          IS_PRE:       ${{ needs.prepare.outputs.prerelease }}
-          CL_COUNT:     ${{ steps.cl.outputs.changes }}
+          BUILDS_DIR:   builds
         run: |
           set -euo pipefail
-          BUILD_DATE=$(date -u +'%Y-%m-%d %H:%M UTC')
-
-          if [ -n "$PREV" ]; then
-            PREV_CELL="\`$PREV\`"
-            COMPARE_URL="${SERVER_URL}/${REPO}/compare/${PREV}...${TAG}"
-            RANGE_LINE="[\`$PREV\` … \`$TAG\`]($COMPARE_URL)"
-          else
-            PREV_CELL="(initial)"
-            RANGE_LINE="(initial release)"
-          fi
-          if [ "$IS_PRE" = 'true' ]; then
-            CHANNEL_CELL="pre-release"
-          else
-            CHANNEL_CELL="stable"
-          fi
-
-          count() { find builds -maxdepth 1 -type f "$@" | wc -l; }
-          # 图形客户端按产物是否齐全判断结果：SFA 需要普通版、Android 5 版
-          # APK 与 version metadata；SFW 每个架构一个安装包；SFL 每个架构
-          # deb / rpm / pacman 各一个。
-          gui_status() {
-            local actual="$1" complete="$2"
-            if [ "$SKIP_GUI" = 'true' ]; then
-              echo "Skipped — disabled via workflow input."
-            elif [ "$complete" = 'true' ]; then
-              echo "Built successfully and attached above."
-            elif [ "$actual" -gt 0 ]; then
-              echo "Partially built (${actual} file(s)) — inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID})."
-            else
-              echo "Build failed — inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID})."
-            fi
-          }
-          SFA_MAIN=$(count -name 'SFA-*.apk' ! -name '*legacy-android-5*')
-          SFA_LEGACY=$(count -name 'SFA-*legacy-android-5*.apk')
-          SFA_META=$(count -name 'SFA-version-metadata.json')
-          SFA_COMPLETE=false
-          if [ "$SFA_MAIN" -gt 0 ] && [ "$SFA_LEGACY" -gt 0 ] && [ "$SFA_META" -eq 1 ]; then SFA_COMPLETE=true; fi
-          SFW_COUNT=$(count -name 'SFW-*.exe')
-          SFW_COMPLETE=false
-          if [ "$SFW_COUNT" -eq 3 ]; then SFW_COMPLETE=true; fi
-          SFL_COUNT=$(count \( -name 'SFL-*.deb' -o -name 'SFL-*.rpm' -o -name 'SFL-*.pkg.tar.zst' \))
-          SFL_COMPLETE=false
-          if [ "$SFL_COUNT" -eq 9 ]; then SFL_COMPLETE=true; fi
-
-          {
-            echo "# sing-box xiaobaf14g &mdash; \`$TAG\`"
-            echo ""
-            echo "> $RANGE_LINE"
-            echo ""
-            echo "| Field | Value |"
-            echo "|---|---|"
-            echo "| Tag | \`$TAG\` |"
-            echo "| Previous | $PREV_CELL |"
-            echo "| Commits | ${CL_COUNT:-0} |"
-            echo "| Channel | $CHANNEL_CELL |"
-            echo "| Built | $BUILD_DATE |"
-            echo ""
-            echo "---"
-            echo ""
-            # GitHub Release 正文上限 125000 字符，留出头尾和 artifacts 表格的余量。
-            if [ -s CHANGELOG_BODY.md ] && [ "$(wc -c < CHANGELOG_BODY.md)" -gt 90000 ]; then
-              head -c 90000 CHANGELOG_BODY.md | sed '$d'
-              echo ""
-              echo "_… 更多提交见 ${RANGE_LINE}_"
-            elif [ -s CHANGELOG_BODY.md ]; then
-              cat CHANGELOG_BODY.md
-            else
-              echo "_No noteworthy changes in this range._"
-            fi
-            echo ""
-            echo "---"
-            echo ""
-            echo "## Artifacts"
-            echo ""
-            echo "> 带 \`-ebpf\` 后缀的是启用 eBPF 入站 (\`with_ebpf\`) 的构建，其余功能与同平台普通版一致。"
-            echo ">"
-            echo "> 带 \`-easytier\` 后缀的是启用 EasyTier endpoint (\`with_easytier\`) 的**实验性**构建，仅提供 amd64 / arm64（含 Android arm64-v8a），其余功能与同平台普通版一致；Android 另有同时启用 eBPF 与 EasyTier 的 \`-ebpf-easytier\` 版。"
-            echo ""
-            if ls builds/*.tar.gz >/dev/null 2>&1; then
-              echo "| File | Size |"
-              echo "|---|---:|"
-              for f in builds/*.tar.gz; do
-                SIZE=$(du -h "$f" | cut -f1 | tr -d ' ')
-                printf '| `%s` | %s |\n' "$(basename "$f")" "$SIZE"
-              done
-            else
-              echo "_No artifacts produced._"
-            fi
-            echo ""
-            GUI_FILES=$(find builds -maxdepth 1 -type f \( -name 'SFA-*' -o -name 'SFW-*' -o -name 'SFL-*' \) | sort)
-            if [ -n "$GUI_FILES" ]; then
-              echo "### GUI Clients"
-              echo ""
-              echo "| File | Size |"
-              echo "|---|---:|"
-              while IFS= read -r f; do
-                SIZE=$(du -h "$f" | cut -f1 | tr -d ' ')
-                printf '| `%s` | %s |\n' "$(basename "$f")" "$SIZE"
-              done <<< "$GUI_FILES"
-              echo ""
-            fi
-            echo "<details><summary><b>SHA256SUMS</b></summary>"
-            echo ""
-            echo '```'
-            cat builds/SHA256SUMS 2>/dev/null || echo '(no checksum manifest)'
-            echo '```'
-            echo ""
-            echo "</details>"
-            echo ""
-            echo "---"
-            echo ""
-            echo "## Android Client"
-            echo ""
-            if [ "$SKIP_ANDROID" = 'true' ]; then
-              echo "> Skipped — disabled via workflow input."
-            elif [ "$ANDROID_RES" = 'success' ]; then
-              echo "> Built successfully and attached above."
-            else
-              echo "> Build failed. Inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) for logs."
-            fi
-            echo ""
-            echo "---"
-            echo ""
-            echo "## GUI Clients"
-            echo ""
-            echo "> 基于 reF1nd 的图形客户端（[\`${SFA_REPOSITORY}@${SFA_REF}\`](${SERVER_URL}/${SFA_REPOSITORY}/tree/${SFA_REF}) / [\`${SFD_REPOSITORY}@${SFD_REF}\`](${SERVER_URL}/${SFD_REPOSITORY}/tree/${SFD_REF})），内核为本次构建的提交。"
-            echo ">"
-            echo "> - **SFA**：包名 \`io.reF1nd.sfa\`，使用本仓库的签名密钥，不能覆盖安装其他签名的同包名应用；\`legacy-android-5\` 为 Android 5.0+ 版本。"
-            echo "> - **SFW**：自签名代码签名证书，SmartScreen 会提示未知发布者；应用内更新要求新旧版本签名证书一致。"
-            echo "> - **SFL**：deb / rpm 已用 \`SFL-signing-key.asc\` 中的 GPG 密钥签名。"
-            echo ""
-            echo "| Client | Status |"
-            echo "|---|---|"
-            echo "| SFA (Android) | $(gui_status $((SFA_MAIN + SFA_LEGACY)) "$SFA_COMPLETE") |"
-            echo "| SFW (Windows) | $(gui_status "$SFW_COUNT" "$SFW_COMPLETE") |"
-            echo "| SFL (Linux) | $(gui_status "$SFL_COUNT" "$SFL_COMPLETE") |"
-            echo ""
-            echo "---"
-            echo ""
-            echo "## Experimental Builds"
-            echo ""
-            if [ "$EXPERIMENTAL_RES" = 'success' ]; then
-              echo "- Desktop: built successfully and attached above."
-            else
-              echo "- Desktop: some builds failed and are not attached."
-            fi
-            if [ "$SKIP_ANDROID" = 'true' ]; then
-              echo "- Android: skipped — disabled via workflow input."
-            elif [ "$ANDROID_EXPERIMENTAL" = 'success' ]; then
-              echo "- Android: built successfully and attached above."
-            else
-              echo "- Android: build failed and is not attached."
-            fi
-            if [ "$EXPERIMENTAL_RES" != 'success' ] || { [ "$SKIP_ANDROID" != 'true' ] && [ "$ANDROID_EXPERIMENTAL" != 'success' ]; }; then
-              echo ""
-              echo "> Inspect the [Actions run](${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}) for logs."
-            fi
-            echo ""
-            echo "---"
-            echo ""
-            echo "<sub>Generated by xiaobaf14g release workflow · <a href=\"${SERVER_URL}/${REPO}/actions/runs/${RUN_ID}\">run #${RUN_ID}</a></sub>"
-          } > CHANGELOG_RELEASE.md
-
+          python3 .github/release_notes.py > CHANGELOG_RELEASE.md
           echo "--- CHANGELOG_RELEASE.md ---"
           cat CHANGELOG_RELEASE.md
 
