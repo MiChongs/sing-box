@@ -11,43 +11,43 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	N "github.com/sagernet/sing/common/network"
 )
 
 // Health check scheduling for URLTestGroup.
 //
-// A round probes three kinds of members:
-//   - the hot set (manual pin, current selection and the best ranked
-//     members; the priority prefix in fallback mode) every round, since the
-//     selection depends on them;
-//   - members that were never measured, without limit, so startup and
-//     provider updates find the best member in one pass;
-//   - the remaining cold members, least recently probed first, at most
-//     max(minColdBudget, N/coldSweepRounds) per round. A large group costs a
-//     bounded slice of probes per interval and is still fully refreshed
-//     every coldSweepRounds intervals; small groups are refreshed every round.
+// A member is probed once its last measurement, by this group or by anyone
+// sharing the history, is older than its refresh period:
+//   - hot members (manual pin, current selection and the best ranked
+//     members; the priority prefix in fallback mode) every interval, since
+//     the selection depends on them;
+//   - other members every coldRefreshIntervals intervals;
+//   - members whose probes keep failing after 1, 2, 4 up to
+//     maxFailureBackoff intervals;
+//   - members never measured right away.
 //
-// Members whose probes keep failing back off exponentially instead of
-// holding a probe slot for a full timeout every round. Rounds are
-// single-flight: periodic ticks are dropped while one runs, and other
-// requests are merged into one queued round.
+// Every probe goes through the box-wide urltest.Prober, so a member shared
+// by several groups costs one connection however many groups are due.
+// Rounds are single-flight: periodic ticks are dropped while one runs, and
+// other requests are merged into one queued round.
 const (
-	probeConcurrency    = 8
-	maxProbeConcurrency = 16
-	hotCandidates       = 4
-	minColdBudget       = 64
-	coldSweepRounds     = 8
+	probeConcurrency     = 8
+	hotCandidates        = 3
+	coldRefreshIntervals = 4
 	// Retry delay of a failing member grows from one interval up to this
 	// many intervals.
 	maxFailureBackoff = 8
-	// User-triggered tests skip members this group measured this recently,
-	// so repeated clicks and overlapping dashboard requests stay cheap.
+	// User-triggered tests skip members measured this recently, so repeated
+	// clicks and overlapping dashboard requests stay cheap.
 	fullTestFreshness = 15 * time.Second
 	maxRoundTimeout   = 10 * time.Minute
 	// Ranking leaders measured before the round started are re-probed in up
 	// to this many passes before the selection may move to them.
 	maxVerifyPasses = 2
+	// Network changes re-probe the hot set at most this often.
+	networkRecheckCooldown = 30 * time.Second
 )
 
 type memberHealth struct {
@@ -55,32 +55,34 @@ type memberHealth struct {
 	failures  uint8 // consecutive failed probes
 }
 
-// retryAt is when a failing member is due as a cold target again: one
+// backoff is how long a failing member waits for its next probe: one
 // interval after the first failure, doubling up to maxFailureBackoff.
-func (h *memberHealth) retryAt(interval time.Duration) time.Time {
+func (h memberHealth) backoff(interval time.Duration) time.Duration {
 	backoff := interval
 	for i := uint8(1); i < h.failures && backoff < maxFailureBackoff*interval; i++ {
 		backoff *= 2
 	}
-	return h.lastProbe.Add(backoff)
+	return backoff
 }
 
 type probePlan struct {
-	forceHot bool                // re-probe the hot set even when fresh
-	cold     bool                // probe unmeasured members and the cold budget
-	all      bool                // probe every member not measured within fullTestFreshness
-	focus    map[string]struct{} // members probed regardless of freshness and backoff
+	scheduled bool                // members whose refresh period elapsed
+	full      bool                // every member not measured within fullTestFreshness
+	hotBefore time.Time           // hot members last measured before this time
+	focus     map[string]struct{} // members probed regardless of freshness and backoff
 }
 
 var (
-	probeScheduled = probePlan{cold: true}
-	probeFull      = probePlan{forceHot: true, all: true}
+	probeScheduled = probePlan{scheduled: true}
+	probeFull      = probePlan{full: true}
 )
 
 func (p *probePlan) merge(other probePlan) {
-	p.forceHot = p.forceHot || other.forceHot
-	p.cold = p.cold || other.cold
-	p.all = p.all || other.all
+	p.scheduled = p.scheduled || other.scheduled
+	p.full = p.full || other.full
+	if other.hotBefore.After(p.hotBefore) {
+		p.hotBefore = other.hotBefore
+	}
 	if len(other.focus) > 0 && p.focus == nil {
 		p.focus = make(map[string]struct{}, len(other.focus))
 	}
@@ -88,14 +90,16 @@ func (p *probePlan) merge(other probePlan) {
 }
 
 type probeRound struct {
-	plan    probePlan
-	session *urlTestSession
+	plan probePlan
+	// session is the start of the recursive test that requested the round,
+	// whose results are shared with it; zero outside one.
+	session time.Time
 	done    chan struct{}
 	access  sync.Mutex
 	result  map[string]uint16
 }
 
-func newProbeRound(plan probePlan, session *urlTestSession) *probeRound {
+func newProbeRound(plan probePlan, session time.Time) *probeRound {
 	plan.focus = maps.Clone(plan.focus)
 	return &probeRound{
 		plan:    plan,
@@ -105,10 +109,19 @@ func newProbeRound(plan probePlan, session *urlTestSession) *probeRound {
 	}
 }
 
+func (r *probeRound) measured(tag string) bool {
+	r.access.Lock()
+	defer r.access.Unlock()
+	_, loaded := r.result[tag]
+	return loaded
+}
+
 type probeTarget struct {
 	tag     string
 	realTag string
 	dialer  adapter.Outbound
+	// since is the oldest shared result accepted for this target.
+	since time.Time
 }
 
 func (g *URLTestGroup) lifetime() context.Context {
@@ -120,11 +133,9 @@ func (g *URLTestGroup) lifetime() context.Context {
 
 // requestRound starts a round when none is running. Otherwise a request
 // that may not queue is dropped (nil), a full request joins a running full
-// round, and anything else is merged into the single queued round. The
-// round shares the probe session carried by ctx, so sibling groups tested
-// in one recursive pass measure a common leaf once.
+// round, and anything else is merged into the single queued round.
 func (g *URLTestGroup) requestRound(ctx context.Context, plan probePlan, queue bool) *probeRound {
-	_, session := urlTestSessionFromContext(ctx)
+	session := urlTestSessionFromContext(ctx)
 	g.roundAccess.Lock()
 	defer g.roundAccess.Unlock()
 	if g.runningRound == nil {
@@ -136,13 +147,16 @@ func (g *URLTestGroup) requestRound(ctx context.Context, plan probePlan, queue b
 	if !queue {
 		return nil
 	}
-	if plan.all && g.runningRound.plan.all {
+	if plan.full && g.runningRound.plan.full {
 		return g.runningRound
 	}
 	if g.queuedRound == nil {
 		g.queuedRound = newProbeRound(plan, session)
 	} else {
 		g.queuedRound.plan.merge(plan)
+		if !session.IsZero() && (g.queuedRound.session.IsZero() || session.Before(g.queuedRound.session)) {
+			g.queuedRound.session = session
+		}
 	}
 	return g.queuedRound
 }
@@ -171,14 +185,14 @@ func (g *URLTestGroup) executeRound(round *probeRound) {
 	}
 	startedAt := time.Now()
 	targets := g.planTargets(st, round.plan, startedAt)
-	verifiedSince := startedAt.Add(-g.freshness(round.plan))
-	ctx, cancel := context.WithTimeout(context.WithValue(lifetime, urlTestSessionContextKey{}, round.session), g.roundTimeout(len(targets)))
+	ctx, cancel := context.WithTimeout(lifetime, g.roundTimeout(len(targets)))
 	defer cancel()
 	probed := len(targets)
 	g.probeTargets(ctx, round, targets)
 	if !g.fallback.enabled {
 		// A member can reach the top of the ranking on an old measurement;
 		// confirm it before the selection may move there.
+		verifiedSince := startedAt.Add(-g.freshness(round.plan))
 		for range maxVerifyPasses {
 			if ctx.Err() != nil {
 				break
@@ -204,20 +218,21 @@ func (g *URLTestGroup) executeRound(round *probeRound) {
 	}
 }
 
-// planTargets lists the members a round probes, hot set first so they are
-// measured in the first wave with the least contention.
+// planTargets lists the members a round probes, hot and focused members
+// first so they are measured in the first wave.
 func (g *URLTestGroup) planTargets(st *groupState, plan probePlan, now time.Time) []probeTarget {
 	type candidate struct {
 		detour   adapter.Outbound
 		realTag  string
 		lastSeen time.Time
+		since    time.Time
 	}
 	var (
 		hot        = g.hotMembers(st)
-		freshness  = g.freshness(plan)
+		dueSince   = now.Add(-g.interval / 2)
 		priority   []candidate
 		unmeasured []candidate
-		cold       []candidate
+		due        []candidate
 	)
 	for _, detour := range st.outbounds {
 		tag := detour.Tag()
@@ -226,59 +241,53 @@ func (g *URLTestGroup) planTargets(st *groupState, plan probePlan, now time.Time
 		if realTag == "" {
 			continue
 		}
-		var lastProbe, retryAt time.Time
 		g.healthAccess.Lock()
-		if health := g.health[tag]; health != nil {
-			lastProbe = health.lastProbe
-			if health.failures > 0 {
-				retryAt = health.retryAt(g.interval)
-			}
+		var health memberHealth
+		if current := g.health[tag]; current != nil {
+			health = *current
 		}
 		g.healthAccess.Unlock()
-		// Measurements by other groups or the API count for periodic checks;
-		// user tests only skip what this group itself just measured.
-		lastSeen := lastProbe
+		lastSeen := health.lastProbe
 		if history := g.history.LoadURLTestHistory(realTag); history != nil && history.Time.After(lastSeen) {
 			lastSeen = history.Time
 		}
-		var fresh bool
-		if plan.all {
-			fresh = !lastProbe.IsZero() && now.Sub(lastProbe) < freshness
-		} else {
-			fresh = !lastSeen.IsZero() && now.Sub(lastSeen) < freshness
-		}
-		member := candidate{detour, realTag, lastSeen}
+		member := candidate{detour: detour, realTag: realTag, lastSeen: lastSeen}
 		_, focused := plan.focus[tag]
 		_, isHot := hot[tag]
 		switch {
-		case focused, isHot && plan.forceHot:
+		case focused:
+			member.since = now
 			priority = append(priority, member)
-		case isHot:
-			if !fresh {
+		case isHot && lastSeen.Before(plan.hotBefore):
+			member.since = plan.hotBefore
+			priority = append(priority, member)
+		case plan.full && (lastSeen.IsZero() || now.Sub(lastSeen) >= fullTestFreshness):
+			member.since = now.Add(-fullTestFreshness)
+			if isHot {
 				priority = append(priority, member)
-			}
-		case plan.all:
-			if !fresh {
+			} else {
 				unmeasured = append(unmeasured, member)
 			}
-		case !plan.cold:
+		case !plan.scheduled:
 		case lastSeen.IsZero():
+			member.since = dueSince
 			unmeasured = append(unmeasured, member)
-		case fresh, now.Before(retryAt):
-		default:
-			cold = append(cold, member)
+		case g.isDue(health, isHot, lastSeen, now):
+			member.since = dueSince
+			if isHot {
+				priority = append(priority, member)
+			} else {
+				due = append(due, member)
+			}
 		}
 	}
-
-	sort.SliceStable(cold, func(i, j int) bool {
-		return cold[i].lastSeen.Before(cold[j].lastSeen)
+	sort.SliceStable(due, func(i, j int) bool {
+		return due[i].lastSeen.Before(due[j].lastSeen)
 	})
-	budget := max(minColdBudget, (len(st.outbounds)+coldSweepRounds-1)/coldSweepRounds)
-	cold = cold[:min(len(cold), budget)]
 
-	targets := make([]probeTarget, 0, len(priority)+len(unmeasured)+len(cold))
+	targets := make([]probeTarget, 0, len(priority)+len(unmeasured)+len(due))
 	planned := make(map[string]bool, cap(targets))
-	for _, members := range [][]candidate{priority, unmeasured, cold} {
+	for _, members := range [][]candidate{priority, unmeasured, due} {
 		for _, member := range members {
 			if planned[member.realTag] {
 				continue
@@ -288,21 +297,40 @@ func (g *URLTestGroup) planTargets(st *groupState, plan probePlan, now time.Time
 				continue
 			}
 			planned[member.realTag] = true
-			targets = append(targets, probeTarget{tag: member.detour.Tag(), realTag: member.realTag, dialer: dialer})
+			targets = append(targets, probeTarget{tag: member.detour.Tag(), realTag: member.realTag, dialer: dialer, since: member.since})
 		}
 	}
 	return targets
 }
 
+// isDue reports whether a measured member's refresh period has elapsed.
+func (g *URLTestGroup) isDue(health memberHealth, hot bool, lastSeen time.Time, now time.Time) bool {
+	period := g.interval
+	switch {
+	case health.failures > 0:
+		// A failing selection or pin keeps being probed every interval
+		// until the selection moves on.
+		if !hot {
+			period = health.backoff(g.interval)
+		}
+	case !hot:
+		period = coldRefreshIntervals * g.interval
+	}
+	// Ticks are one interval apart, while the last measurement finished
+	// some time after its tick; half an interval of slack keeps members
+	// from slipping to the following tick.
+	return now.Sub(lastSeen) >= period-g.interval/2
+}
+
 // freshness is how recent a measurement must be for plan to skip a member.
 func (g *URLTestGroup) freshness(plan probePlan) time.Duration {
-	if plan.all {
+	if plan.full {
 		return fullTestFreshness
 	}
 	return g.interval / 2
 }
 
-// hotMembers returns the tags probed every round.
+// hotMembers returns the tags refreshed every interval.
 func (g *URLTestGroup) hotMembers(st *groupState) map[string]struct{} {
 	hot := make(map[string]struct{}, 2*hotCandidates+3)
 	if pin := g.manualPin.Load(); pin != nil {
@@ -316,12 +344,17 @@ func (g *URLTestGroup) hotMembers(st *groupState) map[string]struct{} {
 	}
 	if g.fallback.enabled {
 		// Members ahead of the selection decide when fallback switches back,
-		// the next one takes over when the selection fails.
+		// the one after it takes over when the selection fails.
 		limit := hotCandidates
 		if selectedTCP != nil {
-			limit = max(limit, slices.Index(st.tags, selectedTCP.Tag())+2)
+			if index := slices.Index(st.tags, selectedTCP.Tag()); index >= 0 {
+				limit = max(limit, min(index, 2*hotCandidates))
+				if index+1 < len(st.tags) {
+					hot[st.tags[index+1]] = struct{}{}
+				}
+			}
 		}
-		for _, detour := range st.outbounds[:min(limit, 2*hotCandidates, len(st.outbounds))] {
+		for _, detour := range st.outbounds[:min(limit, len(st.outbounds))] {
 			hot[detour.Tag()] = struct{}{}
 		}
 		return hot
@@ -346,10 +379,7 @@ func (g *URLTestGroup) unverifiedLeaders(round *probeRound, since time.Time) []p
 	for _, ranked := range [][]rankedOutbound{st.rankedTCP, st.rankedUDP} {
 		for _, candidate := range ranked[:min(len(ranked), hotCandidates)] {
 			tag := candidate.outbound.Tag()
-			round.access.Lock()
-			_, measured := round.result[tag]
-			round.access.Unlock()
-			if measured {
+			if round.measured(tag) {
 				continue
 			}
 			realTag := RealTag(candidate.outbound, N.NetworkTCP)
@@ -364,14 +394,14 @@ func (g *URLTestGroup) unverifiedLeaders(round *probeRound, since time.Time) []p
 				continue
 			}
 			planned[realTag] = true
-			targets = append(targets, probeTarget{tag: tag, realTag: realTag, dialer: dialer})
+			targets = append(targets, probeTarget{tag: tag, realTag: realTag, dialer: dialer, since: since})
 		}
 	}
 	return targets
 }
 
 func probeWorkers(targets int) int {
-	return min(max(targets/16, probeConcurrency), maxProbeConcurrency, targets)
+	return min(probeConcurrency, targets)
 }
 
 // roundTimeout bounds a round to the waves its targets need at full
@@ -386,7 +416,7 @@ func (g *URLTestGroup) roundTimeout(targets int) time.Duration {
 }
 
 // probeTargets measures targets on a fixed worker pool, so a round over a
-// large group never holds more than maxProbeConcurrency goroutines.
+// large group never holds more than probeConcurrency probes.
 func (g *URLTestGroup) probeTargets(ctx context.Context, round *probeRound, targets []probeTarget) {
 	if len(targets) == 0 {
 		return
@@ -410,35 +440,59 @@ func (g *URLTestGroup) probeTargets(ctx context.Context, round *probeRound, targ
 }
 
 func (g *URLTestGroup) probe(ctx context.Context, round *probeRound, target probeTarget) {
-	key := urlTestSessionKey{tag: target.realTag, link: g.link, matcher: g.expectedStatus}
-	result := round.session.test(ctx, key, func() urlTestResult {
-		probeCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
-		defer cancel()
-		delay, err := urlTestBounded(probeCtx, g.link, target.dialer, g.expectedStatus)
-		return urlTestResult{delay, err}
+	since := target.since
+	if !round.session.IsZero() && round.session.Before(since) {
+		since = round.session
+	}
+	result := g.history.Prober().Probe(ctx, urltest.ProbeRequest{
+		Tag:     target.realTag,
+		Link:    g.link,
+		Status:  g.expectedStatus,
+		Dialer:  target.dialer,
+		Timeout: C.TCPTimeout,
+		Since:   since,
 	})
-	if result.err != nil {
+	if result.Err != nil {
 		if ctx.Err() != nil {
 			// The round was cut short; that says nothing about the member.
 			return
 		}
-		failures := g.recordProbe(target.tag, false)
-		g.history.DeleteURLTestHistory(target.realTag)
-		g.logger.Debug("outbound ", target.tag, " unavailable: ", result.err)
+		failures := g.recordProbe(target.tag, result.Time, false)
+		deleteURLTestHistory(g.history, target.realTag, result.Time)
+		g.logger.Debug("outbound ", target.tag, " unavailable: ", result.Err)
 		if failures == selectionFailureGrace && g.isSelected(target.tag) {
 			g.logger.Info("selected outbound ", target.tag, " failed ", failures, " health checks in a row")
 		}
 		return
 	}
-	g.recordProbe(target.tag, true)
-	g.history.StoreURLTestHistory(target.realTag, &adapter.URLTestHistory{
-		Time:  time.Now(),
-		Delay: result.delay,
-	})
+	g.recordProbe(target.tag, result.Time, true)
+	storeURLTestHistory(g.history, target.realTag, result)
 	round.access.Lock()
-	round.result[target.tag] = result.delay
+	round.result[target.tag] = result.Delay
 	round.access.Unlock()
-	g.logger.Debug("outbound ", target.tag, " available: ", result.delay, "ms")
+	g.logger.Debug("outbound ", target.tag, " available: ", result.Delay, "ms")
+}
+
+// storeURLTestHistory records a successful probe unless a newer
+// measurement arrived meanwhile; shared results may be seconds old.
+func storeURLTestHistory(history adapter.URLTestHistoryStorage, tag string, result urltest.ProbeResult) {
+	if current := history.LoadURLTestHistory(tag); current != nil && current.Time.After(result.Time) {
+		return
+	}
+	history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
+		Time:  result.Time,
+		Delay: result.Delay,
+	})
+}
+
+// deleteURLTestHistory drops the delay of a member that failed at
+// failedAt, keeping a measurement taken after the failure.
+func deleteURLTestHistory(history adapter.URLTestHistoryStorage, tag string, failedAt time.Time) {
+	current := history.LoadURLTestHistory(tag)
+	if current == nil || current.Time.After(failedAt) {
+		return
+	}
+	history.DeleteURLTestHistory(tag)
 }
 
 func (g *URLTestGroup) isSelected(tag string) bool {
@@ -451,8 +505,11 @@ func (g *URLTestGroup) isSelected(tag string) bool {
 }
 
 // recordProbe updates a member's health and returns its consecutive
-// failures.
-func (g *URLTestGroup) recordProbe(tag string, available bool) uint8 {
+// failures. A successful probe also forgives its dial failures.
+func (g *URLTestGroup) recordProbe(tag string, at time.Time, available bool) uint8 {
+	if available {
+		g.reportDialSuccess(tag)
+	}
 	g.healthAccess.Lock()
 	defer g.healthAccess.Unlock()
 	if g.health == nil {
@@ -463,7 +520,9 @@ func (g *URLTestGroup) recordProbe(tag string, available bool) uint8 {
 		health = new(memberHealth)
 		g.health[tag] = health
 	}
-	health.lastProbe = time.Now()
+	if at.After(health.lastProbe) {
+		health.lastProbe = at
+	}
 	if available {
 		health.failures = 0
 	} else if health.failures < math.MaxUint8 {
@@ -482,12 +541,14 @@ func (g *URLTestGroup) probeFailures(tag string) uint8 {
 }
 
 // networkChanged drops what the previous network taught: failing members
-// may be reachable now, so their backoff is cleared, and the hot set is
-// re-probed right away. The cold members refresh on the regular schedule.
+// are retried on the next tick instead of after their backoff, dial
+// failures are forgotten, and the hot set is re-probed right away unless
+// that happened within networkRecheckCooldown. Other members refresh on
+// their regular schedule.
 func (g *URLTestGroup) networkChanged() {
 	g.healthAccess.Lock()
 	for _, health := range g.health {
-		health.failures = 0
+		health.failures = min(health.failures, 1)
 	}
 	g.healthAccess.Unlock()
 	g.dialFailureAccess.Lock()
@@ -498,7 +559,15 @@ func (g *URLTestGroup) networkChanged() {
 		// Idle: the loop runs a round as soon as traffic resumes.
 		return
 	}
-	g.requestRound(g.lifetime(), probePlan{forceHot: true}, true)
+	now := urlTestClock()
+	last := g.networkRecheckAt.Load()
+	if last != 0 && now-last < int64(networkRecheckCooldown) {
+		return
+	}
+	if !g.networkRecheckAt.CompareAndSwap(last, now) {
+		return
+	}
+	g.requestRound(g.lifetime(), probePlan{hotBefore: time.Now()}, true)
 }
 
 // delaySnapshot reports the delays measured by round plus the last known

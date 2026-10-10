@@ -2,6 +2,7 @@ package clashapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sort"
 	"strconv"
@@ -493,8 +494,9 @@ func groupContains(outboundManager adapter.OutboundManager, outboundGroup adapte
 	return false
 }
 
-// getProxyDelay performs multi-sample delay testing for accuracy.
-// Tests up to 3 times and returns the median for stable results.
+// getProxyDelay measures the proxy once. Each probe is a connection through
+// the node, which nodes billed per request pay for, so there is no
+// resampling; a probe of the same node and URL already running is joined.
 func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		query := r.URL.Query()
@@ -503,7 +505,7 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			url = ""
 		}
 		timeout, err := strconv.ParseInt(query.Get("timeout"), 10, 32)
-		if err != nil {
+		if err != nil || timeout <= 0 {
 			render.Status(r, http.StatusBadRequest)
 			render.JSON(w, r, ErrBadRequest)
 			return
@@ -521,34 +523,16 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 		// or PUT {"name":""} when the user really wants it.
 
 		realTag := group.RealTag(proxy, N.NetworkTCP)
-		timeoutDuration := time.Millisecond * time.Duration(timeout)
-		testContext := urltest.ContextWithUnifiedDelay(r.Context(), urltest.UnifiedDelayFromContext(server.ctx))
-
-		// Multi-sample: test up to 3 times, collect valid results
-		const maxSamples = 3
-		var samples []uint16
-		for i := 0; i < maxSamples; i++ {
-			ctx, cancel := context.WithTimeout(testContext, timeoutDuration)
-			t, testErr := urltest.URLTest(ctx, url, proxy)
-			cancel()
-			if testErr != nil || t == 0 {
-				continue
-			}
-			samples = append(samples, t)
-			// If first sample is very fast (<50ms), result is already reliable
-			if i == 0 && t < 50 {
-				break
-			}
-		}
-
-		if len(samples) == 0 {
-			// All attempts failed — check if it was a timeout
-			ctx, cancel := context.WithTimeout(testContext, timeoutDuration)
-			_, _ = urltest.URLTest(ctx, url, proxy)
-			timedOut := ctx.Err() != nil
-			cancel()
-
-			if timedOut {
+		ctx, cancel := context.WithTimeout(urltest.ContextWithUnifiedDelay(r.Context(), urltest.UnifiedDelayFromContext(server.ctx)), time.Millisecond*time.Duration(timeout))
+		defer cancel()
+		result := server.urlTestHistory.Prober().Probe(ctx, urltest.ProbeRequest{
+			Tag:    realTag,
+			Link:   url,
+			Dialer: proxy,
+			Since:  time.Now(),
+		})
+		if result.Err != nil {
+			if ctx.Err() != nil || errors.Is(result.Err, context.DeadlineExceeded) {
 				render.Status(r, http.StatusGatewayTimeout)
 				render.JSON(w, r, ErrRequestTimeout)
 			} else {
@@ -557,13 +541,10 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			}
 			return
 		}
-
-		// Take median for stability
-		sort.Slice(samples, func(i, j int) bool { return samples[i] < samples[j] })
-		delay := samples[len(samples)/2]
+		delay := result.Delay
 
 		server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
-			Time:  time.Now(),
+			Time:  result.Time,
 			Delay: delay,
 		})
 		for _, detour := range server.outbound.Outbounds() {

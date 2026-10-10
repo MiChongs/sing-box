@@ -55,9 +55,13 @@ The URL to test. `https://www.gstatic.com/generate_204` will be used if empty.
 
 The test interval. `3m` will be used if empty.
 
-Every interval, the current selection and the fastest members are tested, along with members never tested before.
-Other members are refreshed in turns, least recently tested first: groups of up to 64 members are fully refreshed every interval, larger groups at most every 8 intervals.
+Every interval, the current selection and the 3 fastest members are tested, along with members never tested before.
+Other members are refreshed every 4 intervals.
 A member whose tests keep failing is retried after 1, 2, 4 and up to 8 intervals; a network change resets this.
+
+A member tested recently by another group or the API is not tested again, and groups testing the same member at the same time share one test.
+Tests of all groups run at the same moments, so groups with the same interval wake the network once.
+After a network change, the current selection and the fastest members are tested again, at most every 30 seconds.
 
 #### tolerance
 

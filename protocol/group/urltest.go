@@ -3,7 +3,6 @@ package group
 import (
 	"context"
 	"io"
-	"maps"
 	"net"
 	"regexp"
 	"slices"
@@ -20,7 +19,6 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
-	"github.com/sagernet/sing/common/batch"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -40,12 +38,14 @@ type manualPinData struct {
 
 const (
 	// Failover dials after the selected member fails. Each attempt can take a
-	// full dial timeout, so only the best few ranked members are tried.
-	maxFailoverCandidates = 3
+	// full dial timeout and costs a connection to the member, so only the
+	// best ranked members are tried.
+	maxFailoverCandidates = 2
 
-	// Dial failures on one member that trigger a targeted recheck (mihomo
+	// Dial failures of one member, each confirmed by a failover member
+	// reaching the same destination, that trigger a recheck of it (mihomo
 	// onDialFailed parity), at most once per dialRecheckCooldown.
-	dialFailureThreshold = 5
+	dialFailureThreshold = 3
 	dialRecheckCooldown  = 30 * time.Second
 
 	// The current selection survives this many consecutive failed probes
@@ -505,20 +505,18 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		// The caller gave up; that says nothing about the member.
 		return nil, err
 	}
-	s.group.reportDialFailure(outbound.Tag())
-	s.logger.ErrorContext(ctx, "primary outbound ", outbound.Tag(), " failed: ", err)
+	s.logger.ErrorContext(ctx, "outbound ", outbound.Tag(), " failed: ", err)
 	for _, detour := range s.group.failoverCandidates(N.NetworkName(network), outbound) {
-		conn, err = detour.DialContext(ctx, network, destination)
-		if err == nil {
-			s.group.reportDialSuccess(detour.Tag())
+		failoverConn, failoverErr := detour.DialContext(ctx, network, destination)
+		if failoverErr == nil {
+			s.group.reportFailover(outbound.Tag(), detour.Tag())
 			adapter.RecordGroupDial(ctx, s.Tag(), detour)
 			s.logger.InfoContext(ctx, "failover to ", detour.Tag())
-			return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
+			return s.group.interruptGroup.NewConn(failoverConn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
 		}
 		if ctx.Err() != nil {
-			return nil, err
+			return nil, failoverErr
 		}
-		s.group.reportDialFailure(detour.Tag())
 	}
 	return nil, E.Cause(err, "all outbounds failed for ", network, " to ", destination)
 }
@@ -538,20 +536,18 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 	if ctx.Err() != nil {
 		return nil, err
 	}
-	s.group.reportDialFailure(outbound.Tag())
-	s.logger.ErrorContext(ctx, "primary outbound ", outbound.Tag(), " failed: ", err)
+	s.logger.ErrorContext(ctx, "outbound ", outbound.Tag(), " failed: ", err)
 	for _, detour := range s.group.failoverCandidates(N.NetworkUDP, outbound) {
-		conn, err = detour.ListenPacket(ctx, destination)
-		if err == nil {
-			s.group.reportDialSuccess(detour.Tag())
+		failoverConn, failoverErr := detour.ListenPacket(ctx, destination)
+		if failoverErr == nil {
+			s.group.reportFailover(outbound.Tag(), detour.Tag())
 			adapter.RecordGroupDial(ctx, s.Tag(), detour)
 			s.logger.InfoContext(ctx, "failover to ", detour.Tag())
-			return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
+			return s.group.interruptGroup.NewPacketConn(failoverConn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
 		}
 		if ctx.Err() != nil {
-			return nil, err
+			return nil, failoverErr
 		}
-		s.group.reportDialFailure(detour.Tag())
 	}
 	return nil, E.Cause(err, "all outbounds failed for UDP to ", destination)
 }
@@ -577,16 +573,11 @@ func (s *URLTest) onProviderUpdated(tag string) error {
 	s.providerAccess.Unlock()
 	s.group.pruneMemberState(tags)
 	if s.isGroupActive() {
-		s.group.access.Lock()
-		if s.group.ticker != nil {
-			s.group.ticker.Reset(s.group.interval)
-		}
-		s.group.access.Unlock()
 		// Queued behind any running round and coalesced with other pending
-		// requests; new members have never been measured, so the round
-		// picks them up regardless of the cold budget. Provider refreshes
-		// are not user speed tests and must keep the manual pin.
-		s.group.requestRound(s.ctx, probeScheduled, true)
+		// requests; new members have never been measured and are probed,
+		// the others only when due. Provider refreshes are not user speed
+		// tests and must keep the manual pin.
+		s.group.requestRound(s.ctx, probePlan{scheduled: true}, true)
 	}
 	return nil
 }
@@ -618,7 +609,6 @@ type URLTestGroup struct {
 	state atomic.Pointer[groupState]
 
 	access      sync.Mutex
-	ticker      *time.Ticker
 	close       chan struct{}
 	closed      bool
 	started     atomic.Bool
@@ -626,11 +616,12 @@ type URLTestGroup struct {
 	lastActive  atomic.Int64 // urlTestClock reading of the last dial
 
 	// Probe scheduling, see urltest_probe.go.
-	roundAccess  sync.Mutex
-	runningRound *probeRound
-	queuedRound  *probeRound
-	healthAccess sync.Mutex
-	health       map[string]*memberHealth
+	roundAccess      sync.Mutex
+	runningRound     *probeRound
+	queuedRound      *probeRound
+	healthAccess     sync.Mutex
+	health           map[string]*memberHealth
+	networkRecheckAt atomic.Int64
 
 	// Dial-failure tracking: counts user-facing dial failures per tag.
 	// Past the threshold, a targeted recheck runs (mihomo onDialFailed parity).
@@ -710,17 +701,26 @@ func (g *URLTestGroup) Touch() {
 	if g.closed {
 		return
 	}
-	if g.ticker != nil {
+	if g.loopRunning.Load() {
 		g.markActive()
 		return
 	}
 	// lastActive is left stale on purpose: loopCheck sees the idle gap and
 	// runs a round right away.
-	ticker := time.NewTicker(g.interval)
-	g.ticker = ticker
 	g.loopRunning.Store(true)
-	g.pauseCallback = pause.RegisterTicker(g.pause, ticker, g.interval, nil)
-	go g.loopCheck(ticker, g.close)
+	wake := make(chan struct{}, 1)
+	if g.pause != nil {
+		g.pauseCallback = g.pause.RegisterCallback(func(event int) {
+			switch event {
+			case pause.EventDeviceWake, pause.EventNetworkWake:
+				select {
+				case wake <- struct{}{}:
+				default:
+				}
+			}
+		})
+	}
+	go g.loopCheck(g.close, wake)
 	g.logger.Info("health check resumed")
 }
 
@@ -735,54 +735,70 @@ func (g *URLTestGroup) Close() error {
 	if g.cancel != nil {
 		g.cancel()
 	}
-	if g.ticker != nil {
-		g.ticker.Stop()
-		g.ticker = nil
-		g.pause.UnregisterCallback(g.pauseCallback)
-		g.pauseCallback = nil
-	}
-	g.loopRunning.Store(false)
+	g.stopLoopLocked()
 	if g.close != nil {
 		close(g.close)
 	}
-	urltest.PruneSessionCaches()
 	return nil
 }
 
-func (g *URLTestGroup) loopCheck(ticker *time.Ticker, closeChan <-chan struct{}) {
+func (g *URLTestGroup) stopLoopLocked() {
+	g.loopRunning.Store(false)
+	if g.pauseCallback != nil {
+		g.pause.UnregisterCallback(g.pauseCallback)
+		g.pauseCallback = nil
+	}
+}
+
+// loopCheck runs a health check on every tick of the shared grid (see
+// nextTick) until the group has been idle for idleTimeout. While the device
+// or network is paused no tick is armed; waking re-arms it.
+func (g *URLTestGroup) loopCheck(closeChan <-chan struct{}, wake <-chan struct{}) {
 	if g.idleFor() > g.interval {
 		g.markActive()
 		g.CheckOutbounds(false)
 	}
+	timer := time.NewTimer(nextTick(g.interval))
+	defer timer.Stop()
 	for {
 		select {
 		case <-closeChan:
 			return
-		case <-ticker.C:
+		case <-wake:
+			timer.Reset(nextTick(g.interval))
+			continue
+		case <-timer.C:
+		}
+		if g.pause != nil && g.pause.IsPaused() {
+			continue
 		}
 		if g.idleFor() > g.idleTimeout {
 			g.access.Lock()
-			if g.ticker == ticker {
-				ticker.Stop()
-				g.ticker = nil
-				g.pause.UnregisterCallback(g.pauseCallback)
-				g.pauseCallback = nil
-				g.loopRunning.Store(false)
+			if !g.closed {
+				g.stopLoopLocked()
 			}
 			g.access.Unlock()
 			g.logger.Info("health check paused due to idle timeout")
 			return
 		}
 		g.CheckOutbounds(false)
+		timer.Reset(nextTick(g.interval))
 	}
 }
 
-// urlTestClockBase anchors lastActive to the monotonic clock without the
-// allocation an atomic time.Time store costs on every dial.
+// urlTestClockBase anchors lastActive and the tick grid to the monotonic
+// clock without the allocation an atomic time.Time store costs on every dial.
 var urlTestClockBase = time.Now()
 
 func urlTestClock() int64 {
 	return int64(time.Since(urlTestClockBase))
+}
+
+// nextTick returns the time until the next multiple of interval on the
+// process-wide clock. Groups sharing an interval tick together, so their
+// probes wake the radio once per interval instead of once per group.
+func nextTick(interval time.Duration) time.Duration {
+	return interval - time.Duration(urlTestClock()%int64(interval))
 }
 
 func (g *URLTestGroup) markActive() {
@@ -971,9 +987,17 @@ func (g *URLTestGroup) hasExcessiveDialFailures(tag string) bool {
 	return g.dialFailureCount[tag] >= dialFailureThreshold
 }
 
-// reportDialFailure is called by DialContext/ListenPacket on a failed dial.
-// Past the threshold it schedules a recheck of the failing member and the
-// hot set, at most once per dialRecheckCooldown.
+// reportFailover records that failed could not reach a destination that
+// recovered did. Dials failing on every member point at the destination,
+// not the member, and are not counted.
+func (g *URLTestGroup) reportFailover(failed string, recovered string) {
+	g.reportDialSuccess(recovered)
+	g.reportDialFailure(failed)
+}
+
+// reportDialFailure counts a confirmed dial failure of tag. Past the
+// threshold the member is re-probed, at most once per dialRecheckCooldown;
+// until a probe succeeds the selection does not hold on to it.
 func (g *URLTestGroup) reportDialFailure(tag string) {
 	g.dialFailureAccess.Lock()
 	if g.dialFailureCount == nil {
@@ -1000,7 +1024,7 @@ func (g *URLTestGroup) reportDialFailure(tag string) {
 		return
 	}
 	g.logger.Debug("outbound ", tag, " failed ", count, " dials, rechecking")
-	g.requestRound(g.lifetime(), probePlan{forceHot: true, focus: map[string]struct{}{tag: {}}}, true)
+	g.requestRound(g.lifetime(), probePlan{focus: map[string]struct{}{tag: {}}}, true)
 }
 
 // reportDialSuccess is called when a dial succeeds — clears the failure counter.
@@ -1239,184 +1263,4 @@ func outboundByTag(outbounds []adapter.Outbound, tag string) adapter.Outbound {
 		}
 	}
 	return nil
-}
-
-// urlTestBounded returns once ctx is done even if the outbound ignores
-// cancellation, so one unresponsive member cannot hang the whole check.
-func urlTestBounded(ctx context.Context, link string, detour N.Dialer, matcher *urltest.StatusMatcher) (uint16, error) {
-	testChan := make(chan urlTestResult, 1)
-	go func() {
-		delay, err := urltest.URLTestWithStatus(ctx, link, detour, matcher)
-		testChan <- urlTestResult{delay, err}
-	}()
-	select {
-	case result := <-testChan:
-		return result.delay, result.err
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	}
-}
-
-type urlTestResult struct {
-	delay uint16
-	err   error
-}
-
-type urlTestSessionKey struct {
-	tag     string
-	link    string
-	matcher *urltest.StatusMatcher
-}
-
-type urlTestSessionCall struct {
-	done   chan struct{}
-	result urlTestResult
-}
-
-type urlTestSession struct {
-	access sync.Mutex
-	calls  map[urlTestSessionKey]*urlTestSessionCall
-}
-
-type urlTestSessionContextKey struct{}
-
-type recursiveURLTestGroup interface {
-	adapter.OutboundGroup
-	urlTest(ctx context.Context, force bool) (map[string]uint16, error)
-}
-
-func urlTestSessionFromContext(ctx context.Context) (context.Context, *urlTestSession) {
-	if session, loaded := ctx.Value(urlTestSessionContextKey{}).(*urlTestSession); loaded {
-		return ctx, session
-	}
-	session := &urlTestSession{calls: make(map[urlTestSessionKey]*urlTestSessionCall)}
-	return context.WithValue(ctx, urlTestSessionContextKey{}, session), session
-}
-
-func (s *urlTestSession) test(ctx context.Context, key urlTestSessionKey, test func() urlTestResult) (result urlTestResult) {
-	s.access.Lock()
-	call, loaded := s.calls[key]
-	if !loaded {
-		call = &urlTestSessionCall{done: make(chan struct{})}
-		s.calls[key] = call
-	}
-	s.access.Unlock()
-	if loaded {
-		select {
-		case <-call.done:
-			return call.result
-		case <-ctx.Done():
-			return urlTestResult{err: ctx.Err()}
-		}
-	}
-	defer func() {
-		call.result = result
-		close(call.done)
-	}()
-	return test()
-}
-
-type urlTestBatch struct {
-	ctx      context.Context
-	outbound adapter.OutboundManager
-	history  adapter.URLTestHistoryStorage
-	logger   log.Logger
-	session  *urlTestSession
-	batch    *batch.Batch[any]
-	checked  map[string]bool
-	groups   []adapter.OutboundGroup
-	access   sync.Mutex
-	result   map[string]uint16
-}
-
-func URLTestOutbounds(ctx context.Context, outboundManager adapter.OutboundManager, history adapter.URLTestHistoryStorage, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, force bool) map[string]uint16 {
-	ctx, session := urlTestSessionFromContext(ctx)
-	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](10))
-	testBatch := &urlTestBatch{
-		ctx:      ctx,
-		outbound: outboundManager,
-		history:  history,
-		logger:   logger,
-		session:  session,
-		batch:    b,
-		checked:  make(map[string]bool),
-		result:   make(map[string]uint16),
-	}
-	testBatch.test(outbounds, link, interval, force)
-	b.Wait()
-	for _, outboundGroup := range testBatch.groups {
-		groupHistory := history.LoadURLTestHistory(RealTag(outboundGroup, N.NetworkTCP))
-		if groupHistory != nil {
-			testBatch.result[outboundGroup.Tag()] = groupHistory.Delay
-		}
-	}
-	return testBatch.result
-}
-
-func (b *urlTestBatch) test(outbounds []adapter.Outbound, link string, interval time.Duration, force bool) {
-	for _, detour := range outbounds {
-		tag := detour.Tag()
-		if b.checked[tag] {
-			continue
-		}
-		switch nested := detour.(type) {
-		case recursiveURLTestGroup:
-			b.checked[tag] = true
-			b.groups = append(b.groups, nested)
-			b.batch.Go(tag, func() (any, error) {
-				nestedResult, _ := nested.urlTest(b.ctx, force)
-				b.access.Lock()
-				maps.Copy(b.result, nestedResult)
-				b.access.Unlock()
-				return nil, nil
-			})
-		case adapter.OutboundGroup:
-			b.checked[tag] = true
-			b.groups = append(b.groups, nested)
-			b.test(common.FilterNotNil(common.Map(nested.All(), func(it string) adapter.Outbound {
-				member, _ := b.outbound.Outbound(it)
-				return member
-			})), link, interval, force)
-		default:
-			history := b.history.LoadURLTestHistory(tag)
-			if !force && history != nil && time.Since(history.Time) < interval {
-				continue
-			}
-			b.checked[tag] = true
-			b.batch.Go(tag, func() (any, error) {
-				testResult := b.session.test(b.ctx, urlTestSessionKey{tag: tag, link: link}, func() urlTestResult {
-					testCtx, cancel := context.WithTimeout(b.ctx, C.TCPTimeout)
-					defer cancel()
-					testChan := make(chan urlTestResult, 1)
-					go func() {
-						delay, testErr := urltest.URLTest(testCtx, link, detour)
-						testChan <- urlTestResult{delay, testErr}
-					}()
-					select {
-					case testResult := <-testChan:
-						return testResult
-					case <-testCtx.Done():
-						return urlTestResult{err: testCtx.Err()}
-					}
-				})
-				if testResult.err != nil {
-					if b.ctx.Err() != nil {
-						return nil, nil
-					}
-					b.logger.Debug("outbound ", tag, " unavailable: ", testResult.err)
-					b.history.DeleteURLTestHistory(tag)
-				} else {
-					b.logger.Debug("outbound ", tag, " available: ", testResult.delay, "ms")
-					b.history.StoreURLTestHistory(tag, &adapter.URLTestHistory{
-						Time:  time.Now(),
-						Delay: testResult.delay,
-					})
-					b.access.Lock()
-					b.result[tag] = testResult.delay
-					b.access.Unlock()
-				}
-				return nil, nil
-			})
-		}
-	}
 }

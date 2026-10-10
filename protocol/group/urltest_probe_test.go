@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	adapterOutbound "github.com/sagernet/sing-box/adapter/outbound"
 	"github.com/sagernet/sing-box/common/interrupt"
 	"github.com/sagernet/sing-box/common/urltest"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -22,49 +24,43 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestURLTestPlanBoundsColdMembers(t *testing.T) {
-	group, history, members := newProbeTestGroup(t, "", 1000)
+func TestURLTestPlanRefreshesColdMembersLessOften(t *testing.T) {
+	group, history, members := newProbeTestGroup(t, "", 20)
 	now := time.Now()
 	for i, member := range members {
-		// Older measurements for higher indexes, so they are refreshed first.
 		history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{
-			Time:  now.Add(-time.Hour - time.Duration(i)*time.Second),
+			Time:  now.Add(-group.interval),
 			Delay: uint16(100 + i),
 		})
 	}
 	group.rebuildRankedCandidates()
-	selected := members[500]
+	selected := members[10]
 	group.selectedOutboundTCP.Store(selected)
 
-	targets := group.planTargets(group.state.Load(), probeScheduled, now)
+	// One interval after the last round only the hot set is due: the
+	// selection and the best ranked members.
+	hot := append([]string{selected.Tag()}, outboundTags(members[:hotCandidates])...)
+	require.ElementsMatch(t, hot, probeTargetTags(group.planTargets(group.state.Load(), probeScheduled, now)))
 
-	budget := len(members) / coldSweepRounds
-	require.Len(t, targets, 1+hotCandidates+budget)
-	hot := probeTargetTags(targets[:1+hotCandidates])
-	require.Contains(t, hot, selected.Tag())
-	for _, member := range members[:hotCandidates] {
-		require.Contains(t, hot, member.Tag())
-	}
-	cold := probeTargetTags(targets[1+hotCandidates:])
-	require.Contains(t, cold, members[len(members)-1].Tag())
-	require.NotContains(t, cold, members[hotCandidates].Tag())
-}
+	// Cold members are refreshed every coldRefreshIntervals intervals.
+	stale := members[15]
+	history.StoreURLTestHistory(stale.Tag(), &adapter.URLTestHistory{
+		Time:  now.Add(-coldRefreshIntervals * group.interval),
+		Delay: 200,
+	})
+	targets := probeTargetTags(group.planTargets(group.state.Load(), probeScheduled, now))
+	require.ElementsMatch(t, append(hot, stale.Tag()), targets)
+	// Hot members come first.
+	require.Equal(t, stale.Tag(), targets[len(targets)-1])
 
-func TestURLTestPlanSmallGroupProbesEveryStaleMember(t *testing.T) {
-	group, history, members := newProbeTestGroup(t, "", 20)
-	now := time.Now()
+	// Measured half an interval ago: nothing is due.
 	for _, member := range members {
-		history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{Time: now.Add(-group.interval), Delay: 100})
+		history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{Time: now.Add(-group.interval / 4), Delay: 100})
 	}
-	history.StoreURLTestHistory(members[0].Tag(), &adapter.URLTestHistory{Time: now, Delay: 100})
-
-	targets := group.planTargets(group.state.Load(), probeScheduled, now)
-
-	require.Len(t, targets, len(members)-1)
-	require.NotContains(t, probeTargetTags(targets), members[0].Tag())
+	require.Empty(t, group.planTargets(group.state.Load(), probeScheduled, now))
 }
 
-func TestURLTestPlanProbesUnmeasuredMembersWithoutBudget(t *testing.T) {
+func TestURLTestPlanProbesUnmeasuredMembers(t *testing.T) {
 	group, _, members := newProbeTestGroup(t, "", 300)
 
 	targets := group.planTargets(group.state.Load(), probeScheduled, time.Now())
@@ -86,7 +82,7 @@ func TestURLTestPlanBacksOffFailingMembers(t *testing.T) {
 	scheduled := probeTargetTags(group.planTargets(group.state.Load(), probeScheduled, now))
 	require.NotContains(t, scheduled, members[0].Tag())
 	require.Contains(t, scheduled, members[1].Tag())
-	require.Contains(t, scheduled, members[2].Tag())
+	require.NotContains(t, scheduled, members[2].Tag())
 
 	full := probeTargetTags(group.planTargets(group.state.Load(), probeFull, now))
 	require.ElementsMatch(t, outboundTags(members), full)
@@ -107,6 +103,21 @@ func TestURLTestPlanFocusIgnoresFreshness(t *testing.T) {
 	targets := group.planTargets(group.state.Load(), probePlan{focus: map[string]struct{}{focus: {}}}, now)
 
 	require.Equal(t, []string{focus}, probeTargetTags(targets))
+	require.Equal(t, now, targets[0].since)
+}
+
+func TestURLTestPlanNetworkChangeProbesHotSet(t *testing.T) {
+	group, history, members := newProbeTestGroup(t, "", 10)
+	now := time.Now()
+	for i, member := range members {
+		history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{Time: now.Add(-time.Second), Delay: uint16(100 + i)})
+	}
+	group.rebuildRankedCandidates()
+	group.selectedOutboundTCP.Store(members[0])
+
+	targets := group.planTargets(group.state.Load(), probePlan{hotBefore: now}, now)
+
+	require.ElementsMatch(t, outboundTags(members[:hotCandidates]), probeTargetTags(targets))
 }
 
 func TestURLTestFallbackWatchesPriorityPrefix(t *testing.T) {
@@ -114,11 +125,11 @@ func TestURLTestFallbackWatchesPriorityPrefix(t *testing.T) {
 	group.fallback = URLTestFallback{enabled: true}
 	now := time.Now()
 	for _, member := range members {
-		history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{Time: now, Delay: 100})
+		history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{Time: now.Add(-time.Second), Delay: 100})
 	}
 	group.selectedOutboundTCP.Store(members[5])
 
-	targets := group.planTargets(group.state.Load(), probePlan{forceHot: true}, now)
+	targets := group.planTargets(group.state.Load(), probePlan{hotBefore: now}, now)
 
 	require.ElementsMatch(t, outboundTags(members[:7]), probeTargetTags(targets))
 }
@@ -130,12 +141,12 @@ func TestURLTestSelectionToleratesSingleProbeFailure(t *testing.T) {
 	group.rebuildRankedCandidates()
 	group.selectedOutboundTCP.Store(current)
 
-	group.recordProbe(current.Tag(), false)
+	group.recordProbe(current.Tag(), time.Now(), false)
 	selected, available := group.Select(N.NetworkTCP)
 	require.True(t, available)
 	require.Same(t, current, selected)
 
-	group.recordProbe(current.Tag(), false)
+	group.recordProbe(current.Tag(), time.Now(), false)
 	selected, available = group.Select(N.NetworkTCP)
 	require.True(t, available)
 	require.Same(t, best, selected)
@@ -147,7 +158,7 @@ func TestURLTestUnverifiedLeadersAreReprobed(t *testing.T) {
 	history.StoreURLTestHistory(members[0].Tag(), &adapter.URLTestHistory{Time: startedAt.Add(-time.Hour), Delay: 1})
 	history.StoreURLTestHistory(members[1].Tag(), &adapter.URLTestHistory{Time: startedAt, Delay: 50})
 	group.rebuildRankedCandidates()
-	round := newProbeRound(probeScheduled, nil)
+	round := newProbeRound(probeScheduled, time.Time{})
 	round.result[members[1].Tag()] = 50
 
 	leaders := group.unverifiedLeaders(round, startedAt)
@@ -174,6 +185,45 @@ func TestURLTestRoundRecordsResults(t *testing.T) {
 	for _, member := range members {
 		require.EqualValues(t, 1, member.dialCount.Load())
 	}
+
+	// A second user test moments later is served from the fresh results.
+	_, err = group.URLTest(context.Background())
+	require.NoError(t, err)
+	for _, member := range members {
+		require.EqualValues(t, 1, member.dialCount.Load())
+	}
+}
+
+func TestURLTestGroupsShareProbes(t *testing.T) {
+	server := newNoContentServer(t)
+	first, history, members := newProbeTestGroup(t, server.URL, 4)
+	release := make(chan struct{})
+	for _, member := range members {
+		member.release = release
+	}
+	second := newProbeTestGroupWith(first.outbound, history, server.URL, members[1:])
+
+	firstDone := make(chan struct{})
+	go func() {
+		first.CheckOutbounds(false)
+		close(firstDone)
+	}()
+	require.Eventually(t, func() bool { return members[1].dialCount.Load() == 1 }, time.Second, time.Millisecond)
+	secondDone := make(chan struct{})
+	go func() {
+		second.CheckOutbounds(false)
+		close(secondDone)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	<-firstDone
+	<-secondDone
+
+	for _, member := range members {
+		require.EqualValues(t, 1, member.dialCount.Load(), member.Tag())
+		require.NotNil(t, history.LoadURLTestHistory(member.Tag()))
+	}
+	require.NotNil(t, second.selectedOutboundTCP.Load())
 }
 
 func TestURLTestRoundsCoalesce(t *testing.T) {
@@ -193,7 +243,7 @@ func TestURLTestRoundsCoalesce(t *testing.T) {
 	require.NotSame(t, full, queued)
 	focus := members[0].Tag()
 	require.Same(t, queued, group.requestRound(ctx, probePlan{focus: map[string]struct{}{focus: {}}}, true))
-	require.True(t, queued.plan.cold)
+	require.True(t, queued.plan.scheduled)
 	require.Contains(t, queued.plan.focus, focus)
 
 	close(release)
@@ -230,7 +280,10 @@ func TestURLTestRoundStopsWithGroup(t *testing.T) {
 
 func TestURLTestDialFailureRecheckCooldown(t *testing.T) {
 	server := newNoContentServer(t)
-	group, _, members := newProbeTestGroup(t, server.URL, 2)
+	group, history, members := newProbeTestGroup(t, server.URL, 3)
+	for _, member := range members {
+		history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: 100})
+	}
 	failing := members[0]
 	failing.failing.Store(true)
 
@@ -238,7 +291,10 @@ func TestURLTestDialFailureRecheckCooldown(t *testing.T) {
 		group.reportDialFailure(failing.Tag())
 	}
 	waitProbeRoundsIdle(t, group)
+	// Only the failing member is rechecked.
 	require.EqualValues(t, 1, failing.dialCount.Load())
+	require.Zero(t, members[1].dialCount.Load())
+	require.Zero(t, members[2].dialCount.Load())
 	require.True(t, group.hasExcessiveDialFailures(failing.Tag()))
 
 	for range 3 * dialFailureThreshold {
@@ -250,6 +306,74 @@ func TestURLTestDialFailureRecheckCooldown(t *testing.T) {
 	group.reportDialSuccess(failing.Tag())
 	require.False(t, group.hasExcessiveDialFailures(failing.Tag()))
 	require.Zero(t, group.dialFailureTracked.Load())
+}
+
+func TestURLTestDialFailuresNeedFailoverConfirmation(t *testing.T) {
+	group, history, members := newProbeTestGroup(t, "", 3)
+	for i, member := range members {
+		history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: uint16(100 + i)})
+	}
+	group.rebuildRankedCandidates()
+	group.selectedOutboundTCP.Store(members[0])
+	instance := &URLTest{
+		Adapter: adapterOutbound.NewAdapter(C.TypeURLTest, "test", []string{N.NetworkTCP, N.NetworkUDP}, outboundTags(members)),
+		logger:  log.NewNOPFactory().NewLogger("test"),
+		group:   group,
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	destination := M.SocksaddrFromNet(listener.Addr())
+
+	// Every member failing points at the destination: nothing is counted.
+	for _, member := range members {
+		member.failing.Store(true)
+	}
+	_, err = instance.DialContext(context.Background(), N.NetworkTCP, destination)
+	require.Error(t, err)
+	require.False(t, group.hasExcessiveDialFailures(members[0].Tag()))
+	require.Zero(t, group.dialFailureTracked.Load())
+	require.EqualValues(t, 1+maxFailoverCandidates, members[0].dialCount.Load()+members[1].dialCount.Load()+members[2].dialCount.Load())
+
+	// The next member reaching the destination confirms the failure.
+	members[1].failing.Store(false)
+	conn, err := instance.DialContext(context.Background(), N.NetworkTCP, destination)
+	require.NoError(t, err)
+	conn.Close()
+	require.EqualValues(t, 1, group.dialFailureTracked.Load())
+}
+
+func TestURLTestNetworkChangeCooldown(t *testing.T) {
+	server := newNoContentServer(t)
+	group, history, members := newProbeTestGroup(t, server.URL, 5)
+	for i, member := range members {
+		history.StoreURLTestHistory(member.Tag(), &adapter.URLTestHistory{Time: time.Now(), Delay: uint16(100 + i)})
+	}
+	group.rebuildRankedCandidates()
+	group.selectedOutboundTCP.Store(members[0])
+	group.loopRunning.Store(true)
+
+	group.networkChanged()
+	waitProbeRoundsIdle(t, group)
+	for i, member := range members {
+		if i < hotCandidates {
+			require.EqualValues(t, 1, member.dialCount.Load(), member.Tag())
+		} else {
+			require.Zero(t, member.dialCount.Load(), member.Tag())
+		}
+	}
+
+	group.networkChanged()
+	waitProbeRoundsIdle(t, group)
+	require.EqualValues(t, 1, members[0].dialCount.Load())
+}
+
+func TestNextTickAlignsGroups(t *testing.T) {
+	interval := 50 * time.Millisecond
+	delay := nextTick(interval)
+	require.Positive(t, delay)
+	require.LessOrEqual(t, delay, interval)
+	require.Less(t, (urlTestClock()+int64(delay))%int64(interval), int64(5*time.Millisecond))
 }
 
 func TestURLTestHistoryNotificationsCoalesce(t *testing.T) {
@@ -271,14 +395,20 @@ func newProbeTestGroup(t *testing.T, link string, count int) (*URLTestGroup, *ur
 	t.Helper()
 	manager := &recursiveURLTestOutboundManager{outbounds: make(map[string]adapter.Outbound, count)}
 	members := make([]*probeTestOutbound, 0, count)
-	outbounds := make([]adapter.Outbound, 0, count)
 	for i := range count {
 		member := &probeTestOutbound{tag: "member-" + strconv.Itoa(i)}
 		manager.outbounds[member.tag] = member
 		members = append(members, member)
-		outbounds = append(outbounds, member)
 	}
 	history := urltest.NewHistoryStorage()
+	return newProbeTestGroupWith(manager, history, link, members), history, members
+}
+
+func newProbeTestGroupWith(manager adapter.OutboundManager, history *urltest.HistoryStorage, link string, members []*probeTestOutbound) *URLTestGroup {
+	outbounds := make([]adapter.Outbound, 0, len(members))
+	for _, member := range members {
+		outbounds = append(outbounds, member)
+	}
 	group := &URLTestGroup{
 		ctx:            context.Background(),
 		outbound:       manager,
@@ -290,7 +420,7 @@ func newProbeTestGroup(t *testing.T, link string, count int) (*URLTestGroup, *ur
 		interruptGroup: interrupt.NewGroup(),
 	}
 	group.storeOutbounds(outbounds)
-	return group, history, members
+	return group
 }
 
 func waitProbeRoundsIdle(t *testing.T, group *URLTestGroup) {

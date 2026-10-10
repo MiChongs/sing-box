@@ -119,6 +119,7 @@ func testGroupMembers(ctx context.Context, server *Server, outboundGroup adapter
 		concurrency = 1
 	}
 	b, _ := batch.New(ctx, batch.WithConcurrencyNum[any](concurrency))
+	since := time.Now()
 	checked := make(map[string]bool, len(outbounds))
 	result := make(map[string]uint16, len(outbounds))
 	var resultAccess sync.Mutex
@@ -135,14 +136,20 @@ func testGroupMembers(ctx context.Context, server *Server, outboundGroup adapter
 			continue
 		}
 		b.Go(realTag, func() (any, error) {
-			t, testErr := urltest.URLTest(ctx, url, p)
+			probeResult := server.urlTestHistory.Prober().Probe(ctx, urltest.ProbeRequest{
+				Tag:    realTag,
+				Link:   url,
+				Dialer: p,
+				Since:  since,
+			})
+			t, testErr := probeResult.Delay, probeResult.Err
 			if testErr != nil {
 				server.logger.Debug("outbound ", tag, " unavailable: ", testErr)
 				// Don't delete history on single API test failure — let periodic checks handle it
 			} else {
 				server.logger.Debug("outbound ", tag, " available: ", t, "ms")
 				server.urlTestHistory.StoreURLTestHistory(realTag, &adapter.URLTestHistory{
-					Time:  time.Now(),
+					Time:  probeResult.Time,
 					Delay: t,
 				})
 				resultAccess.Lock()
