@@ -2,6 +2,17 @@
 icon: material/alert-decagram
 ---
 
+#### 1.15.0-alpha.12
+
+* Desktop: Improve the tray menu on Wayland **1**
+* Fixes and improvements
+
+**1**:
+
+On Wayland compositors that support the layer shell protocol, such as niri and KDE Plasma, the tray menu of the
+Linux client is now shown as a layer shell surface instead of a regular window, so it is placed next to the tray
+icon and is no longer decorated or tiled by the compositor.
+
 #### 1.15.0-alpha.11
 
 * Fixes and improvements
