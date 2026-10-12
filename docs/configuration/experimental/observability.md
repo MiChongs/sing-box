@@ -225,6 +225,10 @@ The exporter exposes bounded metrics including:
 - `singbox_inbound_connections_*` and `singbox_network_connections_*`;
 - latest outbound URL test delay and timestamp gauges;
 - `singbox_recent_connections` and `singbox_recent_connections_capacity`;
+- `singbox_tcp_concurrent_*` metrics of [`dns.tcp_concurrent`](/configuration/dns/#tcp_concurrent): the switch,
+  races, races where every attempt failed and races the remembered address won alone, started, failed, canceled and
+  late-closed attempts, wins grouped by the position of the winning attempt (`position` label), the total connect time
+  of the winners, and the remembered destinations and failed addresses;
 - `singbox_observability_http_*` API request, response-size and duration
   counters, plus current SSE subscribers and sent events.
 

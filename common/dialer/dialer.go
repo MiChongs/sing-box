@@ -102,6 +102,7 @@ func NewWithOptions(options Options) (N.Dialer, error) {
 			dnsQueryOptions,
 			time.Duration(dialOptions.FallbackDelay),
 		)
+		setTCPConcurrentOverride(dialer, dialOptions.TCPConcurrent)
 	}
 	return dialer, nil
 }

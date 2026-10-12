@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/expiringmap"
 	"github.com/sagernet/sing-box/common/process"
 	"github.com/sagernet/sing-box/common/taskmonitor"
@@ -326,6 +327,8 @@ func (r *Router) ResetNetwork() {
 	r.processCacheGeneration.Add(1)
 	r.httpClientManager.ResetNetwork()
 	r.dns.ResetNetwork()
+	// Winning and failed addresses describe the previous network.
+	dialer.TCPConcurrentFromContext(r.ctx).ResetHistory()
 	if r.processCache != nil {
 		r.processCache.Purge()
 	}

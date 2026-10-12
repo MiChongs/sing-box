@@ -4,7 +4,9 @@ import (
 	"net/http"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/service"
 
 	"github.com/go-chi/chi/v5"
@@ -41,6 +43,8 @@ type configSchema struct {
 	LogLevel string         `json:"log-level"`
 	IPv6     bool           `json:"ipv6"`
 	Tun      map[string]any `json:"tun"`
+	// dns.tcp_concurrent; PATCH switches it at runtime like mihomo.
+	TCPConcurrent *bool `json:"tcp-concurrent,omitempty"`
 }
 
 func getConfigs(server *Server, logFactory log.Factory) func(w http.ResponseWriter, r *http.Request) {
@@ -52,12 +56,13 @@ func getConfigs(server *Server, logFactory log.Factory) func(w http.ResponseWrit
 			logLevel = log.LevelError
 		}
 		render.JSON(w, r, &configSchema{
-			Mode:        server.clashMode.Mode(),
-			ModeList:    server.clashMode.ModeList(),
-			Modes:       server.clashMode.ModeList(),
-			AllowLan:    true,
-			BindAddress: "*",
-			LogLevel:    log.FormatLevel(logLevel),
+			Mode:          server.clashMode.Mode(),
+			ModeList:      server.clashMode.ModeList(),
+			Modes:         server.clashMode.ModeList(),
+			AllowLan:      true,
+			BindAddress:   "*",
+			LogLevel:      log.FormatLevel(logLevel),
+			TCPConcurrent: common.Ptr(dialer.TCPConcurrentFromContext(server.ctx).Enabled()),
 		})
 	}
 }
@@ -71,8 +76,17 @@ func patchConfigs(server *Server) func(w http.ResponseWriter, r *http.Request) {
 			render.JSON(w, r, ErrBadRequest)
 			return
 		}
+		tcpConcurrent := dialer.TCPConcurrentFromContext(server.ctx)
+		if newConfig.TCPConcurrent != nil && tcpConcurrent == nil {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("tcp-concurrent is unavailable"))
+			return
+		}
 		if newConfig.Mode != "" {
 			server.clashMode.SetMode(newConfig.Mode)
+		}
+		if newConfig.TCPConcurrent != nil {
+			tcpConcurrent.SetEnabled(*newConfig.TCPConcurrent)
 		}
 		render.NoContent(w, r)
 	}

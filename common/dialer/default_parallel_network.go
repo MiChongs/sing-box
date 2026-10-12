@@ -33,6 +33,12 @@ func DialSerialNetwork(ctx context.Context, dialer N.Dialer, network string, des
 			errors = append(errors, err)
 		}
 	} else {
+		// Outbounds that dial address lists themselves, such as VPN endpoints
+		// and SOCKS or HTTP clients, race route-resolved addresses with
+		// dns.tcp_concurrent.
+		if parallelDialer, isParallel := dialer.(N.ParallelDialer); isParallel && N.NetworkName(network) == N.NetworkTCP {
+			return parallelDialer.DialParallel(ctx, network, destination, destinationAddresses)
+		}
 		for _, address := range destinationAddresses {
 			conn, err := dialer.DialContext(ctx, network, M.SocksaddrFrom(address, destination.Port))
 			if err == nil {

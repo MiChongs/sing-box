@@ -78,6 +78,7 @@ func (m *Manager) writePrometheus(writer io.Writer) error {
 	for _, item := range urlTests {
 		writeLabeledIntegerMetric(output, "singbox_outbound_urltest_timestamp_seconds", item.name, item.timestamp)
 	}
+	m.writeTCPConcurrentMetrics(output)
 	m.writeAPIMetrics(output)
 	return output.Flush()
 }

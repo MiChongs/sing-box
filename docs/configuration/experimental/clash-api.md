@@ -115,6 +115,19 @@
     `PATCH /rules/disable` takes `{"<index>": true|false}` to disable or enable
     rules by `index`; `PUT /rules/{uuid}` still toggles a rule by `uuid`.
 
+!!! info "TCP concurrent dialing"
+
+    Like mihomo, `GET /configs` reports `tcp-concurrent`, and `tcp-concurrent` in `PATCH /configs` switches
+    [`dns.tcp_concurrent`](/configuration/dns/#tcp_concurrent) at runtime. The switch is not persisted, and
+    dialers with their own `tcp_concurrent` ignore it.
+
+    `GET /dns/tcp-concurrent` returns `enabled`, `adaptive` (no `attempt_delay`), `attemptDelay` (milliseconds),
+    `maxConcurrent`, the `statistics` (`races`, `raceFailures`, `historyHits`, `attempts`, `failures`,
+    `canceled`, `lateClosed`, `wins` counted by the position of the winning attempt, and `averageConnectTime` in
+    milliseconds), the remembered `destinations` (`host`, `port`, `address`, smoothed `connectTime` in
+    milliseconds, `expiresAt`) and the failed addresses `failures` (`address`, `expiresAt`).
+    `DELETE /dns/tcp-concurrent` clears the history and keeps the statistics.
+
 ### Fields
 
 #### external_controller

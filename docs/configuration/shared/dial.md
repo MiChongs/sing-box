@@ -57,6 +57,7 @@ icon: material/new-box
   "fallback_delay": "",
 
   "resolve_on_detour": false,
+  "tcp_concurrent": false,
 
   // Deprecated
   
@@ -287,6 +288,18 @@ Only take effect when `domain_strategy` or `network_strategy` is set.
 When `detour` is set, also resolve the domain name of the server address using `domain_resolver` before handing off to the detour.
 
 `300ms` is used by default.
+
+#### tcp_concurrent
+
+Override [`dns.tcp_concurrent`](/configuration/dns/#tcp_concurrent) for this dialer: `true` races resolved addresses
+even while `dns.tcp_concurrent` is off, and `false` never races them. Follows `dns.tcp_concurrent` when not set.
+
+Applies to the server address of the outbound, and to the destination addresses of `direct` outbounds and VPN
+endpoints. For `socks` and `http` outbounds, only `true` also races route-resolved destination addresses through the
+proxy server. That is useful only when the server answers a connect request after reaching the destination: sing-box's
+SOCKS inbound and proxies such as Squid do, while sing-box's HTTP inbound and mihomo answer at once.
+
+Has no effect with `tcp_fast_open`.
 
 #### domain_strategy
 

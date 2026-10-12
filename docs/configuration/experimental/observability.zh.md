@@ -202,6 +202,9 @@ scrape_configs:
 - `singbox_inbound_connections_*` 和 `singbox_network_connections_*`；
 - 最新 outbound URLTest 延迟和时间戳 gauge；
 - `singbox_recent_connections` 和 `singbox_recent_connections_capacity`；
+- [`dns.tcp_concurrent`](/zh/configuration/dns/#tcp_concurrent) 的 `singbox_tcp_concurrent_*` 指标：开关状态、
+  竞速次数、全部失败与由历史地址单独胜出的竞速次数，尝试的发起、失败、取消与延迟关闭次数，按胜出尝试序号
+  （`position` 标签）分组的胜出次数，胜出连接的累计耗时，以及记住的目标与失败地址数量；
 - `singbox_observability_http_*` API 请求、响应大小和耗时 counter，以及当前
   SSE 订阅者和已发送事件数。
 

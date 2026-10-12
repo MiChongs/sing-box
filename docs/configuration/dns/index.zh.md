@@ -38,6 +38,7 @@ icon: material/alert-decagram
     "timeout": "",
     "reverse_mapping": false,
     "allow_resolver_discovery": false,
+    "tcp_concurrent": false, // 或 {}
     "client_subnet": "",
     "fakeip": {}
   }
@@ -170,6 +171,59 @@ DNS 缓存的最大 TTL，单位为秒。
 
 设为 `true` 可取消这层内置拒绝，DNS 规则仍可拒绝此类查询。
 其他查询类型和名称不受影响。
+
+#### tcp_concurrent
+
+并发拨号域名解析出的全部地址，使用最先建立的 TCP 连接。
+
+适用于拨号返回前已确认与目标握手的场景：
+
+* `direct` 出站，包括域名与 `resolve` 路由动作解析出的地址；
+* 所有出站的服务器地址；
+* VPN 端点（WireGuard、Tailscale、OpenVPN、OpenConnect、MASQUE、EasyTier）与 `tailcat` 出站在隧道内的连接；
+* 经由 `detour` 交给上述出站的连接，由该出站接收全部地址并自行并发拨号；
+* `socks` 与 `http` 出站经由代理服务器并发拨号路由已解析的目标地址，仅当该出站自身设置了
+  [`tcp_concurrent`](/zh/configuration/shared/dial/#tcp_concurrent)。
+
+不适用于 UDP（建立连接时不发送任何数据，无从竞速）、启用 `tcp_fast_open` 的拨号器（握手推迟到首次写入），
+以及 VMess、VLESS、Trojan、Shadowsocks 等在服务器到达目标之前即返回的代理协议。
+
+连接尝试按连接历史与地址族排序：最近一次连上该目标的地址最先尝试，一分钟内失败过的地址最后尝试，其余地址按域名策略
+优先的地址族开始，IPv6 与 IPv4 交替排列。连接建立后，其余尝试立即取消，此后才完成的连接会被关闭。任一尝试失败时
+立即开始下一个尝试。网络变化时清空连接历史。
+
+[Clash API](/zh/configuration/experimental/clash-api/) 可通过 `PATCH /configs` 的 `tcp-concurrent` 字段在运行时
+开关，通过 `GET /dns/tcp-concurrent` 查看统计与连接历史，通过 `DELETE /dns/tcp-concurrent` 清空连接历史。
+[可观测性](/zh/configuration/experimental/observability/) 以 `singbox_tcp_concurrent_*` 指标导出统计数据。
+拨号器可通过自身的 [`tcp_concurrent`](/zh/configuration/shared/dial/#tcp_concurrent) 覆盖此选项。
+
+接受布尔值或对象。默认禁用。
+
+```json
+{
+  "enabled": true,
+  "attempt_delay": "",
+  "max_concurrent": 0
+}
+```
+
+##### enabled
+
+启用 TCP 并发拨号。
+
+##### attempt_delay
+
+相邻两次连接尝试之间的固定间隔。`0s` 表示同时开始全部尝试。
+
+为空时按目标自适应：近期没有连接记录的目标同时开始全部尝试；10 分钟内连接过的目标先只尝试上次胜出的地址，
+若它在其平滑连接耗时的两倍（介于 `20ms` 与 `250ms` 之间）内仍未连上，再开始其余尝试。因此连接正常的目标
+只需一次握手。
+
+##### max_concurrent
+
+同时进行的连接尝试数量上限。先前的尝试失败后再开始后续尝试。
+
+默认不限制。
 
 #### client_subnet
 

@@ -118,6 +118,8 @@ type AbstractDialerOptions struct {
 	FallbackDelay              badoption.Duration                `json:"fallback_delay,omitempty"`
 
 	ResolverOnDetour bool `json:"resolve_on_detour,omitempty"`
+	// TCPConcurrent overrides dns.tcp_concurrent for this dialer.
+	TCPConcurrent *bool `json:"tcp_concurrent,omitempty"`
 
 	// Deprecated: migrated to domain resolver
 	DomainStrategy DomainStrategy `json:"domain_strategy,omitempty" schema:"omit"`

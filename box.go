@@ -225,6 +225,12 @@ func New(options Options) (*Box, error) {
 	service.MustRegister[adapter.NetworkNamespaceManager](ctx, netnsManager)
 	internalServices = append(internalServices, netnsManager)
 	dnsOptions := common.PtrValueOrDefault(options.DNS)
+	// Registered even when disabled, so the Clash API can enable it at runtime.
+	tcpConcurrent, err := dialer.NewTCPConcurrent(logFactory.NewLogger("tcp-concurrent"), dnsOptions.TCPConcurrent)
+	if err != nil {
+		return nil, err
+	}
+	service.MustRegisterPtr(ctx, tcpConcurrent)
 	endpointManager := endpoint.NewManager(endpointRegistry)
 	inboundManager := inbound.NewManager(inboundRegistry, endpointManager)
 	outboundManager := outbound.NewManager(outboundRegistry, endpointManager, routeOptions.Final)

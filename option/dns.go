@@ -24,6 +24,8 @@ type RawDNSOptions struct {
 	DefaultRejectRcode     *DNSRejectRCode    `json:"default_reject_rcode,omitempty"`
 	AllowResolverDiscovery bool               `json:"allow_resolver_discovery,omitempty"`
 	DNSClientOptions
+
+	TCPConcurrent *TCPConcurrentOptions `json:"tcp_concurrent,omitempty"`
 }
 
 type DNSOptions struct {
@@ -101,6 +103,40 @@ func (o *OptimisticDNSOptions) UnmarshalJSON(bytes []byte) error {
 func (o OptimisticDNSOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
 	objectForm := schema.StrictObject()
 	err := builder.FlattenStruct(objectForm, reflect.TypeFor[OptimisticDNSOptions]())
+	if err != nil {
+		return nil, err
+	}
+	return schema.AnyOf(schema.BooleanNode(), objectForm), nil
+}
+
+type _TCPConcurrentOptions struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// AttemptDelay staggers successive connection attempts. When unset, the
+	// delay adapts to the connection history of each destination.
+	AttemptDelay  *badoption.Duration `json:"attempt_delay,omitempty"`
+	MaxConcurrent uint32              `json:"max_concurrent,omitempty"`
+}
+
+type TCPConcurrentOptions _TCPConcurrentOptions
+
+func (o TCPConcurrentOptions) MarshalJSON() ([]byte, error) {
+	if o.AttemptDelay == nil && o.MaxConcurrent == 0 {
+		return json.Marshal(o.Enabled)
+	}
+	return json.Marshal(_TCPConcurrentOptions(o))
+}
+
+func (o *TCPConcurrentOptions) UnmarshalJSON(bytes []byte) error {
+	err := json.Unmarshal(bytes, &o.Enabled)
+	if err == nil {
+		return nil
+	}
+	return json.UnmarshalDisallowUnknownFields(bytes, (*_TCPConcurrentOptions)(o))
+}
+
+func (o TCPConcurrentOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	objectForm := schema.StrictObject()
+	err := builder.FlattenStruct(objectForm, reflect.TypeFor[TCPConcurrentOptions]())
 	if err != nil {
 		return nil, err
 	}

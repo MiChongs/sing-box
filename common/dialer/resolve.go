@@ -41,9 +41,11 @@ type resolveDialer struct {
 	initErr       error
 	queryOptions  adapter.DNSQueryOptions
 	fallbackDelay time.Duration
+	concurrent    TCPConcurrentPolicy
 }
 
 func NewResolveDialer(ctx context.Context, dialer N.Dialer, parallel bool, server string, queryOptions adapter.DNSQueryOptions, fallbackDelay time.Duration) ResolveDialer {
+	concurrent := NewTCPConcurrentPolicy(ctx, nil)
 	if parallelDialer, isParallel := dialer.(ParallelInterfaceDialer); isParallel {
 		return &resolveParallelNetworkDialer{
 			resolveDialer{
@@ -54,6 +56,7 @@ func NewResolveDialer(ctx context.Context, dialer N.Dialer, parallel bool, serve
 				server:        server,
 				queryOptions:  queryOptions,
 				fallbackDelay: fallbackDelay,
+				concurrent:    concurrent,
 			},
 			parallelDialer,
 		}
@@ -66,6 +69,7 @@ func NewResolveDialer(ctx context.Context, dialer N.Dialer, parallel bool, serve
 		server:        server,
 		queryOptions:  queryOptions,
 		fallbackDelay: fallbackDelay,
+		concurrent:    concurrent,
 	}
 }
 
@@ -104,8 +108,11 @@ func (d *resolveDialer) DialContext(ctx context.Context, network string, destina
 	if err != nil {
 		return nil, err
 	}
+	if detour, isDetour := d.dialer.(*DetourDialer); isDetour {
+		return dialDetourConcurrent(ctx, d.concurrent, detour, d.parallel, network, destination, addresses, d.queryOptions.Strategy == C.DomainStrategyPreferIPv6, d.fallbackDelay)
+	}
 	if d.parallel {
-		return N.DialParallel(ctx, d.dialer, network, destination, addresses, d.queryOptions.Strategy == C.DomainStrategyPreferIPv6, d.fallbackDelay)
+		return DialConcurrent(ctx, d.concurrent, d.dialer, network, destination, addresses, d.queryOptions.Strategy == C.DomainStrategyPreferIPv6, d.fallbackDelay)
 	} else {
 		return N.DialSerial(ctx, d.dialer, network, destination, addresses)
 	}
@@ -156,7 +163,7 @@ func (d *resolveParallelNetworkDialer) DialParallelInterface(ctx context.Context
 		fallbackDelay = d.fallbackDelay
 	}
 	if d.parallel {
-		return DialParallelNetwork(ctx, d.dialer, network, destination, addresses, d.queryOptions.Strategy == C.DomainStrategyPreferIPv6, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+		return DialConcurrentNetwork(ctx, d.concurrent, d.dialer, network, destination, addresses, d.queryOptions.Strategy == C.DomainStrategyPreferIPv6, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
 	} else {
 		return DialSerialNetwork(ctx, d.dialer, network, destination, addresses, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
 	}

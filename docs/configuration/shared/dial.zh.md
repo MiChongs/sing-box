@@ -57,6 +57,7 @@ icon: material/new-box
   "fallback_delay": "",
 
   "resolve_on_detour": false,
+  "tcp_concurrent": false,
   
   // 废弃的
 
@@ -276,6 +277,17 @@ TCP keep-alive 探测次数。
 #### resolve_on_detour
 
 当设置了 `detour` 时，在将连接交给 detour 之前，也通过 `domain_resolver` 解析服务器地址的域名。
+
+#### tcp_concurrent
+
+为此拨号器覆盖 [`dns.tcp_concurrent`](/zh/configuration/dns/#tcp_concurrent)：`true` 表示即使 `dns.tcp_concurrent`
+关闭也并发拨号解析出的地址，`false` 表示从不并发拨号。未设置时跟随 `dns.tcp_concurrent`。
+
+适用于出站的服务器地址，以及 `direct` 出站与 VPN 端点的目标地址。对于 `socks` 与 `http` 出站，仅当设置为 `true`
+时，才会经由代理服务器并发拨号路由已解析的目标地址。这仅在服务器到达目标后才答复连接请求时有效：sing-box 的
+SOCKS 入站与 Squid 等代理如此，而 sing-box 的 HTTP 入站与 mihomo 会立即答复。
+
+启用 `tcp_fast_open` 时无效。
 
 #### domain_strategy
 

@@ -51,6 +51,7 @@ type Endpoint struct {
 	bindAccess           sync.Mutex
 	started              atomic.Bool
 	innerDNSQueryOptions adapter.DNSQueryOptions
+	tcpConcurrent        dialer.TCPConcurrentPolicy
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.WireGuardEndpointOptions) (adapter.Endpoint, error) {
@@ -63,6 +64,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		localAddresses: options.Address,
 		onDemand:       options.OnDemand,
 	}
+	ep.tcpConcurrent = dialer.NewTCPConcurrentPolicy(ctx, options.TCPConcurrent)
 	if options.Detour != "" && options.ListenPort != 0 {
 		return nil, E.New("`listen_port` is conflict with `detour`")
 	}
@@ -320,11 +322,26 @@ func (w *Endpoint) DialContext(ctx context.Context, network string, destination 
 		if err != nil {
 			return nil, err
 		}
-		return N.DialSerial(ctx, w.endpoint, network, destination, destinationAddresses)
+		return dialer.DialSerialConcurrent(ctx, w.tcpConcurrent, w.endpoint, network, destination, destinationAddresses)
 	} else if !destination.Addr.IsValid() {
 		return nil, E.New("invalid destination: ", destination)
 	}
 	return w.endpoint.DialContext(ctx, network, destination)
+}
+
+// DialParallel dials route-resolved addresses through the tunnel and races
+// them with dns.tcp_concurrent.
+func (w *Endpoint) DialParallel(ctx context.Context, network string, destination M.Socksaddr, destinationAddresses []netip.Addr) (net.Conn, error) {
+	switch N.NetworkName(network) {
+	case N.NetworkTCP:
+		w.logger.InfoContext(ctx, "outbound connection to ", destination)
+	case N.NetworkUDP:
+		w.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+	}
+	if !w.started.Load() {
+		return nil, E.New("WireGuard is not ready yet")
+	}
+	return dialer.DialSerialConcurrent(ctx, w.tcpConcurrent, w.endpoint, network, destination, destinationAddresses)
 }
 
 func (w *Endpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {

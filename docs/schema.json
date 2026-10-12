@@ -835,6 +835,9 @@
         },
         "resolve_on_detour": {
           "type": "boolean"
+        },
+        "tcp_concurrent": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -918,6 +921,30 @@
         },
         "client_subnet": {
           "$ref": "#/$defs/IPAddressOrPrefix"
+        },
+        "tcp_concurrent": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "attempt_delay": {
+                  "$ref": "#/$defs/Duration"
+                },
+                "max_concurrent": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 4294967295
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
         }
       },
       "additionalProperties": false
@@ -2101,6 +2128,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "prefer_go": {
               "type": "boolean"
             },
@@ -2313,6 +2343,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -2500,6 +2533,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -2643,6 +2679,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "prefer_go": {
               "type": "boolean"
             },
@@ -2780,6 +2819,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "prefer_go": {
@@ -2982,6 +3024,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -3161,6 +3206,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -3290,6 +3338,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -3424,6 +3475,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -3589,6 +3643,9 @@
           "$ref": "#/$defs/Duration"
         },
         "resolve_on_detour": {
+          "type": "boolean"
+        },
+        "tcp_concurrent": {
           "type": "boolean"
         }
       },
@@ -4198,6 +4255,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "inner_domain_resolver": {
               "$ref": "#/$defs/DomainResolver"
             },
@@ -4528,6 +4588,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -4990,6 +5053,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "inner_domain_resolver": {
               "$ref": "#/$defs/DomainResolver"
             },
@@ -5283,6 +5349,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -5981,6 +6050,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "inner_domain_resolver": {
               "$ref": "#/$defs/DomainResolver"
             },
@@ -6288,6 +6360,9 @@
             },
             "resolve_on_detour": {
               "type": "boolean"
+            },
+            "tcp_concurrent": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -6518,6 +6593,9 @@
         "resolve_on_detour": {
           "type": "boolean"
         },
+        "tcp_concurrent": {
+          "type": "boolean"
+        },
         "idle_timeout": {
           "$ref": "#/$defs/Duration"
         },
@@ -6698,6 +6776,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "idle_timeout": {
@@ -9625,6 +9706,9 @@
             },
             "resolve_on_detour": {
               "type": "boolean"
+            },
+            "tcp_concurrent": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -10760,6 +10844,9 @@
         },
         "resolve_on_detour": {
           "type": "boolean"
+        },
+        "tcp_concurrent": {
+          "type": "boolean"
         }
       },
       "additionalProperties": false
@@ -11209,6 +11296,9 @@
           "$ref": "#/$defs/Duration"
         },
         "resolve_on_detour": {
+          "type": "boolean"
+        },
+        "tcp_concurrent": {
           "type": "boolean"
         }
       },
@@ -13487,6 +13577,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -13684,6 +13777,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "direct_domain_strategy": {
               "$ref": "#/$defs/DomainStrategy"
             },
@@ -13818,6 +13914,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -14013,6 +14112,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -14263,6 +14365,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -14594,6 +14699,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -14797,6 +14905,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -15022,6 +15133,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -15295,6 +15409,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -15505,6 +15622,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -15886,6 +16006,9 @@
                 "resolve_on_detour": {
                   "type": "boolean"
                 },
+                "tcp_concurrent": {
+                  "type": "boolean"
+                },
                 "server": {
                   "type": "string"
                 },
@@ -16060,6 +16183,9 @@
                   "$ref": "#/$defs/Duration"
                 },
                 "resolve_on_detour": {
+                  "type": "boolean"
+                },
+                "tcp_concurrent": {
                   "type": "boolean"
                 },
                 "server": {
@@ -16238,6 +16364,9 @@
                 "resolve_on_detour": {
                   "type": "boolean"
                 },
+                "tcp_concurrent": {
+                  "type": "boolean"
+                },
                 "server": {
                   "type": "string"
                 },
@@ -16412,6 +16541,9 @@
                   "$ref": "#/$defs/Duration"
                 },
                 "resolve_on_detour": {
+                  "type": "boolean"
+                },
+                "tcp_concurrent": {
                   "type": "boolean"
                 },
                 "server": {
@@ -16589,6 +16721,9 @@
                 "resolve_on_detour": {
                   "type": "boolean"
                 },
+                "tcp_concurrent": {
+                  "type": "boolean"
+                },
                 "server": {
                   "type": "string"
                 },
@@ -16764,6 +16899,9 @@
                 "resolve_on_detour": {
                   "type": "boolean"
                 },
+                "tcp_concurrent": {
+                  "type": "boolean"
+                },
                 "server": {
                   "type": "string"
                 },
@@ -16937,6 +17075,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -17131,6 +17272,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -17408,6 +17552,9 @@
             },
             "resolve_on_detour": {
               "type": "boolean"
+            },
+            "tcp_concurrent": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -17530,6 +17677,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "executable_path": {
@@ -17671,6 +17821,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -17835,6 +17988,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -18126,6 +18282,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -18297,6 +18456,9 @@
               "$ref": "#/$defs/Duration"
             },
             "resolve_on_detour": {
+              "type": "boolean"
+            },
+            "tcp_concurrent": {
               "type": "boolean"
             },
             "server": {
@@ -20298,6 +20460,9 @@
             },
             "resolve_on_detour": {
               "type": "boolean"
+            },
+            "tcp_concurrent": {
+              "type": "boolean"
             }
           },
           "required": [
@@ -21216,6 +21381,9 @@
                         "resolve_on_detour": {
                           "type": "boolean"
                         },
+                        "tcp_concurrent": {
+                          "type": "boolean"
+                        },
                         "idle_timeout": {
                           "$ref": "#/$defs/Duration"
                         },
@@ -21405,6 +21573,9 @@
                             "$ref": "#/$defs/Duration"
                           },
                           "resolve_on_detour": {
+                            "type": "boolean"
+                          },
+                          "tcp_concurrent": {
                             "type": "boolean"
                           },
                           "idle_timeout": {
@@ -22152,6 +22323,9 @@
             "resolve_on_detour": {
               "type": "boolean"
             },
+            "tcp_concurrent": {
+              "type": "boolean"
+            },
             "server": {
               "type": "string"
             },
@@ -22476,6 +22650,9 @@
           "$ref": "#/$defs/Duration"
         },
         "resolve_on_detour": {
+          "type": "boolean"
+        },
+        "tcp_concurrent": {
           "type": "boolean"
         }
       },

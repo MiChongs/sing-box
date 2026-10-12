@@ -38,6 +38,7 @@ icon: material/alert-decagram
     "timeout": "",
     "reverse_mapping": false,
     "allow_resolver_discovery": false,
+    "tcp_concurrent": false, // or {}
     "client_subnet": "",
     "fakeip": {}
   }
@@ -172,6 +173,65 @@ response (`NOERROR`) before DNS rules or upstream servers are consulted.
 
 Set to `true` to remove this built-in rejection. DNS rules can still reject these
 queries. Other query types and names are unaffected.
+
+#### tcp_concurrent
+
+Race TCP connections to all addresses a domain resolves to, and use the first connection established.
+
+It applies wherever the handshake with the destination is confirmed before the dial returns:
+
+* `direct` outbounds, for domains and for addresses resolved by the `resolve` route action;
+* the server address of every outbound;
+* VPN endpoints (WireGuard, Tailscale, OpenVPN, OpenConnect, MASQUE, EasyTier) and `tailcat` outbounds, inside the
+  tunnel;
+* through a `detour` to one of the above, which receives all addresses and races them itself;
+* `socks` and `http` outbounds racing route-resolved destinations through the proxy, only with their own
+  [`tcp_concurrent`](/configuration/shared/dial/#tcp_concurrent).
+
+It does not apply to UDP, where connecting sends nothing to race; to dialers with `tcp_fast_open`, which defer the
+handshake to the first write; or to proxy protocols such as VMess, VLESS, Trojan and Shadowsocks, which return before
+their server reached the destination.
+
+Attempts are ordered by connection history and address family: the address that last connected to the destination
+goes first, addresses that failed within the last minute go last, and IPv6 and IPv4 addresses alternate, starting with
+the family preferred by the domain strategy. Once a connection is established, the remaining attempts are canceled and
+connections that complete afterwards are closed. A failed attempt starts the next one immediately. The history is
+dropped when the network changes.
+
+The [Clash API](/configuration/experimental/clash-api/) switches it at runtime with the `tcp-concurrent` field of
+`PATCH /configs`, reports statistics and history at `GET /dns/tcp-concurrent` and clears the history with
+`DELETE /dns/tcp-concurrent`. [Observability](/configuration/experimental/observability/) exports the statistics as
+`singbox_tcp_concurrent_*` metrics. Dialers override it with their own
+[`tcp_concurrent`](/configuration/shared/dial/#tcp_concurrent).
+
+Accepts a boolean or an object. Disabled by default.
+
+```json
+{
+  "enabled": true,
+  "attempt_delay": "",
+  "max_concurrent": 0
+}
+```
+
+##### enabled
+
+Enable concurrent TCP dialing.
+
+##### attempt_delay
+
+Fixed delay between successive connection attempts. `0s` starts all attempts at once.
+
+When empty, the delay adapts to each destination: a destination without recent history starts all attempts at once,
+while a destination that connected within the last 10 minutes starts with the address that won last time and starts
+the others when it has not connected within twice its smoothed connect time, between `20ms` and `250ms`. A healthy
+destination therefore costs a single handshake.
+
+##### max_concurrent
+
+Maximum number of attempts in progress at the same time. Further attempts start as earlier ones fail.
+
+No limit by default.
 
 #### client_subnet
 

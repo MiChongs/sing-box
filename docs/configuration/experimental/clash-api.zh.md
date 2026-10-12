@@ -108,6 +108,18 @@
     `PATCH /rules/disable` 接受 `{"<index>": true|false}`，按 `index` 禁用或启用规则；
     `PUT /rules/{uuid}` 仍可按 `uuid` 切换规则状态。
 
+!!! info "TCP 并发拨号"
+
+    与 mihomo 一致，`GET /configs` 返回 `tcp-concurrent`，`PATCH /configs` 的 `tcp-concurrent` 在运行时开关
+    [`dns.tcp_concurrent`](/zh/configuration/dns/#tcp_concurrent)。该开关不会持久化，设置了自身
+    `tcp_concurrent` 的拨号器不受其影响。
+
+    `GET /dns/tcp-concurrent` 返回 `enabled`、`adaptive`（未设置 `attempt_delay`）、`attemptDelay`（毫秒）、
+    `maxConcurrent`，统计数据 `statistics`（`races`、`raceFailures`、`historyHits`、`attempts`、`failures`、
+    `canceled`、`lateClosed`、按胜出尝试序号计数的 `wins`、平均连接耗时 `averageConnectTime`（毫秒）），
+    记住的目标 `destinations`（`host`、`port`、`address`、平滑连接耗时 `connectTime`（毫秒）、`expiresAt`）
+    与失败地址 `failures`（`address`、`expiresAt`）。`DELETE /dns/tcp-concurrent` 清空连接历史并保留统计数据。
+
 ### Fields
 
 #### external_controller

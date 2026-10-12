@@ -62,6 +62,7 @@ type Endpoint struct {
 	logger               log.ContextLogger
 	dnsRouter            adapter.DNSRouter
 	innerDNSQueryOptions adapter.DNSQueryOptions
+	tcpConcurrent        dialer.TCPConcurrentPolicy
 	services             platform.Services
 	localName            string
 	localConfig          string
@@ -168,6 +169,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		done:                 make(chan struct{}),
 		proxyNATListeners:    make(map[uint16]*proxyNATListener),
 	}
+	ep.tcpConcurrent = dialer.NewTCPConcurrentPolicy(ctx, options.TCPConcurrent)
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	sockets := &socketFactory{
 		endpoint:        ep,
@@ -630,12 +632,28 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 		if lookupErr != nil {
 			return nil, lookupErr
 		}
-		return N.DialSerial(ctx, e.device, network, destination, destinationAddresses)
+		return dialer.DialSerialConcurrent(ctx, e.tcpConcurrent, e.device, network, destination, destinationAddresses)
 	}
 	if !destination.Addr.IsValid() {
 		return nil, E.New("invalid destination: ", destination)
 	}
 	return e.device.DialContext(ctx, network, destination)
+}
+
+// DialParallel dials route-resolved addresses through the tunnel and races
+// them with dns.tcp_concurrent.
+func (e *Endpoint) DialParallel(ctx context.Context, network string, destination M.Socksaddr, destinationAddresses []netip.Addr) (net.Conn, error) {
+	switch N.NetworkName(network) {
+	case N.NetworkTCP:
+		e.logger.InfoContext(ctx, "outbound connection to ", destination)
+	case N.NetworkUDP:
+		e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+	}
+	err := e.waitReady(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return dialer.DialSerialConcurrent(ctx, e.tcpConcurrent, e.device, network, destination, destinationAddresses)
 }
 
 func (e *Endpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {

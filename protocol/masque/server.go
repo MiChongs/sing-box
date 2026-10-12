@@ -46,6 +46,7 @@ type ServerEndpoint struct {
 	ctx                  context.Context
 	dnsRouter            adapter.DNSRouter
 	innerDNSQueryOptions adapter.DNSQueryOptions
+	tcpConcurrent        dialer.TCPConcurrentPolicy
 	listener             *listener.Listener
 	httpServer           *http.Server
 	tlsConfig            tls.ServerConfig
@@ -93,6 +94,7 @@ func NewServerEndpoint(ctx context.Context, router adapter.Router, logger log.Co
 		quicOptions:          options.HTTP3Options,
 		localAddresses:       options.Address,
 	}
+	serverEndpoint.tcpConcurrent = dialer.NewTCPConcurrentPolicy(ctx, nil)
 	server, err := masque.NewServer(masque.ServerOptions{
 		Context:         ctx,
 		Logger:          logger,
@@ -299,12 +301,27 @@ func (s *ServerEndpoint) DialContext(ctx context.Context, network string, destin
 		if err != nil {
 			return nil, err
 		}
-		return N.DialSerial(ctx, s.device, network, destination, destinationAddresses)
+		return dialer.DialSerialConcurrent(ctx, s.tcpConcurrent, s.device, network, destination, destinationAddresses)
 	}
 	if !destination.Addr.IsValid() {
 		return nil, E.New("invalid destination: ", destination)
 	}
 	return s.device.DialContext(ctx, network, destination)
+}
+
+// DialParallel dials route-resolved addresses through the tunnel and races
+// them with dns.tcp_concurrent.
+func (s *ServerEndpoint) DialParallel(ctx context.Context, network string, destination M.Socksaddr, destinationAddresses []netip.Addr) (net.Conn, error) {
+	switch N.NetworkName(network) {
+	case N.NetworkTCP:
+		s.logger.InfoContext(ctx, "outbound connection to ", destination)
+	case N.NetworkUDP:
+		s.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+	}
+	if !s.started.Load() {
+		return nil, E.New("endpoint is not ready yet")
+	}
+	return dialer.DialSerialConcurrent(ctx, s.tcpConcurrent, s.device, network, destination, destinationAddresses)
 }
 
 func (s *ServerEndpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {

@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"net"
+	"net/netip"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/outbound"
@@ -27,6 +28,8 @@ type Outbound struct {
 	outbound.Adapter
 	logger logger.ContextLogger
 	client *http.Client
+
+	tcpConcurrent dialer.TCPConcurrentPolicy
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.HTTPOutboundOptions) (adapter.Outbound, error) {
@@ -48,11 +51,13 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
-	return &Outbound{
+	outbound := &Outbound{
 		Adapter: outbound.NewAdapterWithDialerOptions(C.TypeHTTP, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
 		logger:  logger,
 		client:  client,
-	}, nil
+	}
+	outbound.tcpConcurrent = dialer.NewProxyTCPConcurrentPolicy(ctx, options.TCPConcurrent)
+	return outbound, nil
 }
 
 func (h *Outbound) InterfaceUpdated(ctx context.Context) {
@@ -85,6 +90,20 @@ func (h *Outbound) DialContext(ctx context.Context, network string, destination 
 	default:
 		return nil, E.Extend(N.ErrUnknownNetwork, network)
 	}
+}
+
+// DialParallel connects to route-resolved addresses through the proxy, racing
+// them when the outbound sets tcp_concurrent: the race needs a proxy that
+// answers CONNECT only once it reached the destination.
+func (h *Outbound) DialParallel(ctx context.Context, network string, destination M.Socksaddr, destinationAddresses []netip.Addr) (net.Conn, error) {
+	if N.NetworkName(network) != N.NetworkTCP {
+		return dialer.DialEach(ctx, h, network, destination, destinationAddresses)
+	}
+	ctx, metadata := adapter.ExtendContext(ctx)
+	metadata.Outbound = h.Tag()
+	metadata.Destination = destination
+	h.logger.InfoContext(ctx, "outbound connection to ", destination)
+	return dialer.DialSerialConcurrent(ctx, h.tcpConcurrent, h.client, network, destination, destinationAddresses)
 }
 
 func (h *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {

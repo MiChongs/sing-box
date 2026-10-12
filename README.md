@@ -19,6 +19,7 @@
 - [Nowhere 协议](#nowhere-协议)
 - [EasyTier 端点](#easytier-端点)
 - [eBPF 入站](#ebpf-入站)
+- [TCP 并发拨号](#tcp-并发拨号)
 - [Clash API 扩展](#clash-api-扩展)
 - [其他改进](#其他改进)
 - [继承自 reF1nd 的功能](#继承自-ref1nd-的功能)
@@ -531,6 +532,33 @@ wazero 仅在 amd64 与 arm64 架构上以编译方式执行，其他架构使�
 ```
 
 完整说明参见 [eBPF 入站](./docs/configuration/inbound/ebpf.zh.md)、[内核要求](./docs/manual/misc/ebpf-kernel-requirements.zh.md)与[故障排查](./docs/manual/misc/ebpf-troubleshooting.zh.md)。
+
+## TCP 并发拨号
+
+`dns.tcp_concurrent` 对域名解析出的多个地址并发建立 TCP 连接，采用最先建立的连接，对应 mihomo 的 `tcp-concurrent`。
+
+```json
+{
+  "dns": {
+    "tcp_concurrent": true
+  }
+}
+```
+
+**适用范围**：凡是拨号返回前已确认与目标握手的路径都会并发：`direct` 出站（域名与 `resolve` 路由动作解析出的地址）、所有出站的服务器地址、WireGuard / Tailscale / OpenVPN / OpenConnect / MASQUE / EasyTier 端点与 `tailcat` 出站在隧道内的连接，以及经由 `detour` 交给这些出站的连接（由 detour 目标接收全部地址后自行并发）。`socks` 与 `http` 出站经代理服务器并发路由已解析的目标，需在该出站上显式设置 `tcp_concurrent: true`，因为这取决于服务器是否在到达目标后才答复（sing-box 的 SOCKS 入站与 Squid 如此，sing-box 的 HTTP 入站与 mihomo 会立即答复）。
+
+**不适用**：UDP（建立连接不发送数据，无从竞速）、`tcp_fast_open`（握手推迟到首次写入）、VMess / VLESS / Trojan / Shadowsocks 等在服务器到达目标之前即返回的代理协议。
+
+与 mihomo 同时向全部地址发起连接相比：
+
+- **按历史与地址族排序**：最近一次连上该目标的地址最先尝试，一分钟内失败过的地址最后尝试，其余地址从优先地址族开始 IPv6 与 IPv4 交替排列（RFC 8305）。失败记录按地址与端口保存，共用同一地址的域名可相互受益；网络变化时清空。
+- **自适应启动**：没有近期记录的目标同时尝试全部地址；10 分钟内连接过的目标先只尝试上次胜出的地址，若它在其平滑连接耗时的两倍（20–250 ms）内未连上，再开始其余尝试。连接正常的目标只需一次握手。
+- **失败立即补位**：任一尝试失败时立即开始下一个尝试，不等待间隔。
+- **取消落败尝试**：连接建立后立即取消其余尝试，此后才完成的连接立即关闭。
+- **可调节**：`attempt_delay` 设定固定间隔（`0s` 即全部同时开始），`max_concurrent` 限制同时进行的尝试数量；拨号字段 `tcp_concurrent` 可为单个出站强制开启或关闭。
+- **运行时开关与观测**：`GET` / `PATCH /configs` 的 `tcp-concurrent` 与 mihomo 面板兼容；`GET /dns/tcp-concurrent` 查看统计与连接历史，`DELETE /dns/tcp-concurrent` 清空历史；可观测性导出 `singbox_tcp_concurrent_*` 指标，Grafana 面板含对应图表。
+
+字段说明参见 [DNS](./docs/configuration/dns/index.zh.md#tcp_concurrent) 与 [拨号字段](./docs/configuration/shared/dial.zh.md#tcp_concurrent)。
 
 ## Clash API 扩展
 

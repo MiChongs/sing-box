@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/experimental/clashmode"
 	"github.com/sagernet/sing-box/log"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
@@ -113,5 +115,62 @@ func TestReloadConfigs(t *testing.T) {
 		require.Equal(t, "invalid configuration", errorMessage(t, response))
 		require.Equal(t, 1, checker.checked)
 		require.Zero(t, router.reloaded)
+	})
+}
+
+func TestConfigsTCPConcurrent(t *testing.T) {
+	t.Parallel()
+
+	newTestServer := func(tcpConcurrent *dialer.TCPConcurrent) (http.Handler, *clashmode.Manager) {
+		ctx := context.Background()
+		if tcpConcurrent != nil {
+			ctx = service.ContextWithPtr(ctx, tcpConcurrent)
+		}
+		clashMode := clashmode.NewManager(ctx, log.NewNOPFactory().Logger(), "Rule", []string{"Rule", "Global"})
+		server := &Server{
+			ctx:       ctx,
+			clashMode: clashMode,
+			logger:    log.NewNOPFactory().NewLogger("clash-api"),
+		}
+		return configRouter(server, log.NewNOPFactory()), clashMode
+	}
+	request := func(handler http.Handler, method string, body string) *httptest.ResponseRecorder {
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, httptest.NewRequest(method, "/", strings.NewReader(body)))
+		return response
+	}
+	getTCPConcurrent := func(t *testing.T, handler http.Handler) bool {
+		response := request(handler, http.MethodGet, "")
+		require.Equal(t, http.StatusOK, response.Code)
+		var configs map[string]any
+		require.NoError(t, json.Unmarshal(response.Body.Bytes(), &configs))
+		enabled, loaded := configs["tcp-concurrent"].(bool)
+		require.True(t, loaded, "GET /configs must report tcp-concurrent like mihomo")
+		return enabled
+	}
+
+	t.Run("toggle at runtime", func(t *testing.T) {
+		tcpConcurrent, err := dialer.NewTCPConcurrent(log.NewNOPFactory().NewLogger("tcp-concurrent"), nil)
+		require.NoError(t, err)
+		handler, _ := newTestServer(tcpConcurrent)
+		require.False(t, getTCPConcurrent(t, handler))
+
+		require.Equal(t, http.StatusNoContent, request(handler, http.MethodPatch, `{"tcp-concurrent": true}`).Code)
+		require.True(t, tcpConcurrent.Enabled())
+		require.True(t, getTCPConcurrent(t, handler))
+
+		require.Equal(t, http.StatusNoContent, request(handler, http.MethodPatch, `{"mode": "Rule"}`).Code)
+		require.True(t, tcpConcurrent.Enabled(), "a PATCH without the field keeps it")
+
+		require.Equal(t, http.StatusNoContent, request(handler, http.MethodPatch, `{"tcp-concurrent": false}`).Code)
+		require.False(t, tcpConcurrent.Enabled())
+	})
+
+	t.Run("unavailable rejects the whole patch", func(t *testing.T) {
+		handler, clashMode := newTestServer(nil)
+		require.False(t, getTCPConcurrent(t, handler))
+		response := request(handler, http.MethodPatch, `{"mode": "Global", "tcp-concurrent": true}`)
+		require.Equal(t, http.StatusBadRequest, response.Code)
+		require.Equal(t, "Rule", clashMode.Mode())
 	})
 }

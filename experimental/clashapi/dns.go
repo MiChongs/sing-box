@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing/common"
 
@@ -13,9 +14,11 @@ import (
 	"github.com/miekg/dns"
 )
 
-func dnsRouter(router adapter.DNSRouter) http.Handler {
+func dnsRouter(router adapter.DNSRouter, tcpConcurrent *dialer.TCPConcurrent) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/query", queryDNS(router))
+	r.Get("/tcp-concurrent", getTCPConcurrent(tcpConcurrent))
+	r.Delete("/tcp-concurrent", resetTCPConcurrent(tcpConcurrent))
 	return r
 }
 

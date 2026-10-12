@@ -16,6 +16,7 @@ import (
 
 	"github.com/sagernet/cors"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/dialer"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
@@ -162,7 +163,7 @@ func NewServer(ctx context.Context, logFactory log.ObservableFactory, options op
 		r.Mount("/script", scriptRouter())
 		r.Mount("/profile", profileRouter())
 		r.Mount("/cache", cacheRouter(ctx))
-		r.Mount("/dns", dnsRouter(s.dnsRouter))
+		r.Mount("/dns", dnsRouter(s.dnsRouter, dialer.TCPConcurrentFromContext(s.ctx)))
 		r.Mount("/smart", smartRouter(ctx))
 
 		if service.FromContext[adapter.PlatformInterface](ctx) == nil {

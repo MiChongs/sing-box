@@ -66,6 +66,7 @@ type Endpoint struct {
 	hotpCounter        atomic.Uint64
 
 	innerDNSQueryOptions adapter.DNSQueryOptions
+	tcpConcurrent        dialer.TCPConcurrentPolicy
 }
 
 type clientState struct {
@@ -124,6 +125,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		statusUpdated: make(chan struct{}),
 		onDemand:      options.OnDemand,
 	}
+	openConnectEndpoint.tcpConcurrent = dialer.NewTCPConcurrentPolicy(ctx, options.TCPConcurrent)
 	openConnectEndpoint.innerDNSQueryOptions = innerDNSQueryOptions
 	openConnectEndpoint.state.Store(new(clientState))
 	success := false
@@ -651,12 +653,28 @@ func (e *Endpoint) DialContext(ctx context.Context, network string, destination 
 		if err != nil {
 			return nil, err
 		}
-		return N.DialSerial(ctx, e.device, network, destination, destinationAddresses)
+		return dialer.DialSerialConcurrent(ctx, e.tcpConcurrent, e.device, network, destination, destinationAddresses)
 	}
 	if !destination.Addr.IsValid() {
 		return nil, E.New("invalid destination: ", destination)
 	}
 	return e.device.DialContext(ctx, network, destination)
+}
+
+// DialParallel dials route-resolved addresses through the tunnel and races
+// them with dns.tcp_concurrent.
+func (e *Endpoint) DialParallel(ctx context.Context, network string, destination M.Socksaddr, destinationAddresses []netip.Addr) (net.Conn, error) {
+	switch N.NetworkName(network) {
+	case N.NetworkTCP:
+		e.logger.InfoContext(ctx, "outbound connection to ", destination)
+	case N.NetworkUDP:
+		e.logger.InfoContext(ctx, "outbound packet connection to ", destination)
+	}
+	readyErr := e.waitReady(ctx)
+	if readyErr != nil {
+		return nil, readyErr
+	}
+	return dialer.DialSerialConcurrent(ctx, e.tcpConcurrent, e.device, network, destination, destinationAddresses)
 }
 
 func (e *Endpoint) ListenPacketWithDestination(ctx context.Context, destination M.Socksaddr) (net.PacketConn, netip.Addr, error) {

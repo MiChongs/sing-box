@@ -2232,6 +2232,502 @@
         "w": 24,
         "h": 1
       },
+      "id": 48,
+      "panels": [],
+      "title": "TCP Concurrent Dialing",
+      "type": "row",
+      "description": "dns.tcp_concurrent races of resolved addresses."
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Dials that raced several resolved addresses, the ones the remembered address won alone, and the ones where every attempt failed.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 65,
+        "w": 8,
+        "h": 8
+      },
+      "id": 49,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(rate(singbox_tcp_concurrent_races_total{instance=~\"$instance\"}[$rate_interval]))",
+          "instant": false,
+          "legendFormat": "Races",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(rate(singbox_tcp_concurrent_history_hits_total{instance=~\"$instance\"}[$rate_interval]))",
+          "instant": false,
+          "legendFormat": "Won by history",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(rate(singbox_tcp_concurrent_race_failures_total{instance=~\"$instance\"}[$rate_interval]))",
+          "instant": false,
+          "legendFormat": "All attempts failed",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "title": "Race Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Connection attempts started by races and how the ones that did not win ended.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ops",
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 4,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": true,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 8,
+        "y": 65,
+        "w": 8,
+        "h": 8
+      },
+      "id": 50,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(rate(singbox_tcp_concurrent_attempts_total{instance=~\"$instance\"}[$rate_interval]))",
+          "instant": false,
+          "legendFormat": "Started",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(rate(singbox_tcp_concurrent_attempt_failures_total{instance=~\"$instance\"}[$rate_interval]))",
+          "instant": false,
+          "legendFormat": "Failed",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(rate(singbox_tcp_concurrent_attempts_canceled_total{instance=~\"$instance\"}[$rate_interval]))",
+          "instant": false,
+          "legendFormat": "Canceled",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(rate(singbox_tcp_concurrent_late_connections_closed_total{instance=~\"$instance\"}[$rate_interval]))",
+          "instant": false,
+          "legendFormat": "Closed late",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "title": "Attempt Outcomes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Won races in the range grouped by the position of the winning attempt; position 1 is the first address tried.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none",
+          "decimals": 1,
+          "min": 0
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 16,
+        "y": 65,
+        "w": 4,
+        "h": 8
+      },
+      "id": 51,
+      "options": {
+        "displayMode": "gradient",
+        "maxVizHeight": 300,
+        "minVizHeight": 16,
+        "minVizWidth": 8,
+        "namePlacement": "auto",
+        "orientation": "horizontal",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showUnfilled": true,
+        "sizing": "auto",
+        "valueMode": "color"
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum by (position)(increase(singbox_tcp_concurrent_wins_total{instance=~\"$instance\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "Attempt {{position}}",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Wins by Attempt Position",
+      "type": "bargauge"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Average connect time of the winning attempts in the range.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "ms",
+          "decimals": 1
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 65,
+        "w": 4,
+        "h": 4
+      },
+      "id": 52,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "1000 * sum(increase(singbox_tcp_concurrent_connect_seconds_total{instance=~\"$instance\"}[$__range])) / sum(increase(singbox_tcp_concurrent_wins_total{instance=~\"$instance\"}[$__range]))",
+          "instant": true,
+          "legendFormat": "Connect Time",
+          "range": false,
+          "refId": "A"
+        }
+      ],
+      "title": "Average Connect Time",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "description": "Destinations with a remembered winning address and addresses tried last after a recent failure.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "x": 20,
+        "y": 69,
+        "w": 4,
+        "h": 4
+      },
+      "id": 53,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "auto",
+        "wideLayout": true
+      },
+      "pluginVersion": "11.6.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(singbox_tcp_concurrent_remembered_destinations{instance=~\"$instance\"})",
+          "instant": true,
+          "legendFormat": "Destinations",
+          "range": false,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${DS_PROMETHEUS}"
+          },
+          "editorMode": "code",
+          "exemplar": false,
+          "expr": "sum(singbox_tcp_concurrent_failed_addresses{instance=~\"$instance\"})",
+          "instant": true,
+          "legendFormat": "Failed",
+          "range": false,
+          "refId": "B"
+        }
+      ],
+      "title": "History",
+      "type": "stat"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 73,
+        "w": 24,
+        "h": 1
+      },
       "id": 31,
       "panels": [],
       "title": "Prometheus Health",
@@ -2270,7 +2766,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 65,
+        "y": 74,
         "w": 6,
         "h": 5
       },
@@ -2338,7 +2834,7 @@
       },
       "gridPos": {
         "x": 6,
-        "y": 65,
+        "y": 74,
         "w": 6,
         "h": 5
       },
@@ -2406,7 +2902,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 65,
+        "y": 74,
         "w": 6,
         "h": 5
       },
@@ -2474,7 +2970,7 @@
       },
       "gridPos": {
         "x": 18,
-        "y": 65,
+        "y": 74,
         "w": 6,
         "h": 5
       },
@@ -2574,7 +3070,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 70,
+        "y": 79,
         "w": 12,
         "h": 8
       },
@@ -2687,7 +3183,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 70,
+        "y": 79,
         "w": 12,
         "h": 8
       },
@@ -2747,7 +3243,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 78
+        "y": 87
       },
       "id": 44,
       "panels": [],
@@ -2813,7 +3309,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 79
+        "y": 88
       },
       "id": 45,
       "options": {
@@ -2906,7 +3402,7 @@
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 79
+        "y": 88
       },
       "id": 46,
       "options": {
@@ -2944,7 +3440,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 87,
+        "y": 96,
         "w": 24,
         "h": 1
       },
@@ -3040,7 +3536,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 88,
+        "y": 97,
         "w": 16,
         "h": 8
       },
@@ -3184,7 +3680,7 @@
       },
       "gridPos": {
         "x": 16,
-        "y": 88,
+        "y": 97,
         "w": 8,
         "h": 8
       },
@@ -3329,7 +3825,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 96,
+        "y": 105,
         "w": 24,
         "h": 13
       },
@@ -3536,7 +4032,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 109,
+        "y": 118,
         "w": 24,
         "h": 13
       },
@@ -3736,7 +4232,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 122,
+        "y": 131,
         "w": 24,
         "h": 11
       },
