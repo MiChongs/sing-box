@@ -375,6 +375,12 @@ func (s *Server) handleDownlink(writer http.ResponseWriter, request *http.Reques
 		conn.reader = session.uploadQueue
 	}
 
+	// 部分入站在 NewConnectionEx 里同步处理整条连接 (如 VLESS 的 mux / XUDP)，
+	// 下面的 select 要等它返回才执行。请求一结束就在这里关闭连接: packet-up 的
+	// 上行队列与请求无关，否则它会一直等数据，handler 不返回，会话泄漏，
+	// HTTP/3 Server.Close 也会一直等下去。
+	stopCloseOnDone := context.AfterFunc(request.Context(), func() { _ = conn.Close() })
+	defer stopCloseOnDone()
 	done := make(chan struct{})
 	s.handler.NewConnectionEx(request.Context(), conn, source, M.Socksaddr{}, N.OnceClose(func(it error) {
 		close(done)

@@ -71,7 +71,7 @@ func (c *xhttpConn) Read(p []byte) (int, error) {
 	if err != nil && err != io.EOF && c.closed.Load() {
 		return n, net.ErrClosed
 	}
-	return n, err
+	return n, wrapError(err)
 }
 
 func (c *xhttpConn) Write(p []byte) (int, error) {
@@ -82,7 +82,7 @@ func (c *xhttpConn) Write(p []byte) (int, error) {
 	if err != nil && c.deadlineFired.Load() {
 		return n, xhttpDeadlineError{}
 	}
-	return n, err
+	return n, wrapError(err)
 }
 
 func (c *xhttpConn) Close() error {

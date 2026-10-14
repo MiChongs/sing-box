@@ -26,3 +26,7 @@ func buildH3Transport(N.Dialer, M.Socksaddr, boxtls.Config, *config, time.Durati
 func (s *Server) serveH3(net.PacketConn) error {
 	return errH3NotIncluded
 }
+
+func isH3Closed(error) bool {
+	return false
+}

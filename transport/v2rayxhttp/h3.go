@@ -5,6 +5,7 @@ package v2rayxhttp
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"net"
 	"net/http"
 	"time"
@@ -110,6 +111,42 @@ func (s *Server) serveH3(packetConn net.PacketConn) error {
 		return nil
 	}
 	return err
+}
+
+// isH3Closed: quic-go 的连接关闭错误本身就匹配 net.ErrClosed，但 http3 把它们
+// 换成了不匹配的 *http3.Error，"H3 error (0x0)" 就是这样被记成 ERROR 的。
+// 以下 HTTP/3 / QUIC 错误都是隧道正常结束，而不是故障:
+//   - 任一端取消请求 (H3_REQUEST_CANCELLED)，客户端关闭隧道时就是这样结束请求的；
+//   - 以 H3_NO_ERROR 重置流或关闭连接 (含服务端空闲关闭)；
+//   - 以应用错误码 0 关闭 QUIC 连接: http3.Transport 关闭连接时用的就是 0，
+//     无错误关闭的连接也报告 0，本端为 "H3 error (0x0) (local)"；
+//   - 对端丢失连接状态后的 stateless reset (相当于 TCP RST)；
+//   - 本端 listener / transport 关闭。
+func isH3Closed(err error) bool {
+	var (
+		h3Err     *http3.Error
+		streamErr *quic.StreamError
+		appErr    *quic.ApplicationError
+		resetErr  *quic.StatelessResetError
+	)
+	switch {
+	case errors.As(err, &h3Err):
+		return isH3ClosedCode(h3Err.ErrorCode)
+	case errors.As(err, &streamErr):
+		return isH3ClosedCode(http3.ErrCode(streamErr.ErrorCode))
+	case errors.As(err, &appErr):
+		return isH3ClosedCode(http3.ErrCode(appErr.ErrorCode))
+	}
+	return errors.As(err, &resetErr) || errors.Is(err, quic.ErrServerClosed) || errors.Is(err, quic.ErrTransportClosed)
+}
+
+func isH3ClosedCode(code http3.ErrCode) bool {
+	switch code {
+	case 0, http3.ErrCodeNoError, http3.ErrCodeRequestCanceled:
+		return true
+	default:
+		return false
+	}
 }
 
 type h3ServerCloser struct {

@@ -7,6 +7,8 @@ import (
 	"net"
 	"testing"
 
+	"github.com/sagernet/sing-box/adapter"
+	boxtls "github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/logger"
@@ -39,6 +41,28 @@ func TestE2E_HTTP3(t *testing.T) {
 			checkEcho(t, client, 4, 512*1024)
 		})
 	}
+}
+
+func TestE2E_HTTP3TunnelClose(t *testing.T) {
+	checkTunnelClose(t, func(t *testing.T, handler adapter.V2RayServerTransportHandler) M.Socksaddr {
+		t.Helper()
+		server, err := NewServer(context.Background(), logger.NOP(), &option.V2RayXHTTPOptions{Path: "/xhttp"}, newTestTLSServer(t, "h3"), handler)
+		if err != nil {
+			t.Fatal(err)
+		}
+		packetConn, err := net.ListenPacket("udp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go server.ServePacket(packetConn)
+		t.Cleanup(func() {
+			_ = server.Close()
+			_ = packetConn.Close()
+		})
+		return M.SocksaddrFromNet(packetConn.LocalAddr())
+	}, func(t *testing.T) boxtls.Config {
+		return newTestTLSClient(t, "example.com", "h3")
+	})
 }
 
 // 上行走 HTTP/3 (UDP)，下行走明文 HTTP/1.1 (TCP)，两个入口共用同一个 Server 的 session 表。
