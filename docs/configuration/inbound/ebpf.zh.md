@@ -164,9 +164,11 @@ DNS。上述筛选仍然作用于普通的非 DNS 流量，因此 `hijack` 不�
 `local.bypass_private_address`、`local.bypass_port` 或其他 bypass 规则本会让
 它们在内核直连。内核在检查所有 bypass 之前先检查强制接管前缀。
 
-每个地址族最多接受一个前缀（后端每地址族只保留一个强制接管前缀）。与 DNS
-fake-ip 范围重叠的前缀会在启动时报错，因为 fake-ip 已占用该槽位；需要使用
-`redir-host` DNS 模式才能配置 bypass_exclude。
+每个地址族最多接受一个前缀。内核每个地址族保留两个强制接管前缀，由所有路径
+共用，DNS fake-ip 范围和两个 `bypass_exclude` 列表合计占用，因此 fake-ip DNS 可以
+与每个地址族一个 bypass_exclude 前缀同时使用。在 fake-ip 之外，`local.bypass_exclude`
+与 `shared.bypass_exclude` 使用同一地址族的不同前缀需要三个槽位，启动时会报错。
+每个前缀在所有路径上都会被接管。`fakeip_icmp: reply` 只应答 fake-ip 范围。
 
 典型用途：让 VPN/CGNAT 网段（如 Tailscale 的 `100.64.0.0/10` 及 IPv6
 `fd7a:115c:a1e0::/48`）保持被接管，使 tailnet 流量能够到达 `tailscale`
@@ -251,8 +253,8 @@ raw-IP、PPP/PPPoE 和受支持的隧道链路应使用 `socket_assign`。local 
 ### shared.bypass_exclude
 
 与 `local.bypass_exclude` 相同，但作用于 shared 数据面：这些 CIDR 前缀会在
-所有 shared bypass 决策之前被强制接管。每个地址族最多接受一个前缀，与 DNS
-fake-ip 范围重叠的前缀会在启动时报错。
+所有 shared bypass 决策之前被强制接管。每个地址族最多接受一个前缀；与 fake-ip
+共用强制接管槽位的规则见 `local.bypass_exclude`。
 
 ### shared.bypass_rule_set
 

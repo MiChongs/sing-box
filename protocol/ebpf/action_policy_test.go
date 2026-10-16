@@ -149,30 +149,75 @@ func TestNormalizeBypassExclude(t *testing.T) {
 	}
 }
 
-func TestValidateBypassExcludeConflicts(t *testing.T) {
-	i := &Inbound{
-		localBypassExclude:  []netip.Prefix{netip.MustParsePrefix("100.64.0.0/10")},
-		sharedBypassExclude: []netip.Prefix{netip.MustParsePrefix("fd7a:115c:a1e0::/48")},
-	}
-	if err := i.validateBypassExcludeConflicts(); err != nil {
-		t.Fatal(err)
-	}
-	i.fakeIPIPv4Prefix = netip.MustParsePrefix("198.18.0.0/16")
-	if err := i.validateBypassExcludeConflicts(); err == nil {
-		t.Fatal("fakeip IPv4 conflict accepted")
-	}
-	i.fakeIPIPv4Prefix = netip.Prefix{}
-	i.fakeIPIPv6Prefix = netip.MustParsePrefix("fdfe:dcba:9876::/64")
-	if err := i.validateBypassExcludeConflicts(); err == nil {
-		t.Fatal("fakeip IPv6 conflict accepted")
+func TestValidateForceInterceptPrefixes(t *testing.T) {
+	prefix := netip.MustParsePrefix
+	for _, testCase := range []struct {
+		name          string
+		fakeIPv4      string
+		fakeIPv6      string
+		localExclude  []string
+		sharedExclude []string
+		accepted      bool
+	}{
+		{"bypass_exclude without fake-ip", "", "", []string{"100.64.0.0/10"}, []string{"fd7a:115c:a1e0::/48"}, true},
+		{"IPv4 fake-ip beside local bypass_exclude", "198.18.0.0/16", "", []string{"100.64.0.0/10"}, nil, true},
+		{"same bypass_exclude on both paths", "198.18.0.0/16", "", []string{"100.64.0.0/10"}, []string{"100.64.0.0/10"}, true},
+		{"three IPv4 prefixes", "198.18.0.0/16", "", []string{"100.64.0.0/10"}, []string{"10.0.0.0/8"}, false},
+		{"three IPv6 prefixes", "", "fdfe:dcba:9876::/64", []string{"fd00::/8"}, []string{"fd7a:115c:a1e0::/48"}, false},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			i := &Inbound{}
+			if testCase.fakeIPv4 != "" {
+				i.fakeIPIPv4Prefix = prefix(testCase.fakeIPv4)
+			}
+			if testCase.fakeIPv6 != "" {
+				i.fakeIPIPv6Prefix = prefix(testCase.fakeIPv6)
+			}
+			for _, value := range testCase.localExclude {
+				i.localBypassExclude = append(i.localBypassExclude, prefix(value))
+			}
+			for _, value := range testCase.sharedExclude {
+				i.sharedBypassExclude = append(i.sharedBypassExclude, prefix(value))
+			}
+			err := i.validateForceInterceptPrefixes()
+			if (err == nil) != testCase.accepted {
+				t.Fatalf("accepted = %v, want %v: %v", err == nil, testCase.accepted, err)
+			}
+		})
 	}
 }
 
-// The local data planes look a socket's UID up in a single LPM map, so the
-// UID decisions handed to sing-ebpf must already be final and non-overlapping.
-// An include range sent together with an overlapping pass decision made the
-// library drop the pass, and every exclude_* option was ignored as soon as any
-// include_* option was configured.
+// TestBuildActionPolicyCombinesFakeIPAndBypassExclude covers fake-ip DNS with
+// a Tailscale bypass_exclude prefix, which share the IPv4 force-intercept
+// slots; only the fake-ip range is answered by the ICMP echo responder.
+func TestBuildActionPolicyCombinesFakeIPAndBypassExclude(t *testing.T) {
+	fakeIP := netip.MustParsePrefix("198.18.0.0/16")
+	tailnet := netip.MustParsePrefix("100.64.0.0/10")
+	inbound := &Inbound{
+		enableTCP:          true,
+		enableUDP:          true,
+		fakeIPIPv4Prefix:   fakeIP,
+		localBypassExclude: []netip.Prefix{tailnet},
+	}
+	inbound.localPolicy.BypassPrivateAddress = true
+	policy, err := inbound.buildActionPolicy()
+	if err != nil {
+		t.Fatal(err)
+	}
+	echoReply := make(map[netip.Prefix]bool)
+	for _, decision := range policy.Local.DestinationCIDR {
+		if decision.Action == commonEBPF.DecisionIntercept {
+			echoReply[decision.Prefix] = decision.EchoReply
+		}
+	}
+	if want := map[netip.Prefix]bool{fakeIP: true, tailnet: false}; !reflect.DeepEqual(echoReply, want) {
+		t.Fatalf("local intercept decisions = %v, want %v", echoReply, want)
+	}
+	if _, err = commonEBPF.CompileActionPolicy(policy); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestBuildActionPolicySubtractsExcludedUIDsFromIncludes(t *testing.T) {
 	inbound := &Inbound{localPolicy: localUIDPolicy{
 		IncludeUIDConfigured: true,

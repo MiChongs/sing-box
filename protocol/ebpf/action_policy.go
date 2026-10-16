@@ -4,7 +4,9 @@ package ebpf
 
 import (
 	"net/netip"
+	"slices"
 	"sort"
+	"strings"
 
 	commonEBPF "github.com/MiChongs/sing-ebpf"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -24,38 +26,42 @@ func validateActionPolicyScope(policy commonEBPF.ActionPolicy) error {
 	return nil
 }
 
-// validateBypassExcludeConflicts rejects bypass_exclude prefixes that would
-// collide with the fake-ip force-intercept slot. The backend force-intercept
-// is a single prefix per address family; fake-ip occupies the same slot, so a
-// bypass_exclude prefix for the same family would make the compiled policy
-// ambiguous (multiple intercept prefixes) or be silently ignored.
-func (i *Inbound) validateBypassExcludeConflicts() error {
-	conflict := func(name, family string, bypassExclude, fakeIP netip.Prefix) error {
-		if fakeIP.IsValid() && bypassExclude.IsValid() {
-			return E.New(name, " bypass_exclude ", bypassExclude, " conflicts with the ", family,
-				" fake-ip force-intercept prefix ", fakeIP, "; use redir-host DNS mode or drop one of them")
+// validateForceInterceptPrefixes rejects bypass_exclude prefixes that do not
+// fit the force-intercept slots. The data planes keep
+// commonEBPF.ForceInterceptPrefixesPerFamily prefixes per address family,
+// shared by every path, for the fake-ip range and both bypass_exclude lists
+// together. sing-ebpf rejects the same policy; this names the options.
+func (i *Inbound) validateForceInterceptPrefixes() error {
+	check := func(family string, ipv4 bool, fakeIP netip.Prefix) error {
+		var (
+			prefixes []netip.Prefix
+			sources  []string
+		)
+		add := func(source string, prefix netip.Prefix) {
+			if !prefix.IsValid() || prefix.Addr().Is4() != ipv4 || slices.Contains(prefixes, prefix) {
+				return
+			}
+			prefixes = append(prefixes, prefix)
+			sources = append(sources, source+" "+prefix.String())
+		}
+		add("fake-ip", fakeIP)
+		for _, prefix := range i.localBypassExclude {
+			add("local.bypass_exclude", prefix)
+		}
+		for _, prefix := range i.sharedBypassExclude {
+			add("shared.bypass_exclude", prefix)
+		}
+		if len(prefixes) > commonEBPF.ForceInterceptPrefixesPerFamily {
+			return E.New("eBPF force-intercepts at most ", commonEBPF.ForceInterceptPrefixesPerFamily, " ", family,
+				" prefixes across the fake-ip range and both bypass_exclude lists, got ", strings.Join(sources, ", "),
+				"; use the same bypass_exclude prefix for local and shared, drop one, or use redir-host DNS mode")
 		}
 		return nil
 	}
-	for _, prefix := range i.localBypassExclude {
-		if prefix.Addr().Is4() {
-			if err := conflict("local", "IPv4", prefix, i.fakeIPIPv4Prefix); err != nil {
-				return err
-			}
-		} else if err := conflict("local", "IPv6", prefix, i.fakeIPIPv6Prefix); err != nil {
-			return err
-		}
+	if err := check("IPv4", true, i.fakeIPIPv4Prefix); err != nil {
+		return err
 	}
-	for _, prefix := range i.sharedBypassExclude {
-		if prefix.Addr().Is4() {
-			if err := conflict("shared", "IPv4", prefix, i.fakeIPIPv4Prefix); err != nil {
-				return err
-			}
-		} else if err := conflict("shared", "IPv6", prefix, i.fakeIPIPv6Prefix); err != nil {
-			return err
-		}
-	}
-	return nil
+	return check("IPv6", false, i.fakeIPIPv6Prefix)
 }
 
 // compileProcessUIDPolicy converts sing-box's include/exclude/package result
@@ -175,7 +181,7 @@ func (i *Inbound) compileActionPolicy() (commonEBPF.CompiledPolicy, error) {
 }
 
 func (i *Inbound) buildActionPolicy() (commonEBPF.ActionPolicy, error) {
-	if err := i.validateBypassExcludeConflicts(); err != nil {
+	if err := i.validateForceInterceptPrefixes(); err != nil {
 		return commonEBPF.ActionPolicy{}, err
 	}
 	// The local data planes and the process tracker must see the same final
@@ -262,14 +268,16 @@ func appendDestinationPolicy(
 			Prefix: prefix, Action: commonEBPF.DecisionIntercept,
 		})
 	}
+	// Only fake-ip addresses have no real host, so only they are answered by
+	// the local ICMP echo responder.
 	if fakeIPv4.IsValid() {
 		scope.DestinationCIDR = append(scope.DestinationCIDR, commonEBPF.CIDRDecision{
-			Prefix: fakeIPv4, Action: commonEBPF.DecisionIntercept,
+			Prefix: fakeIPv4, Action: commonEBPF.DecisionIntercept, EchoReply: true,
 		})
 	}
 	if fakeIPv6.IsValid() {
 		scope.DestinationCIDR = append(scope.DestinationCIDR, commonEBPF.CIDRDecision{
-			Prefix: fakeIPv6, Action: commonEBPF.DecisionIntercept,
+			Prefix: fakeIPv6, Action: commonEBPF.DecisionIntercept, EchoReply: true,
 		})
 	}
 	appendPortDecisions(scope, bypassPorts, dnsMode, enableTCP, enableUDP)

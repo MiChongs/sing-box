@@ -179,10 +179,14 @@ even when `local.bypass_private_address`, `local.bypass_port`, or another
 bypass rule would otherwise pass them in kernel. The kernel checks the
 force-intercept prefix before all bypass checks.
 
-At most one IPv4 and one IPv6 prefix is accepted (the backend keeps a single
-force-intercept prefix per address family). A prefix that overlaps the DNS
-fake-ip range is rejected at startup because fake-ip already occupies that
-slot; use `redir-host` DNS mode when you need bypass_exclude.
+At most one IPv4 and one IPv6 prefix is accepted. The kernel keeps two
+force-intercept prefixes per address family, shared by every path, for the
+DNS fake-ip range and both `bypass_exclude` lists together, so fake-ip DNS can
+be combined with one bypass_exclude prefix per family. Using different
+prefixes of the same family for `local.bypass_exclude` and
+`shared.bypass_exclude` beside fake-ip needs three slots and is rejected at
+startup. Each prefix is intercepted on every path. `fakeip_icmp: reply`
+answers only the fake-ip range.
 
 Typical use: keep a VPN/CGNAT range such as Tailscale's `100.64.0.0/10` (and
 IPv6 `fd7a:115c:a1e0::/48`) intercepted so tailnet traffic can reach a
@@ -273,8 +277,8 @@ Bypasses private and special-use destinations. Default is `true`.
 
 Like `local.bypass_exclude`, but for the shared data plane: CIDR prefixes
 that are force-intercepted ahead of every shared bypass decision. At most one
-IPv4 and one IPv6 prefix is accepted, and a prefix that overlaps the DNS
-fake-ip range is rejected at startup.
+IPv4 and one IPv6 prefix is accepted; see `local.bypass_exclude` for how the
+prefixes share the force-intercept slots with fake-ip.
 
 ### shared.bypass_rule_set
 

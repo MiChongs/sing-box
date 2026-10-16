@@ -360,8 +360,9 @@ func normalizeSourceCIDR(name string, prefixes []netip.Prefix) (badoption.Listab
 }
 
 // normalizeBypassExclude masks and validates bypass_exclude prefixes. The
-// backend force-intercept slot holds a single prefix per address family, so
-// bypass_exclude accepts at most one IPv4 and one IPv6 prefix. These prefixes
+// data planes keep two force-intercept prefixes per address family, which the
+// fake-ip range may share, so bypass_exclude accepts at most one IPv4 and one
+// IPv6 prefix; validateForceInterceptPrefixes checks the total. These prefixes
 // are force-intercepted ahead of every bypass decision (private-address, port,
 // DNS, UID), so a VPN/CGNAT tail such as Tailscale's 100.64.0.0/10 can still
 // reach a proxy even when bypass_private_address would otherwise pass it in
