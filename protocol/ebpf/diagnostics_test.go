@@ -136,12 +136,29 @@ func TestEBPFDiagnosticsIncludesEffectiveTCState(t *testing.T) {
 }
 
 func TestEBPFDiagnosticsSchemaVersionIncludesEffectiveRuntimeFields(t *testing.T) {
-	if adapter.EBPFDiagnosticsSchemaVersion != 13 {
-		t.Fatalf("schema version = %d, want 13 after adding UDP release path diagnostics", adapter.EBPFDiagnosticsSchemaVersion)
+	if adapter.EBPFDiagnosticsSchemaVersion != 16 {
+		t.Fatalf("schema version = %d, want 16 after adding map metadata diagnostics", adapter.EBPFDiagnosticsSchemaVersion)
 	}
 	diagnostics := diagnosticsForAPI(EBPFDiagnostics{SchemaVersion: adapter.EBPFDiagnosticsSchemaVersion, LocalCgroupAttachMode: "link_create"})
-	if diagnostics.SchemaVersion != 13 {
-		t.Fatalf("diagnostics schema version = %d, want 13", diagnostics.SchemaVersion)
+	if diagnostics.SchemaVersion != 16 {
+		t.Fatalf("diagnostics schema version = %d, want 16", diagnostics.SchemaVersion)
+	}
+}
+
+func TestDiagnosticsReportsWaitingSharedInterface(t *testing.T) {
+	inbound := &Inbound{
+		sharedEnabled: true,
+		sharedOptions: option.EBPFSharedOptions{Interface: []string{"wlan2", "rmnet0"}},
+	}
+	diagnostics := inbound.Diagnostics()
+	if diagnostics.State != EBPFDiagnosticsStateWaitingForInterface {
+		t.Fatalf("state = %s, want %s", diagnostics.State, EBPFDiagnosticsStateWaitingForInterface)
+	}
+	if len(diagnostics.WaitingRoles) != 1 || diagnostics.WaitingRoles[0] != "shared" {
+		t.Fatalf("waiting roles = %v, want [shared]", diagnostics.WaitingRoles)
+	}
+	if len(diagnostics.WaitingInterfaces) != 2 || diagnostics.WaitingInterfaces[0] != "wlan2" || diagnostics.WaitingInterfaces[1] != "rmnet0" {
+		t.Fatalf("waiting interfaces = %v, want [wlan2 rmnet0]", diagnostics.WaitingInterfaces)
 	}
 }
 
@@ -174,7 +191,7 @@ func TestKernelRuntimeForAPI(t *testing.T) {
 		MapOccupancy: commonEBPF.MapOccupancyReport{
 			Status: "unknown",
 			Maps: []commonEBPF.MapOccupancy{{
-				ID: 9, Name: "sb_shared_flows", Type: "LRUHash", MaxEntries: 4096,
+				ID: 9, Name: "sb_shared_flows", Category: "runtime", Type: "LRUHash", MaxEntries: 4096,
 				Entries: 3, Supported: true,
 			}},
 			Error: "map enumeration incomplete",
@@ -187,7 +204,8 @@ func TestKernelRuntimeForAPI(t *testing.T) {
 		t.Fatalf("unexpected programs: %+v", diagnostics.Programs)
 	}
 	if diagnostics.MapOccupancy.Status != "unknown" || diagnostics.MapOccupancy.Error != "map enumeration incomplete" ||
-		len(diagnostics.MapOccupancy.Maps) != 1 || diagnostics.MapOccupancy.Maps[0].Entries != 3 {
+		len(diagnostics.MapOccupancy.Maps) != 1 || diagnostics.MapOccupancy.Maps[0].Entries != 3 ||
+		diagnostics.MapOccupancy.Maps[0].Category != "runtime" {
 		t.Fatalf("unexpected map occupancy: %+v", diagnostics.MapOccupancy)
 	}
 }

@@ -85,6 +85,7 @@ func (s *sharedRewrite) Start(interfaceNames []string, hostAddresses []netip.Add
 	if err := dataPlane.Reconcile(interfaceNames, hostAddresses); err != nil {
 		return E.Errors(err, s.Close())
 	}
+	s.startFlowJanitor()
 	if s.sharedBackendInstance() == nil {
 		s.inbound.logger.Debug(
 			"eBPF shared packet-rewrite waiting for downstream interfaces: interfaces=[",
@@ -265,6 +266,16 @@ func (s *sharedRewrite) stopFlowJanitor() {
 
 func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}) {
 	defer close(done)
+	tcTicker := time.NewTicker(tcAssignmentMaintenanceInterval)
+	defer tcTicker.Stop()
+	var tcContinuation <-chan time.Time
+	var tcTimer *time.Timer
+	defer func() {
+		if tcTimer != nil {
+			tcTimer.Stop()
+		}
+	}()
+	tcMaintenancePending := false
 	var releaseTimer *time.Timer
 	var releaseTimerChannel <-chan time.Time
 	resetReleaseTimer := func(backend *ECommon.SharedPacketRewriteBackend) {
@@ -296,19 +307,20 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 	}()
 	pressure := false
 	knownPressure := false
-	belowExitRounds := 0
+	var belowExitRounds uint32
 	var lastReservationFailures uint64
 	scanInProgress := false
 	for {
 		backend := s.sharedBackendInstance()
-		if backend == nil {
-			return
+		var flowWake <-chan struct{}
+		if backend != nil {
+			flowWake = backend.TCPFlowWake()
 		}
 		sweepRequested := false
 		select {
 		case <-ctx.Done():
 			return
-		case <-backend.TCPFlowWake():
+		case <-flowWake:
 			resetReleaseTimer(backend)
 			knownPressure, sweepRequested = updateSharedFlowWakeState(
 				pressure,
@@ -319,7 +331,24 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 			if !sweepRequested {
 				continue
 			}
+		case <-s.inbound.tcAssignmentWake:
+			tcMaintenancePending = true
+		case <-tcTicker.C:
+			tcMaintenancePending = true
+		case <-tcContinuation:
+			tcContinuation = nil
+			tcMaintenancePending = true
 		case <-releaseTimerChannel:
+		}
+		if tcMaintenancePending {
+			complete, _ := s.inbound.sweepTCAssignmentMaintenance()
+			tcMaintenancePending = false
+			if !complete {
+				resetMaintenanceContinuation(&tcTimer, &tcContinuation)
+			}
+		}
+		if backend == nil {
+			continue
 		}
 		now := time.Now()
 		if !sweepRequested {
@@ -398,31 +427,16 @@ func updateSharedFlowWakeState(pressure, knownPressure, scanInProgress bool, usa
 }
 
 func flowUsagePressure(active bool, usage ECommon.MapUsage) bool {
-	if usage.Capacity == 0 {
-		return false
-	}
 	if active {
-		return uint64(usage.Entries)*100 > uint64(usage.Capacity)*sharedFlowPressureExitPercent
+		return mapUsageAbovePercent(usage, sharedFlowPressureExitPercent)
 	}
-	return uint64(usage.Entries)*100 >= uint64(usage.Capacity)*sharedFlowPressureEnterPercent
+	return mapUsageAtLeastPercent(usage, sharedFlowPressureEnterPercent)
 }
 
-func updateSharedFlowPressure(active bool, belowExitRounds int, usage ECommon.MapUsage) (bool, int, bool, bool) {
-	if usage.Capacity == 0 {
-		return active, 0, false, false
-	}
-	if !active {
-		if uint64(usage.Entries)*100 >= uint64(usage.Capacity)*sharedFlowPressureEnterPercent {
-			return true, 0, true, false
-		}
-		return false, 0, false, false
-	}
-	if uint64(usage.Entries)*100 > uint64(usage.Capacity)*sharedFlowPressureExitPercent {
-		return true, 0, false, false
-	}
-	belowExitRounds++
-	if belowExitRounds < sharedFlowPressureExitRounds {
-		return true, belowExitRounds, false, false
-	}
-	return false, 0, false, true
+func updateSharedFlowPressure(active bool, belowExitRounds uint32, usage ECommon.MapUsage) (bool, uint32, bool, bool) {
+	return updateMapPressure(active, belowExitRounds, usage, mapPressureHysteresis{
+		enterPercent: sharedFlowPressureEnterPercent,
+		exitPercent:  sharedFlowPressureExitPercent,
+		exitRounds:   sharedFlowPressureExitRounds,
+	})
 }

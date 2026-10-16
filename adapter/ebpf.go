@@ -4,7 +4,7 @@ import "time"
 
 // EBPFDiagnosticsSchemaVersion versions the complete GetEBPFDiagnostics
 // response. It remains available even when no eBPF inbound is running.
-const EBPFDiagnosticsSchemaVersion = 13
+const EBPFDiagnosticsSchemaVersion = 16
 
 // EBPFDiagnosticsProvider exposes a running inbound's eBPF state to the
 // sing-box API without coupling the API service to the optional eBPF package.
@@ -37,6 +37,7 @@ type EBPFMapOccupancyDiagnostics struct {
 type EBPFMapDiagnostics struct {
 	ID         uint32
 	Name       string
+	Category   string
 	Type       string
 	MaxEntries uint32
 	KeySize    uint32
@@ -92,6 +93,21 @@ type EBPFRuntimeDiagnostics struct {
 	TCLastHealthCheckAt           *time.Time
 	TCLastReconcileAt             *time.Time
 	TCNetworkGeneration           uint64
+	TCAssignmentSweepScanned      uint64
+	TCAssignmentSweepRemoved      uint64
+	TCAssignmentSweepComplete     bool
+	TCAssignmentSweepEntries      uint64
+	TCAssignmentSweepCapacity     uint64
+	TCAssignmentSweepPressure     bool
+	TCAssignmentSweepRuns         uint64
+	TCAssignmentSweepPartial      uint64
+	TCAssignmentSweepFailure      string
+	TCAssignmentSweepLastAt       *time.Time
+	TCAssignmentSweepPartialAt    *time.Time
+	CgroupRecoveryQueueOverflows  uint64
+	CgroupRecoveryQueueOverflowAt *time.Time
+	WaitingRoles                  []string
+	WaitingInterfaces             []string
 
 	Attachments []EBPFAttachmentDiagnostics
 

@@ -128,7 +128,7 @@ type EBPFDiagnostics struct {
 	LocalUDPRecoveryMode          string     `json:"local_udp_recovery_mode,omitempty"`
 	LocalUDPMapPressure           string     `json:"local_udp_map_pressure,omitempty"`
 	LocalUDPNetworkGeneration     uint32     `json:"local_udp_network_generation,omitempty"`
-	LocalUDPReleaseObserver       bool       `json:"local_udp_release_observer,omitempty"`
+	LocalUDPReleaseObserver       bool       `json:"local_udp_release_observer"`
 	LocalUDPReleaseFallbackReason string     `json:"local_udp_release_fallback_reason,omitempty"`
 	LocalUDPReleaseProgram        string     `json:"local_udp_release_program,omitempty"`
 	SharedEnabled                 bool       `json:"shared_enabled"`
@@ -150,6 +150,21 @@ type EBPFDiagnostics struct {
 	TCLastHealthCheckAt           *time.Time `json:"tc_last_health_check_at,omitempty"`
 	TCLastReconcileAt             *time.Time `json:"tc_last_reconcile_at,omitempty"`
 	TCNetworkGeneration           uint64     `json:"tc_network_generation,omitempty"`
+	TCAssignmentSweepScanned      uint64     `json:"tc_assignment_sweep_scanned,omitempty"`
+	TCAssignmentSweepRemoved      uint64     `json:"tc_assignment_sweep_removed,omitempty"`
+	TCAssignmentSweepComplete     bool       `json:"tc_assignment_sweep_complete"`
+	TCAssignmentSweepEntries      uint64     `json:"tc_assignment_sweep_entries,omitempty"`
+	TCAssignmentSweepCapacity     uint64     `json:"tc_assignment_sweep_capacity,omitempty"`
+	TCAssignmentSweepPressure     bool       `json:"tc_assignment_sweep_pressure"`
+	TCAssignmentSweepRuns         uint64     `json:"tc_assignment_sweep_runs,omitempty"`
+	TCAssignmentSweepPartial      uint64     `json:"tc_assignment_sweep_partial,omitempty"`
+	TCAssignmentSweepFailure      string     `json:"tc_assignment_sweep_failure,omitempty"`
+	TCAssignmentSweepLastAt       *time.Time `json:"tc_assignment_sweep_last_at,omitempty"`
+	TCAssignmentSweepPartialAt    *time.Time `json:"tc_assignment_sweep_partial_at,omitempty"`
+	CgroupRecoveryQueueOverflows  uint64     `json:"cgroup_recovery_queue_overflows,omitempty"`
+	CgroupRecoveryQueueOverflowAt *time.Time `json:"cgroup_recovery_queue_overflow_at,omitempty"`
+	WaitingRoles                  []string   `json:"waiting_roles,omitempty"`
+	WaitingInterfaces             []string   `json:"waiting_interfaces,omitempty"`
 
 	Attachments []EBPFAttachmentDiagnostics `json:"attachments,omitempty"`
 
@@ -380,6 +395,21 @@ func diagnosticsForAPI(diagnostics EBPFDiagnostics) adapter.EBPFRuntimeDiagnosti
 		TCLastHealthCheckAt:           diagnostics.TCLastHealthCheckAt,
 		TCLastReconcileAt:             diagnostics.TCLastReconcileAt,
 		TCNetworkGeneration:           diagnostics.TCNetworkGeneration,
+		TCAssignmentSweepScanned:      diagnostics.TCAssignmentSweepScanned,
+		TCAssignmentSweepRemoved:      diagnostics.TCAssignmentSweepRemoved,
+		TCAssignmentSweepComplete:     diagnostics.TCAssignmentSweepComplete,
+		TCAssignmentSweepEntries:      diagnostics.TCAssignmentSweepEntries,
+		TCAssignmentSweepCapacity:     diagnostics.TCAssignmentSweepCapacity,
+		TCAssignmentSweepPressure:     diagnostics.TCAssignmentSweepPressure,
+		TCAssignmentSweepRuns:         diagnostics.TCAssignmentSweepRuns,
+		TCAssignmentSweepPartial:      diagnostics.TCAssignmentSweepPartial,
+		TCAssignmentSweepFailure:      diagnostics.TCAssignmentSweepFailure,
+		TCAssignmentSweepLastAt:       diagnostics.TCAssignmentSweepLastAt,
+		TCAssignmentSweepPartialAt:    diagnostics.TCAssignmentSweepPartialAt,
+		CgroupRecoveryQueueOverflows:  diagnostics.CgroupRecoveryQueueOverflows,
+		CgroupRecoveryQueueOverflowAt: diagnostics.CgroupRecoveryQueueOverflowAt,
+		WaitingRoles:                  append([]string(nil), diagnostics.WaitingRoles...),
+		WaitingInterfaces:             append([]string(nil), diagnostics.WaitingInterfaces...),
 		Attachments:                   attachments,
 		LastError:                     diagnostics.LastError,
 		LastErrorAt:                   diagnostics.LastErrorAt,
@@ -490,6 +520,7 @@ func kernelRuntimeForAPI(observedAt time.Time, runtimeState commonEBPF.RuntimeSt
 		maps = append(maps, adapter.EBPFMapDiagnostics{
 			ID:         uint32(item.ID),
 			Name:       item.Name,
+			Category:   string(item.Category),
 			Type:       item.Type,
 			MaxEntries: item.MaxEntries,
 			KeySize:    item.KeySize,
@@ -598,6 +629,7 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 	sort.Slice(diagnostics.Attachments, func(a, b int) bool {
 		return diagnostics.Attachments[a].InterfaceName < diagnostics.Attachments[b].InterfaceName
 	})
+	diagnostics.WaitingRoles, diagnostics.WaitingInterfaces = i.waitingAttachmentDiagnostics(diagnostics.Attachments)
 
 	var lastErrorAt time.Time
 	limiters := []*warningLimiter{
@@ -649,6 +681,30 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 		diagnostics.TCLastReconcileAt = &reconcileAt
 	}
 	diagnostics.TCNetworkGeneration = i.networkGeneration
+	diagnostics.TCAssignmentSweepScanned = i.tcAssignmentSweepScanned.Load()
+	diagnostics.TCAssignmentSweepRemoved = i.tcAssignmentSweepRemoved.Load()
+	diagnostics.TCAssignmentSweepComplete = i.tcAssignmentSweepComplete.Load()
+	diagnostics.TCAssignmentSweepEntries = i.tcAssignmentSweepEntries.Load()
+	diagnostics.TCAssignmentSweepCapacity = i.tcAssignmentSweepCapacity.Load()
+	diagnostics.TCAssignmentSweepPressure = i.tcAssignmentSweepPressure.Load()
+	diagnostics.TCAssignmentSweepRuns = i.tcAssignmentSweepRuns.Load()
+	diagnostics.TCAssignmentSweepPartial = i.tcAssignmentSweepPartial.Load()
+	if failure, ok := i.tcAssignmentSweepFailure.Load().(string); ok {
+		diagnostics.TCAssignmentSweepFailure = failure
+	}
+	if at := i.tcAssignmentSweepLastAt.Load(); at != 0 {
+		t := time.Unix(0, at)
+		diagnostics.TCAssignmentSweepLastAt = &t
+	}
+	if at := i.tcAssignmentSweepPartialAt.Load(); at != 0 {
+		t := time.Unix(0, at)
+		diagnostics.TCAssignmentSweepPartialAt = &t
+	}
+	diagnostics.CgroupRecoveryQueueOverflows = i.cgroupRecoveryQueueOverflows.Load()
+	if at := i.cgroupRecoveryQueueOverflowAt.Load(); at != 0 {
+		t := time.Unix(0, at)
+		diagnostics.CgroupRecoveryQueueOverflowAt = &t
+	}
 	if i.diagnostics.haveOutcome {
 		diagnostics.RecoveryPending = i.diagnostics.lastOutcome.general == tcSharedRewriteRecoverable ||
 			i.diagnostics.lastOutcome.sharedRewrite == tcSharedRewriteRecoverable ||
@@ -773,6 +829,60 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 	return diagnostics
 }
 
+func (i *Inbound) waitingAttachmentDiagnostics(attachments []EBPFAttachmentDiagnostics) ([]string, []string) {
+	roles := make([]string, 0, 2)
+	interfaces := make([]string, 0, 2)
+	add := func(role, interfaceName string) {
+		roleKnown := false
+		for _, existing := range roles {
+			if existing == role {
+				roleKnown = true
+				break
+			}
+		}
+		if !roleKnown {
+			roles = append(roles, role)
+		}
+		if interfaceName != "" {
+			for _, existing := range interfaces {
+				if existing == interfaceName {
+					return
+				}
+			}
+			interfaces = append(interfaces, interfaceName)
+		}
+	}
+	if i.localEnabled && !attachmentHasRole(attachments, "local") {
+		defaultInterface := i.monitoredDefaultInterfaceName()
+		if defaultInterface == "" {
+			defaultInterface = "default"
+		}
+		add("local", defaultInterface)
+	}
+	if i.sharedEnabled && !attachmentHasRole(attachments, "shared") {
+		configured := activeSharedInterfaces(i.sharedOptions.Interface, i.monitoredDefaultInterfaceName())
+		if len(configured) == 0 {
+			add("shared", "configured interface")
+		} else {
+			for _, interfaceName := range configured {
+				if !attachmentHasInterface(attachments, interfaceName, "shared") {
+					add("shared", interfaceName)
+				}
+			}
+		}
+	}
+	return roles, interfaces
+}
+
+func attachmentHasInterface(attachments []EBPFAttachmentDiagnostics, interfaceName, role string) bool {
+	for _, attachment := range attachments {
+		if attachment.InterfaceName == interfaceName && (attachment.Role == role || attachment.Role == "local+shared") {
+			return true
+		}
+	}
+	return false
+}
+
 type sharedNetworkFragmentPassStats interface {
 	IngressFragmentPasses() (uint64, error)
 	EgressFragmentPasses() (uint64, error)
@@ -853,6 +963,12 @@ func (d EBPFDiagnostics) WriteText(w io.Writer) error {
 	}
 	if d.SharedEnabled {
 		lines = append(lines, fmt.Sprintf("Shared data plane: %s", d.SharedDataPlane))
+	}
+	if len(d.WaitingRoles) > 0 {
+		lines = append(lines, fmt.Sprintf("Waiting paths: %s", strings.Join(d.WaitingRoles, ", ")))
+	}
+	if len(d.WaitingInterfaces) > 0 {
+		lines = append(lines, fmt.Sprintf("Waiting interfaces: %s", strings.Join(d.WaitingInterfaces, ", ")))
 	}
 	if d.TCBackendMode != "" {
 		lines = append(lines, fmt.Sprintf(
@@ -964,16 +1080,14 @@ func (i *Inbound) logStartupSummary() {
 		mountsSummary = strings.Join(mounts, ", ")
 	}
 
-	waiting := make([]string, 0, 2)
-	if diagnostics.LocalEnabled && !attachmentHasRole(diagnostics.Attachments, "local") {
-		waiting = append(waiting, "local")
-	}
-	if diagnostics.SharedEnabled && !attachmentHasRole(diagnostics.Attachments, "shared") {
-		waiting = append(waiting, "shared")
-	}
+	waiting := diagnostics.WaitingRoles
 	waitingSummary := "none"
 	if len(waiting) > 0 {
 		waitingSummary = strings.Join(waiting, ", ")
+	}
+	waitingInterfacesSummary := "none"
+	if len(diagnostics.WaitingInterfaces) > 0 {
+		waitingInterfacesSummary = strings.Join(diagnostics.WaitingInterfaces, ", ")
 	}
 
 	fakeIPICMPSummary := "off"
@@ -992,6 +1106,7 @@ func (i *Inbound) logStartupSummary() {
 
 	i.logger.Debug(
 		"eBPF inbound started: paths=[", pathsSummary, "] mounts=[", mountsSummary,
-		"] waiting_for_interface=[", waitingSummary, "] fakeip_icmp=[", fakeIPICMPSummary, "]",
+		"] waiting_for_interface=[", waitingSummary, "] waiting_interfaces=[", waitingInterfacesSummary,
+		"] fakeip_icmp=[", fakeIPICMPSummary, "]",
 	)
 }

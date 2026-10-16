@@ -15,6 +15,53 @@ uses a conservative release check because affected kernels can fault while
 that capability is being probed. When TCX link creation is available it is
 preferred; otherwise sing-box uses the compatible `clsact` attachment.
 
+## Platform profiles
+
+There are two practical deployment profiles. They share the same eBPF objects,
+but their kernel ownership, permissions, and link topology are different.
+
+### Standard Linux and OpenWrt
+
+For a normal Linux host or OpenWrt router, run sing-box as root. Creating the
+maps and programs needs `CAP_BPF` (or `CAP_SYS_ADMIN`), attachment needs
+`CAP_NET_ADMIN`, and startup cleanup reads attached programs by ID, which needs
+`CAP_SYS_ADMIN`; kernels before 5.11 also need `CAP_SYS_RESOURCE` to raise the
+memlock limit. The selected configuration must expose the
+required BPF syscall, maps, helpers, TC classifier, and—only for local TC—a
+usable veth. Local `cgroup` additionally needs a visible writable cgroup v2
+hierarchy. Mount cgroup2 before startup when the distribution does not mount it
+automatically; bpffs is only needed where pinned netd or other pin-based
+integration is used.
+
+OpenWrt modules must match the exact running kernel and target architecture.
+Depending on the selected data plane, the target image commonly needs the BPF,
+TC/scheduler classifier, and veth modules (often packaged as `kmod-bpf`,
+`kmod-sched-core`, `kmod-veth`, or split `cls_bpf`/`act_bpf` packages; names vary
+by release). No `bpftool`, `tc`, `ip`, libbpf, or clang executable is required at
+runtime: sing-box uses BPF syscalls and netlink directly. Use the built-in probe
+with the same interface and protocols as the service, then perform a real
+startup because route, qdisc, sysctl, and LSM permissions are not proven by the
+non-attaching probe.
+
+### Root Android
+
+Root access alone is not a compatibility guarantee. The root service must see
+the vendor cgroup v2 hierarchy; bpffs and netd pins are additionally required
+when netd coexistence or hook restoration is in use. Android SELinux must
+allow the selected BPF, cgroup, TC, route, and sysctl operations. Android 15+
+and vendor kernels may place a single-program netd owner on cgroup hooks; the
+runtime reports and selects multi-program, legacy, or the narrowly recognized
+netd pass-through replacement path. Optional socket-release and process-tracking
+hooks can be denied and will fall back to bounded LRU cleanup or userspace
+process lookup without disabling the main data plane.
+
+Local TC still needs vendor veth/TC and policy-routing support; local cgroup does
+not need veth or TC. `packet_rewrite` needs Ethernet framing, while
+`socket_assign` supports the documented raw-IP, PPP, and tunnel links. Validate
+the actual device with `sing-box tools ebpf status` and a real start, recording
+the kernel release/configuration, build fingerprint, SELinux audit denials,
+selected attachment/cleanup paths, and interface framing.
+
 ## Data-plane capability summary
 
 | Data plane | Hook and delivery | Link requirement | Main extra requirements |
@@ -187,8 +234,9 @@ Startup needs enough privilege for the selected data plane to:
 
 Running as root is the most portable arrangement. Capability-only deployments
 depend on kernel version, distribution policy, LSM rules, and Android SELinux
-policy; they commonly require `CAP_NET_ADMIN`, `CAP_BPF`, and on older kernels
-`CAP_SYS_ADMIN`.
+policy; they need `CAP_BPF`, `CAP_NET_ADMIN`, and `CAP_SYS_ADMIN` (startup
+cleanup reads attached programs by ID), plus `CAP_SYS_RESOURCE` on kernels
+before 5.11.
 
 No `bpftool`, `tc`, or `ip` executable is required at runtime. sing-box uses BPF
 syscalls and netlink directly.
@@ -252,9 +300,12 @@ cgroup is checked. These checks do not create qdiscs, attach hooks, or modify
 system state.
 
 The command also prints a one-shot occupancy diagnostic for visible `sb_` maps.
-Map types that cannot be safely iterated are marked `UNKNOWN`. This diagnostic
-never runs periodically while sing-box is active and does not modify maps or
-data paths.
+Runtime state maps use `healthy`, `warning`, and `degraded` thresholds. Maps
+whose capacity is derived from the current compiled policy use `configured`;
+being full is expected and is not runtime pressure. Fixed-layout maps that
+cannot be safely iterated use `not_applicable`, while an actual iteration error
+uses `recovery_failed`. This diagnostic never runs periodically while sing-box
+is active and does not modify maps or data paths.
 
 The probe uses the selected protocols, address families, data planes, and shared interface.
 For local TC mode it reports the required TC socket-cookie helper and the optional

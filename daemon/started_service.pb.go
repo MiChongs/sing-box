@@ -7678,6 +7678,7 @@ type EBPFMapDiagnostics struct {
 	Supported     bool                   `protobuf:"varint,9,opt,name=supported,proto3" json:"supported,omitempty"`
 	Error         string                 `protobuf:"bytes,10,opt,name=error,proto3" json:"error,omitempty"`
 	Pressure      string                 `protobuf:"bytes,11,opt,name=pressure,proto3" json:"pressure,omitempty"`
+	Category      string                 `protobuf:"bytes,12,opt,name=category,proto3" json:"category,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -7789,6 +7790,13 @@ func (x *EBPFMapDiagnostics) GetPressure() string {
 	return ""
 }
 
+func (x *EBPFMapDiagnostics) GetCategory() string {
+	if x != nil {
+		return x.Category
+	}
+	return ""
+}
+
 type EBPFInboundDiagnostics struct {
 	state                         protoimpl.MessageState         `protogen:"open.v1"`
 	ObservedAt                    int64                          `protobuf:"varint,2,opt,name=observedAt,proto3" json:"observedAt,omitempty"`
@@ -7843,6 +7851,18 @@ type EBPFInboundDiagnostics struct {
 	LocalUdpReleaseObserver       bool                           `protobuf:"varint,57,opt,name=localUdpReleaseObserver,proto3" json:"localUdpReleaseObserver,omitempty"`
 	LocalUdpReleaseFallbackReason string                         `protobuf:"bytes,58,opt,name=localUdpReleaseFallbackReason,proto3" json:"localUdpReleaseFallbackReason,omitempty"`
 	LocalUdpReleaseProgram        string                         `protobuf:"bytes,59,opt,name=localUdpReleaseProgram,proto3" json:"localUdpReleaseProgram,omitempty"`
+	WaitingRoles                  []string                       `protobuf:"bytes,60,rep,name=waitingRoles,proto3" json:"waitingRoles,omitempty"`
+	WaitingInterfaces             []string                       `protobuf:"bytes,61,rep,name=waitingInterfaces,proto3" json:"waitingInterfaces,omitempty"`
+	TcAssignmentSweepEntries      uint64                         `protobuf:"varint,62,opt,name=tcAssignmentSweepEntries,proto3" json:"tcAssignmentSweepEntries,omitempty"`
+	TcAssignmentSweepCapacity     uint64                         `protobuf:"varint,63,opt,name=tcAssignmentSweepCapacity,proto3" json:"tcAssignmentSweepCapacity,omitempty"`
+	TcAssignmentSweepPressure     bool                           `protobuf:"varint,64,opt,name=tcAssignmentSweepPressure,proto3" json:"tcAssignmentSweepPressure,omitempty"`
+	TcAssignmentSweepRuns         uint64                         `protobuf:"varint,65,opt,name=tcAssignmentSweepRuns,proto3" json:"tcAssignmentSweepRuns,omitempty"`
+	TcAssignmentSweepPartial      uint64                         `protobuf:"varint,66,opt,name=tcAssignmentSweepPartial,proto3" json:"tcAssignmentSweepPartial,omitempty"`
+	TcAssignmentSweepLastAt       *int64                         `protobuf:"varint,67,opt,name=tcAssignmentSweepLastAt,proto3,oneof" json:"tcAssignmentSweepLastAt,omitempty"`
+	TcAssignmentSweepPartialAt    *int64                         `protobuf:"varint,68,opt,name=tcAssignmentSweepPartialAt,proto3,oneof" json:"tcAssignmentSweepPartialAt,omitempty"`
+	CgroupRecoveryQueueOverflows  uint64                         `protobuf:"varint,69,opt,name=cgroupRecoveryQueueOverflows,proto3" json:"cgroupRecoveryQueueOverflows,omitempty"`
+	CgroupRecoveryQueueOverflowAt *int64                         `protobuf:"varint,70,opt,name=cgroupRecoveryQueueOverflowAt,proto3,oneof" json:"cgroupRecoveryQueueOverflowAt,omitempty"`
+	TcAssignmentSweepFailure      string                         `protobuf:"bytes,71,opt,name=tcAssignmentSweepFailure,proto3" json:"tcAssignmentSweepFailure,omitempty"`
 	unknownFields                 protoimpl.UnknownFields
 	sizeCache                     protoimpl.SizeCache
 }
@@ -8237,6 +8257,90 @@ func (x *EBPFInboundDiagnostics) GetLocalUdpReleaseFallbackReason() string {
 func (x *EBPFInboundDiagnostics) GetLocalUdpReleaseProgram() string {
 	if x != nil {
 		return x.LocalUdpReleaseProgram
+	}
+	return ""
+}
+
+func (x *EBPFInboundDiagnostics) GetWaitingRoles() []string {
+	if x != nil {
+		return x.WaitingRoles
+	}
+	return nil
+}
+
+func (x *EBPFInboundDiagnostics) GetWaitingInterfaces() []string {
+	if x != nil {
+		return x.WaitingInterfaces
+	}
+	return nil
+}
+
+func (x *EBPFInboundDiagnostics) GetTcAssignmentSweepEntries() uint64 {
+	if x != nil {
+		return x.TcAssignmentSweepEntries
+	}
+	return 0
+}
+
+func (x *EBPFInboundDiagnostics) GetTcAssignmentSweepCapacity() uint64 {
+	if x != nil {
+		return x.TcAssignmentSweepCapacity
+	}
+	return 0
+}
+
+func (x *EBPFInboundDiagnostics) GetTcAssignmentSweepPressure() bool {
+	if x != nil {
+		return x.TcAssignmentSweepPressure
+	}
+	return false
+}
+
+func (x *EBPFInboundDiagnostics) GetTcAssignmentSweepRuns() uint64 {
+	if x != nil {
+		return x.TcAssignmentSweepRuns
+	}
+	return 0
+}
+
+func (x *EBPFInboundDiagnostics) GetTcAssignmentSweepPartial() uint64 {
+	if x != nil {
+		return x.TcAssignmentSweepPartial
+	}
+	return 0
+}
+
+func (x *EBPFInboundDiagnostics) GetTcAssignmentSweepLastAt() int64 {
+	if x != nil && x.TcAssignmentSweepLastAt != nil {
+		return *x.TcAssignmentSweepLastAt
+	}
+	return 0
+}
+
+func (x *EBPFInboundDiagnostics) GetTcAssignmentSweepPartialAt() int64 {
+	if x != nil && x.TcAssignmentSweepPartialAt != nil {
+		return *x.TcAssignmentSweepPartialAt
+	}
+	return 0
+}
+
+func (x *EBPFInboundDiagnostics) GetCgroupRecoveryQueueOverflows() uint64 {
+	if x != nil {
+		return x.CgroupRecoveryQueueOverflows
+	}
+	return 0
+}
+
+func (x *EBPFInboundDiagnostics) GetCgroupRecoveryQueueOverflowAt() int64 {
+	if x != nil && x.CgroupRecoveryQueueOverflowAt != nil {
+		return *x.CgroupRecoveryQueueOverflowAt
+	}
+	return 0
+}
+
+func (x *EBPFInboundDiagnostics) GetTcAssignmentSweepFailure() string {
+	if x != nil {
+		return x.TcAssignmentSweepFailure
 	}
 	return ""
 }
@@ -9518,7 +9622,7 @@ const file_daemon_started_service_proto_rawDesc = "" +
 	"\x1bEBPFMapOccupancyDiagnostics\x12\x16\n" +
 	"\x06status\x18\x01 \x01(\tR\x06status\x12.\n" +
 	"\x04maps\x18\x02 \x03(\v2\x1a.daemon.EBPFMapDiagnosticsR\x04maps\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error\"\xa4\x02\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\"\xc0\x02\n" +
 	"\x12EBPFMapDiagnostics\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\rR\x02id\x12\x12\n" +
 	"\x04name\x18\x02 \x01(\tR\x04name\x12\x12\n" +
@@ -9533,7 +9637,8 @@ const file_daemon_started_service_proto_rawDesc = "" +
 	"\tsupported\x18\t \x01(\bR\tsupported\x12\x14\n" +
 	"\x05error\x18\n" +
 	" \x01(\tR\x05error\x12\x1a\n" +
-	"\bpressure\x18\v \x01(\tR\bpressure\"\xa5\x15\n" +
+	"\bpressure\x18\v \x01(\tR\bpressure\x12\x1a\n" +
+	"\bcategory\x18\f \x01(\tR\bcategory\"\xcd\x1b\n" +
 	"\x16EBPFInboundDiagnostics\x12\x1e\n" +
 	"\n" +
 	"observedAt\x18\x02 \x01(\x03R\n" +
@@ -9589,12 +9694,27 @@ const file_daemon_started_service_proto_rawDesc = "" +
 	"\x1alocalSelfBypassCleanupMode\x188 \x01(\tR\x1alocalSelfBypassCleanupMode\x128\n" +
 	"\x17localUdpReleaseObserver\x189 \x01(\bR\x17localUdpReleaseObserver\x12D\n" +
 	"\x1dlocalUdpReleaseFallbackReason\x18: \x01(\tR\x1dlocalUdpReleaseFallbackReason\x126\n" +
-	"\x16localUdpReleaseProgram\x18; \x01(\tR\x16localUdpReleaseProgramB\x0e\n" +
+	"\x16localUdpReleaseProgram\x18; \x01(\tR\x16localUdpReleaseProgram\x12\"\n" +
+	"\fwaitingRoles\x18< \x03(\tR\fwaitingRoles\x12,\n" +
+	"\x11waitingInterfaces\x18= \x03(\tR\x11waitingInterfaces\x12:\n" +
+	"\x18tcAssignmentSweepEntries\x18> \x01(\x04R\x18tcAssignmentSweepEntries\x12<\n" +
+	"\x19tcAssignmentSweepCapacity\x18? \x01(\x04R\x19tcAssignmentSweepCapacity\x12<\n" +
+	"\x19tcAssignmentSweepPressure\x18@ \x01(\bR\x19tcAssignmentSweepPressure\x124\n" +
+	"\x15tcAssignmentSweepRuns\x18A \x01(\x04R\x15tcAssignmentSweepRuns\x12:\n" +
+	"\x18tcAssignmentSweepPartial\x18B \x01(\x04R\x18tcAssignmentSweepPartial\x12=\n" +
+	"\x17tcAssignmentSweepLastAt\x18C \x01(\x03H\x05R\x17tcAssignmentSweepLastAt\x88\x01\x01\x12C\n" +
+	"\x1atcAssignmentSweepPartialAt\x18D \x01(\x03H\x06R\x1atcAssignmentSweepPartialAt\x88\x01\x01\x12B\n" +
+	"\x1ccgroupRecoveryQueueOverflows\x18E \x01(\x04R\x1ccgroupRecoveryQueueOverflows\x12I\n" +
+	"\x1dcgroupRecoveryQueueOverflowAt\x18F \x01(\x03H\aR\x1dcgroupRecoveryQueueOverflowAt\x88\x01\x01\x12:\n" +
+	"\x18tcAssignmentSweepFailure\x18G \x01(\tR\x18tcAssignmentSweepFailureB\x0e\n" +
 	"\f_lastErrorAtB\x11\n" +
 	"\x0f_lastRecoveryAtB\x0e\n" +
 	"\f_nextRetryAtB\x16\n" +
 	"\x14_tcLastHealthCheckAtB\x14\n" +
-	"\x12_tcLastReconcileAtJ\x04\b\x01\x10\x02\"\xdb\x01\n" +
+	"\x12_tcLastReconcileAtB\x1a\n" +
+	"\x18_tcAssignmentSweepLastAtB\x1d\n" +
+	"\x1b_tcAssignmentSweepPartialAtB \n" +
+	"\x1e_cgroupRecoveryQueueOverflowAtJ\x04\b\x01\x10\x02\"\xdb\x01\n" +
 	"\x19EBPFAttachmentDiagnostics\x12$\n" +
 	"\rinterfaceName\x18\x01 \x01(\tR\rinterfaceName\x12&\n" +
 	"\x0einterfaceIndex\x18\x02 \x01(\x05R\x0einterfaceIndex\x12\x12\n" +
