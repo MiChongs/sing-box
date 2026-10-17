@@ -220,6 +220,14 @@ type EBPFDiagnostics struct {
 	Counters EBPFCounters `json:"counters"`
 }
 
+type udpReleasePathDiagnostics interface {
+	UDPReleasePathDiagnostics() (bool, string, string)
+}
+
+// The cgroup backend must keep reporting its socket-release path; without
+// this the optional check in Diagnostics would silently leave it empty.
+var _ udpReleasePathDiagnostics = (*commonEBPF.CgroupBackend)(nil)
+
 // tcOutcomeHistory is the small amount of extra bookkeeping Diagnostics
 // needs that nothing else in this package already tracks: the last outcome
 // runTCInterfaceUpdateLoop's update step reported, when a failing component
@@ -578,9 +586,11 @@ func (i *Inbound) Diagnostics() EBPFDiagnostics {
 		diagnostics.LocalUDPRecoveryMode = udpState.RecoveryMode
 		diagnostics.LocalUDPMapPressure = udpState.MapPressure
 		diagnostics.LocalUDPNetworkGeneration = udpState.NetworkGeneration
-		diagnostics.LocalUDPReleaseObserver = udpState.ReleaseObserver
-		diagnostics.LocalUDPReleaseFallbackReason = udpState.ReleaseFallbackReason
-		diagnostics.LocalUDPReleaseProgram = udpState.ReleaseProgram
+		if releasePath, ok := any(backend).(udpReleasePathDiagnostics); ok {
+			diagnostics.LocalUDPReleaseObserver,
+				diagnostics.LocalUDPReleaseFallbackReason,
+				diagnostics.LocalUDPReleaseProgram = releasePath.UDPReleasePathDiagnostics()
+		}
 	}
 	if i.sharedEnabled {
 		diagnostics.SharedDataPlane = i.sharedDataPlane
