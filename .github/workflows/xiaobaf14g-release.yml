@@ -21,10 +21,10 @@ on:
         type: boolean
         default: false
       skip_gui:
-        description: '跳过 SFA / SFW / SFL 图形客户端构建'
+        description: '跳过 SFA / SFW / SFL 图形客户端构建（默认跳过，取消勾选才构建）'
         required: false
         type: boolean
-        default: false
+        default: true
 
 permissions:
   contents: write
@@ -108,7 +108,8 @@ jobs:
               PRE=false
             fi
             SKIP_ANDROID=false
-            SKIP_GUI=false
+            # 图形客户端默认不随 tag 构建；需要时手动运行本工作流并取消 skip_gui。
+            SKIP_GUI=true
           fi
           {
             echo "version=$VERSION"

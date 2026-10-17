@@ -7,7 +7,7 @@
 [![Last Commit](https://img.shields.io/github/last-commit/MiChongs/sing-box/xiaobaf14g-testing)](https://github.com/MiChongs/sing-box/commits/xiaobaf14g-testing)
 [![Code Size](https://img.shields.io/github/languages/code-size/MiChongs/sing-box)](https://github.com/MiChongs/sing-box)
 
-本项目是 [sing-box](https://github.com/SagerNet/sing-box) 的衍生版本，基于 [reF1nd/sing-box](https://github.com/reF1nd/sing-box) 维护。在兼容上游配置格式的前提下，本分支新增 Smart 出站组、XHTTP 传输、VLESS Encryption、QUICX 与 Nowhere 协议以及 EasyTier 端点，扩展了 Clash API，并为 Windows、Linux、macOS、FreeBSD 与 Android 提供命令行程序及 SFA、SFW、SFL 图形客户端的发布构建。
+本项目是 [sing-box](https://github.com/SagerNet/sing-box) 的衍生版本，基于 [reF1nd/sing-box](https://github.com/reF1nd/sing-box) 维护。在兼容上游配置格式的前提下，本分支新增 Smart 出站组、XHTTP 传输、VLESS Encryption、QUICX 与 Nowhere 协议以及 EasyTier 端点，扩展了 Clash API，并为 Windows、Linux、macOS、FreeBSD 与 Android 提供命令行程序的发布构建，SFA、SFW、SFL 图形客户端按需构建。
 
 ## 目录
 
@@ -656,7 +656,7 @@ wazero 仅在 amd64 与 arm64 架构上以编译方式执行，其他架构使�
 
 ## 图形客户端
 
-图形客户端基于 reF1nd 客户端维护，与命令行程序使用同一提交的内核构建，版本号保持一致。
+图形客户端基于 reF1nd 客户端维护，与命令行程序使用同一提交的内核构建，版本号保持一致。发布默认不构建图形客户端；需要时在 Actions 中手动运行 `xiaobaf14g release` 工作流，并取消勾选 `skip_gui`。
 
 | 客户端 | 平台 | 源码仓库 | 安装包 |
 |---|---|---|---|
