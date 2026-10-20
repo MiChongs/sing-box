@@ -231,6 +231,14 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		udpDialer6.LocalAddr = &net.UDPAddr{IP: net.IPv6unspecified, Port: int(options.UDPBindPort)}
 		udpAddr6 = M.SocksaddrFrom(netip.IPv6Unspecified(), options.UDPBindPort).String()
 	}
+	if networkManager != nil && !options.BindAddressNoPort {
+		if options.Inet4BindAddress == nil {
+			dialer4.Control = appendEBPFOutboundPortReservation(networkManager, dialer4.Control)
+		}
+		if options.Inet6BindAddress == nil {
+			dialer6.Control = appendEBPFOutboundPortReservation(networkManager, dialer6.Control)
+		}
+	}
 	if options.TCPMultiPath {
 		dialer4.SetMultipathTCP(true)
 	}

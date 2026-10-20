@@ -31,6 +31,10 @@ func AppendEBPFSelfBypass(_ adapter.NetworkManager, controlFunc control.Func) co
 	return controlFunc
 }
 
+func appendEBPFOutboundPortReservation(_ adapter.NetworkManager, controlFunc control.Func) control.Func {
+	return controlFunc
+}
+
 func appendEBPFSelfBypass(_ adapter.NetworkManager, dialerControl, listenerControl control.Func) (control.Func, control.Func) {
 	return dialerControl, listenerControl
 }

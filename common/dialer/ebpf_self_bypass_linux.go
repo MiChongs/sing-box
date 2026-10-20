@@ -14,6 +14,8 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
+
+	"golang.org/x/sys/unix"
 )
 
 // bindEBPFSelfBypassConnLifecycle pairs userspace socket registration with the
@@ -146,6 +148,7 @@ func EBPFSelfBypassCleanup(networkManager adapter.NetworkManager, rawConn syscal
 
 func PrepareEBPFSelfBypass(networkManager adapter.NetworkManager, inbounds []option.Inbound) error {
 	localInstances := 0
+	localSocketAssign := false
 	for _, inbound := range inbounds {
 		switch inbound.Type {
 		case C.TypeEBPF:
@@ -156,6 +159,7 @@ func PrepareEBPFSelfBypass(networkManager adapter.NetworkManager, inbounds []opt
 			localEnabled, _ := ebpfOptions.EffectiveEnablement()
 			if localEnabled {
 				localInstances++
+				localSocketAssign = ebpfOptions.Local.DataPlane == "socket_assign"
 			}
 		}
 	}
@@ -186,7 +190,55 @@ func PrepareEBPFSelfBypass(networkManager adapter.NetworkManager, inbounds []opt
 		_ = tracker.Close()
 		return err
 	}
+	if localSocketAssign {
+		if setter, loaded := networkManager.(interface{ SetEBPFLocalSocketAssign(bool) }); loaded {
+			setter.SetEBPFLocalSocketAssign(true)
+		}
+	}
 	return nil
+}
+
+// appendEBPFOutboundPortReservation makes an outbound TCP socket take its
+// source port at bind time when local socket assignment is active.
+//
+// Socket assignment keeps every intercepted local socket's original tuple, and
+// a direct outbound for it connects from the same address to the same
+// destination. When the outbound is bound to an interface (auto-detected or
+// configured), the kernel's connect-time uniqueness check does not treat it
+// and an unbound application socket as the same tuple, so an application may
+// connect from the port a live outbound uses. Both sockets then share one
+// tuple and the host delivers either peer's segments to the wrong one, which
+// stalls that connection until a SYN retransmission. A port taken by bind()
+// is skipped by every connect-time port selection. SO_REUSEADDR lets bind fall
+// back to ports held only by TIME_WAIT outbound sockets once nothing else is
+// free; the first pass still prefers unused ports.
+func appendEBPFOutboundPortReservation(networkManager adapter.NetworkManager, controlFunc control.Func) control.Func {
+	provider, loaded := networkManager.(interface{ EBPFLocalSocketAssign() bool })
+	if !loaded || !provider.EBPFLocalSocketAssign() {
+		return controlFunc
+	}
+	return control.Append(controlFunc, reserveEBPFOutboundPort)
+}
+
+func reserveEBPFOutboundPort(network, _ string, conn syscall.RawConn) error {
+	var sockaddr unix.Sockaddr
+	switch network {
+	case "tcp4":
+		sockaddr = &unix.SockaddrInet4{}
+	case "tcp6":
+		sockaddr = &unix.SockaddrInet6{}
+	default:
+		return nil
+	}
+	return control.Raw(conn, func(fd uintptr) error {
+		if err := unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1); err != nil {
+			return E.Cause(err, "reserve eBPF outbound port")
+		}
+		if err := unix.Bind(int(fd), sockaddr); err != nil {
+			return E.Cause(err, "reserve eBPF outbound port")
+		}
+		return nil
+	})
 }
 
 // AppendEBPFSelfBypass appends the eBPF self-bypass registration callback to a

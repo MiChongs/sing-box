@@ -10,7 +10,8 @@ import (
 )
 
 type ebpfSelfBypassState struct {
-	tracker atomic.Pointer[commonEBPF.SelfBypass]
+	tracker           atomic.Pointer[commonEBPF.SelfBypass]
+	localSocketAssign atomic.Bool
 }
 
 func (r *NetworkManager) SetEBPFSelfBypass(tracker *commonEBPF.SelfBypass) error {
@@ -26,6 +27,16 @@ func (r *NetworkManager) SetEBPFSelfBypass(tracker *commonEBPF.SelfBypass) error
 
 func (r *NetworkManager) EBPFSelfBypass() *commonEBPF.SelfBypass {
 	return r.ebpfSelfBypass.tracker.Load()
+}
+
+// SetEBPFLocalSocketAssign records whether local traffic is delivered by
+// socket assignment, whose intercepted sockets keep their original tuple.
+func (r *NetworkManager) SetEBPFLocalSocketAssign(enabled bool) {
+	r.ebpfSelfBypass.localSocketAssign.Store(enabled)
+}
+
+func (r *NetworkManager) EBPFLocalSocketAssign() bool {
+	return r.ebpfSelfBypass.localSocketAssign.Load()
 }
 
 func (r *NetworkManager) ClearEBPFSelfBypass(tracker *commonEBPF.SelfBypass) {
