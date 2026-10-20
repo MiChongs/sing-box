@@ -295,3 +295,49 @@ func TestUDPClientTableShardsSpreadAcrossClientAddress(t *testing.T) {
 		)
 	}
 }
+
+func TestTCUDPFlowCacheRevalidatesAndFollowsSession(t *testing.T) {
+	var table udpClientTable
+	client := netip.MustParseAddrPort("192.0.2.10:53000")
+	flow := tcUDPFlowKey{client: client, destination: netip.MustParseAddrPort("1.1.1.1:53"), interfaceIndex: 3}
+	key := udpSessionKey{Source: client, Scope: udpSessionScopeLocalTC, SocketCookie: 42}
+	if _, loaded := table.cachedTCFlow(flow, 0); loaded {
+		t.Fatal("empty cache returned a flow")
+	}
+	// No session yet: nothing to bind the flow to.
+	table.setTCFlow(flow, key, 0)
+	if _, loaded := table.cachedTCFlow(flow, 0); loaded {
+		t.Fatal("flow was cached without a session")
+	}
+	state := table.loadOrCreate(key)
+	table.setTCFlow(flow, key, 0)
+	if cached, loaded := table.cachedTCFlow(flow, int64(tcUDPFlowRevalidateInterval)-1); !loaded || cached != key {
+		t.Fatalf("cached flow = %+v %v, want %+v", cached, loaded, key)
+	}
+	if _, loaded := table.cachedTCFlow(flow, int64(tcUDPFlowRevalidateInterval)); loaded {
+		t.Fatal("flow was not revalidated after the interval")
+	}
+	table.setTCFlow(flow, key, int64(tcUDPFlowRevalidateInterval))
+	table.deleteWithCleanup(key, state)
+	if _, loaded := table.cachedTCFlow(flow, int64(tcUDPFlowRevalidateInterval)); loaded {
+		t.Fatal("flow outlived its session")
+	}
+	shard := table.tcFlowShard(flow)
+	if len(shard.flows) != 0 {
+		t.Fatalf("closed session left %d cached flows", len(shard.flows))
+	}
+	// A replacement session under the same key must not reuse the old entry.
+	table.loadOrCreate(key)
+	table.setTCFlow(flow, key, 0)
+	shard.access.Lock()
+	entry := shard.flows[flow]
+	entry.state = &udpClientState{}
+	shard.flows[flow] = entry
+	shard.access.Unlock()
+	if _, loaded := table.cachedTCFlow(flow, 0); loaded {
+		t.Fatal("flow bound to a stale session state was reused")
+	}
+	if len(shard.flows) != 0 {
+		t.Fatal("stale flow entry was not removed")
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,6 +32,17 @@ const (
 	// Idle sockets are reclaimed at their next actual expiry deadline in
 	// addition to capacity-triggered eviction in get().
 	udpReplySocketIdleTimeout = 5 * time.Minute
+
+	// tcUDPFlowRevalidateInterval bounds how long a TC UDP flow reuses the
+	// assignment it last read from the kernel. Reading it costs a bpf syscall,
+	// so doing that for every datagram dominated the TC UDP path. A new socket
+	// reusing the same client port (a new socket cookie) is picked up within
+	// this interval; until then its datagrams, to the same destination, keep
+	// using the previous session.
+	tcUDPFlowRevalidateInterval = time.Second
+	// tcUDPFlowsPerSession bounds the flows one session remembers for cleanup;
+	// a session with more destinations falls back to per-packet lookups.
+	tcUDPFlowsPerSession = 64
 )
 
 var errUDPReplySocketCapacity = errors.New("UDP eBPF reply socket pool is at capacity")
@@ -39,6 +51,26 @@ type udpClientTable struct {
 	clientShards     [udpClientShardCount]udpClientShard
 	redirectAccess   sync.RWMutex
 	redirectSessions map[udpRedirectSessionKey]udpSessionKey
+	tcFlowShards     [udpClientShardCount]tcUDPFlowShard
+}
+
+// tcUDPFlowKey is what a TC UDP datagram carries before its assignment is
+// read: client, original destination and the ingress interface from OOB.
+type tcUDPFlowKey struct {
+	client         netip.AddrPort
+	destination    netip.AddrPort
+	interfaceIndex uint32
+}
+
+type tcUDPFlowEntry struct {
+	key       udpSessionKey
+	state     *udpClientState
+	checkedAt int64
+}
+
+type tcUDPFlowShard struct {
+	access sync.RWMutex
+	flows  map[tcUDPFlowKey]tcUDPFlowEntry
 }
 
 type udpClientShard struct {
@@ -87,6 +119,7 @@ type udpClientState struct {
 	closed          bool
 	cgroupDataPlane bool
 	cgroupOriginals map[netip.Addr]commonEBPF.OriginalDestination
+	tcFlows         []tcUDPFlowKey
 }
 
 type udpRedirectBinding struct {
@@ -360,6 +393,8 @@ func (t *udpClientTable) deleteWithCleanup(key udpSessionKey, expected *udpClien
 			})
 		}
 	}
+	flows := expected.tcFlows
+	expected.tcFlows = nil
 	expected.closed = true
 	clear(expected.bindings)
 	clear(expected.cgroupOriginals)
@@ -374,7 +409,70 @@ func (t *udpClientTable) deleteWithCleanup(key udpSessionKey, expected *udpClien
 		}
 	}
 	t.redirectAccess.Unlock()
+	for _, flow := range flows {
+		t.deleteTCFlow(flow, expected)
+	}
 	return udpSessionCleanup{cgroupRedirects: redirects, tcAssignments: assignments}
+}
+
+func (t *udpClientTable) tcFlowShard(flow tcUDPFlowKey) *tcUDPFlowShard {
+	return &t.tcFlowShards[shardIndexForAddrPort(flow.client, udpClientShardCount)]
+}
+
+// cachedTCFlow returns the session a TC UDP flow was last bound to, as long as
+// that binding was read from the kernel less than
+// tcUDPFlowRevalidateInterval before now and the session is still open.
+func (t *udpClientTable) cachedTCFlow(flow tcUDPFlowKey, now int64) (udpSessionKey, bool) {
+	shard := t.tcFlowShard(flow)
+	shard.access.RLock()
+	entry, loaded := shard.flows[flow]
+	shard.access.RUnlock()
+	if !loaded || now-entry.checkedAt >= int64(tcUDPFlowRevalidateInterval) {
+		return udpSessionKey{}, false
+	}
+	if state, loaded := t.load(entry.key); !loaded || state != entry.state {
+		t.deleteTCFlow(flow, entry.state)
+		return udpSessionKey{}, false
+	}
+	return entry.key, true
+}
+
+// setTCFlow records the session a TC UDP flow was bound to by an assignment
+// read at now.
+func (t *udpClientTable) setTCFlow(flow tcUDPFlowKey, key udpSessionKey, now int64) {
+	state, loaded := t.load(key)
+	if !loaded {
+		return
+	}
+	state.access.Lock()
+	if state.closed {
+		state.access.Unlock()
+		return
+	}
+	if !slices.Contains(state.tcFlows, flow) {
+		if len(state.tcFlows) >= tcUDPFlowsPerSession {
+			state.access.Unlock()
+			return
+		}
+		state.tcFlows = append(state.tcFlows, flow)
+	}
+	state.access.Unlock()
+	shard := t.tcFlowShard(flow)
+	shard.access.Lock()
+	if shard.flows == nil {
+		shard.flows = make(map[tcUDPFlowKey]tcUDPFlowEntry)
+	}
+	shard.flows[flow] = tcUDPFlowEntry{key: key, state: state, checkedAt: now}
+	shard.access.Unlock()
+}
+
+func (t *udpClientTable) deleteTCFlow(flow tcUDPFlowKey, state *udpClientState) {
+	shard := t.tcFlowShard(flow)
+	shard.access.Lock()
+	if entry, loaded := shard.flows[flow]; loaded && entry.state == state {
+		delete(shard.flows, flow)
+	}
+	shard.access.Unlock()
 }
 
 func (s *udpClientState) isCgroupDataPlane() bool {
