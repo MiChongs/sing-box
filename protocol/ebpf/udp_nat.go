@@ -144,7 +144,7 @@ func (s *udpNATService) connection(
 			key:          key,
 			writer:       writer,
 			localAddr:    source,
-			packetChan:   make(chan *N.PacketBuffer, 64),
+			packets:      newUDPNATPacketQueue(),
 			doneChan:     make(chan struct{}),
 			readDeadline: pipe.MakeDeadline(),
 			onClose:      onClose,
@@ -255,9 +255,7 @@ func (c *udpNATConn) enqueuePacketLocked(buffer *buf.Buffer, destination M.Socks
 		Buffer:      buffer,
 		Destination: destination,
 	}
-	select {
-	case c.packetChan <- packet:
-	default:
+	if !c.packets.push(packet) {
 		c.service.queueDrops.Add(1)
 		packet.Buffer.Release()
 		N.PutPacketBuffer(packet)
@@ -376,7 +374,7 @@ type udpNATConn struct {
 	handlerAccess   sync.RWMutex
 	handler         N.UDPHandlerEx
 	packetAccess    sync.RWMutex
-	packetChan      chan *N.PacketBuffer
+	packets         *udpNATPacketQueue
 	closeOnce       sync.Once
 	doneChan        chan struct{}
 	readDeadline    pipe.Deadline
@@ -393,19 +391,33 @@ var (
 	_ N.PacketBatchWriteCreator    = (*udpNATConn)(nil)
 )
 
-func (c *udpNATConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
-	select {
-	case packet := <-c.packetChan:
-		_, err := buffer.ReadOnceFrom(packet.Buffer)
-		destination := packet.Destination
-		packet.Buffer.Release()
-		N.PutPacketBuffer(packet)
-		return destination, err
-	case <-c.doneChan:
-		return M.Socksaddr{}, io.ErrClosedPipe
-	case <-c.readDeadline.Wait():
-		return M.Socksaddr{}, os.ErrDeadlineExceeded
+// waitPacket returns the next queued packet, waiting until one arrives, the
+// connection closes or the read deadline passes.
+func (c *udpNATConn) waitPacket() (*N.PacketBuffer, error) {
+	for {
+		if packet, loaded := c.packets.pop(); loaded {
+			return packet, nil
+		}
+		select {
+		case <-c.packets.notify:
+		case <-c.doneChan:
+			return nil, io.ErrClosedPipe
+		case <-c.readDeadline.Wait():
+			return nil, os.ErrDeadlineExceeded
+		}
 	}
+}
+
+func (c *udpNATConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	packet, err := c.waitPacket()
+	if err != nil {
+		return M.Socksaddr{}, err
+	}
+	_, err = buffer.ReadOnceFrom(packet.Buffer)
+	destination := packet.Destination
+	packet.Buffer.Release()
+	N.PutPacketBuffer(packet)
+	return destination, err
 }
 
 func (c *udpNATConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr) error {
@@ -430,17 +442,14 @@ func (c *udpNATConn) InitializeReadWaiter(options N.ReadWaitOptions) bool {
 }
 
 func (c *udpNATConn) WaitReadPacket() (*buf.Buffer, M.Socksaddr, error) {
-	select {
-	case packet := <-c.packetChan:
-		buffer := c.readWaitOptions.Copy(packet.Buffer)
-		destination := packet.Destination
-		N.PutPacketBuffer(packet)
-		return buffer, destination, nil
-	case <-c.doneChan:
-		return nil, M.Socksaddr{}, io.ErrClosedPipe
-	case <-c.readDeadline.Wait():
-		return nil, M.Socksaddr{}, os.ErrDeadlineExceeded
+	packet, err := c.waitPacket()
+	if err != nil {
+		return nil, M.Socksaddr{}, err
 	}
+	buffer := c.readWaitOptions.Copy(packet.Buffer)
+	destination := packet.Destination
+	N.PutPacketBuffer(packet)
+	return buffer, destination, nil
 }
 
 func (c *udpNATConn) CreatePacketBatchReadWaiter() (N.PacketBatchReadWaiter, bool) {
@@ -459,14 +468,13 @@ func (c *udpNATConn) WaitReadPackets() ([]*buf.Buffer, []M.Socksaddr, error) {
 	buffers := []*buf.Buffer{buffer}
 	destinations := []M.Socksaddr{destination}
 	for len(buffers) < batchSize {
-		select {
-		case packet := <-c.packetChan:
-			buffers = append(buffers, c.readWaitOptions.Copy(packet.Buffer))
-			destinations = append(destinations, packet.Destination)
-			N.PutPacketBuffer(packet)
-		default:
+		packet, loaded := c.packets.pop()
+		if !loaded {
 			return buffers, destinations, nil
 		}
+		buffers = append(buffers, c.readWaitOptions.Copy(packet.Buffer))
+		destinations = append(destinations, packet.Destination)
+		N.PutPacketBuffer(packet)
 	}
 	return buffers, destinations, nil
 }
@@ -487,24 +495,23 @@ func (c *udpNATConn) SetHandler(handler N.UDPHandlerEx) {
 	readWaitOptions := c.readWaitOptions
 	var queuedPackets []*N.PacketBuffer
 	for {
-		select {
-		case packet := <-c.packetChan:
-			queuedPackets = append(queuedPackets, packet)
-		default:
-			c.packetAccess.Unlock()
-			c.handlerAccess.Unlock()
-			for _, packet := range queuedPackets {
-				if c.isClosed() {
-					packet.Buffer.Release()
-					N.PutPacketBuffer(packet)
-					continue
-				}
-				buffer := readWaitOptions.Copy(packet.Buffer)
-				handler.NewPacketEx(buffer, packet.Destination)
-				N.PutPacketBuffer(packet)
-			}
-			return
+		packet, loaded := c.packets.pop()
+		if !loaded {
+			break
 		}
+		queuedPackets = append(queuedPackets, packet)
+	}
+	c.packetAccess.Unlock()
+	c.handlerAccess.Unlock()
+	for _, packet := range queuedPackets {
+		if c.isClosed() {
+			packet.Buffer.Release()
+			N.PutPacketBuffer(packet)
+			continue
+		}
+		buffer := readWaitOptions.Copy(packet.Buffer)
+		handler.NewPacketEx(buffer, packet.Destination)
+		N.PutPacketBuffer(packet)
 	}
 }
 
@@ -543,19 +550,18 @@ func (c *udpNATConn) close() {
 		c.handlerAccess.Lock()
 		c.packetAccess.Lock()
 		for {
-			select {
-			case packet := <-c.packetChan:
-				packet.Buffer.Release()
-				N.PutPacketBuffer(packet)
-			default:
-				handler := c.handler
-				close(c.doneChan)
-				c.packetAccess.Unlock()
-				c.handlerAccess.Unlock()
-				_ = common.Close(handler)
-				return
+			packet, loaded := c.packets.pop()
+			if !loaded {
+				break
 			}
+			packet.Buffer.Release()
+			N.PutPacketBuffer(packet)
 		}
+		handler := c.handler
+		close(c.doneChan)
+		c.packetAccess.Unlock()
+		c.handlerAccess.Unlock()
+		_ = common.Close(handler)
 	})
 }
 

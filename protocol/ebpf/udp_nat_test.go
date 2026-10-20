@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -246,14 +247,16 @@ func TestUDPNATOwnedPacketReleasedWhenQueueIsFull(t *testing.T) {
 	source := M.ParseSocksaddr("192.0.2.10:53000")
 	destination := M.ParseSocksaddr("1.1.1.1:53")
 	key := udpSessionKey{Source: source.AddrPort(), Scope: udpSessionScopeLocalTC}
-	for range 64 {
+	// Full-size listener buffers reach the byte limit before the packet limit.
+	queued := udpNATQueueByteLimit / buf.NewPacket().Cap()
+	for range queued {
 		buffer := buf.NewPacket()
 		service.NewPacketBuffer(key, buffer, source, destination, nil)
 	}
 	connection := receiveUDPNATTestConnection(t, connections)
 	natConn := connection.conn.(*udpNATConn)
-	if len(natConn.packetChan) != cap(natConn.packetChan) {
-		t.Fatalf("packet queue length = %d, want %d", len(natConn.packetChan), cap(natConn.packetChan))
+	if length := natConn.packets.len(); length != queued {
+		t.Fatalf("packet queue length = %d, want %d", length, queued)
 	}
 	overflow := buf.NewPacket()
 	_, _ = overflow.WriteString("overflow")
@@ -264,10 +267,100 @@ func TestUDPNATOwnedPacketReleasedWhenQueueIsFull(t *testing.T) {
 	if diagnostics := service.diagnostics(); diagnostics.QueueDrops != 1 {
 		t.Fatalf("queue drops = %d, want 1", diagnostics.QueueDrops)
 	}
-	for range 64 {
-		packet := <-natConn.packetChan
+	for range queued {
+		packet, loaded := natConn.packets.pop()
+		if !loaded {
+			t.Fatal("queued packet is missing")
+		}
 		packet.Buffer.Release()
 		N.PutPacketBuffer(packet)
+	}
+}
+
+func TestUDPNATQueueHoldsSmallPacketsUpToPacketLimit(t *testing.T) {
+	queue := newUDPNATPacketQueue()
+	push := func(payload string) bool {
+		buffer := buf.NewSize(len(payload))
+		_, _ = buffer.WriteString(payload)
+		packet := N.NewPacketBuffer()
+		*packet = N.PacketBuffer{Buffer: buffer}
+		if queue.push(packet) {
+			return true
+		}
+		buffer.Release()
+		N.PutPacketBuffer(packet)
+		return false
+	}
+	for index := range udpNATQueuePacketLimit {
+		if !push(fmt.Sprint(index)) {
+			t.Fatalf("packet %d was rejected below the packet limit", index)
+		}
+	}
+	if push("overflow") {
+		t.Fatal("packet beyond the packet limit was accepted")
+	}
+	for index := range udpNATQueuePacketLimit {
+		packet, loaded := queue.pop()
+		if !loaded {
+			t.Fatalf("packet %d is missing", index)
+		}
+		if got := string(packet.Buffer.Bytes()); got != fmt.Sprint(index) {
+			t.Fatalf("packet %d payload = %q, want FIFO order", index, got)
+		}
+		packet.Buffer.Release()
+		N.PutPacketBuffer(packet)
+	}
+	if _, loaded := queue.pop(); loaded {
+		t.Fatal("drained queue returned a packet")
+	}
+	if queue.packets != nil || queue.bytes != 0 {
+		t.Fatalf("drained queue kept %d slots and %d bytes", len(queue.packets), queue.bytes)
+	}
+}
+
+func TestUDPNATQueueWakesWaitingReader(t *testing.T) {
+	connections := make(chan udpNATTestConnection, 1)
+	service := newUDPNATService(
+		&udpNATTestHandler{connections: connections},
+		func(key udpSessionKey, _ M.Socksaddr, _ M.Socksaddr, _ any) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc) {
+			return true, context.WithValue(context.Background(), udpNATContextKey{}, key), udpNATTestWriter{}, nil
+		},
+		time.Minute,
+	)
+	t.Cleanup(func() { _ = service.Close() })
+	source := M.ParseSocksaddr("192.0.2.10:53000")
+	destination := M.ParseSocksaddr("1.1.1.1:53")
+	key := udpSessionKey{Source: source.AddrPort(), Scope: udpSessionScopeLocalTC}
+	service.NewPacket(key, [][]byte{[]byte("first")}, source, destination, nil)
+	natConn := receiveUDPNATTestConnection(t, connections).conn.(*udpNATConn)
+	read := func() string {
+		buffer := buf.NewPacket()
+		defer buffer.Release()
+		if _, err := natConn.ReadPacket(buffer); err != nil {
+			t.Fatal(err)
+		}
+		return string(buffer.Bytes())
+	}
+	if got := read(); got != "first" {
+		t.Fatalf("first packet = %q", got)
+	}
+	result := make(chan string, 1)
+	go func() { result <- read() }()
+	time.Sleep(20 * time.Millisecond)
+	service.NewPacket(key, [][]byte{[]byte("second")}, source, destination, nil)
+	select {
+	case got := <-result:
+		if got != "second" {
+			t.Fatalf("second packet = %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("waiting reader was not woken by a new packet")
+	}
+	_ = natConn.Close()
+	buffer := buf.NewPacket()
+	defer buffer.Release()
+	if _, err := natConn.ReadPacket(buffer); err == nil {
+		t.Fatal("read from a closed connection succeeded")
 	}
 }
 
