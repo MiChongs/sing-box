@@ -4,65 +4,10 @@ package ebpf
 
 import (
 	"net/netip"
-	"slices"
 	"sort"
-	"strings"
 
 	commonEBPF "github.com/MiChongs/sing-ebpf"
-	E "github.com/sagernet/sing/common/exceptions"
 )
-
-// validateActionPolicyScope keeps data-plane-specific mapping decisions in
-// sing-box. These fields have no corresponding map in the selected eBPF
-// paths, so silently passing them to sing-ebpf would turn a caller mistake
-// into an ignored policy.
-func validateActionPolicyScope(policy commonEBPF.ActionPolicy) error {
-	if len(policy.Local.SourceCIDR) > 0 || len(policy.Local.SourceMAC) > 0 {
-		return E.New("local eBPF action policy does not support source CIDR or MAC decisions")
-	}
-	if len(policy.Shared.UID) > 0 {
-		return E.New("shared eBPF action policy does not support UID decisions")
-	}
-	return nil
-}
-
-// validateForceInterceptPrefixes rejects bypass_exclude prefixes that do not
-// fit the force-intercept slots. The data planes keep
-// commonEBPF.ForceInterceptPrefixesPerFamily prefixes per address family,
-// shared by every path, for the fake-ip range and both bypass_exclude lists
-// together. sing-ebpf rejects the same policy; this names the options.
-func (i *Inbound) validateForceInterceptPrefixes() error {
-	check := func(family string, ipv4 bool, fakeIP netip.Prefix) error {
-		var (
-			prefixes []netip.Prefix
-			sources  []string
-		)
-		add := func(source string, prefix netip.Prefix) {
-			if !prefix.IsValid() || prefix.Addr().Is4() != ipv4 || slices.Contains(prefixes, prefix) {
-				return
-			}
-			prefixes = append(prefixes, prefix)
-			sources = append(sources, source+" "+prefix.String())
-		}
-		add("fake-ip", fakeIP)
-		for _, prefix := range i.localBypassExclude {
-			add("local.bypass_exclude", prefix)
-		}
-		for _, prefix := range i.sharedBypassExclude {
-			add("shared.bypass_exclude", prefix)
-		}
-		if len(prefixes) > commonEBPF.ForceInterceptPrefixesPerFamily {
-			return E.New("eBPF force-intercepts at most ", commonEBPF.ForceInterceptPrefixesPerFamily, " ", family,
-				" prefixes across the fake-ip range and both bypass_exclude lists, got ", strings.Join(sources, ", "),
-				"; use the same bypass_exclude prefix for local and shared, drop one, or use redir-host DNS mode")
-		}
-		return nil
-	}
-	if err := check("IPv4", true, i.fakeIPIPv4Prefix); err != nil {
-		return err
-	}
-	return check("IPv6", false, i.fakeIPIPv6Prefix)
-}
 
 // compileProcessUIDPolicy converts sing-box's include/exclude/package result
 // into final UID actions for sing-ebpf, for both the local data planes and the
@@ -181,17 +126,12 @@ func (i *Inbound) compileActionPolicy() (commonEBPF.CompiledPolicy, error) {
 }
 
 func (i *Inbound) buildActionPolicy() (commonEBPF.ActionPolicy, error) {
-	if err := i.validateForceInterceptPrefixes(); err != nil {
-		return commonEBPF.ActionPolicy{}, err
-	}
 	// The local data planes and the process tracker must see the same final
 	// UID actions. Passing include ranges and overlapping exclude ranges as
 	// separate decisions would let the include win and silently drop every
 	// exclude_* option whenever an include_* option is configured.
 	uidDecisions, uidDefault := i.compileProcessUIDPolicy()
 	policy := commonEBPF.ActionPolicy{
-		EnableTCP: i.enableTCP,
-		EnableUDP: i.enableUDP,
 		Local: commonEBPF.ActionScope{
 			Default: uidDefault,
 			UID:     uidDecisions,
@@ -203,6 +143,7 @@ func (i *Inbound) buildActionPolicy() (commonEBPF.ActionPolicy, error) {
 	appendDestinationPolicy(&policy.Local, i.localPolicy.BypassPrivateAddress, i.localBypassPort, i.localDNSMode,
 		i.fakeIPIPv4Prefix, i.fakeIPIPv6Prefix, i.localBypassExclude, i.enableTCP, i.enableUDP)
 
+	policy.Shared.Default = sharedSourceDefault(len(i.sharedOptions.IncludeSourceCIDR), len(i.sharedIncludeMAC))
 	for _, prefix := range i.sharedOptions.IncludeSourceCIDR {
 		policy.Shared.SourceCIDR = append(policy.Shared.SourceCIDR, commonEBPF.CIDRDecision{
 			Prefix: prefix, Action: commonEBPF.DecisionIntercept,
@@ -227,10 +168,14 @@ func (i *Inbound) buildActionPolicy() (commonEBPF.ActionPolicy, error) {
 		i.fakeIPIPv4Prefix, i.fakeIPIPv6Prefix, i.sharedBypassExclude, i.enableTCP, i.enableUDP)
 	i.localInitialDestinations = destinationPassDecisions(policy.Local.DestinationCIDR)
 	i.sharedInitialDestinations = destinationPassDecisions(policy.Shared.DestinationCIDR)
-	if err := validateActionPolicyScope(policy); err != nil {
-		return commonEBPF.ActionPolicy{}, err
-	}
 	return policy, nil
+}
+
+func sharedSourceDefault(includeCIDRs, includeMACs int) commonEBPF.Decision {
+	if includeCIDRs > 0 || includeMACs > 0 {
+		return commonEBPF.DecisionPass
+	}
+	return commonEBPF.DecisionIntercept
 }
 
 func destinationPassDecisions(decisions []commonEBPF.CIDRDecision) []commonEBPF.CIDRDecision {
@@ -304,12 +249,12 @@ func appendPortDecisions(scope *commonEBPF.ActionScope, bypass []portRange, dnsM
 			}
 		}
 	}
-	if dnsMode == dnsModeHijack {
+	if dnsMode == dnsModeHijack || dnsMode == dnsModeRespectPolicy {
 		if enableTCP {
-			scope.DestinationPort = append(scope.DestinationPort, commonEBPF.PortDecision{Protocol: commonEBPF.ProtocolTCP, Port: 53, Action: commonEBPF.DecisionIntercept})
+			scope.DestinationPort = append(scope.DestinationPort, commonEBPF.PortDecision{Protocol: commonEBPF.ProtocolTCP, Port: 53, Action: commonEBPF.DecisionIntercept, AfterSelectors: dnsMode == dnsModeRespectPolicy})
 		}
 		if enableUDP {
-			scope.DestinationPort = append(scope.DestinationPort, commonEBPF.PortDecision{Protocol: commonEBPF.ProtocolUDP, Port: 53, Action: commonEBPF.DecisionIntercept})
+			scope.DestinationPort = append(scope.DestinationPort, commonEBPF.PortDecision{Protocol: commonEBPF.ProtocolUDP, Port: 53, Action: commonEBPF.DecisionIntercept, AfterSelectors: dnsMode == dnsModeRespectPolicy})
 		}
 	} else if dnsMode == dnsModeOff {
 		if enableTCP {

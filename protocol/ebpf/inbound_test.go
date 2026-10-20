@@ -228,6 +228,9 @@ func TestValidateScopedOptions(t *testing.T) {
 	if err := validateSharedOptions(false, option.EBPFSharedOptions{BypassPrivateAddress: common.Ptr(false)}); err == nil {
 		t.Fatal("expected shared private-address policy to be rejected without shared mode")
 	}
+	if err := validateSharedOptions(false, option.EBPFSharedOptions{DefaultInterface: true}); err == nil {
+		t.Fatal("expected shared default-interface attachment to be rejected without shared mode")
+	}
 }
 
 func TestNormalizeLocalDataPlane(t *testing.T) {
@@ -238,7 +241,7 @@ func TestNormalizeLocalDataPlane(t *testing.T) {
 		cgroupPath string
 	}{
 		{name: "default", options: option.EBPFLocalOptions{}, dataPlane: localDataPlaneCgroup},
-		{name: "explicit tc", options: option.EBPFLocalOptions{DataPlane: "tc"}, dataPlane: localDataPlaneTC},
+		{name: "explicit socket_assign", options: option.EBPFLocalOptions{DataPlane: "socket_assign"}, dataPlane: localDataPlaneSocketAssign},
 		{name: "cgroup root", options: option.EBPFLocalOptions{DataPlane: "cgroup"}, dataPlane: localDataPlaneCgroup},
 		{name: "explicit cgroup", options: option.EBPFLocalOptions{DataPlane: "cgroup", CgroupPath: "/sys/fs/cgroup/sing-box"}, dataPlane: localDataPlaneCgroup, cgroupPath: "/sys/fs/cgroup/sing-box"},
 		{name: "implicit cgroup path", options: option.EBPFLocalOptions{CgroupPath: "/sys/fs/cgroup/sing-box"}, dataPlane: localDataPlaneCgroup, cgroupPath: "/sys/fs/cgroup/sing-box"},

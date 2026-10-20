@@ -3,10 +3,42 @@
 package ebpf
 
 import (
+	"errors"
 	"testing"
+	"time"
 
 	commonEBPF "github.com/MiChongs/sing-ebpf"
 )
+
+func TestTCMaintenanceCoalescesEventsAndContinuesPartialScans(t *testing.T) {
+	now := time.Unix(1, 0)
+	var schedule maintenanceSchedule
+	if schedule.delay(now) != 0 || schedule.finish(now, true, false, nil) != 0 {
+		t.Fatal("normal completed sweep should wait for activity or watchdog")
+	}
+	for n := 1; n < 50; n++ {
+		elapsed := time.Duration(n) * 100 * time.Millisecond
+		if got := schedule.delay(now.Add(elapsed)); got != tcAssignmentMaintenanceCooldown-elapsed {
+			t.Fatalf("wake %d postponed deadline: %v", n, got)
+		}
+	}
+	now = now.Add(tcAssignmentMaintenanceCooldown)
+	if schedule.delay(now) != 0 {
+		t.Fatal("pending event was not released")
+	}
+	if got := schedule.finish(now, false, false, nil); got != tcAssignmentMaintenanceContinue {
+		t.Fatalf("partial scan delay = %v", got)
+	}
+	if got := schedule.finish(now, true, true, nil); got != tcAssignmentPressureCooldown {
+		t.Fatalf("pressure delay = %v", got)
+	}
+	if schedule.finish(now, false, true, errors.New("scan failed")) != tcAssignmentMaintenanceCooldown || schedule.delay(now) != tcAssignmentMaintenanceCooldown {
+		t.Fatal("scan failure must not cause a short-delay retry loop")
+	}
+	if schedule.finish(now, false, true, errors.New("scan failed")) != 2*tcAssignmentMaintenanceCooldown {
+		t.Fatal("repeated failure must back off")
+	}
+}
 
 func TestTCAssignmentPressureHysteresis(t *testing.T) {
 	usage := commonEBPF.MapUsage{Entries: 70, Capacity: 100}
@@ -32,35 +64,23 @@ func TestTCAssignmentPartialUsageIsNotPressureEvidence(t *testing.T) {
 		t.Fatalf("empty/unknown usage changed pressure state: active=%v rounds=%d entered=%v exited=%v", active, rounds, entered, exited)
 	}
 }
-
-func TestTCAssignmentActivityWakeIsRateLimited(t *testing.T) {
-	inbound := &Inbound{tcAssignmentWake: make(chan struct{}, 1)}
-	inbound.noteTCAssignmentActivity()
-	select {
-	case <-inbound.tcAssignmentWake:
-	default:
-		t.Fatal("first activity did not wake maintenance")
+func TestTCSweepReportsIndependentMapValidity(t *testing.T) {
+	i := &Inbound{}
+	i.recordTCAssignmentSweep(commonEBPF.TCAssignmentSweepResult{
+		Usage: commonEBPF.MapUsage{Entries: 7, Capacity: 64}, UsageKnown: true,
+		ReturnUsage: commonEBPF.MapUsage{Entries: 40, Capacity: 64}, ReturnUsageKnown: true, Complete: true,
+	})
+	i.recordTCAssignmentSweep(commonEBPF.TCAssignmentSweepResult{
+		Usage: commonEBPF.MapUsage{Entries: 8, Capacity: 64}, UsageKnown: true,
+		FailureMap: "sb_tc_return", Failure: "scan",
+	})
+	if !i.tcAssignmentSweepUsageKnown.Load() || i.tcReturnSweepUsageKnown.Load() {
+		t.Fatal("return failure erased assignment validity or reported stale return usage as current")
 	}
-	for range 1000 {
-		inbound.noteTCAssignmentActivity()
+	if i.tcAssignmentSweepEntries.Load() != 8 || i.tcReturnSweepEntries.Load() != 40 {
+		t.Fatal("per-map snapshots were mixed")
 	}
-	select {
-	case <-inbound.tcAssignmentWake:
-		t.Fatal("activity within the interval woke maintenance again")
-	default:
-	}
-	inbound.tcAssignmentActivityWakeAt.Add(-int64(tcAssignmentActivityWakeInterval))
-	inbound.noteTCAssignmentActivity()
-	select {
-	case <-inbound.tcAssignmentWake:
-	default:
-		t.Fatal("activity after the interval did not wake maintenance")
-	}
-	// Event wakes such as interface changes are not rate limited.
-	inbound.requestTCAssignmentMaintenance()
-	select {
-	case <-inbound.tcAssignmentWake:
-	default:
-		t.Fatal("explicit maintenance request was suppressed")
+	if name, _ := i.tcAssignmentSweepFailureMap.Load().(string); name != "sb_tc_return" {
+		t.Fatalf("failure map = %q", name)
 	}
 }

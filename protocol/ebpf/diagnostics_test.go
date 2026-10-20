@@ -23,6 +23,20 @@ type captureLogger struct {
 	infoMessages  []string
 }
 
+func TestStructuredEBPFEventIsJSON(t *testing.T) {
+	message := ebpfStructuredEvent("tc_runtime", map[string]any{
+		"network": "tcp,udp",
+		"count":   2,
+	})
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(message), &decoded); err != nil {
+		t.Fatalf("structured event is not JSON: %v", err)
+	}
+	if decoded["event"] != "tc_runtime" || decoded["network"] != "tcp,udp" {
+		t.Fatalf("unexpected structured event: %v", decoded)
+	}
+}
+
 func (l *captureLogger) Trace(args ...any) {}
 func (l *captureLogger) Debug(args ...any) {
 	var builder strings.Builder
@@ -33,7 +47,15 @@ func (l *captureLogger) Debug(args ...any) {
 	}
 	l.debugMessages = append(l.debugMessages, builder.String())
 }
-func (l *captureLogger) Info(args ...any)  { l.infoMessages = append(l.infoMessages, "called") }
+func (l *captureLogger) Info(args ...any) {
+	var builder strings.Builder
+	for _, arg := range args {
+		if text, ok := arg.(string); ok {
+			builder.WriteString(text)
+		}
+	}
+	l.infoMessages = append(l.infoMessages, builder.String())
+}
 func (l *captureLogger) Warn(args ...any)  {}
 func (l *captureLogger) Error(args ...any) {}
 func (l *captureLogger) Fatal(args ...any) {}
@@ -53,7 +75,7 @@ func (l *captureLogger) PanicContext(context.Context, ...any) {}
 // the state that is not a failure at all: a data plane is configured but no
 // matching interface exists yet, so there is nothing to attach to.
 func TestDiagnosticsReportsWaitingForInterfaceWhenNothingIsAttachedYet(t *testing.T) {
-	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneTC}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign}
 	diagnostics := inbound.Diagnostics()
 	if diagnostics.SchemaVersion != adapter.EBPFDiagnosticsSchemaVersion || diagnostics.ObservedAt.IsZero() {
 		t.Fatalf("diagnostics metadata = version %d at %v, want schema version %d and timestamp", diagnostics.SchemaVersion, diagnostics.ObservedAt, adapter.EBPFDiagnosticsSchemaVersion)
@@ -67,7 +89,7 @@ func TestDiagnosticsReportsWaitingForInterfaceWhenNothingIsAttachedYet(t *testin
 }
 
 func TestEBPFDiagnosticsUsesShortRequestDrivenCache(t *testing.T) {
-	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneTC}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign}
 	first := inbound.EBPFDiagnostics()
 	second := inbound.EBPFDiagnostics()
 	if !first.ObservedAt.Equal(second.ObservedAt) {
@@ -116,6 +138,7 @@ func TestEBPFDiagnosticsIncludesEffectiveTCState(t *testing.T) {
 		TCRoutingMark:            1 << 29,
 		TCRoutingTable:           2022,
 		TCRoutingPriority:        10000,
+		TCRoutingSlot:            2,
 		TCAttachmentCount:        2,
 		TCRetiredAttachmentCount: 1,
 		TCRetiredDeliveryCount:   1,
@@ -128,7 +151,7 @@ func TestEBPFDiagnosticsIncludesEffectiveTCState(t *testing.T) {
 	if diagnostics.SchemaVersion != adapter.EBPFDiagnosticsSchemaVersion || diagnostics.TCBackendMode != "socket_assign" ||
 		diagnostics.TCListenerLookupMode != "sockmap" || diagnostics.TCAttachmentMode != "tcx" ||
 		diagnostics.TCDeliveryInterfaceIndex != 42 || diagnostics.TCAttachmentCount != 2 ||
-		diagnostics.TCNetworkGeneration != 3 || diagnostics.TCLastHealthCheckAt == nil ||
+		diagnostics.TCNetworkGeneration != 3 || diagnostics.TCRoutingSlot != 2 || diagnostics.TCLastHealthCheckAt == nil ||
 		!diagnostics.TCLastHealthCheckAt.Equal(observedHealth) || diagnostics.TCLastReconcileAt == nil ||
 		!diagnostics.TCLastReconcileAt.Equal(observedReconcile) {
 		t.Fatalf("effective TC state was not propagated: %+v", diagnostics)
@@ -136,12 +159,12 @@ func TestEBPFDiagnosticsIncludesEffectiveTCState(t *testing.T) {
 }
 
 func TestEBPFDiagnosticsSchemaVersionIncludesEffectiveRuntimeFields(t *testing.T) {
-	if adapter.EBPFDiagnosticsSchemaVersion != 16 {
-		t.Fatalf("schema version = %d, want 16 after adding map metadata diagnostics", adapter.EBPFDiagnosticsSchemaVersion)
+	if adapter.EBPFDiagnosticsSchemaVersion != 18 {
+		t.Fatalf("schema version = %d, want 18 after adding slot diagnostics", adapter.EBPFDiagnosticsSchemaVersion)
 	}
 	diagnostics := diagnosticsForAPI(EBPFDiagnostics{SchemaVersion: adapter.EBPFDiagnosticsSchemaVersion, LocalCgroupAttachMode: "link_create"})
-	if diagnostics.SchemaVersion != 16 {
-		t.Fatalf("diagnostics schema version = %d, want 16", diagnostics.SchemaVersion)
+	if diagnostics.SchemaVersion != 18 {
+		t.Fatalf("diagnostics schema version = %d, want 18", diagnostics.SchemaVersion)
 	}
 }
 
@@ -214,7 +237,7 @@ func TestKernelRuntimeForAPI(t *testing.T) {
 // case: local TC configured and actually attached to an interface, nothing
 // failing, no rollback anomaly.
 func TestDiagnosticsReportsNormalWithAHealthyAttachment(t *testing.T) {
-	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneTC}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign}
 	inbound.tcDataPlane = &testTCRuntime{
 		attachments: []commonEBPF.AttachmentInfo{{
 			InterfaceName:  "eth0",
@@ -397,7 +420,7 @@ func TestDiagnosticsUDPSessionCountIncludesSharedPacketRewriteClients(t *testing
 // distinctly from an ordinary in-progress recovery.
 func TestDiagnosticsReportsNeedsAttentionWhenBypassRuleSetIsInconsistent(t *testing.T) {
 	inbound := &Inbound{}
-	inbound.bypassRuleSetInconsistent = true
+	inbound.localBypassRules.inconsistent = true
 	diagnostics := inbound.Diagnostics()
 	if diagnostics.LocalBypassRuleSet.Consistent {
 		t.Fatal("LocalBypassRuleSet.Consistent = true, want false")
@@ -436,7 +459,7 @@ func TestDiagnosticsLastErrorIncludesSharedRewriteWarnings(t *testing.T) {
 // produces valid, complete JSON matching the struct's fields -- not just
 // that it doesn't panic.
 func TestDiagnosticsWriteJSONRoundTrips(t *testing.T) {
-	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneTC}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign}
 	diagnostics := inbound.Diagnostics()
 	var buffer bytes.Buffer
 	if err := diagnostics.WriteJSON(&buffer); err != nil {
@@ -453,7 +476,7 @@ func TestDiagnosticsWriteJSONRoundTrips(t *testing.T) {
 
 // TestDiagnosticsWriteTextIncludesTheKeyFields covers the text-only fields.
 func TestDiagnosticsWriteTextIncludesTheKeyFields(t *testing.T) {
-	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneTC}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign}
 	diagnostics := inbound.Diagnostics()
 	var buffer bytes.Buffer
 	if err := diagnostics.WriteText(&buffer); err != nil {
@@ -478,22 +501,22 @@ func TestDiagnosticsWriteTextIncludesTheKeyFields(t *testing.T) {
 }
 
 // TestLogStartupSummaryNamesEachRequiredFact checks enabled paths, mounts,
-// waiting interfaces, and FakeIP coverage in the single Debug line.
+// waiting interfaces, and FakeIP coverage in the single Info line.
 func TestLogStartupSummaryNamesEachRequiredFact(t *testing.T) {
 	logger := &captureLogger{}
 	inbound := &Inbound{
 		localEnabled:    true,
-		localDataPlane:  localDataPlaneTC,
+		localDataPlane:  localDataPlaneSocketAssign,
 		fakeIPICMPReply: true,
 		logger:          logger,
 	}
 	inbound.logStartupSummary()
 
-	if len(logger.debugMessages) != 1 || len(logger.infoMessages) != 0 {
-		t.Fatalf("log calls: Debug=%d Info=%d, want Debug=1 Info=0", len(logger.debugMessages), len(logger.infoMessages))
+	if len(logger.debugMessages) != 0 || len(logger.infoMessages) != 1 {
+		t.Fatalf("log calls: Debug=%d Info=%d, want Debug=0 Info=1", len(logger.debugMessages), len(logger.infoMessages))
 	}
-	message := logger.debugMessages[0]
-	for _, want := range []string{"local=tc", "waiting_for_interface=[local]", "fakeip_icmp=[enabled, not yet covering any attachment]"} {
+	message := logger.infoMessages[0]
+	for _, want := range []string{`"event":"inbound_start"`, `"state":"waiting_for_interface"`, `"configured_paths":["local=socket_assign"]`, `"waiting_paths":["local"]`, `"fakeip_icmp":"enabled, not yet covering any attachment"`} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("summary %q missing %q", message, want)
 		}
@@ -508,7 +531,7 @@ func TestLogStartupSummaryReportsAnActualAttachmentAndItsFakeIPICMPCoverage(t *t
 	logger := &captureLogger{}
 	inbound := &Inbound{
 		localEnabled:    true,
-		localDataPlane:  localDataPlaneTC,
+		localDataPlane:  localDataPlaneSocketAssign,
 		fakeIPICMPReply: true,
 		logger:          logger,
 	}
@@ -522,11 +545,11 @@ func TestLogStartupSummaryReportsAnActualAttachmentAndItsFakeIPICMPCoverage(t *t
 	}
 	inbound.logStartupSummary()
 
-	if len(logger.debugMessages) != 1 || len(logger.infoMessages) != 0 {
-		t.Fatalf("log calls: Debug=%d Info=%d, want Debug=1 Info=0", len(logger.debugMessages), len(logger.infoMessages))
+	if len(logger.debugMessages) != 0 || len(logger.infoMessages) != 1 {
+		t.Fatalf("log calls: Debug=%d Info=%d, want Debug=0 Info=1", len(logger.debugMessages), len(logger.infoMessages))
 	}
-	message := logger.debugMessages[0]
-	for _, want := range []string{"mounts=[eth0(local,tcx)]", "waiting_for_interface=[none]", "fakeip_icmp=[eth0(local)]"} {
+	message := logger.infoMessages[0]
+	for _, want := range []string{`"active_attachments":[{"interface":"eth0"`, `"mechanism":"tcx"`, `"waiting_paths":[]`, `"fakeip_icmp":"eth0(local)"`} {
 		if !strings.Contains(message, want) {
 			t.Fatalf("summary %q missing %q", message, want)
 		}

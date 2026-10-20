@@ -4,7 +4,7 @@ import "time"
 
 // EBPFDiagnosticsSchemaVersion versions the complete GetEBPFDiagnostics
 // response. It remains available even when no eBPF inbound is running.
-const EBPFDiagnosticsSchemaVersion = 16
+const EBPFDiagnosticsSchemaVersion = 18
 
 // EBPFDiagnosticsProvider exposes a running inbound's eBPF state to the
 // sing-box API without coupling the API service to the optional eBPF package.
@@ -81,10 +81,12 @@ type EBPFRuntimeDiagnostics struct {
 	TCListenerLookupMode          string
 	TCAttachmentMode              string
 	TCDeliveryInterface           string
+	TCNetworkNamespace            string
 	TCDeliveryInterfaceIndex      int
 	TCRoutingMark                 uint32
 	TCRoutingTable                int
 	TCRoutingPriority             int
+	TCRoutingSlot                 int
 	TCAttachmentCount             int
 	TCRetiredAttachmentCount      int
 	TCRetiredDeliveryCount        int
@@ -93,6 +95,13 @@ type EBPFRuntimeDiagnostics struct {
 	TCLastHealthCheckAt           *time.Time
 	TCLastReconcileAt             *time.Time
 	TCNetworkGeneration           uint64
+	TCReturnSweepEntries          uint64
+	TCReturnSweepCapacity         uint64
+	TCReturnSweepScanned          uint64
+	TCReturnSweepRemoved          uint64
+	TCAssignmentSweepUsageKnown   bool
+	TCReturnSweepUsageKnown       bool
+	TCAssignmentSweepFailureMap   string
 	TCAssignmentSweepScanned      uint64
 	TCAssignmentSweepRemoved      uint64
 	TCAssignmentSweepComplete     bool
@@ -167,6 +176,7 @@ type EBPFAttachmentDiagnostics struct {
 	Framing        string
 	Mechanism      string
 	ICMPEchoReply  bool
+	Slot           int
 }
 
 type EBPFBypassRuleSetBackendState struct {
@@ -186,6 +196,9 @@ type EBPFCounters struct {
 	TCSocketLookupFailures        uint64
 	TCSKAssignFailures            uint64
 	TCAssignmentUpdateFailures    uint64
+	TCReturnUpdateFailures        uint64
+	TCReturnConflicts             uint64
+	TCReturnLookupFailures        uint64
 	TCLocalFragmentPasses         uint64
 	TCSharedFragmentPasses        uint64
 	TokenReservationFailures      uint64

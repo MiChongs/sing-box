@@ -19,7 +19,7 @@ icon: material/stethoscope
 | CPU 或内存持续增长 | pprof、活动 UDP 会话、回复 socket 池、map 占用 | Go heap/goroutine、用户态会话抖动或内核 map 分配 |
 | 设备重启或 kernel panic | `/sys/fs/pstore`、内核版本、已启用策略 | 内核 verifier/map/驱动问题，仅用户态日志不足以判断 |
 
-不要只凭“eBPF”一词推断责任路径。local `cgroup`、local `tc`、shared
+不要只凭“eBPF”一词推断责任路径。local `cgroup`、local `socket_assign`、shared
 `socket_assign` 和 shared `packet_rewrite` 使用不同 hook、map、交付和清理机制。
 
 ## 最低限度材料
@@ -85,23 +85,37 @@ dmesg -T > dmesg-after-reboot.txt
 
 ## 日志与运行状态
 
-启动成功后会在 Debug 级别输出一条简要的 `eBPF inbound started` 摘要：启用的路径、
-每个 attachment 实际挂载的接口与机制、仍在等待接口的路径，以及 `fakeip_icmp`
-实际覆盖的范围。Debug 日志还会输出 `eBPF cgroup active` 或 `eBPF TC active`
-摘要，其中包括选中的
-数据面及实际运行路径。TC 摘要还会按需列出默认接口、
-attachment、内部监听器、路由状态和 delivery 接口，每个 attachment 会标明
-local/shared 角色和帧格式。网络事件仅在 attachment 或受管
-网络状态发生变化时输出 Debug 日志，修复失败会输出限频的 Warn 日志。用户态 handoff
-异常会输出限频后的 Warn 或 Error 日志；BPF 报文返回路径不输出逐包日志。接口生命周期
-主要由事件驱动，并使用低频漂移检查修复没有产生相应通知的内核状态变化。shared
-`packet_rewrite` 会在 flow 事件、释放期限或 map 压力需要时执行有界维护；这些任务
-不会定期输出状态日志。
+启动成功后会在 Info 级别输出一条简要 JSON 事件，例如
+`eBPF {"event":"inbound_start","state":"waiting_for_interface",...}`。
+其中状态直接来自
+运行时诊断（`normal`、`waiting_for_interface`、`recovering`、
+`needs_attention`），配置启用的路径不代表已经实际挂载。默认接口暂时不可用时，
+只在状态进入等待时输出一次警告；接口恢复时输出一条 Info，不会在每次
+reconcile 中重复刷屏。
+
+Debug 日志还会输出详细的 `eBPF {"event":"tc_runtime",...}` 或
+`eBPF {"event":"cgroup_runtime",...}` JSON 事件，包括选中的数据面、实际路径、
+监听器、路由状态和 delivery 接口。attachment 发生变化时会在 Info 日志中以
+`tc_attachments_changed` 事件同时记录变化前后的 attachment 集合和 network generation。
+每个 attachment 会标明 local/shared 角色和帧格式。修复失败会输出限频的 Warn 日志；用户态
+handoff 异常会输出限频后的 Warn 或 Error 日志；BPF 报文返回路径不输出逐包日志。接口
+生命周期主要由事件驱动，并使用低频漂移检查修复没有产生相应通知的内核状态变化。shared
+`packet_rewrite` 会在 flow 事件、释放期限或 map 压力需要时执行有界维护；这些任务不会
+定期输出状态日志。
 
 如果日志报告 assignment 或 UDP 原目标读取失败，请保留首次错误前后的完整日志，
 并同时采集下文的 TC attachment 信息。
 
 ### 解读 `sing-box api ebpf`
+
+Schema 18 将轻量状态与深度检查分开。用 `sing-box api ebpf --deep` 或 dashboard
+的“深度检查所属 Map”枚举内核资源。每个 inbound 有自己的 `kernelRuntime`，
+顶层仅为去重汇总，不能把它的压力归到所有 inbound。深度快照按需读取，最多缓存 5 秒。
+
+assignment 与返程 map 占用分别报告；未知/未完成扫描不等于零，上一次完整计数只代表
+历史状态。`tcAssignmentSweepFailureMap` 标明扫描失败的 map。`not_applicable`
+不参与压力计算；策略 map 的配置容量不代表运行时饱和。返程写入失败、所有权冲突和
+查询失败分别计数，应比较增量，而非把累计历史错误持续视为新故障。
 
 顶层状态是运行情况摘要：
 
@@ -132,12 +146,16 @@ UDP socket-release 路径单独报告：
   `socket_release_unsupported`、`ringbuf_unsupported`、`ringbuf_map_load_failed`、
   `ringbuf_reader_unavailable` 或 `release_notification_program_load_failed`。
 
-local TC 或 shared `socket_assign` 启用时，API 还会返回 `tc_*` 运行态字段：实际
+local socket assignment 或 shared `socket_assign` 启用时，API 还会返回 `tc_*` 运行态字段：实际
 `tcx`/`clsact`/`mixed` 挂载机制、TCP listener 的 `sockmap`/`direct` 查找方式、delivery
-接口及其 ifindex、策略路由 mark/table/priority、活动和待回收资源数量、健康状态、最近
+接口及其 ifindex、策略路由 mark/table/priority 与 TC 路由槽位、活动和待回收资源数量、健康状态、最近
 health check/reconcile 时间以及网络代数。它们来自运行中的资源快照，不是按内核版本推测；
 `tc_network_generation` 在受管网络切换时递增，可用于把切换前后的连接和计数分开分析。
 这些字段不会触发逐包统计、map 全量扫描或新的后台定时器。
+
+当多个 sing-ebpf runtime 共享同一接口时，`attachments[].slot` 和
+`tc_routing_slot` 用于区分实例持有的 TC attachment 与策略路由分配。它们只用于诊断，
+不是稳定的配置值，重启后可能被重新分配。
 
 计数器通常在当前进程或缓存生命周期内累计。应在一个小规模受控测试前后各取快照，
 不要脱离时间窗口解释单个大数值：
@@ -210,7 +228,7 @@ TC 状态、`dmesg` 和目标系统可用的 BPF 检查工具判断。
 
 ## attachment 和接口检查
 
-local `cgroup` 模式跟随选中的 cgroup v2 层级，不挂载网络接口；local `tc` 才跟随
+local `cgroup` 模式跟随选中的 cgroup v2 层级，不挂载网络接口；local `socket_assign` 才跟随
 当前默认接口。shared 模式跟随配置的下游接口，并会重试启动时不存在的接口。配置的
 shared 接口成为当前默认上游时会停止接管，重新成为下游后恢复。网络
 事件也会检查受管 TC filter、策略路由和 delivery 链路。如果接口事件前后接管行为发生
@@ -224,10 +242,10 @@ tc -details qdisc show
 tc -statistics -details filter show
 ```
 
-同时保留启动时的 `eBPF TC active` 摘要。sing-box 运行期间不要手动删除内部 veth
+同时保留启动时的 Info 状态摘要和 `tc_runtime` JSON 事件。sing-box 运行期间不要手动删除内部 veth
 或其管理的 TC filter。
 
-排查 local `tc` 接管时，可对比默认接口 egress filter 和日志所示 delivery 接口
+排查 local `socket_assign` 接管时，可对比默认接口 egress filter 和日志所示 delivery 接口
 ingress filter 的报文计数：
 
 ```sh
@@ -265,7 +283,7 @@ tuple；五元组代理不能安全地单独重定向后续分片。若不应出
 `last_error_at`、`last_recovery_at`、`next_retry_at`、attachment ifindex 变化与
 route/link 事件。
 
-local TC 跟随当前默认接口。shared 接口仅在作为下游时可接管；暂时成为默认上游时会
+local socket assignment 跟随当前默认接口。shared 接口仅在作为下游时可接管；暂时成为默认上游时会
 按设计卸载。旧 local attachment 可保留到新默认接口准备完成，以减少不必要的空窗。
 这些机制不会重新创建被 Android 撤销的热点 IPv6 前缀、默认路由、DHCP、NAT 或转发。
 

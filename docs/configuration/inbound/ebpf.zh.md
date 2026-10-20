@@ -51,7 +51,7 @@ eBPF 入站将选中的本机或下游 TCP/UDP 流量透明送入 sing-box 常�
 | 路径 | 数据面 | 用途 |
 | --- | --- | --- |
 | local | `cgroup`（默认） | 在 cgroup v2 层级接管本机 socket，不跟随网络接口。 |
-| local | `tc` | 在当前默认接口接管本机报文。 |
+| local | `socket_assign` | 在当前默认接口接管本机报文。 |
 | shared | `packet_rewrite`（默认） | 在以太网帧下游接口改写报文并恢复回复。 |
 | shared | `socket_assign` | 将报文分配给透明监听器，也支持 raw-IP、PPP 和隧道链路。 |
 
@@ -89,7 +89,25 @@ TC filter 优先级，范围 1 至 65535，默认 `1`。仅在需要与其他 fi
 | `reply` | 对发往已配置 FakeIP 前缀且安全、未分片的请求合成本地 Echo Reply。 |
 
 该回复只表示本机作出了响应，不反映映射目标的可达性或延迟。local `cgroup` 没有报文
-hook，无法响应本机 ICMP；local `tc` 和两种 shared 数据面可响应各自路径上的请求。
+hook，无法响应本机 ICMP；local `socket_assign` 和两种 shared 数据面可响应各自路径上的请求。
+
+### 独立选择机制
+
+`cgroup` 与 `packet_rewrite` 面向兼容性；`socket_assign` 面向较高内核能力，
+仍属实验性路径，TCP **和** UDP 都在私有网络命名空间中保持原始 tuple。
+旧配置中的 local `tc` 必须改为 `socket_assign`，不保留别名。
+
+| Local | Shared | 使用的机制 |
+| --- | --- | --- |
+| cgroup | packet_rewrite | socket-address 改写 + 以太网报文改写，不创建 assignment netns |
+| cgroup | socket_assign | cgroup hooks + 独立的 shared assignment netns |
+| socket_assign | packet_rewrite | 本机 assignment netns + 独立的 shared rewrite |
+| socket_assign | socket_assign | 复用 assignment 引擎/netns，local/shared 策略独立 |
+
+也可以仅启用任一 scope。TCP/UDP 选择作用于启用的 scope，IPv6 按 scope 独立配置；
+禁用路径不会启用另一条路径的 IPv6 listener，也不会更改其策略。socket_assign 的
+cgroup 自绕过和进程跟踪属于可选加速，不是强制依赖。能力不足会明确启动失败，
+不会静默切换机制。
 
 ## local
 
@@ -100,7 +118,7 @@ shared；一旦任一字段显式出现，未显式启用的路径即为禁用�
 
 ### local.data_plane
 
-可选 `cgroup`（默认）或 `tc`。TC 路径跟随当前默认接口，cgroup 路径跟随选中的
+可选 `cgroup`（默认）或 `socket_assign`。TC 路径跟随当前默认接口，cgroup 路径跟随选中的
 cgroup v2 子树。
 
 ### local.cgroup_path
@@ -124,7 +142,7 @@ recvmsg hook 上挂载一个直接放行的占位程序，导致所有 cgroup �
 LRU 回退。
 
 其他以独占方式持有 hook 的程序都会被保留，启动将失败，并在错误中指明该程序。这种
-情况下应使用 local `tc`。
+情况下应使用 local `socket_assign`。
 
 ### local.dns_mode
 
@@ -164,11 +182,9 @@ DNS。上述筛选仍然作用于普通的非 DNS 流量，因此 `hijack` 不�
 `local.bypass_private_address`、`local.bypass_port` 或其他 bypass 规则本会让
 它们在内核直连。内核在检查所有 bypass 之前先检查强制接管前缀。
 
-每个地址族最多接受一个前缀。内核每个地址族保留两个强制接管前缀，由所有路径
-共用，DNS fake-ip 范围和两个 `bypass_exclude` 列表合计占用，因此 fake-ip DNS 可以
-与每个地址族一个 bypass_exclude 前缀同时使用。在 fake-ip 之外，`local.bypass_exclude`
-与 `shared.bypass_exclude` 使用同一地址族的不同前缀需要三个槽位，启动时会报错。
-每个前缀在所有路径上都会被接管。`fakeip_icmp: reply` 只应答 fake-ip 范围。
+支持多个 IPv4 和 IPv6 前缀，可以与 FakeIP 同时使用。前缀会规范化并去重；
+local 和 shared 的集合完全独立，本机强制接管前缀不会传播到 shared 路径。
+`fakeip_icmp: reply` 只应答 fake-ip 范围。
 
 典型用途：让 VPN/CGNAT 网段（如 Tailscale 的 `100.64.0.0/10` 及 IPv6
 `fd7a:115c:a1e0::/48`）保持被接管，使 tailnet 流量能够到达 `tailscale`
@@ -223,11 +239,34 @@ DNS。上述筛选仍然作用于普通的非 DNS 流量，因此 `hijack` 不�
 
 启用从所配置下游接口进入的流量接管。
 
+### shared.default_interface
+
+允许配置的 shared 接口在同时成为当前默认上游接口时继续保持挂载，默认 `false`。
+
+单接口旁路网关中，客户端和上游路由器位于同一接口，客户端将网关和 DNS 指向本机，此时应启用
+本选项。shared 路径仍然只处理其他设备进入本机的报文；本机流量仍由 `local` 管理。
+local 与 shared 均使用 `socket_assign` 且接口相同时，runtime 会在同一个 attachment 中合并
+egress 与 ingress 角色；shared `packet_rewrite` 则使用独立持有的 TC filter。两种组合都保持
+local 与 shared 策略相互独立。
+
+本选项不会启用 IP forwarding、同接口防火墙转发、NAT、DHCP、IPv6 路由器通告或热点服务。
+尤其是此模式下被 bypass 的 IPv4 流量通常需要 SNAT/masquerade，才能确保回包仍经过本机，
+并避免客户端被重定向到上游路由器。Wi-Fi AP 也必须允许客户端之间通信。
+
+旧 Android 设备在关闭 Wi-Fi 客户端模式后复用 `wlan0` 作为热点时，默认上游通常已经变为
+蜂窝接口，因此 `wlan0` 仍是普通下游接口，一般不需要开启本选项。使用独立 `wlan2`、
+`wlan3` 等热点接口的新设备同样不需要。
+
 ### shared.data_plane
 
 可选 `packet_rewrite`（默认）或 `socket_assign`。`packet_rewrite` 要求以太网帧；
 raw-IP、PPP/PPPoE 和受支持的隧道链路应使用 `socket_assign`。local 与 shared 可
 独立选择数据面。
+
+`socket_assign` 和 local `socket_assign` 的 **TCP、UDP 都使用专用网络命名空间**，透明 UDP
+回包 socket 也位于其中，两种协议都不改写 IP 地址或端口。代理出站拨号、local cgroup
+监听器和 `packet_rewrite` 保持原有路径。这样可以隔离宿主 NAT 状态和端口占用；
+需要 netns/veth 支持及创建、进入命名空间的权限，参见[内核要求](../../manual/misc/ebpf-kernel-requirements.md)。
 
 ### shared.dns_mode
 
@@ -239,7 +278,8 @@ raw-IP、PPP/PPPoE 和受支持的隧道链路应使用 `socket_assign`。local 
 ==启用 shared 接管时必填==
 
 客户端流量进入本机的下游接口，可配置多个。暂不存在的接口会重试；接口成为当前默认
-上游时暂时排除，恢复下游角色后重新接管。不接受 loopback。
+上游时暂时排除，恢复下游角色后重新接管；启用 `shared.default_interface` 后不执行该排除。
+不接受 loopback。
 
 ### shared.ipv6
 
@@ -253,8 +293,8 @@ raw-IP、PPP/PPPoE 和受支持的隧道链路应使用 `socket_assign`。local 
 ### shared.bypass_exclude
 
 与 `local.bypass_exclude` 相同，但作用于 shared 数据面：这些 CIDR 前缀会在
-所有 shared bypass 决策之前被强制接管。每个地址族最多接受一个前缀；与 fake-ip
-共用强制接管槽位的规则见 `local.bypass_exclude`。
+所有 shared bypass 决策之前被强制接管。支持多个 IPv4 和 IPv6 前缀，与
+`local.bypass_exclude` 相互独立。
 
 ### shared.bypass_rule_set
 
@@ -308,7 +348,7 @@ raw-IP、PPP/PPPoE 和受支持的隧道链路应使用 `socket_assign`。local 
   UDP 清理、socket storage 和时间源模式，以及 UDP socket-release 路径；需要启用
   [sing-box API 服务](/zh/configuration/service/api/)。
 
-local TC 和 shared `socket_assign` 还会报告实际的 TCX/clsact 挂载机制、SOCKMAP/direct
+local socket assignment 和 shared `socket_assign` 还会报告实际的 TCX/clsact 挂载机制、SOCKMAP/direct
 listener 查找、delivery 接口、策略路由值、活动/待回收资源数量、health/reconcile 时间，
 以及在受管网络切换边界递增的网络代数。
 

@@ -14,6 +14,7 @@ import (
 
 	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing/common/bufio"
+	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
 
 	"golang.org/x/net/ipv4"
@@ -55,11 +56,11 @@ type udpClientTable struct {
 }
 
 // tcUDPFlowKey is what a TC UDP datagram carries before its assignment is
-// read: client, original destination and the ingress interface from OOB.
+// read. The receiving interface always belongs to the isolated namespace, so
+// the original interface is only known from the assignment itself.
 type tcUDPFlowKey struct {
-	client         netip.AddrPort
-	destination    netip.AddrPort
-	interfaceIndex uint32
+	client      netip.AddrPort
+	destination netip.AddrPort
 }
 
 type tcUDPFlowEntry struct {
@@ -130,6 +131,7 @@ type udpRedirectBinding struct {
 	tcAssignmentKeyInterfaceIndex uint32
 	tcAssignmentKeyValid          bool
 	tcAssignment                  commonEBPF.TCAssignment
+	tcReturn                      commonEBPF.TCReturnHandle
 }
 
 type tcAssignmentCleanup struct {
@@ -141,6 +143,7 @@ type tcAssignmentCleanup struct {
 type udpSessionCleanup struct {
 	cgroupRedirects []netip.Addr
 	tcAssignments   []tcAssignmentCleanup
+	tcReturns       []commonEBPF.TCReturnHandle
 }
 
 func (t *udpClientTable) load(key udpSessionKey) (*udpClientState, bool) {
@@ -258,18 +261,7 @@ func (t *udpClientTable) clientShard(key udpSessionKey) *udpClientShard {
 // not a cryptographic hash, so a party able to choose destination addresses
 // specifically to collide under it could still concentrate them onto one
 // shard. This function only changes how inputs are distributed across
-// shards; it does not change what happens once a shard fills. Of this
-// function's two callers, only udpReplySocketPool enforces a per-shard
-// capacity at all (udpReplySocketShardCapacity, with capacity-triggered
-// eviction and rejection in get()) -- the client tables
-// (udpClientTable/sharedUDPClientTable) have no capacity bound on a shard's
-// map and grow with however many sessions are actually active. For the
-// reply socket pool specifically: its usable total capacity before any
-// single destination pattern hits a capacity rejection on its own shard
-// still depends on how evenly that traffic happens to hash, not simply on
-// udpClientShardCount * udpReplySocketShardCapacity -- that product is the
-// pool's absolute ceiling under perfectly even placement, not a promised
-// floor for every traffic shape.
+// shards. Reply socket capacity is global, independent of shard distribution.
 func shardIndexForAddrPort(addrPort netip.AddrPort, shardCount int) int {
 	const offset64 = 14695981039346656037
 	const prime64 = 1099511628211
@@ -332,7 +324,12 @@ func (t *udpClientTable) setDirectAssignmentBinding(
 		state.sourceMAC = append(state.sourceMAC[:0], sourceMAC...)
 	}
 	state.socketCookie = assignment.SocketCookie
+	previous := state.bindings[destination]
+	if previous.replyAlias {
+		state.replyAliasCount--
+	}
 	state.bindings[destination] = udpRedirectBinding{
+		tcReturn:                      previous.tcReturn,
 		tcAssignmentKeyInterfaceIndex: assignmentKeyInterfaceIndex,
 		tcAssignmentKeyValid:          true,
 		tcAssignment:                  assignment,
@@ -384,7 +381,11 @@ func (t *udpClientTable) deleteWithCleanup(key udpSessionKey, expected *udpClien
 		redirects = append(redirects, address)
 	}
 	assignments := make([]tcAssignmentCleanup, 0, len(expected.bindings))
+	var returns []commonEBPF.TCReturnHandle
 	for destination, binding := range expected.bindings {
+		if binding.tcReturn.IsValid() {
+			returns = append(returns, binding.tcReturn)
+		}
 		if binding.tcAssignmentKeyValid {
 			assignments = append(assignments, tcAssignmentCleanup{
 				destination:       destination,
@@ -412,7 +413,59 @@ func (t *udpClientTable) deleteWithCleanup(key udpSessionKey, expected *udpClien
 	for _, flow := range flows {
 		t.deleteTCFlow(flow, expected)
 	}
-	return udpSessionCleanup{cgroupRedirects: redirects, tcAssignments: assignments}
+	return udpSessionCleanup{cgroupRedirects: redirects, tcAssignments: assignments, tcReturns: returns}
+}
+
+// Retain once per destination, never once per packet. Taking the state lock
+// also serializes this acquisition with session close and reply-alias creation.
+func (s *udpClientState) retainTCReturn(backend *commonEBPF.TCBackend, client, destination netip.AddrPort) error {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.closed {
+		return E.New("TC UDP session is closed")
+	}
+	binding, loaded := s.bindings[destination]
+	if !loaded {
+		return E.New("TC UDP assignment binding is missing")
+	}
+	if binding.tcReturn.IsValid() {
+		return nil
+	}
+	handle, err := backend.AcquireReturnRoute(commonEBPF.ProtocolUDP, client, destination)
+	if err != nil {
+		return err
+	}
+	binding.tcReturn = handle
+	s.bindings[destination] = binding
+	return nil
+}
+
+func (s *udpClientState) retainTCReplyReturn(backend *commonEBPF.TCBackend, destination netip.AddrPort) error {
+	s.access.Lock()
+	defer s.access.Unlock()
+	if s.closed {
+		return E.New("TC UDP session is closed")
+	}
+	binding, loaded := s.bindings[destination]
+	if !loaded {
+		return E.New("TC UDP reply binding is missing")
+	}
+	if binding.tcReturn.IsValid() {
+		return nil
+	}
+	for originalDestination, original := range s.bindings {
+		if originalDestination.Addr().Is4() != destination.Addr().Is4() || !original.tcReturn.IsValid() {
+			continue
+		}
+		handle, err := backend.AcquireReplyRoute(original.tcReturn, destination)
+		if err != nil {
+			return err
+		}
+		binding.tcReturn = handle
+		s.bindings[destination] = binding
+		return nil
+	}
+	return E.New("TC UDP reply has no retained return route")
 }
 
 func (t *udpClientTable) tcFlowShard(flow tcUDPFlowKey) *tcUDPFlowShard {

@@ -299,7 +299,7 @@ func TestUDPClientTableShardsSpreadAcrossClientAddress(t *testing.T) {
 func TestTCUDPFlowCacheRevalidatesAndFollowsSession(t *testing.T) {
 	var table udpClientTable
 	client := netip.MustParseAddrPort("192.0.2.10:53000")
-	flow := tcUDPFlowKey{client: client, destination: netip.MustParseAddrPort("1.1.1.1:53"), interfaceIndex: 3}
+	flow := tcUDPFlowKey{client: client, destination: netip.MustParseAddrPort("1.1.1.1:53")}
 	key := udpSessionKey{Source: client, Scope: udpSessionScopeLocalTC, SocketCookie: 42}
 	if _, loaded := table.cachedTCFlow(flow, 0); loaded {
 		t.Fatal("empty cache returned a flow")

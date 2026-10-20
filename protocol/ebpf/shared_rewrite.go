@@ -6,7 +6,6 @@ import (
 	"context"
 	"net/netip"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -59,7 +58,7 @@ func newSharedRewrite(inbound *Inbound, options option.EBPFSharedOptions) *share
 	}
 	mapCapacity := effectiveSharedPacketRewriteMapCapacity(
 		defaultMapCapacity,
-		len(inbound.sharedBypassRuleSet) > 0 ||
+		len(inbound.sharedBypassRules.ruleSets) > 0 ||
 			len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
 			len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0,
 	)
@@ -69,7 +68,9 @@ func newSharedRewrite(inbound *Inbound, options option.EBPFSharedOptions) *share
 		mapCapacity: mapCapacity,
 		tcPriority:  inbound.tcPriority,
 	}
-	shared.udpNat = newUDPNATService(shared, shared.preparePacketConnection, inbound.udpTimeout)
+	if inbound.enableUDP {
+		shared.udpNat = newUDPNATService(shared, shared.preparePacketConnection, inbound.udpTimeout)
+	}
 	return shared
 }
 
@@ -94,10 +95,9 @@ func (s *sharedRewrite) Start(interfaceNames []string, hostAddresses []netip.Add
 	}
 	s.startFlowJanitor()
 	if s.sharedBackendInstance() == nil {
-		s.inbound.logger.Debug(
-			"eBPF shared packet-rewrite waiting for downstream interfaces: interfaces=[",
-			strings.Join(s.interfaces, ", "), "]",
-		)
+		s.inbound.logger.Debug("eBPF ", ebpfStructuredEvent("shared_waiting", map[string]any{
+			"interfaces": s.interfaces,
+		}))
 	}
 	return nil
 }
@@ -107,8 +107,7 @@ func (s *sharedRewrite) prepareBackend() (*ECommon.SharedPacketRewriteBackend, e
 	if s.inbound.sharedRewriteIPv6Enabled() {
 		redirectIPv6 = s.inbound.redirectIPv6Prefix
 	}
-	cgroupBackend := s.inbound.cgroupBackendInstance()
-	backend, err := ECommon.PrepareSharedPacketRewrite(cgroupBackend, ECommon.SharedPacketRewriteConfig{
+	backend, err := ECommon.PrepareSharedPacketRewrite(ECommon.SharedPacketRewriteConfig{
 		ListenerPort:  s.listeners.selectedPort(),
 		EnableTCP:     s.inbound.enableTCP,
 		EnableUDP:     s.inbound.enableUDP,
@@ -125,7 +124,7 @@ func (s *sharedRewrite) prepareBackend() (*ECommon.SharedPacketRewriteBackend, e
 	s.inbound.bypassRuleSetAccess.Lock()
 	initialPolicy, policyErr := s.inbound.combineDestinationDecisions(
 		s.inbound.sharedInitialDestinations,
-		s.inbound.sharedBypassRuleSetPolicy,
+		s.inbound.sharedBypassRules.policy,
 	)
 	if policyErr == nil {
 		_, err = backend.UpdateDestinationDecisions(initialPolicy)
@@ -147,17 +146,18 @@ func (s *sharedRewrite) sharedRewriteReady(attachments []string) {
 		return
 	}
 	s.startFlowJanitor()
-	s.inbound.logger.Debug(
-		"eBPF shared packet-rewrite active: attachments=[", strings.Join(attachments, ", "), "]",
-		", redirect_listener_port=", s.listeners.selectedPort(),
-		", dns_mode=", s.inbound.sharedDNSMode,
-		", ipv6=", s.inbound.sharedRewriteIPv6Enabled(),
-		", bypass_private_address=", s.inbound.sharedBypassPrivate,
-		", source_cidr={include:", len(s.inbound.sharedOptions.IncludeSourceCIDR),
-		", exclude:", len(s.inbound.sharedOptions.ExcludeSourceCIDR), "}",
-		", source_mac={include:", len(s.inbound.sharedIncludeMAC),
-		", exclude:", len(s.inbound.sharedExcludeMAC), "}",
-	)
+	s.inbound.logger.Debug("eBPF ", ebpfStructuredEvent("shared_active", map[string]any{
+		"attachments":            attachments,
+		"default_interface":      s.inbound.sharedOptions.DefaultInterface,
+		"listener_port":          s.listeners.selectedPort(),
+		"dns_mode":               s.inbound.sharedDNSMode,
+		"ipv6":                   s.inbound.sharedRewriteIPv6Enabled(),
+		"bypass_private_address": s.inbound.sharedBypassPrivate,
+		"source_cidr_include":    len(s.inbound.sharedOptions.IncludeSourceCIDR),
+		"source_cidr_exclude":    len(s.inbound.sharedOptions.ExcludeSourceCIDR),
+		"source_mac_include":     len(s.inbound.sharedIncludeMAC),
+		"source_mac_exclude":     len(s.inbound.sharedExcludeMAC),
+	}))
 }
 
 func (s *sharedRewrite) startListeners() error {
@@ -189,6 +189,7 @@ func (s *sharedRewrite) Close() error {
 			if closeErr == nil {
 				closeErr = E.New("shared packet-rewrite runtime remained open after close")
 			}
+			return closeErr
 		}
 	}
 	listenerErr := s.closeListeners()
@@ -277,9 +278,17 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 	defer tcTicker.Stop()
 	var tcContinuation <-chan time.Time
 	var tcTimer *time.Timer
+	var tcSchedule maintenanceSchedule
+	// Independent jobs share scheduling semantics, never one another's state.
+	var flowSchedule maintenanceSchedule
+	var flowTimer *time.Timer
+	var flowContinuation <-chan time.Time
 	defer func() {
 		if tcTimer != nil {
 			tcTimer.Stop()
+		}
+		if flowTimer != nil {
+			flowTimer.Stop()
 		}
 	}()
 	tcMaintenancePending := false
@@ -335,6 +344,10 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 		if backend != nil {
 			flowWake = backend.TCPFlowWake()
 		}
+		var tcWake <-chan struct{}
+		if tcContinuation == nil {
+			tcWake = s.inbound.tcAssignmentWake
+		}
 		sweepRequested := false
 		select {
 		case <-ctx.Done():
@@ -350,26 +363,37 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 			if !sweepRequested {
 				continue
 			}
-		case <-s.inbound.tcAssignmentWake:
+		case <-tcWake:
 			tcMaintenancePending = true
 		case <-tcTicker.C:
 			tcMaintenancePending = true
+			// Kernel-only allocations do not appear in KnownFlowUsage and may
+			// never produce a userspace wake. Keep a bounded orphan watchdog.
+			sweepRequested = flowContinuation == nil
 		case <-tcContinuation:
 			tcContinuation = nil
 			tcMaintenancePending = true
 		case <-releaseTimerChannel:
+		case <-flowContinuation:
+			flowContinuation = nil
+			sweepRequested = true
 		}
 		if tcMaintenancePending {
-			complete, _ := s.inbound.sweepTCAssignmentMaintenance()
+			s.inbound.maintainTCAssignments(&tcSchedule, &tcTimer, &tcContinuation)
 			tcMaintenancePending = false
-			if !complete {
-				resetMaintenanceContinuation(&tcTimer, &tcContinuation)
-			}
 		}
 		if backend == nil {
 			continue
 		}
 		now := time.Now()
+		if sweepRequested {
+			if delay := flowSchedule.delay(now); delay > 0 {
+				if flowContinuation == nil {
+					resetMaintenanceTimer(&flowTimer, &flowContinuation, delay)
+				}
+				sweepRequested = false
+			}
+		}
 		if !sweepRequested {
 			lastReleaseFlush = now
 			_, flushErr := backend.FlushReleasedTCPFlows(now, sharedFlowReleaseFlushBudget)
@@ -408,7 +432,7 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 		} else {
 			scanInProgress = !result.Complete
 			if !result.Complete {
-				backend.RequestMaintenance()
+				resetMaintenanceTimer(&flowTimer, &flowContinuation, flowSchedule.finish(time.Now(), false, pressure, nil))
 				continue
 			}
 			entered, exited := false, false
@@ -422,17 +446,20 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 				belowExitRounds = 0
 			}
 			if entered {
-				s.inbound.logger.Warn(
-					"eBPF shared-network proxy map pressure: state=", result.Usage.Entries,
-					"/", result.Usage.Capacity,
-					", max_idle=", sharedFlowPressureMaxIdle,
-				)
+				s.inbound.logger.Warn("eBPF ", ebpfStructuredEvent("shared_map_pressure", map[string]any{
+					"entries":  result.Usage.Entries,
+					"capacity": result.Usage.Capacity,
+					"max_idle": sharedFlowPressureMaxIdle.String(),
+				}))
 			} else if exited {
-				s.inbound.logger.Info(
-					"eBPF shared-network proxy map pressure cleared: state=", result.Usage.Entries,
-					"/", result.Usage.Capacity,
-				)
+				s.inbound.logger.Info("eBPF ", ebpfStructuredEvent("shared_map_pressure_cleared", map[string]any{
+					"entries":  result.Usage.Entries,
+					"capacity": result.Usage.Capacity,
+				}))
 			}
+		}
+		if delay := flowSchedule.finish(time.Now(), result.Complete, pressure, err); delay > 0 {
+			resetMaintenanceTimer(&flowTimer, &flowContinuation, delay)
 		}
 	}
 }

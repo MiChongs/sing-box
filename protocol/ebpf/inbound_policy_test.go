@@ -71,9 +71,8 @@ func (e errString) Error() string { return string(e) }
 func newLoopbackTestTCBackend(t *testing.T) *commonEBPF.TCBackend {
 	t.Helper()
 	policy, err := commonEBPF.CompileActionPolicy(commonEBPF.ActionPolicy{
-		EnableTCP: true,
-		Local:     commonEBPF.ActionScope{Default: commonEBPF.DecisionIntercept},
-		Shared:    commonEBPF.ActionScope{Default: commonEBPF.DecisionIntercept},
+		Local:  commonEBPF.ActionScope{Default: commonEBPF.DecisionIntercept},
+		Shared: commonEBPF.ActionScope{Default: commonEBPF.DecisionIntercept},
 	})
 	if err != nil {
 		t.Fatalf("compile policy: %v", err)
@@ -90,6 +89,19 @@ func newLoopbackTestTCBackend(t *testing.T) *commonEBPF.TCBackend {
 	}
 	t.Cleanup(func() { _ = backend.Close() })
 	return backend
+}
+
+// Rollback tests deliberately exercise multiple mechanism owners. Production
+// targets are selected by scope and never include an inactive mechanism.
+func applyTestPolicyBackends(i *Inbound, policy []commonEBPF.CIDRDecision) error {
+	var targets []bypassPolicyBackend
+	if backend := i.tcBackend(); backend != nil {
+		targets = append(targets, bypassPolicyBackend{"TC", backend.UpdateLocalDestinationDecisions, backend.RequiresRebuild, &i.localBypassRules.tc})
+	}
+	if backend := i.cgroupBackendInstance(); backend != nil {
+		targets = append(targets, bypassPolicyBackend{"cgroup", backend.UpdateDestinationDecisions, backend.RequiresRebuild, &i.localBypassRules.cgroup})
+	}
+	return i.applyRuleSetPolicyToBackends(&i.localBypassRules, "local.bypass_rule_set", policy, targets)
 }
 
 func bypassPolicyFor(t *testing.T, prefixes ...netip.Prefix) []commonEBPF.CIDRDecision {
@@ -128,24 +140,24 @@ func TestApplyBypassCIDRPolicyRevertsAnEarlierBackendWhenALaterOneFails(t *testi
 	previous := bypassPolicyFor(t, netip.MustParsePrefix("10.0.0.0/8"))
 	next := bypassPolicyFor(t, netip.MustParsePrefix("192.168.0.0/16"))
 
-	inbound := &Inbound{}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign}
 	inbound.tcDataPlane = newUnstartedTCRuntime(tc)
 	inbound.setCgroupBackend(&commonEBPF.CgroupBackend{}) // zero value: never usable
-	inbound.bypassRuleSetPolicy = previous
-	inbound.bypassRuleSetPolicyVersion = 5
-	inbound.bypassRuleSetExpectedPolicy = previous
-	inbound.bypassRuleSetExpectedVersion = 5
-	inbound.bypassRuleSetTC = bypassRuleSetBackendVersion{version: 5, known: true}
+	inbound.localBypassRules.policy = previous
+	inbound.localBypassRules.policyVersion = 5
+	inbound.localBypassRules.expectedPolicy = previous
+	inbound.localBypassRules.expectedVersion = 5
+	inbound.localBypassRules.tc = bypassRuleSetBackendVersion{version: 5, known: true}
 
-	err := inbound.applyBypassCIDRPolicyLocked(next)
+	err := applyTestPolicyBackends(inbound, next)
 	if err == nil {
 		t.Fatal("apply succeeded despite the cgroup backend being permanently unusable")
 	}
-	if inbound.bypassRuleSetInconsistent {
+	if inbound.localBypassRules.inconsistent {
 		t.Fatal("marked inconsistent even though TC's own revert had no reason to fail")
 	}
-	if !reflect.DeepEqual(inbound.bypassRuleSetPolicy, previous) {
-		t.Fatalf("bypassRuleSetPolicy = %+v, want it left at the previous policy on failure", inbound.bypassRuleSetPolicy)
+	if !reflect.DeepEqual(inbound.localBypassRules.policy, previous) {
+		t.Fatalf("bypassRuleSetPolicy = %+v, want it left at the previous policy on failure", inbound.localBypassRules.policy)
 	}
 	changed, revertCheckErr := tc.UpdateLocalDestinationDecisions(previous)
 	if revertCheckErr != nil {
@@ -154,15 +166,15 @@ func TestApplyBypassCIDRPolicyRevertsAnEarlierBackendWhenALaterOneFails(t *testi
 	if changed {
 		t.Fatal("TC backend was not actually reverted to the previous policy: re-applying it was not a no-op")
 	}
-	if inbound.bypassRuleSetPolicyVersion != 5 {
+	if inbound.localBypassRules.policyVersion != 5 {
 		t.Fatalf(
 			"bypassRuleSetPolicyVersion = %d, want 5 (unchanged: the overall attempt failed and was fully reverted, "+
 				"so the policy version must not have advanced even though an attempt was made)",
-			inbound.bypassRuleSetPolicyVersion,
+			inbound.localBypassRules.policyVersion,
 		)
 	}
-	if inbound.bypassRuleSetTC != (bypassRuleSetBackendVersion{version: 5, known: true}) {
-		t.Fatalf("bypassRuleSetTC = %+v, want {version:5 known:true} (rolled back once TC's own revert succeeded)", inbound.bypassRuleSetTC)
+	if inbound.localBypassRules.tc != (bypassRuleSetBackendVersion{version: 5, known: true}) {
+		t.Fatalf("bypassRuleSetTC = %+v, want {version:5 known:true} (rolled back once TC's own revert succeeded)", inbound.localBypassRules.tc)
 	}
 }
 
@@ -192,39 +204,39 @@ func TestApplyBypassCIDRPolicyLeavesBackendVersionOnFailedRevert(t *testing.T) {
 	previous := oversizedBypassPolicy(t)
 	next := bypassPolicyFor(t, netip.MustParsePrefix("192.168.0.0/16"))
 
-	inbound := &Inbound{}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign}
 	inbound.logger = log.NewNOPFactory().Logger()
 	inbound.tcDataPlane = newUnstartedTCRuntime(tc)
 	inbound.setCgroupBackend(&commonEBPF.CgroupBackend{}) // zero value: never usable
-	inbound.bypassRuleSetPolicy = previous
-	inbound.bypassRuleSetPolicyVersion = 5
-	inbound.bypassRuleSetExpectedPolicy = previous
-	inbound.bypassRuleSetExpectedVersion = 5
-	inbound.bypassRuleSetTC = bypassRuleSetBackendVersion{version: 5, known: true}
+	inbound.localBypassRules.policy = previous
+	inbound.localBypassRules.policyVersion = 5
+	inbound.localBypassRules.expectedPolicy = previous
+	inbound.localBypassRules.expectedVersion = 5
+	inbound.localBypassRules.tc = bypassRuleSetBackendVersion{version: 5, known: true}
 
-	err := inbound.applyBypassCIDRPolicyLocked(next)
+	err := applyTestPolicyBackends(inbound, next)
 	if err == nil {
 		t.Fatal("apply succeeded despite the cgroup backend being permanently unusable")
 	}
-	if !inbound.bypassRuleSetInconsistent {
+	if !inbound.localBypassRules.inconsistent {
 		t.Fatal("want bypassRuleSetInconsistent=true: TC's own revert to the oversized previous policy must have failed")
 	}
-	if inbound.bypassRuleSetPolicyVersion != 5 {
+	if inbound.localBypassRules.policyVersion != 5 {
 		t.Fatalf(
 			"bypassRuleSetPolicyVersion = %d, want 5 (unchanged: bypassRuleSetPolicy itself was never updated on this "+
 				"failed attempt, so the version naming it must not move either)",
-			inbound.bypassRuleSetPolicyVersion,
+			inbound.localBypassRules.policyVersion,
 		)
 	}
-	if inbound.bypassRuleSetTC.known {
+	if inbound.localBypassRules.tc.known {
 		t.Fatal("bypassRuleSetTC.known = true, want false: TC's own revert failed, so its true state is unconfirmed")
 	}
-	if inbound.bypassRuleSetTC.version != 6 {
+	if inbound.localBypassRules.tc.version != 6 {
 		t.Fatalf(
 			"bypassRuleSetTC.version = %d, want 6 (the last point TC was actually confirmed at -- its own successful "+
 				"forward apply during this same attempt -- retained alongside known=false, not silently reverted to "+
 				"a number that would claim a confirmed state)",
-			inbound.bypassRuleSetTC.version,
+			inbound.localBypassRules.tc.version,
 		)
 	}
 }
@@ -239,35 +251,35 @@ func TestApplyBypassCIDRPolicyVersionUnchangedForIdenticalContent(t *testing.T) 
 	tc := newLoopbackTestTCBackend(t)
 	policy := bypassPolicyFor(t, netip.MustParsePrefix("192.168.0.0/16"))
 
-	inbound := &Inbound{}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign}
 	inbound.tcDataPlane = newUnstartedTCRuntime(tc)
 
-	if err := inbound.applyBypassCIDRPolicyLocked(policy); err != nil {
+	if err := applyTestPolicyBackends(inbound, policy); err != nil {
 		t.Fatalf("first apply: %v", err)
 	}
-	firstVersion := inbound.bypassRuleSetPolicyVersion
+	firstVersion := inbound.localBypassRules.policyVersion
 	if firstVersion == 0 {
 		t.Fatal("bypassRuleSetPolicyVersion did not advance on the very first apply")
 	}
 
-	if err := inbound.applyBypassCIDRPolicyLocked(policy); err != nil {
+	if err := applyTestPolicyBackends(inbound, policy); err != nil {
 		t.Fatalf("second, identical apply: %v", err)
 	}
-	if inbound.bypassRuleSetPolicyVersion != firstVersion {
+	if inbound.localBypassRules.policyVersion != firstVersion {
 		t.Fatalf(
 			"bypassRuleSetPolicyVersion = %d after re-applying identical content, want unchanged from %d",
-			inbound.bypassRuleSetPolicyVersion, firstVersion,
+			inbound.localBypassRules.policyVersion, firstVersion,
 		)
 	}
 
 	changed := bypassPolicyFor(t, netip.MustParsePrefix("10.0.0.0/8"))
-	if err := inbound.applyBypassCIDRPolicyLocked(changed); err != nil {
+	if err := applyTestPolicyBackends(inbound, changed); err != nil {
 		t.Fatalf("third apply with different content: %v", err)
 	}
-	if inbound.bypassRuleSetPolicyVersion != firstVersion+1 {
+	if inbound.localBypassRules.policyVersion != firstVersion+1 {
 		t.Fatalf(
 			"bypassRuleSetPolicyVersion = %d after applying genuinely different content, want %d",
-			inbound.bypassRuleSetPolicyVersion, firstVersion+1,
+			inbound.localBypassRules.policyVersion, firstVersion+1,
 		)
 	}
 }
@@ -283,31 +295,31 @@ func TestApplyBypassCIDRPolicyVersionUnchangedForIdenticalContent(t *testing.T) 
 func TestBypassRuleSetRetryCountOnlyCountsSchedulerRetries(t *testing.T) {
 	tc := newLoopbackTestTCBackend(t)
 
-	inbound := &Inbound{}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign}
 	inbound.logger = log.NewNOPFactory().Logger()
 	inbound.tcDataPlane = newUnstartedTCRuntime(tc)
-	inbound.bypassRuleSetStarted = true
+	inbound.localBypassRules.started = true
 
 	if err := inbound.refreshBypassRuleSetsLocked(false); err != nil {
 		t.Fatalf("ordinary refresh: %v", err)
 	}
-	if inbound.bypassRuleSetRetryCount != 0 {
-		t.Fatalf("bypassRuleSetRetryCount = %d, want 0 after an ordinary refresh that was not a retry", inbound.bypassRuleSetRetryCount)
+	if inbound.localBypassRules.retryCount != 0 {
+		t.Fatalf("bypassRuleSetRetryCount = %d, want 0 after an ordinary refresh that was not a retry", inbound.localBypassRules.retryCount)
 	}
 
 	if outcome := inbound.retryBypassRuleSetIfNeededLocked(); outcome != tcSharedRewriteSettled {
 		t.Fatalf("outcome = %v, want settled when bypassRuleSetNeedsRetry is false", outcome)
 	}
-	if inbound.bypassRuleSetRetryCount != 0 {
-		t.Fatalf("bypassRuleSetRetryCount = %d, want 0: nothing needed a retry, so none should be counted", inbound.bypassRuleSetRetryCount)
+	if inbound.localBypassRules.retryCount != 0 {
+		t.Fatalf("bypassRuleSetRetryCount = %d, want 0: nothing needed a retry, so none should be counted", inbound.localBypassRules.retryCount)
 	}
 
-	inbound.bypassRuleSetNeedsRetry = true
+	inbound.localBypassRules.needsRetry = true
 	if outcome := inbound.retryBypassRuleSetIfNeededLocked(); outcome != tcSharedRewriteSettled {
 		t.Fatalf("outcome = %v, want settled once the retried refresh succeeds", outcome)
 	}
-	if inbound.bypassRuleSetRetryCount != 1 {
-		t.Fatalf("bypassRuleSetRetryCount = %d, want 1 after exactly one scheduler-driven retry", inbound.bypassRuleSetRetryCount)
+	if inbound.localBypassRules.retryCount != 1 {
+		t.Fatalf("bypassRuleSetRetryCount = %d, want 1 after exactly one scheduler-driven retry", inbound.localBypassRules.retryCount)
 	}
 }
 
@@ -338,26 +350,26 @@ func TestApplyBypassCIDRPolicySucceedsAcrossRealBackends(t *testing.T) {
 	tc := newLoopbackTestTCBackend(t)
 	next := bypassPolicyFor(t, netip.MustParsePrefix("192.168.0.0/16"))
 
-	inbound := &Inbound{}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign}
 	inbound.tcDataPlane = newUnstartedTCRuntime(tc)
-	inbound.bypassRuleSetPolicyVersion = 5
-	inbound.bypassRuleSetExpectedVersion = 5
-	inbound.bypassRuleSetTC = bypassRuleSetBackendVersion{version: 5, known: true}
+	inbound.localBypassRules.policyVersion = 5
+	inbound.localBypassRules.expectedVersion = 5
+	inbound.localBypassRules.tc = bypassRuleSetBackendVersion{version: 5, known: true}
 
-	if err := inbound.applyBypassCIDRPolicyLocked(next); err != nil {
+	if err := applyTestPolicyBackends(inbound, next); err != nil {
 		t.Fatalf("apply with only a healthy TC backend: %v", err)
 	}
-	if !reflect.DeepEqual(inbound.bypassRuleSetPolicy, next) {
-		t.Fatalf("bypassRuleSetPolicy = %+v, want the newly-applied policy", inbound.bypassRuleSetPolicy)
+	if !reflect.DeepEqual(inbound.localBypassRules.policy, next) {
+		t.Fatalf("bypassRuleSetPolicy = %+v, want the newly-applied policy", inbound.localBypassRules.policy)
 	}
-	if inbound.bypassRuleSetInconsistent {
+	if inbound.localBypassRules.inconsistent {
 		t.Fatal("marked inconsistent after a fully successful apply")
 	}
-	if inbound.bypassRuleSetPolicyVersion != 6 {
-		t.Fatalf("bypassRuleSetPolicyVersion = %d, want 6 (content genuinely changed from the starting version)", inbound.bypassRuleSetPolicyVersion)
+	if inbound.localBypassRules.policyVersion != 6 {
+		t.Fatalf("bypassRuleSetPolicyVersion = %d, want 6 (content genuinely changed from the starting version)", inbound.localBypassRules.policyVersion)
 	}
-	if inbound.bypassRuleSetTC != (bypassRuleSetBackendVersion{version: 6, known: true}) {
-		t.Fatalf("bypassRuleSetTC = %+v, want {version:6 known:true} (TC caught up to the new version on a successful apply)", inbound.bypassRuleSetTC)
+	if inbound.localBypassRules.tc != (bypassRuleSetBackendVersion{version: 6, known: true}) {
+		t.Fatalf("bypassRuleSetTC = %+v, want {version:6 known:true} (TC caught up to the new version on a successful apply)", inbound.localBypassRules.tc)
 	}
 }
 
@@ -378,24 +390,24 @@ func TestApplyBypassCIDRPolicySucceedsAcrossRealBackends(t *testing.T) {
 // attempt.
 func TestBypassRuleSetExpectedVersionTracksTheLatestAttemptEvenOnFailure(t *testing.T) {
 	tc := newLoopbackTestTCBackend(t)
-	inbound := &Inbound{}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign}
 	inbound.logger = log.NewNOPFactory().Logger()
 	inbound.tcDataPlane = newUnstartedTCRuntime(tc)
 	inbound.setCgroupBackend(&commonEBPF.CgroupBackend{}) // zero value: never usable
 
 	first := bypassPolicyFor(t, netip.MustParsePrefix("10.0.0.0/8"))
-	if err := inbound.applyBypassCIDRPolicyLocked(first); err == nil {
+	if err := applyTestPolicyBackends(inbound, first); err == nil {
 		t.Fatal("apply succeeded despite the cgroup backend being permanently unusable")
 	}
-	if inbound.bypassRuleSetExpectedVersion != 1 {
+	if inbound.localBypassRules.expectedVersion != 1 {
 		t.Fatalf(
 			"bypassRuleSetExpectedVersion = %d, want 1 immediately after the first (failed) attempt -- "+
 				"a diagnostics reader during the pending-retry window must see the target, not a stale value",
-			inbound.bypassRuleSetExpectedVersion,
+			inbound.localBypassRules.expectedVersion,
 		)
 	}
-	if inbound.bypassRuleSetPolicyVersion != 0 {
-		t.Fatalf("bypassRuleSetPolicyVersion = %d, want 0: nothing has actually succeeded yet", inbound.bypassRuleSetPolicyVersion)
+	if inbound.localBypassRules.policyVersion != 0 {
+		t.Fatalf("bypassRuleSetPolicyVersion = %d, want 0: nothing has actually succeeded yet", inbound.localBypassRules.policyVersion)
 	}
 
 	// A second, different failed attempt -- e.g. a further rule-set change
@@ -403,17 +415,17 @@ func TestBypassRuleSetExpectedVersionTracksTheLatestAttemptEvenOnFailure(t *test
 	// the expected version again right away, proving a retry firing after
 	// this point would chase this newer content, not the first attempt's.
 	second := bypassPolicyFor(t, netip.MustParsePrefix("172.16.0.0/12"))
-	if err := inbound.applyBypassCIDRPolicyLocked(second); err == nil {
+	if err := applyTestPolicyBackends(inbound, second); err == nil {
 		t.Fatal("apply succeeded despite the cgroup backend being permanently unusable")
 	}
-	if inbound.bypassRuleSetExpectedVersion != 2 {
+	if inbound.localBypassRules.expectedVersion != 2 {
 		t.Fatalf(
 			"bypassRuleSetExpectedVersion = %d, want 2: a second, different failed attempt must supersede the first immediately",
-			inbound.bypassRuleSetExpectedVersion,
+			inbound.localBypassRules.expectedVersion,
 		)
 	}
-	if inbound.bypassRuleSetPolicyVersion != 0 {
-		t.Fatalf("bypassRuleSetPolicyVersion = %d, want still 0: still nothing has actually succeeded", inbound.bypassRuleSetPolicyVersion)
+	if inbound.localBypassRules.policyVersion != 0 {
+		t.Fatalf("bypassRuleSetPolicyVersion = %d, want still 0: still nothing has actually succeeded", inbound.localBypassRules.policyVersion)
 	}
 
 	// The retry that finally succeeds -- simulated here by removing the
@@ -423,20 +435,20 @@ func TestBypassRuleSetExpectedVersionTracksTheLatestAttemptEvenOnFailure(t *test
 	// latest content, not the first, now-superseded one, and must catch
 	// bypassRuleSetPolicyVersion up to bypassRuleSetExpectedVersion exactly.
 	inbound.setCgroupBackend(nil)
-	if err := inbound.applyBypassCIDRPolicyLocked(second); err != nil {
+	if err := applyTestPolicyBackends(inbound, second); err != nil {
 		t.Fatalf("retry of the latest expected content: %v", err)
 	}
-	if inbound.bypassRuleSetPolicyVersion != inbound.bypassRuleSetExpectedVersion {
+	if inbound.localBypassRules.policyVersion != inbound.localBypassRules.expectedVersion {
 		t.Fatalf(
 			"bypassRuleSetPolicyVersion = %d, bypassRuleSetExpectedVersion = %d, want them equal once the retry succeeds",
-			inbound.bypassRuleSetPolicyVersion, inbound.bypassRuleSetExpectedVersion,
+			inbound.localBypassRules.policyVersion, inbound.localBypassRules.expectedVersion,
 		)
 	}
-	if inbound.bypassRuleSetPolicyVersion != 2 {
-		t.Fatalf("bypassRuleSetPolicyVersion = %d, want 2 (the second attempt's version, not the first's)", inbound.bypassRuleSetPolicyVersion)
+	if inbound.localBypassRules.policyVersion != 2 {
+		t.Fatalf("bypassRuleSetPolicyVersion = %d, want 2 (the second attempt's version, not the first's)", inbound.localBypassRules.policyVersion)
 	}
-	if !reflect.DeepEqual(inbound.bypassRuleSetPolicy, second) {
-		t.Fatalf("bypassRuleSetPolicy = %+v, want the second (latest expected) policy, not the first", inbound.bypassRuleSetPolicy)
+	if !reflect.DeepEqual(inbound.localBypassRules.policy, second) {
+		t.Fatalf("bypassRuleSetPolicy = %+v, want the second (latest expected) policy, not the first", inbound.localBypassRules.policy)
 	}
 }
 
@@ -451,14 +463,14 @@ func TestBypassRuleSetExpectedVersionTracksTheLatestAttemptEvenOnFailure(t *test
 // would otherwise sit unnoticed for up to ten minutes, not the seconds
 // -scale exponential backoff every other TC failure in this package gets.
 func TestUpdateBypassRuleSetWakesTheSchedulerOnFailure(t *testing.T) {
-	inbound := &Inbound{bypassRuleSetStarted: true}
+	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign, localBypassRules: bypassRuleSetState{started: true}}
 	inbound.logger = log.NewNOPFactory().Logger()
 	inbound.tcDataPlane = newUnstartedTCRuntime(&commonEBPF.TCBackend{}) // zero value: never usable
 	inbound.interfaceMonitor.network = &testNetworkUpdateMonitor{}
 	inbound.interfaceMonitor.updates = make(chan struct{}, 1)
 
 	inbound.updateBypassRuleSet(nil)
-	if !inbound.bypassRuleSetNeedsRetry {
+	if !inbound.localBypassRules.needsRetry {
 		t.Fatal("fixture failed to create a pending bypass_rule_set retry -- the backend must be unusable for this test to mean anything")
 	}
 	select {
