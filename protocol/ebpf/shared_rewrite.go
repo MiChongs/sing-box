@@ -395,6 +395,12 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 			}
 		}
 		if !sweepRequested {
+			if !releaseBacklog && now.Sub(lastReleaseFlush) < sharedFlowReleaseFlushInterval {
+				// Every path that is not sweeping lands here, including flow
+				// wakes during a sweep cooldown; keep them all on one cadence.
+				resetReleaseTimer(backend, false)
+				continue
+			}
 			lastReleaseFlush = now
 			_, flushErr := backend.FlushReleasedTCPFlows(now, sharedFlowReleaseFlushBudget)
 			if flushErr != nil {
