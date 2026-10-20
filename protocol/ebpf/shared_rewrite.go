@@ -24,6 +24,13 @@ const (
 	sharedFlowPressureExitRounds   = 3
 	sharedFlowFallbackScanBudget   = 1024
 	sharedFlowReleaseFlushBudget   = 4096
+	// sharedFlowReleaseFlushInterval coalesces released TCP flow flushes. Each
+	// flush walks every pending release, and every release has its own
+	// deadline one grace period after it, so flushing at each deadline walked
+	// the whole pending set once per closed connection while holding the lock
+	// the connection path needs. Releases are already deferred by that grace
+	// period; finishing them up to this much later changes nothing.
+	sharedFlowReleaseFlushInterval = 100 * time.Millisecond
 )
 
 type sharedRewrite struct {
@@ -278,14 +285,26 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 	tcMaintenancePending := false
 	var releaseTimer *time.Timer
 	var releaseTimerChannel <-chan time.Time
-	resetReleaseTimer := func(backend *ECommon.SharedPacketRewriteBackend) {
-		delay, available := backend.NextTCPFlowReleaseDelay(time.Now())
+	var lastReleaseFlush time.Time
+	releaseBacklog := false
+	resetReleaseTimer := func(backend *ECommon.SharedPacketRewriteBackend, flushed bool) {
+		now := time.Now()
+		delay, available := backend.NextTCPFlowReleaseDelay(now)
 		if !available {
+			releaseBacklog = false
 			if releaseTimer != nil {
 				releaseTimer.Stop()
 			}
 			releaseTimerChannel = nil
 			return
+		}
+		if flushed {
+			// A flush leaves an already expired deadline only when it ran out
+			// of budget; finish that backlog without waiting.
+			releaseBacklog = delay == 0
+		}
+		if !releaseBacklog {
+			delay = max(delay, sharedFlowReleaseFlushInterval-now.Sub(lastReleaseFlush))
 		}
 		if releaseTimer == nil {
 			releaseTimer = time.NewTimer(delay)
@@ -321,7 +340,7 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 		case <-ctx.Done():
 			return
 		case <-flowWake:
-			resetReleaseTimer(backend)
+			resetReleaseTimer(backend, false)
 			knownPressure, sweepRequested = updateSharedFlowWakeState(
 				pressure,
 				knownPressure,
@@ -352,11 +371,12 @@ func (s *sharedRewrite) runFlowJanitor(ctx context.Context, done chan<- struct{}
 		}
 		now := time.Now()
 		if !sweepRequested {
+			lastReleaseFlush = now
 			_, flushErr := backend.FlushReleasedTCPFlows(now, sharedFlowReleaseFlushBudget)
 			if flushErr != nil {
 				s.janitorWarnings.warn(s.inbound.logger, "flush released shared-network TCP flows: ", flushErr)
 			}
-			resetReleaseTimer(backend)
+			resetReleaseTimer(backend, true)
 			continue
 		}
 		dataPlane := s.dataPlaneInstance()
