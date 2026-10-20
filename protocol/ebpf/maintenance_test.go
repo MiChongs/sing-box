@@ -32,3 +32,35 @@ func TestTCAssignmentPartialUsageIsNotPressureEvidence(t *testing.T) {
 		t.Fatalf("empty/unknown usage changed pressure state: active=%v rounds=%d entered=%v exited=%v", active, rounds, entered, exited)
 	}
 }
+
+func TestTCAssignmentActivityWakeIsRateLimited(t *testing.T) {
+	inbound := &Inbound{tcAssignmentWake: make(chan struct{}, 1)}
+	inbound.noteTCAssignmentActivity()
+	select {
+	case <-inbound.tcAssignmentWake:
+	default:
+		t.Fatal("first activity did not wake maintenance")
+	}
+	for range 1000 {
+		inbound.noteTCAssignmentActivity()
+	}
+	select {
+	case <-inbound.tcAssignmentWake:
+		t.Fatal("activity within the interval woke maintenance again")
+	default:
+	}
+	inbound.tcAssignmentActivityWakeAt.Add(-int64(tcAssignmentActivityWakeInterval))
+	inbound.noteTCAssignmentActivity()
+	select {
+	case <-inbound.tcAssignmentWake:
+	default:
+		t.Fatal("activity after the interval did not wake maintenance")
+	}
+	// Event wakes such as interface changes are not rate limited.
+	inbound.requestTCAssignmentMaintenance()
+	select {
+	case <-inbound.tcAssignmentWake:
+	default:
+		t.Fatal("explicit maintenance request was suppressed")
+	}
+}

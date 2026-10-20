@@ -211,6 +211,7 @@ type Inbound struct {
 	tcAssignmentSweepLastAt       atomic.Int64
 	tcAssignmentSweepPartialAt    atomic.Int64
 	tcAssignmentWake              chan struct{}
+	tcAssignmentActivityWakeAt    atomic.Int64
 	tcAssignmentJanitorAccess     sync.Mutex
 	tcAssignmentJanitorCancel     context.CancelFunc
 	tcAssignmentJanitorDone       chan struct{}

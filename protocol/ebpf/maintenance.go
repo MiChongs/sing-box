@@ -18,7 +18,16 @@ const (
 	tcAssignmentPressureEnterPercent = 70
 	tcAssignmentPressureExitPercent  = 50
 	tcAssignmentPressureExitRounds   = 3
+	// tcAssignmentActivityWakeInterval bounds how often connection and packet
+	// activity wakes the maintenance worker. Each wake scans the whole
+	// assignment map, so waking on every new flow turned the scan into a
+	// per-connection cost; entries only become stale after
+	// tcAssignmentPressureMaxIdle anyway.
+	tcAssignmentActivityWakeInterval = time.Second
 )
+
+// tcAssignmentClockBase gives activity wakes a monotonic time base.
+var tcAssignmentClockBase = time.Now()
 
 type mapPressureHysteresis struct {
 	enterPercent uint64
@@ -114,6 +123,23 @@ func (i *Inbound) requestTCAssignmentMaintenance() {
 	case i.tcAssignmentWake <- struct{}{}:
 	default:
 	}
+}
+
+// noteTCAssignmentActivity wakes the maintenance worker for observed
+// assignment activity at most once per tcAssignmentActivityWakeInterval.
+func (i *Inbound) noteTCAssignmentActivity() {
+	if i.tcAssignmentWake == nil {
+		return
+	}
+	now := int64(time.Since(tcAssignmentClockBase))
+	last := i.tcAssignmentActivityWakeAt.Load()
+	if last != 0 && now-last < int64(tcAssignmentActivityWakeInterval) {
+		return
+	}
+	if !i.tcAssignmentActivityWakeAt.CompareAndSwap(last, now) {
+		return
+	}
+	i.requestTCAssignmentMaintenance()
 }
 
 func (i *Inbound) runTCAssignmentJanitor(ctx context.Context, done chan<- struct{}) {
