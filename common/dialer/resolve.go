@@ -109,10 +109,10 @@ func (d *resolveDialer) DialContext(ctx context.Context, network string, destina
 		return nil, err
 	}
 	if detour, isDetour := d.dialer.(*DetourDialer); isDetour {
-		return dialDetourConcurrent(ctx, d.concurrent, detour, d.parallel, network, destination, addresses, d.queryOptions.Strategy == C.DomainStrategyPreferIPv6, d.fallbackDelay)
+		return dialDetourConcurrent(ctx, d.concurrent, detour, d.parallel, network, destination, addresses, addresses[0].Is6(), d.fallbackDelay)
 	}
 	if d.parallel {
-		return DialConcurrent(ctx, d.concurrent, d.dialer, network, destination, addresses, d.queryOptions.Strategy == C.DomainStrategyPreferIPv6, d.fallbackDelay)
+		return DialConcurrent(ctx, d.concurrent, d.dialer, network, destination, addresses, addresses[0].Is6(), d.fallbackDelay)
 	} else {
 		return N.DialSerial(ctx, d.dialer, network, destination, addresses)
 	}
@@ -163,7 +163,7 @@ func (d *resolveParallelNetworkDialer) DialParallelInterface(ctx context.Context
 		fallbackDelay = d.fallbackDelay
 	}
 	if d.parallel {
-		return DialConcurrentNetwork(ctx, d.concurrent, d.dialer, network, destination, addresses, d.queryOptions.Strategy == C.DomainStrategyPreferIPv6, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
+		return DialConcurrentNetwork(ctx, d.concurrent, d.dialer, network, destination, addresses, addresses[0].Is6(), strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
 	} else {
 		return DialSerialNetwork(ctx, d.dialer, network, destination, addresses, strategy, interfaceType, fallbackInterfaceType, fallbackDelay)
 	}

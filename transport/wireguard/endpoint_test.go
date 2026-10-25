@@ -45,8 +45,9 @@ func TestEndpointWakeRestoresBind(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			endpoint, pauseManager, bind := newTestEndpoint(t)
 			pauseManager.DevicePause()
-			pauseManager.NetworkPause()
-			firstWake, lastWake := pauseManager.NetworkWake, pauseManager.DeviceWake
+			waitNetworkPauseUpdate(t, endpoint, pauseManager.NetworkPause)
+			networkWake := func() { waitNetworkPauseUpdate(t, endpoint, pauseManager.NetworkWake) }
+			firstWake, lastWake := networkWake, pauseManager.DeviceWake
 			if deviceWakeFirst {
 				firstWake, lastWake = lastWake, firstWake
 			}
@@ -106,9 +107,9 @@ func TestEndpointDeviceSleepAllowsTraffic(t *testing.T) {
 
 func TestEndpointTrafficRetriesFailedNetworkWake(t *testing.T) {
 	endpoint, pauseManager, bind := newTestEndpoint(t)
-	pauseManager.NetworkPause()
+	waitNetworkPauseUpdate(t, endpoint, pauseManager.NetworkPause)
 	bind.failNext.Store(true)
-	pauseManager.NetworkWake()
+	waitNetworkPauseUpdate(t, endpoint, pauseManager.NetworkWake)
 	if got := bind.opens.Load(); got != 2 {
 		t.Fatalf("network wake did not attempt to reopen bind: opens=%d", got)
 	}
@@ -124,8 +125,8 @@ func TestEndpointWakePreservesIdleSuspension(t *testing.T) {
 	endpoint, pauseManager, bind := newTestEndpoint(t)
 	endpoint.SetIdle(true)
 	pauseManager.DevicePause()
-	pauseManager.NetworkPause()
-	pauseManager.NetworkWake()
+	waitNetworkPauseUpdate(t, endpoint, pauseManager.NetworkPause)
+	waitNetworkPauseUpdate(t, endpoint, pauseManager.NetworkWake)
 	pauseManager.DeviceWake()
 	if got := bind.opens.Load(); got != 1 || !endpoint.suspended.Load() {
 		t.Fatalf("wake resumed an idle endpoint: opens=%d, suspended=%v", got, endpoint.suspended.Load())
@@ -200,6 +201,20 @@ func TestEndpointConcurrentPauseAndPacketWrites(t *testing.T) {
 		}
 	})
 	wg.Wait()
+}
+
+// Network pause callbacks update the device asynchronously.
+func waitNetworkPauseUpdate(t *testing.T, endpoint *Endpoint, update func()) {
+	t.Helper()
+	endpoint.pauseAccess.Lock()
+	updated := endpoint.pauseUpdated
+	endpoint.pauseAccess.Unlock()
+	update()
+	select {
+	case <-updated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("network pause update did not finish")
+	}
 }
 
 func newTestEndpoint(t *testing.T) (*Endpoint, pause.Manager, *testEndpointBind) {

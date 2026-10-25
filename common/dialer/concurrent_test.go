@@ -435,7 +435,15 @@ func TestTCPConcurrentLoopback(t *testing.T) {
 	concurrent := newTestTCPConcurrent(t, option.TCPConcurrentOptions{})
 	refusing, listening := netip.MustParseAddr("127.0.0.2"), netip.MustParseAddr("127.0.0.1")
 	var netDialer net.Dialer
+	// The listening address connects only after the refusal, which a cancelled
+	// loser would not record.
+	refused := make(chan struct{})
 	conn, err := concurrent.Dial(context.Background(), M.ParseSocksaddrHostPort("localhost", port), []netip.Addr{refusing, listening}, false, func(ctx context.Context, address netip.Addr) (net.Conn, error) {
+		if address == refusing {
+			defer close(refused)
+		} else {
+			<-refused
+		}
 		return netDialer.DialContext(ctx, N.NetworkTCP, netip.AddrPortFrom(address, port).String())
 	})
 	require.NoError(t, err)

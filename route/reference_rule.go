@@ -127,7 +127,7 @@ func collectRuleReferences(rules []option.Rule, mode string, manager adapter.Out
 				*outbounds = append(*outbounds, action.BypassOptions.Outbound)
 				final = true
 			}
-		case C.RuleActionTypeDirect, C.RuleActionTypeReject, C.RuleActionTypeHijackDNS:
+		case C.RuleActionTypeReject, C.RuleActionTypeHijackDNS:
 			final = true
 		case C.RuleActionTypeResolve:
 			*transports = append(*transports, action.ResolveOptions.Server)

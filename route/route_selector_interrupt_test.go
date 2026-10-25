@@ -35,7 +35,7 @@ func TestSelectorInterruptRoutedConnections(t *testing.T) {
 					logger := log.NewNOPFactory().NewLogger("test")
 					scope := adapter.NewScope(ctx, logger)
 					t.Cleanup(func() { require.NoError(t, scope.Close()) })
-					manager := NewConnectionManager(logger)
+					manager := NewConnectionManager(context.Background(), logger)
 					incoming := newSelectorInterruptTestConn()
 					remote := newSelectorInterruptTestConn()
 					t.Cleanup(func() { incoming.Close(); remote.Close() })

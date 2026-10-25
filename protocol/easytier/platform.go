@@ -71,7 +71,7 @@ func (f *socketFactory) ConnectTCP(ctx context.Context, options platform.TCPConn
 		if f.defaultDialer == nil {
 			return nil, E.New("binding a local TCP address is not supported with detour")
 		}
-		netDialer := f.defaultDialer.DialerForICMPDestination(destination.Addr)
+		netDialer := f.defaultDialer.NetDialer(destination.Addr)
 		netDialer.LocalAddr = options.Bind.LocalAddr
 		netDialer.Control = control.Append(netDialer.Control, reuseControl(options.Bind.ReuseAddr == nil || *options.Bind.ReuseAddr, options.Bind.ReusePort))
 		network := N.NetworkTCP
@@ -174,7 +174,7 @@ func (f *socketFactory) LocalAddrForRemote(ctx context.Context, remote *net.UDPA
 		return nil, E.New("local address discovery is not supported with detour")
 	}
 	destination := M.SocksaddrFromNet(remote).Unwrap()
-	netDialer := f.defaultDialer.DialerForICMPDestination(destination.Addr)
+	netDialer := f.defaultDialer.NetDialer(destination.Addr)
 	conn, err := netDialer.DialContext(ctx, N.NetworkUDP, destination.String())
 	if err != nil {
 		return nil, err

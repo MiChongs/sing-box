@@ -159,7 +159,7 @@ func (r *SmartRegion) NewConnectionEx(ctx context.Context, conn net.Conn, metada
 	}
 	ctx = context.WithValue(ctx, smartMetaCtxKey{}, parent.buildMeta(metadata, false))
 	if parent.interruptExternalConnections {
-		ctx = interrupt.ContextWithIsExternalConnection(ctx)
+		ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 	}
 	r.connection.NewConnection(ctx, r, conn, metadata, onClose)
 }
@@ -172,7 +172,7 @@ func (r *SmartRegion) NewPacketConnectionEx(ctx context.Context, conn N.PacketCo
 	}
 	ctx = context.WithValue(ctx, smartMetaCtxKey{}, parent.buildMeta(metadata, true))
 	if parent.interruptExternalConnections {
-		ctx = interrupt.ContextWithIsExternalConnection(ctx)
+		ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 	}
 	r.connection.NewPacketConnection(ctx, r, conn, metadata, onClose)
 }

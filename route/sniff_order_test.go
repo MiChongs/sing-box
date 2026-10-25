@@ -19,7 +19,7 @@ func TestPacketSniffSpecificProtocolsBeforeQUICShortHeader(t *testing.T) {
 	utpSYN[0] = 0x41
 	shortHeader := append([]byte{0x40}, make([]byte, 20)...)
 	for _, names := range [][]string{nil, {C.ProtocolQUIC, C.ProtocolBitTorrent}, {C.ProtocolBitTorrent, C.ProtocolQUIC}} {
-		action, err := R.NewRuleAction(context.Background(), logger.NOP(), option.RuleAction{
+		action, err := R.NewRuleAction(logger.NOP(), option.RuleAction{
 			Action:       C.RuleActionTypeSniff,
 			SniffOptions: option.RouteActionSniff{Sniffer: names},
 		})

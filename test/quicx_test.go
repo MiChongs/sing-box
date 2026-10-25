@@ -319,8 +319,12 @@ func TestQUICXFragmentLengthOverflow(t *testing.T) {
 		fragmentSize  = 1000
 	)
 	for attempt := 0; attempt < 5 && !quicxConnectionClosed(conn); attempt++ {
-		for index := 0; index < fragmentTotal; index++ {
-			rawQUICXSendUDPMessage(t, conn, 1, 1, fragmentTotal, uint8(index), bytes.Repeat([]byte{byte(index)}, fragmentSize))
+		for index := 0; index < fragmentTotal && !quicxConnectionClosed(conn); index++ {
+			err := rawQUICXTrySendUDPMessage(conn, 1, 1, fragmentTotal, uint8(index), M.ParseSocksaddrHostPort("127.0.0.1", 53), bytes.Repeat([]byte{byte(index)}, fragmentSize))
+			// The server may close the connection while the fragments are sent.
+			if err != nil && !quicxConnectionClosed(conn) {
+				require.NoError(t, err)
+			}
 			time.Sleep(2 * time.Millisecond)
 		}
 		time.Sleep(200 * time.Millisecond)
@@ -1310,6 +1314,10 @@ func rawQUICXSendUDPMessage(t *testing.T, conn *quic.Conn, sessionID uint16, pac
 // fragment looked on the wire.
 func rawQUICXSendUDPMessageTo(t *testing.T, conn *quic.Conn, sessionID uint16, packetID uint16, fragmentTotal uint8, fragmentID uint8, destination M.Socksaddr, data []byte) {
 	t.Helper()
+	require.NoError(t, rawQUICXTrySendUDPMessage(conn, sessionID, packetID, fragmentTotal, fragmentID, destination, data))
+}
+
+func rawQUICXTrySendUDPMessage(conn *quic.Conn, sessionID uint16, packetID uint16, fragmentTotal uint8, fragmentID uint8, destination M.Socksaddr, data []byte) error {
 	message := buf.NewSize(2 + 10 + quicx.AddressSerializer.AddrPortLen(destination) + len(data))
 	defer message.Release()
 	message.WriteByte(quicx.Version)
@@ -1319,9 +1327,12 @@ func rawQUICXSendUDPMessageTo(t *testing.T, conn *quic.Conn, sessionID uint16, p
 	message.WriteByte(fragmentTotal)
 	message.WriteByte(fragmentID)
 	_ = binary.Write(message, binary.BigEndian, uint16(len(data)))
-	require.NoError(t, quicx.AddressSerializer.WriteAddrPort(message, destination))
+	err := quicx.AddressSerializer.WriteAddrPort(message, destination)
+	if err != nil {
+		return err
+	}
 	message.Write(data)
-	require.NoError(t, conn.SendDatagram(message.Bytes()))
+	return conn.SendDatagram(message.Bytes())
 }
 
 type quicxTestDialer struct{}

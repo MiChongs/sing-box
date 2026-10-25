@@ -102,7 +102,7 @@ func TestRouterQUICSniffCacheHandshakeResponseFailure(t *testing.T) {
 		require.True(t, loaded)
 		require.Equal(t, metadata.SniffHost, host)
 	}))
-	manager := NewConnectionManager(logger.NOP())
+	manager := NewConnectionManager(context.Background(), logger.NOP())
 	manager.NewPacketConnection(context.Background(), &quicCloseDialer{remote: remote}, conn, metadata, onClose)
 	require.Equal(t, 1, parentCalls)
 	group.group.Interrupt(true)

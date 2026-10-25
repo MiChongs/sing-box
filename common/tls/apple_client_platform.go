@@ -43,17 +43,6 @@ func (c *appleClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) 
 		return nil, E.Cause(err, "access raw connection")
 	}
 
-	var dupFD int
-	controlErr := syscallConn.Control(func(fd uintptr) {
-		dupFD, err = unix.Dup(int(fd))
-	})
-	if controlErr != nil {
-		return nil, E.Cause(controlErr, "access raw connection")
-	}
-	if err != nil {
-		return nil, E.Cause(err, "duplicate raw connection")
-	}
-
 	serverName := c.serverName
 	serverNamePtr := cStringOrNil(serverName)
 	defer cFree(serverNamePtr)
@@ -70,6 +59,7 @@ func (c *appleClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) 
 	}
 	var anchorsRef unsafe.Pointer
 	if anchors != nil {
+		defer anchors.Release()
 		anchorsRef = anchors.Ref()
 	}
 
@@ -80,6 +70,17 @@ func (c *appleClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) 
 	if c.timeFunc != nil {
 		hasVerifyTime = true
 		verifyTimeUnixMilli = c.timeFunc().UnixMilli()
+	}
+
+	var dupFD int
+	controlErr := syscallConn.Control(func(fd uintptr) {
+		dupFD, err = unix.FcntlInt(fd, unix.F_DUPFD_CLOEXEC, 0)
+	})
+	if controlErr != nil {
+		return nil, E.Cause(controlErr, "access raw connection")
+	}
+	if err != nil {
+		return nil, E.Cause(err, "duplicate raw connection")
 	}
 
 	var errorPtr *C.char
@@ -98,9 +99,6 @@ func (c *appleClientConfig) ClientHandshake(ctx context.Context, conn net.Conn) 
 		C.int64_t(verifyTimeUnixMilli),
 		&errorPtr,
 	)
-	if anchors != nil {
-		anchors.Release()
-	}
 	if client == nil {
 		if errorPtr != nil {
 			defer C.free(unsafe.Pointer(errorPtr))

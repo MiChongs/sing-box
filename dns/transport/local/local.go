@@ -81,7 +81,7 @@ func (t *Transport) Start(stage adapter.StartStage, scope *adapter.Scope) error 
 	switch stage {
 	case adapter.StartStateInitialize:
 		scope.Add(t.configSource.Close)
-		if !t.preferGo && isSystemdResolvedManaged() {
+		if !t.preferGo {
 			resolvedResolver, err := NewResolvedResolver(t.ctx, t.logger)
 			if err == nil {
 				scope.Add(resolvedResolver.Close)
@@ -144,10 +144,11 @@ func (t *Transport) PreferredDomain(domain string) bool {
 }
 
 func (t *Transport) ServerAddresses() []netip.Addr {
-	if t.resolved != nil && !t.resolved.Fallback() {
+	systemConfig := t.configSource.Configuration()
+	if t.resolved != nil && systemConfig.SystemdResolved && !t.resolved.Fallback() {
 		return t.resolved.ServerAddresses()
 	}
-	return common.Map(t.configSource.Configuration().Servers, func(it M.Socksaddr) netip.Addr {
+	return common.Map(systemConfig.Servers, func(it M.Socksaddr) netip.Addr {
 		return it.Addr
 	})
 }
@@ -157,13 +158,14 @@ func (t *Transport) SearchDomains() []string {
 }
 
 func (t *Transport) Environment() []string {
-	if t.resolved != nil {
+	systemConfig := t.configSource.Configuration()
+	if t.resolved != nil && systemConfig.SystemdResolved {
 		if t.resolved.Fallback() {
-			return append([]string{"resolv.conf"}, t.configSource.Configuration().Signature()...)
+			return append([]string{"resolv.conf"}, systemConfig.Signature()...)
 		}
 		return t.resolved.Environment()
 	}
-	return t.configSource.Configuration().Signature()
+	return systemConfig.Signature()
 }
 
 func (t *Transport) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
@@ -200,7 +202,8 @@ func (t *Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callba
 		t.mdnsTransport.ExchangeAsync(ctx, message, callback)
 		return
 	}
-	if t.resolved != nil {
+	systemConfig := t.configSource.Configuration()
+	if t.resolved != nil && systemConfig.SystemdResolved {
 		t.resolved.ExchangeAsync(ctx, message, func(response *mDNS.Msg, err error) {
 			if !errors.Is(err, errResolvedUnavailable) {
 				callback(response, err)
@@ -215,9 +218,9 @@ func (t *Transport) ExchangeAsync(ctx context.Context, message *mDNS.Msg, callba
 				callback(nil, err)
 				return
 			}
-			t.exchangeWithConfig(ctx, message, question.Name, systemConfig, callback)
+			t.exchangeAsync(ctx, message, systemConfig, callback)
 		})
 		return
 	}
-	t.exchangeAsync(ctx, message, question.Name, callback)
+	t.exchangeAsync(ctx, message, systemConfig, callback)
 }

@@ -11,10 +11,6 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 )
 
-func isSystemdResolvedManaged() bool {
-	return false
-}
-
 func NewResolvedResolver(ctx context.Context, logger logger.ContextLogger) (ResolvedResolver, error) {
 	return nil, os.ErrInvalid
 }

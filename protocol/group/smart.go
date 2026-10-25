@@ -2127,7 +2127,7 @@ func (s *Smart) NewConnectionEx(ctx context.Context, conn net.Conn, metadata ada
 	meta := s.buildMeta(metadata, false)
 	ctx = context.WithValue(ctx, smartMetaCtxKey{}, meta)
 	if s.interruptExternalConnections {
-		ctx = interrupt.ContextWithIsExternalConnection(ctx)
+		ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 	}
 	s.connection.NewConnection(ctx, s, conn, metadata, onClose)
 }
@@ -2137,7 +2137,7 @@ func (s *Smart) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, me
 	meta := s.buildMeta(metadata, true)
 	ctx = context.WithValue(ctx, smartMetaCtxKey{}, meta)
 	if s.interruptExternalConnections {
-		ctx = interrupt.ContextWithIsExternalConnection(ctx)
+		ctx = interrupt.ContextWithIsExternalConnection(ctx, true)
 	}
 	s.connection.NewPacketConnection(ctx, s, conn, metadata, onClose)
 }

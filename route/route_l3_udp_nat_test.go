@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/netip"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -34,10 +35,11 @@ func TestL3UDPDestinationNAT(t *testing.T) {
 	writeback := new(testL3NATWriteback)
 	dispatcher := tun.NewForwardDispatcher(handler, writeback, log.NewNOPFactory().NewLogger("forward"), tun.UDPNatOptions{}, 0)
 	defer dispatcher.Close()
-	stage := dispatcher.NewStage(nil)
+	stage, judged := newTestL3Stage(dispatcher)
 
 	request := buildTestIPv4UDPPacket(client, fakeDestination, []byte("request"))
 	require.True(t, stage.Dispatch(request))
+	waitTestL3Judgement(t, stage, judged)
 	stage.Flush()
 	require.Len(t, port.writtenPackets, 1)
 
@@ -96,10 +98,11 @@ func TestL3UDPSniffOverrideDestinationNAT(t *testing.T) {
 	writeback := new(testL3NATWriteback)
 	dispatcher := tun.NewForwardDispatcher(handler, writeback, log.NewNOPFactory().NewLogger("forward"), tun.UDPNatOptions{}, 0)
 	defer dispatcher.Close()
-	stage := dispatcher.NewStage(nil)
+	stage, judged := newTestL3Stage(dispatcher)
 
 	request := buildTestIPv4UDPPacket(client, originalDestination, []byte("request"))
 	require.True(t, stage.Dispatch(request))
+	waitTestL3Judgement(t, stage, judged)
 	stage.Flush()
 	require.Equal(t, 1, dnsRouter.lookupCount)
 	require.Len(t, port.writtenPackets, 1)
@@ -258,4 +261,29 @@ func cloneTestPackets(packets [][]byte) [][]byte {
 		cloned[index] = append([]byte(nil), packet...)
 	}
 	return cloned
+}
+
+// Flows are judged asynchronously: the stage holds the first packet until the
+// judgement completes, then installs it in ResumeJudged.
+func newTestL3Stage(dispatcher *tun.ForwardDispatcher) (*tun.ForwardStage, chan struct{}) {
+	judged := make(chan struct{}, 1)
+	stage := dispatcher.NewStage(nil, func() {
+		select {
+		case judged <- struct{}{}:
+		default:
+		}
+	})
+	return stage, judged
+}
+
+func waitTestL3Judgement(t *testing.T, stage *tun.ForwardStage, judged chan struct{}) {
+	t.Helper()
+	select {
+	case <-judged:
+	case <-time.After(5 * time.Second):
+		t.Fatal("flow judgement did not complete")
+	}
+	stage.ResumeJudged(func([]byte, tun.ForwardFrameMeta) {
+		t.Error("judged packet was not forwarded")
+	})
 }

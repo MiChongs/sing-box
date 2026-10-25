@@ -127,7 +127,7 @@ func (failureDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn,
 func TestResolvedChainNotifiesDialFailure(t *testing.T) {
 	listener := new(failureListenerGroup)
 	metadata := adapter.InboundContext{Destination: M.ParseSocksaddr("example.com:443"), OutboundChain: []adapter.Outbound{listener}}
-	manager := NewConnectionManager(logger.NOP())
+	manager := NewConnectionManager(context.Background(), logger.NOP())
 	conn, peer := net.Pipe()
 	defer peer.Close()
 	manager.NewConnection(context.Background(), failureDialer{}, conn, metadata, nil)

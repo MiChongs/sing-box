@@ -168,6 +168,11 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 			maxDelay: time.Duration(options.Fallback.MaxDelay).Milliseconds(),
 		}
 	}
+	for i, tag := range options.Outbounds {
+		if slices.Contains(options.Outbounds[:i], tag) {
+			return nil, E.New("duplicate tag: ", tag)
+		}
+	}
 	// 解析 expected_status。用户写错立即报错，避免启动后每次探测才发现。
 	matcher, err := urltest.ParseExpectedStatus(options.ExpectedStatus)
 	if err != nil {
