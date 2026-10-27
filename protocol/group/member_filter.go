@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/service"
@@ -98,6 +99,11 @@ func knownMemberTypes(ctx context.Context) []string {
 }
 
 func (f *memberFilter) Match(detour adapter.Outbound) bool {
+	if detour.Type() == C.TypeShadowTLS {
+		// A shadowtls outbound only carries another node of its provider,
+		// such as the helper behind a Clash shadow-tls proxy.
+		return false
+	}
 	if f == nil {
 		return true
 	}

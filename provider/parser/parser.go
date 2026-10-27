@@ -297,3 +297,17 @@ func overrideECHOption(options *option.OutboundECHOptions, overrideECHOptions *o
 	}
 	return &newOptions
 }
+
+type warnHandlerKey struct{}
+
+// ContextWithWarnHandler lets parsers report subscription nodes they have to
+// skip, such as a Clash proxy whose protocol this build does not implement.
+func ContextWithWarnHandler(ctx context.Context, handler func(args ...any)) context.Context {
+	return context.WithValue(ctx, warnHandlerKey{}, handler)
+}
+
+func warn(ctx context.Context, args ...any) {
+	if handler, loaded := ctx.Value(warnHandlerKey{}).(func(args ...any)); loaded {
+		handler(args...)
+	}
+}

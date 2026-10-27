@@ -68,20 +68,34 @@ type XHTTPReuseSettings struct {
 // port and TLS), so build materializes that inheritance into the
 // self-contained option.V2RayXHTTPDownloadOptions.
 type XHTTPDownloadSettings struct {
-	Path              *string             `yaml:"path,omitempty"`
-	Host              *string             `yaml:"host,omitempty"`
-	Headers           *map[string]string  `yaml:"headers,omitempty"`
-	ReuseSettings     *XHTTPReuseSettings `yaml:"reuse-settings,omitempty"`
-	Server            *string             `yaml:"server,omitempty"`
-	Port              *int                `yaml:"port,omitempty"`
-	TLS               *bool               `yaml:"tls,omitempty"`
-	ALPN              *[]string           `yaml:"alpn,omitempty"`
-	ECHOpts           *ECHOptions         `yaml:"ech-opts,omitempty"`
-	RealityOpts       *RealityOptions     `yaml:"reality-opts,omitempty"`
-	SkipCertVerify    *bool               `yaml:"skip-cert-verify,omitempty"`
-	Fingerprint       *string             `yaml:"fingerprint,omitempty"`
-	ServerName        *string             `yaml:"servername,omitempty"`
-	ClientFingerprint *string             `yaml:"client-fingerprint,omitempty"`
+	Path               *string             `yaml:"path,omitempty"`
+	Host               *string             `yaml:"host,omitempty"`
+	Headers            *map[string]string  `yaml:"headers,omitempty"`
+	ReuseSettings      *XHTTPReuseSettings `yaml:"reuse-settings,omitempty"`
+	Server             *string             `yaml:"server,omitempty"`
+	Port               *int                `yaml:"port,omitempty"`
+	TLS                *bool               `yaml:"tls,omitempty"`
+	ALPN               *[]string           `yaml:"alpn,omitempty"`
+	ECHOpts            *ECHOptions         `yaml:"ech-opts,omitempty"`
+	RealityOpts        *RealityOptions     `yaml:"reality-opts,omitempty"`
+	SkipCertVerify     *bool               `yaml:"skip-cert-verify,omitempty"`
+	Fingerprint        *string             `yaml:"fingerprint,omitempty"`
+	ServerName         *string             `yaml:"servername,omitempty"`
+	ClientFingerprint  *string             `yaml:"client-fingerprint,omitempty"`
+	Certificate        *string             `yaml:"certificate,omitempty"`
+	PrivateKey         *string             `yaml:"private-key,omitempty"`
+	NameCertVerify     *string             `yaml:"name-cert-verify,omitempty"`
+	clashTLSExtensions `yaml:",inline"`
+}
+
+func (d *XHTTPDownloadSettings) unsupported() string {
+	if d == nil {
+		return ""
+	}
+	if d.ShadowTLSOpts.enabled() {
+		return "shadow-tls in xhttp download-settings is not supported"
+	}
+	return d.clashTLSExtensions.unsupported()
 }
 
 // clashXHTTP carries what the xhttp-opts conversion needs from the proxy
@@ -207,6 +221,15 @@ func (x clashXHTTP) buildDownload(download *XHTTPDownloadSettings, upload option
 	}
 	if download.ClientFingerprint != nil {
 		tlsOptions.ClientFingerprint = *download.ClientFingerprint
+	}
+	if download.Certificate != nil {
+		tlsOptions.Certificate = *download.Certificate
+	}
+	if download.PrivateKey != nil {
+		tlsOptions.PrivateKey = *download.PrivateKey
+	}
+	if download.NameCertVerify != nil {
+		tlsOptions.NameCertVerify = *download.NameCertVerify
 	}
 	if download.ECHOpts != nil {
 		tlsOptions.ECHOpts = download.ECHOpts

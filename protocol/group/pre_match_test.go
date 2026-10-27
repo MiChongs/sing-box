@@ -52,6 +52,10 @@ func (o *preMatchTestOutbound) Tag() string {
 	return o.tag
 }
 
+func (o *preMatchTestOutbound) Type() string {
+	return "test"
+}
+
 func (o *preMatchTestOutbound) Network() []string {
 	return []string{N.NetworkTCP, N.NetworkUDP}
 }

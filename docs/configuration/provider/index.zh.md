@@ -140,6 +140,21 @@
 
 覆写订阅内容的 TLS 字段, 参阅 [TLS 字段覆写](/zh/configuration/provider/override_tls/)。
 
+### Clash 订阅
+
+Clash / mihomo 的 `proxies` 会转换为 sing-box 出站与端点：
+
+| Clash 类型 | sing-box |
+|---|---|
+| `ss` `vmess` `vless` `trojan` `socks5` `http` `snell` `ssh` `anytls` `hysteria` `hysteria2` `tuic` `direct` | 同协议出站 |
+| `wireguard` `tailscale` `openvpn` `easytier` | 端点 |
+
+需要当前构建未实现的功能的节点会被跳过，并以警告记录原因，例如 `ssr`、`mieru`、`sudoku`、`shadowquic`、`gost-relay`、`trusttunnel`、`zerotier`、Cloudflare WARP 的 `masque`、`restls` / `jls` / `tlsmirror`、mKCP 与 mekya 传输、TUIC v4、AmneziaWG、基于 TLS 的 SOCKS5、`restls` / `gost-plugin` / `kcptun` 插件，以及 Clash 的 `dns` / `reject` 节点。
+
+`shadow-tls`（Shadowsocks 插件与 `shadow-tls-opts`）会生成一个名为 `<name> (shadow-tls)` 的 shadowtls 出站，节点经由它拨号；这类出站不会加入分组。经 shadow-tls 的 Shadowsocks 节点在未启用 `udp-over-tcp` 时仅支持 TCP，因为 sing-box 无法让原生 UDP 绕过 detour。
+
+没有对应项的选项会被忽略，节点使用 sing-box 默认行为：`ip-version`、gRPC 的 `grpc-user-agent` 与连接池、`v2ray-http-upgrade-fast-open`、Reality 的 `support-x25519mlkem768`、Hysteria 2 的 `cwnd` / `udp-mtu` / `handshake-timeout` / obfs 包长、接收窗口以外的 TUIC 调优项、WireGuard / OpenVPN 的 `dns` 与 `ip-stack`，以及 EasyTier 的 KCP / QUIC 代理开关。
+
 ### 本地字段
 
 #### path

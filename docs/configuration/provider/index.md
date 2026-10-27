@@ -140,6 +140,21 @@ Override dialer fields of outbounds in provider, see [Dialer Fields Override](/c
 
 Override TLS fields of outbounds in provider, see [TLS Fields Override](/configuration/provider/override_tls/) for details.
 
+### Clash Subscriptions
+
+Clash / mihomo `proxies` are converted to sing-box outbounds and endpoints:
+
+| Clash type | sing-box |
+|---|---|
+| `ss` `vmess` `vless` `trojan` `socks5` `http` `snell` `ssh` `anytls` `hysteria` `hysteria2` `tuic` `direct` | outbound of the same protocol |
+| `wireguard` `tailscale` `openvpn` `easytier` | endpoint |
+
+A proxy that needs something this build does not implement is skipped and the reason is logged as a warning, for example `ssr`, `mieru`, `sudoku`, `shadowquic`, `gost-relay`, `trusttunnel`, `zerotier`, Cloudflare WARP `masque`, `restls` / `jls` / `tlsmirror`, the mKCP and mekya transports, TUIC v4, AmneziaWG, SOCKS5 over TLS, the `restls` / `gost-plugin` / `kcptun` plugins and Clash `dns` / `reject` proxies.
+
+`shadow-tls` (the Shadowsocks plugin and `shadow-tls-opts`) becomes an extra shadowtls outbound named `<name> (shadow-tls)` that the proxy dials through. Such outbounds never join groups. A Shadowsocks proxy behind shadow-tls is TCP only unless `udp-over-tcp` is enabled, because sing-box cannot send its native UDP around the detour.
+
+Options without a counterpart are ignored and the node keeps the sing-box default: `ip-version`, gRPC `grpc-user-agent` and connection pool, `v2ray-http-upgrade-fast-open`, Reality `support-x25519mlkem768`, Hysteria 2 `cwnd` / `udp-mtu` / `handshake-timeout` / obfs packet sizes, TUIC tuning beyond the receive windows, WireGuard / OpenVPN `dns` and `ip-stack`, and EasyTier KCP / QUIC proxy switches.
+
 ### Local Fields
 
 #### path

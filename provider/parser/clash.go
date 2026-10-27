@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+	"time"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
@@ -31,11 +32,43 @@ type _ClashProxy struct {
 	Options Proxy  `yaml:"-"`
 
 	SingType string `yaml:"-"`
+	// Unsupported explains why the proxy cannot be converted: its type or one
+	// of its options has no counterpart in this build.
+	Unsupported string `yaml:"-"`
 }
 type ClashProxy _ClashProxy
 
 type Proxy interface {
 	Build() any
+}
+
+// clashUnsupported is implemented by proxies whose options may need a feature
+// this build does not have. A non-empty reason skips the proxy instead of
+// creating a node that silently behaves differently from Clash.
+type clashUnsupported interface {
+	unsupported() string
+}
+
+// clashChained is implemented by proxies that need helper outbounds, such as
+// the shadowtls outbound behind shadow-tls. chain may rewrite the built
+// outbound to dial through them.
+type clashChained interface {
+	chain(tag string, outbound *option.Outbound) []option.Outbound
+}
+
+// Clash / mihomo proxy types without an implementation in this build.
+var clashUnsupportedTypes = map[string]string{
+	"ssr":         "ShadowsocksR is not implemented",
+	"mieru":       "mieru is not implemented",
+	"sudoku":      "sudoku is not implemented",
+	"shadowquic":  "ShadowQUIC is not implemented",
+	"gost-relay":  "GOST relay is not implemented",
+	"rematch":     "rematch is a Clash routing construct",
+	"trusttunnel": "TrustTunnel is not implemented",
+	"zerotier":    "ZeroTier is not implemented",
+	"masque":      "Clash masque is Cloudflare WARP authentication, the masque-client endpoint only supports RFC 9484 with username and password",
+	"dns":         "Clash dns proxies map to the deprecated dns outbound, use a hijack-dns route rule",
+	"reject":      "Clash reject proxies map to the deprecated block outbound, use a reject route rule",
 }
 
 func (c *ClashProxy) UnmarshalYAML(value *yaml.Node) error {
@@ -87,7 +120,21 @@ func (c *ClashProxy) UnmarshalYAML(value *yaml.Node) error {
 	case "tailscale":
 		c.SingType = C.TypeTailscale
 		options = &ClashTailscaleOption{}
+	case "direct":
+		c.SingType = C.TypeDirect
+		options = &DirectOption{}
+	case "openvpn":
+		c.SingType = C.TypeOpenVPNClient
+		options = &ClashOpenVPNOption{}
+	case "easytier":
+		c.SingType = C.TypeEasyTier
+		options = &ClashEasyTierOption{}
 	default:
+		if reason, loaded := clashUnsupportedTypes[c.Type]; loaded {
+			c.Unsupported = reason
+		} else {
+			c.Unsupported = "unknown proxy type: " + c.Type
+		}
 		return nil
 	}
 	err = value.Decode(options)
@@ -95,7 +142,18 @@ func (c *ClashProxy) UnmarshalYAML(value *yaml.Node) error {
 		return err
 	}
 	c.Options = options
+	if checker, isChecker := options.(clashUnsupported); isChecker {
+		c.Unsupported = checker.unsupported()
+	}
 	return nil
+}
+
+func (c *ClashProxy) isEndpoint() bool {
+	switch c.SingType {
+	case C.TypeWireGuard, C.TypeTailscale, C.TypeOpenVPNClient, C.TypeEasyTier:
+		return true
+	}
+	return false
 }
 
 func (c *ClashProxy) Build() option.Outbound {
@@ -120,30 +178,35 @@ func (c *ClashProxy) BuildEndpoint() option.Endpoint {
 	return endpoint
 }
 
-func ParseClashSubscription(_ context.Context, content string) ([]option.Outbound, []option.Endpoint, error) {
+func ParseClashSubscription(ctx context.Context, content string) ([]option.Outbound, []option.Endpoint, error) {
 	config := &ClashConfig{}
 	err := yaml.Unmarshal([]byte(content), &config)
 	if err != nil {
 		return nil, nil, E.Cause(err, "parse clash config")
 	}
-	outbounds := common.FilterIsInstance(config.Proxies, func(proxy ClashProxy) (option.Outbound, bool) {
-		if proxy.SingType == "" || proxy.SingType == C.TypeWireGuard || proxy.SingType == C.TypeTailscale {
-			return option.Outbound{}, false
+	var (
+		outbounds []option.Outbound
+		endpoints []option.Endpoint
+	)
+	for _, proxy := range config.Proxies {
+		if proxy.Unsupported != "" {
+			warn(ctx, "skip clash proxy ", proxy.Name, ": ", proxy.Unsupported)
+			continue
 		}
-		return proxy.Build(), true
-	})
-	endpoints := common.FilterIsInstance(config.Proxies, func(proxy ClashProxy) (option.Endpoint, bool) {
-		switch proxy.SingType {
-		case C.TypeWireGuard:
-			if wgOpt, ok := proxy.Options.(*ClashWireGuardOption); ok && wgOpt.AmneziaWGOption != nil {
-				return option.Endpoint{}, false
-			}
-		case C.TypeTailscale:
-		default:
-			return option.Endpoint{}, false
+		if proxy.SingType == "" {
+			continue
 		}
-		return proxy.BuildEndpoint(), true
-	})
+		if proxy.isEndpoint() {
+			endpoints = append(endpoints, proxy.BuildEndpoint())
+			continue
+		}
+		outbound := proxy.Build()
+		outbounds = append(outbounds, outbound)
+		if chained, isChained := proxy.Options.(clashChained); isChained {
+			index := len(outbounds) - 1
+			outbounds = append(outbounds, chained.chain(proxy.Name, &outbounds[index])...)
+		}
+	}
 	return outbounds, endpoints, nil
 }
 
@@ -157,7 +220,55 @@ type ShadowSocksOption struct {
 	PluginOpts        map[string]any `yaml:"plugin-opts,omitempty"`
 	UDPOverTCP        bool           `yaml:"udp-over-tcp,omitempty"`
 	UDPOverTCPVersion int            `yaml:"udp-over-tcp-version,omitempty"`
+	ClientFingerprint string         `yaml:"client-fingerprint,omitempty"`
 	MuxOpts           *MuxOptions    `yaml:"smux,omitempty"`
+}
+
+func (s *ShadowSocksOption) unsupported() string {
+	switch s.Plugin {
+	case "", "obfs", "v2ray-plugin", "shadow-tls":
+	case "restls":
+		return "the restls plugin is not implemented"
+	case "gost-plugin":
+		return "the gost plugin is not implemented"
+	case "kcptun":
+		return "the kcptun plugin is not implemented"
+	default:
+		return "unknown shadowsocks plugin: " + s.Plugin
+	}
+	if s.Plugin == "v2ray-plugin" {
+		return clashV2RayPluginUnsupported(s.PluginOpts)
+	}
+	return ""
+}
+
+// shadow-tls is not a SIP003 plugin in sing-box: the outbound dials through a
+// shadowtls outbound instead.
+func (s *ShadowSocksOption) chain(tag string, outbound *option.Outbound) []option.Outbound {
+	if s.Plugin != "shadow-tls" {
+		return nil
+	}
+	options := outbound.Options.(*option.ShadowsocksOutboundOptions)
+	tls := &TLSOptions{
+		TLS:               true,
+		SNI:               clashStringOption(s.PluginOpts, "host"),
+		SkipCertVerify:    clashBoolOption(s.PluginOpts, "skip-cert-verify"),
+		Fingerprint:       clashStringOption(s.PluginOpts, "fingerprint"),
+		ClientFingerprint: s.ClientFingerprint,
+		Certificate:       clashStringOption(s.PluginOpts, "certificate"),
+		PrivateKey:        clashStringOption(s.PluginOpts, "private-key"),
+		NameCertVerify:    clashStringOption(s.PluginOpts, "name-cert-verify"),
+		ALPN:              clashStringListOption(s.PluginOpts, "alpn"),
+	}
+	container := option.OutboundTLSOptionsContainer{TLS: tls.Build()}
+	version, _ := strconv.Atoi(clashStringOption(s.PluginOpts, "version"))
+	if !s.UDPOverTCP {
+		// mihomo sends native UDP directly to the server, outside shadow-tls;
+		// sing-box can only dial through the detour, which carries TCP alone.
+		options.Network = N.NetworkTCP
+	}
+	return clashShadowTLSChain(tag, &options.DialerOptions, options.ServerOptions, &container,
+		clashStringOption(s.PluginOpts, "password"), version, []string{"h2", "http/1.1"})
 }
 
 func (s *ShadowSocksOption) Build() any {
@@ -192,6 +303,16 @@ type TuicOption struct {
 	FastOpen             bool   `yaml:"fast-open,omitempty"`
 	DisableMTUDiscovery  bool   `yaml:"disable-mtu-discovery,omitempty"`
 	UDPOverStream        bool   `yaml:"udp-over-stream,omitempty"`
+	Token                string `yaml:"token,omitempty"`
+	ReceiveWindowConn    int    `yaml:"recv-window-conn,omitempty"`
+	ReceiveWindow        int    `yaml:"recv-window,omitempty"`
+}
+
+func (t *TuicOption) unsupported() string {
+	if t.Token != "" {
+		return "TUIC v4 (token authentication) is not implemented"
+	}
+	return ""
 }
 
 func (t *TuicOption) Build() any {
@@ -206,8 +327,15 @@ func (t *TuicOption) Build() any {
 		UDPRelayMode:                t.UdpRelayMode,
 		UDPOverStream:               t.UDPOverStream,
 		ZeroRTTHandshake:            t.ReduceRtt,
-		Heartbeat:                   badoption.Duration(t.HeartbeatInterval),
+		Heartbeat:                   badoption.Duration(time.Duration(t.HeartbeatInterval) * time.Millisecond), // milliseconds in Clash
 		OutboundTLSOptionsContainer: clashTLSOptions(t.Server, &t.TLSOptions),
+		QUICOptions: option.QUICOptions{
+			HTTP2Options: option.HTTP2Options{
+				StreamReceiveWindow:     clashMemoryBytes(t.ReceiveWindow),
+				ConnectionReceiveWindow: clashMemoryBytes(t.ReceiveWindowConn),
+			},
+			DisablePathMTUDiscovery: t.DisableMTUDiscovery,
+		},
 	}
 	if t.Ip != "" {
 		options.Server = t.Ip
@@ -239,6 +367,28 @@ type VmessOption struct {
 	GlobalPadding       bool         `yaml:"global-padding,omitempty"`
 	AuthenticatedLength bool         `yaml:"authenticated-length,omitempty"`
 	MuxOpts             *MuxOptions  `yaml:"smux,omitempty"`
+	clashTLSExtensions  `yaml:",inline"`
+}
+
+func (v *VmessOption) unsupported() string {
+	if reason := clashTransportUnsupported(v.Network); reason != "" {
+		return reason
+	}
+	if v.Network == "xhttp" {
+		if reason := v.XHTTPOpts.DownloadSettings.unsupported(); reason != "" {
+			return reason
+		}
+	}
+	return v.clashTLSExtensions.unsupported()
+}
+
+func (v *VmessOption) chain(tag string, outbound *option.Outbound) []option.Outbound {
+	options := outbound.Options.(*option.VMessOutboundOptions)
+	if !v.ShadowTLSOpts.enabled() || options.TLS == nil {
+		return nil
+	}
+	return clashShadowTLSChain(tag, &options.DialerOptions, options.ServerOptions, &options.OutboundTLSOptionsContainer,
+		v.ShadowTLSOpts.Password, v.ShadowTLSOpts.Version, []string{"http/1.1"})
 }
 
 func (v *VmessOption) Build() any {
@@ -273,24 +423,46 @@ func (v *VmessOption) Build() any {
 }
 
 type VlessOption struct {
-	DialerOptions  `yaml:",inline"`
-	ServerOptions  `yaml:",inline"`
-	*TLSOptions    `yaml:",inline"`
-	UUID           string       `yaml:"uuid"`
-	Flow           string       `yaml:"flow,omitempty"`
-	Encryption     string       `yaml:"encryption,omitempty"`
-	UDP            bool         `yaml:"udp,omitempty"`
-	PacketAddr     bool         `yaml:"packet-addr,omitempty"`
-	XUDP           bool         `yaml:"xudp,omitempty"`
-	PacketEncoding string       `yaml:"packet-encoding,omitempty"`
-	Network        string       `yaml:"network,omitempty"`
-	ServerName     string       `yaml:"servername,omitempty"`
-	HTTPOpts       HTTPOptions  `yaml:"http-opts,omitempty"`
-	HTTP2Opts      HTTP2Options `yaml:"h2-opts,omitempty"`
-	GrpcOpts       GrpcOptions  `yaml:"grpc-opts,omitempty"`
-	WSOpts         WSOptions    `yaml:"ws-opts,omitempty"`
-	XHTTPOpts      XHTTPOptions `yaml:"xhttp-opts,omitempty"`
-	MuxOpts        *MuxOptions  `yaml:"smux,omitempty"`
+	DialerOptions      `yaml:",inline"`
+	ServerOptions      `yaml:",inline"`
+	*TLSOptions        `yaml:",inline"`
+	UUID               string       `yaml:"uuid"`
+	Flow               string       `yaml:"flow,omitempty"`
+	Encryption         string       `yaml:"encryption,omitempty"`
+	UDP                bool         `yaml:"udp,omitempty"`
+	PacketAddr         bool         `yaml:"packet-addr,omitempty"`
+	XUDP               bool         `yaml:"xudp,omitempty"`
+	PacketEncoding     string       `yaml:"packet-encoding,omitempty"`
+	Network            string       `yaml:"network,omitempty"`
+	ServerName         string       `yaml:"servername,omitempty"`
+	HTTPOpts           HTTPOptions  `yaml:"http-opts,omitempty"`
+	HTTP2Opts          HTTP2Options `yaml:"h2-opts,omitempty"`
+	GrpcOpts           GrpcOptions  `yaml:"grpc-opts,omitempty"`
+	WSOpts             WSOptions    `yaml:"ws-opts,omitempty"`
+	XHTTPOpts          XHTTPOptions `yaml:"xhttp-opts,omitempty"`
+	MuxOpts            *MuxOptions  `yaml:"smux,omitempty"`
+	clashTLSExtensions `yaml:",inline"`
+}
+
+func (v *VlessOption) unsupported() string {
+	if reason := clashTransportUnsupported(v.Network); reason != "" {
+		return reason
+	}
+	if v.Network == "xhttp" {
+		if reason := v.XHTTPOpts.DownloadSettings.unsupported(); reason != "" {
+			return reason
+		}
+	}
+	return v.clashTLSExtensions.unsupported()
+}
+
+func (v *VlessOption) chain(tag string, outbound *option.Outbound) []option.Outbound {
+	options := outbound.Options.(*option.VLESSOutboundOptions)
+	if !v.ShadowTLSOpts.enabled() || options.TLS == nil {
+		return nil
+	}
+	return clashShadowTLSChain(tag, &options.DialerOptions, options.ServerOptions, &options.OutboundTLSOptionsContainer,
+		v.ShadowTLSOpts.Password, v.ShadowTLSOpts.Version, []string{"http/1.1"})
 }
 
 func (v *VlessOption) Build() any {
@@ -331,6 +503,14 @@ type Socks5Option struct {
 	UserName      string `yaml:"username,omitempty"`
 	Password      string `yaml:"password,omitempty"`
 	UDP           bool   `yaml:"udp,omitempty"`
+	TLS           bool   `yaml:"tls,omitempty"`
+}
+
+func (s *Socks5Option) unsupported() string {
+	if s.TLS {
+		return "SOCKS5 over TLS is not implemented"
+	}
+	return ""
 }
 
 func (s *Socks5Option) Build() any {
@@ -376,6 +556,29 @@ type TrojanOption struct {
 	WSOpts        WSOptions    `yaml:"ws-opts,omitempty"`
 	XHTTPOpts     XHTTPOptions `yaml:"xhttp-opts,omitempty"`
 	MuxOpts       *MuxOptions  `yaml:"smux,omitempty"`
+	SSOpts        struct {
+		Enabled bool `yaml:"enabled,omitempty"`
+	} `yaml:"ss-opts,omitempty"`
+	clashTLSExtensions `yaml:",inline"`
+}
+
+func (t *TrojanOption) unsupported() string {
+	if t.SSOpts.Enabled {
+		return "trojan-go shadowsocks encryption (ss-opts) is not implemented"
+	}
+	if reason := clashTransportUnsupported(t.Network); reason != "" {
+		return reason
+	}
+	return t.clashTLSExtensions.unsupported()
+}
+
+func (t *TrojanOption) chain(tag string, outbound *option.Outbound) []option.Outbound {
+	if !t.ShadowTLSOpts.enabled() {
+		return nil
+	}
+	options := outbound.Options.(*option.TrojanOutboundOptions)
+	return clashShadowTLSChain(tag, &options.DialerOptions, options.ServerOptions, &options.OutboundTLSOptionsContainer,
+		t.ShadowTLSOpts.Password, t.ShadowTLSOpts.Version, []string{"http/1.1"})
 }
 
 func (t *TrojanOption) Build() any {
@@ -409,6 +612,19 @@ type HysteriaOption struct {
 	DisableMTUDiscovery bool   `yaml:"disable-mtu-discovery,omitempty"`
 	FastOpen            bool   `yaml:"fast-open,omitempty"`
 	HopInterval         int    `yaml:"hop-interval,omitempty"`
+	Protocol            string `yaml:"protocol,omitempty"`
+	ObfsProtocol        string `yaml:"obfs-protocol,omitempty"`
+}
+
+func (h *HysteriaOption) unsupported() string {
+	for _, protocol := range []string{h.Protocol, h.ObfsProtocol} {
+		switch protocol {
+		case "", "udp":
+		default:
+			return "hysteria protocol " + protocol + " is not implemented"
+		}
+	}
+	return ""
 }
 
 func (h *HysteriaOption) Build() any {
@@ -418,7 +634,7 @@ func (h *HysteriaOption) Build() any {
 		DialerOptions: h.DialerOptions.Build(),
 		ServerOptions: h.ServerOptions.Build(),
 		ServerPorts:   option.LegacyListable[string](clashPorts(h.Ports)),
-		HopInterval:   badoption.Duration(h.HopInterval),
+		HopInterval:   badoption.Duration(time.Duration(h.HopInterval) * time.Second),
 		Up:            clashSpeedToNetworkBytes(h.Up),
 		UpMbps:        h.UpSpeed,
 		Down:          clashSpeedToNetworkBytes(h.Down),
@@ -452,26 +668,114 @@ type Hysteria2Option struct {
 	ServerOptions `yaml:",inline"`
 	TLSOptions    `yaml:",inline"`
 	Ports         string `yaml:"ports,omitempty"`
-	HopInterval   int    `yaml:"hop-interval,omitempty"`
-	Up            string `yaml:"up,omitempty"`
-	Down          string `yaml:"down,omitempty"`
-	Password      string `yaml:"password,omitempty"`
-	Obfs          string `yaml:"obfs,omitempty"`
-	ObfsPassword  string `yaml:"obfs-password,omitempty"`
+	// seconds, or a "min-max" range of seconds
+	HopInterval                    string                   `yaml:"hop-interval,omitempty"`
+	Up                             string                   `yaml:"up,omitempty"`
+	Down                           string                   `yaml:"down,omitempty"`
+	Password                       string                   `yaml:"password,omitempty"`
+	Obfs                           string                   `yaml:"obfs,omitempty"`
+	ObfsPassword                   string                   `yaml:"obfs-password,omitempty"`
+	BBRProfile                     string                   `yaml:"bbr-profile,omitempty"`
+	InitialStreamReceiveWindow     uint64                   `yaml:"initial-stream-receive-window,omitempty"`
+	MaxStreamReceiveWindow         uint64                   `yaml:"max-stream-receive-window,omitempty"`
+	InitialConnectionReceiveWindow uint64                   `yaml:"initial-connection-receive-window,omitempty"`
+	MaxConnectionReceiveWindow     uint64                   `yaml:"max-connection-receive-window,omitempty"`
+	RealmOpts                      *ClashHysteria2RealmOpts `yaml:"realm-opts,omitempty"`
+}
+
+type ClashHysteria2RealmOpts struct {
+	Enable      bool     `yaml:"enable,omitempty"`
+	ServerURL   string   `yaml:"server-url,omitempty"`
+	Token       string   `yaml:"token,omitempty"`
+	RealmID     string   `yaml:"realm-id,omitempty"`
+	STUNServers []string `yaml:"stun-servers,omitempty"`
+	// TLS of the server URL
+	SNI            string   `yaml:"sni,omitempty"`
+	SkipCertVerify bool     `yaml:"skip-cert-verify,omitempty"`
+	NameCertVerify string   `yaml:"name-cert-verify,omitempty"`
+	Fingerprint    string   `yaml:"fingerprint,omitempty"`
+	Certificate    string   `yaml:"certificate,omitempty"`
+	PrivateKey     string   `yaml:"private-key,omitempty"`
+	ALPN           []string `yaml:"alpn,omitempty"`
+}
+
+func (r *ClashHysteria2RealmOpts) Build() *option.Hysteria2Realm {
+	if r == nil || !r.Enable {
+		return nil
+	}
+	realm := &option.Hysteria2Realm{
+		ServerURL:   r.ServerURL,
+		Token:       r.Token,
+		RealmID:     r.RealmID,
+		STUNServers: r.STUNServers,
+	}
+	tls := TLSOptions{
+		TLS:            true,
+		SNI:            r.SNI,
+		SkipCertVerify: r.SkipCertVerify,
+		NameCertVerify: r.NameCertVerify,
+		Fingerprint:    r.Fingerprint,
+		Certificate:    r.Certificate,
+		PrivateKey:     r.PrivateKey,
+		ALPN:           r.ALPN,
+	}
+	if r.SNI != "" || r.SkipCertVerify || r.NameCertVerify != "" || r.Fingerprint != "" || r.Certificate != "" || len(r.ALPN) > 0 {
+		realm.HTTPClient = &option.HTTPClientOptions{
+			OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: tls.Build()},
+		}
+	}
+	return realm
+}
+
+// clashHopInterval parses the mihomo hysteria2 hop-interval: seconds or a
+// "min-max" range, of which sing-box picks a random value per hop.
+func clashHopInterval(value string) (badoption.Duration, badoption.Duration) {
+	start, end, isRange := strings.Cut(strings.TrimSpace(value), "-")
+	minimum, err := strconv.ParseUint(strings.TrimSpace(start), 10, 64)
+	if err != nil {
+		return 0, 0
+	}
+	if !isRange {
+		return badoption.Duration(time.Duration(minimum) * time.Second), 0
+	}
+	maximum, err := strconv.ParseUint(strings.TrimSpace(end), 10, 64)
+	if err != nil || maximum <= minimum {
+		return badoption.Duration(time.Duration(minimum) * time.Second), 0
+	}
+	return badoption.Duration(time.Duration(minimum) * time.Second), badoption.Duration(time.Duration(maximum) * time.Second)
+}
+
+// clashReceiveWindow prefers the maximum window: sing-box has one value per
+// window, which bounds auto-tuning like mihomo's maximum does.
+func clashReceiveWindow(initial uint64, maximum uint64) *byteformats.MemoryBytes {
+	if maximum == 0 {
+		maximum = initial
+	}
+	return clashMemoryBytes(int(maximum))
 }
 
 func (h *Hysteria2Option) Build() any {
 	h.TLS = true
+	hopInterval, hopIntervalMax := clashHopInterval(h.HopInterval)
 	return &option.Hysteria2OutboundOptions{
 		DialerOptions:               h.DialerOptions.Build(),
 		ServerOptions:               h.ServerOptions.Build(),
 		ServerPorts:                 option.LegacyListable[string](clashPorts(h.Ports)),
-		HopInterval:                 badoption.Duration(h.HopInterval),
+		HopInterval:                 hopInterval,
+		HopIntervalMax:              hopIntervalMax,
 		UpMbps:                      clashSpeedToIntMbps(h.Up),
 		DownMbps:                    clashSpeedToIntMbps(h.Down),
 		Obfs:                        clashHysteria2Obfs(h.Obfs, h.ObfsPassword),
 		Password:                    h.Password,
 		OutboundTLSOptionsContainer: clashTLSOptions(h.Server, &h.TLSOptions),
+		QUICOptions: option.QUICOptions{
+			HTTP2Options: option.HTTP2Options{
+				StreamReceiveWindow:     clashReceiveWindow(h.InitialStreamReceiveWindow, h.MaxStreamReceiveWindow),
+				ConnectionReceiveWindow: clashReceiveWindow(h.InitialConnectionReceiveWindow, h.MaxConnectionReceiveWindow),
+			},
+		},
+		BBRProfile: h.BBRProfile,
+		Realm:      h.RealmOpts.Build(),
 	}
 }
 
@@ -541,21 +845,35 @@ type AnyTLSOption struct {
 	IdleSessionTimeout       int    `yaml:"idle-session-timeout,omitempty"`
 	MinIdleSession           int    `yaml:"min-idle-session,omitempty"`
 	DisableReuse             bool   `yaml:"disable-reuse,omitempty"`
+	ClientMetadata           string `yaml:"client-metadata,omitempty"`
+	clashTLSExtensions       `yaml:",inline"`
+}
+
+func (a *AnyTLSOption) unsupported() string {
+	if a.ShadowTLSOpts.enabled() {
+		// the anytls outbound always performs its own TLS handshake
+		return "anytls over shadow-tls is not supported"
+	}
+	return a.clashTLSExtensions.unsupported()
 }
 
 func (a *AnyTLSOption) Build() any {
 	a.TLS = true
-	return &option.AnyTLSOutboundOptions{
+	options := &option.AnyTLSOutboundOptions{
 		DialerOptions:               a.DialerOptions.Build(),
 		ServerOptions:               a.ServerOptions.Build(),
 		OutboundTLSOptionsContainer: clashTLSOptions(a.Server, &a.TLSOptions),
 		Password:                    a.Password,
-		IdleSessionCheckInterval:    badoption.Duration(a.IdleSessionCheckInterval),
-		IdleSessionTimeout:          badoption.Duration(a.IdleSessionTimeout),
+		IdleSessionCheckInterval:    badoption.Duration(time.Duration(a.IdleSessionCheckInterval) * time.Second),
+		IdleSessionTimeout:          badoption.Duration(time.Duration(a.IdleSessionTimeout) * time.Second),
 		MinIdleSession:              a.MinIdleSession,
 		DisableReuse:                a.DisableReuse,
 		Network:                     clashNetworks(a.UDP),
 	}
+	if a.ClientMetadata != "" {
+		options.ClientMetadata = &a.ClientMetadata
+	}
+	return options
 }
 
 type ClashTailscaleOption struct {
@@ -634,6 +952,13 @@ type ClashWireGuardOption struct {
 	AmneziaWGOption          map[string]any             `yaml:"amnezia-wg-option,omitempty"`
 }
 
+func (w *ClashWireGuardOption) unsupported() string {
+	if len(w.AmneziaWGOption) > 0 {
+		return "AmneziaWG is not implemented"
+	}
+	return ""
+}
+
 func (w *ClashWireGuardOption) Build() any {
 	var address badoption.Listable[netip.Prefix]
 	if w.Ip != "" {
@@ -703,6 +1028,8 @@ type HTTP2Options struct {
 
 type GrpcOptions struct {
 	GrpcServiceName string `yaml:"grpc-service-name,omitempty"`
+	// seconds between keepalive pings
+	PingInterval int `yaml:"ping-interval,omitempty"`
 }
 
 type WSOptions struct {
@@ -819,13 +1146,17 @@ type TLSOptions struct {
 	RealityOpts       *RealityOptions `yaml:"reality-opts,omitempty"`
 	KernelTx          bool            `yaml:"kernel-tx,omitempty"`
 	KernelRx          bool            `yaml:"kernel-rx,omitempty"`
+	// client certificate for mutual TLS, PEM content or a file path
+	Certificate    string `yaml:"certificate,omitempty"`
+	PrivateKey     string `yaml:"private-key,omitempty"`
+	NameCertVerify string `yaml:"name-cert-verify,omitempty"`
 }
 
 func (t *TLSOptions) Build() *option.OutboundTLSOptions {
 	if t == nil || !t.TLS {
 		return nil
 	}
-	return &option.OutboundTLSOptions{
+	options := &option.OutboundTLSOptions{
 		Enabled:              t.TLS,
 		ServerName:           t.SNI,
 		Insecure:             t.SkipCertVerify,
@@ -839,6 +1170,86 @@ func (t *TLSOptions) Build() *option.OutboundTLSOptions {
 		KernelTx:             t.KernelTx,
 		KernelRx:             t.KernelRx,
 	}
+	options.CertificateServerName = t.NameCertVerify
+	options.ClientCertificate, options.ClientCertificatePath = clashPEMOrPath(t.Certificate)
+	options.ClientKey, options.ClientKeyPath = clashPEMOrPath(t.PrivateKey)
+	return options
+}
+
+// clashPEMOrPath splits a Clash certificate / key value, which is either the
+// PEM content itself or a path to it.
+func clashPEMOrPath(value string) (badoption.Listable[string], string) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return nil, ""
+	}
+	if strings.Contains(value, "-----BEGIN") {
+		return trimStringArray(strings.Split(value, "\n")), ""
+	}
+	return nil, value
+}
+
+type ClashShadowTLSOptions struct {
+	Password string `yaml:"password,omitempty"`
+	Version  int    `yaml:"version,omitempty"`
+}
+
+func (o *ClashShadowTLSOptions) enabled() bool {
+	return o != nil && (o.Password != "" || o.Version != 0)
+}
+
+// clashTLSExtensions are the mihomo security layers that replace the TLS
+// handshake of vmess / vless / trojan / anytls.
+type clashTLSExtensions struct {
+	ShadowTLSOpts *ClashShadowTLSOptions `yaml:"shadow-tls-opts,omitempty"`
+	RestlsOpts    map[string]any         `yaml:"restls-opts,omitempty"`
+	JLSOpts       map[string]any         `yaml:"jls-opts,omitempty"`
+	TLSMirrorOpts map[string]any         `yaml:"tlsmirror-opts,omitempty"`
+}
+
+func (e *clashTLSExtensions) unsupported() string {
+	// mihomo treats each layer as configured once any of these fields is set
+	switch {
+	case clashStringOption(e.RestlsOpts, "password") != "" || clashStringOption(e.RestlsOpts, "version-hint") != "" ||
+		clashStringOption(e.RestlsOpts, "restls-script") != "":
+		return "restls is not implemented"
+	case clashStringOption(e.JLSOpts, "password") != "" || clashStringOption(e.JLSOpts, "username") != "":
+		return "JLS is not implemented"
+	case clashStringOption(e.TLSMirrorOpts, "primary-key") != "":
+		return "TLSMirror is not implemented"
+	}
+	return ""
+}
+
+// clashShadowTLSChain moves the TLS handshake of the outbound into a shadowtls
+// outbound and dials through it, which is what mihomo does for shadow-tls:
+// the TLS parameters authenticate the shadow-tls handshake and the proxy
+// protocol then runs in plain text over it.
+func clashShadowTLSChain(tag string, dialer *option.DialerOptions, server option.ServerOptions, tls *option.OutboundTLSOptionsContainer, password string, version int, alpn []string) []option.Outbound {
+	if version == 0 {
+		// mihomo's default
+		version = 2
+	}
+	shadowTLS := common.PtrValueOrDefault(tls.TLS)
+	shadowTLS.Enabled = true
+	if len(shadowTLS.ALPN) == 0 {
+		shadowTLS.ALPN = alpn
+	}
+	helperTag := tag + " (shadow-tls)"
+	helper := option.Outbound{
+		Type: C.TypeShadowTLS,
+		Tag:  helperTag,
+		Options: &option.ShadowTLSOutboundOptions{
+			DialerOptions:               *dialer,
+			ServerOptions:               server,
+			Version:                     version,
+			Password:                    password,
+			OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: &shadowTLS},
+		},
+	}
+	*dialer = option.DialerOptions{Detour: helperTag}
+	tls.TLS = nil
+	return []option.Outbound{helper}
 }
 
 type DialerOptions struct {
@@ -946,8 +1357,50 @@ func clashPluginName(plugin string) string {
 	switch plugin {
 	case "obfs":
 		return "obfs-local"
+	case "shadow-tls":
+		// handled by ShadowSocksOption.chain
+		return ""
 	}
 	return plugin
+}
+
+// clashV2RayPluginUnsupported reports v2ray-plugin options the built-in
+// SIP003 implementation cannot express.
+func clashV2RayPluginUnsupported(opts map[string]any) string {
+	if mode := clashStringOption(opts, "mode"); mode != "" && mode != "websocket" {
+		return "v2ray-plugin mode " + mode + " is not supported"
+	}
+	for _, key := range []string{"skip-cert-verify", "v2ray-http-upgrade"} {
+		if clashBoolOption(opts, key) {
+			return "v2ray-plugin " + key + " is not supported"
+		}
+	}
+	for _, key := range []string{"fingerprint", "certificate", "private-key"} {
+		if clashStringOption(opts, key) != "" {
+			return "v2ray-plugin " + key + " is not supported"
+		}
+	}
+	if headers, loaded := opts["headers"].(map[string]any); loaded && len(headers) > 0 {
+		return "v2ray-plugin headers are not supported"
+	}
+	if ech, loaded := opts["ech-opts"].(map[string]any); loaded && clashBoolOption(ech, "enable") {
+		return "v2ray-plugin ECH is not supported"
+	}
+	return ""
+}
+
+func clashBoolOption(options map[string]any, key string) bool {
+	value, _ := options[key].(bool)
+	return value
+}
+
+func clashStringListOption(options map[string]any, key string) []string {
+	values, _ := options[key].([]any)
+	var result []string
+	for _, value := range values {
+		result = append(result, F.ToString(value))
+	}
+	return result
 }
 
 func clashPluginOptions(plugin string, opts map[string]any) string {
@@ -958,9 +1411,19 @@ func clashPluginOptions(plugin string, opts map[string]any) string {
 		options["obfs-host"] = opts["host"]
 	case "v2ray-plugin":
 		options["mode"] = opts["mode"]
-		options["tls"] = opts["tls"]
+		// the plugin enables TLS when the key is present at all
+		if clashBoolOption(opts, "tls") {
+			options["tls"] = ""
+		}
 		options["host"] = opts["host"]
 		options["path"] = opts["path"]
+		// Clash mux is a switch defaulting to off, the plugin takes a
+		// concurrency defaulting to 1.
+		if clashBoolOption(opts, "mux") {
+			options["mux"] = 1
+		} else {
+			options["mux"] = 0
+		}
 	}
 	return options.Build()
 }
@@ -1036,6 +1499,21 @@ func clashSpeedToNetworkBytes(speed string) *byteformats.NetworkBytesCompat {
 	return networkBytes
 }
 
+// clashTransportUnsupported reports Clash networks without a transport here;
+// building them would silently fall back to plain TCP.
+func clashTransportUnsupported(network string) string {
+	switch network {
+	case "", "tcp", "ws", "http", "h2", "grpc", "xhttp":
+		return ""
+	case "kcp", "mkcp":
+		return "the mKCP transport is not implemented"
+	case "mekya":
+		return "the mekya transport is not implemented"
+	default:
+		return "unknown network: " + network
+	}
+}
+
 func clashTransport(network string, httpOpts HTTPOptions, h2Opts HTTP2Options, grpcOpts GrpcOptions, wsOpts WSOptions, xhttp clashXHTTP) *option.V2RayTransportOptions {
 	switch network {
 	case "xhttp":
@@ -1062,6 +1540,7 @@ func clashTransport(network string, httpOpts HTTPOptions, h2Opts HTTP2Options, g
 			Type: C.V2RayTransportTypeGRPC,
 			GRPCOptions: option.V2RayGRPCOptions{
 				ServiceName: grpcOpts.GrpcServiceName,
+				IdleTimeout: badoption.Duration(time.Duration(grpcOpts.PingInterval) * time.Second),
 			},
 		}
 	case "ws":
