@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing/common/byteformats"
 	E "github.com/sagernet/sing/common/exceptions"
 	F "github.com/sagernet/sing/common/format"
+	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/sing/common/json/badoption"
 	N "github.com/sagernet/sing/common/network"
 
@@ -359,6 +360,8 @@ func (h *HttpOption) Build() any {
 		Password:                    h.Password,
 		OutboundTLSOptionsContainer: clashTLSOptions(h.Server, h.TLSOptions),
 		Headers:                     clashHeaders(h.Headers),
+		// Clash HTTP proxies never relay UDP; CONNECT-UDP is a sing-box extension.
+		Network: N.NetworkTCP,
 	}
 }
 
@@ -551,6 +554,7 @@ func (a *AnyTLSOption) Build() any {
 		IdleSessionTimeout:          badoption.Duration(a.IdleSessionTimeout),
 		MinIdleSession:              a.MinIdleSession,
 		DisableReuse:                a.DisableReuse,
+		Network:                     clashNetworks(a.UDP),
 	}
 }
 
@@ -999,11 +1003,12 @@ func clashSpeedToIntMbps(speed string) int {
 	if num, err := strconv.Atoi(speed); err == nil {
 		return num
 	}
-	networkBytes := byteformats.NetworkBytesCompat{}
-	if err := networkBytes.UnmarshalJSON([]byte(speed)); err != nil {
+	networkBytes := clashSpeedToNetworkBytes(speed)
+	if networkBytes == nil {
 		return 0
 	}
-	return int(networkBytes.Value() / byteformats.MByte * 8)
+	// Value is in bytes per second.
+	return int(networkBytes.Value() * 8 / 1_000_000)
 }
 
 func clashSpeedToNetworkBytes(speed string) *byteformats.NetworkBytesCompat {
@@ -1011,10 +1016,21 @@ func clashSpeedToNetworkBytes(speed string) *byteformats.NetworkBytesCompat {
 		return nil
 	}
 	networkBytes := &byteformats.NetworkBytesCompat{}
+	speed = strings.TrimSpace(speed)
 	if num, err := strconv.Atoi(speed); err == nil {
+		// Clash treats a bare number as Mbps.
 		speed = F.ToString(num, "Mbps")
+	} else if unitIndex := len(speed) - len("mbps"); unitIndex > 0 && speed[unitIndex:] == strings.ToLower(speed[unitIndex:]) &&
+		strings.HasSuffix(speed, "bps") && strings.ContainsRune("kmgt", rune(speed[unitIndex])) {
+		// An all lowercase unit such as "100 mbps" can only mean bits.
+		speed = speed[:unitIndex] + strings.ToUpper(speed[unitIndex:unitIndex+1]) + "bps"
 	}
-	if err := networkBytes.UnmarshalJSON([]byte(speed)); err != nil {
+	// UnmarshalJSON expects a JSON string, not the raw "10 Mbps" text.
+	content, err := json.Marshal(speed)
+	if err != nil {
+		return nil
+	}
+	if err = networkBytes.UnmarshalJSON(content); err != nil {
 		return nil
 	}
 	return networkBytes

@@ -13,6 +13,7 @@
   "password": "admin",
   "path": "",
   "headers": {},
+  "network": "tcp",
   "version": 0,
   "disable_version_fallback": false,
   "tls": {},
@@ -51,6 +52,16 @@ Path of HTTP request.
 #### headers
 
 Extra headers of HTTP request.
+
+#### network
+
+Enabled network
+
+One of `tcp` `udp`.
+
+Both is enabled by default. UDP is relayed with CONNECT-UDP (MASQUE, RFC 9298), which plain HTTP proxy servers usually do not support: set `tcp` for them so that UDP connections are not routed here and groups filtering on `network` treat the node as TCP only.
+
+Nodes parsed from Clash subscriptions are always TCP only, matching Clash.
 
 #### version
 

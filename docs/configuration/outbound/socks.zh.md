@@ -56,6 +56,8 @@ SOCKS5 密码。
 
 默认所有。
 
+SOCKS4 与 SOCKS4a 没有 UDP：未启用 `udp_over_tcp` 时该出站仅支持 TCP，将 `network` 设为 `udp` 会报错。
+
 #### udp_over_tcp
 
 UDP over TCP 配置。

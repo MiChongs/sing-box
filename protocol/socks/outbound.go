@@ -49,12 +49,22 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, err
 	}
+	networks := options.Network.Build()
+	if version != socks.Version5 && !common.PtrValueOrDefault(options.UDPOverTCP).Enabled {
+		// SOCKS4 and SOCKS4a only define CONNECT, so UDP needs UDP over TCP.
+		if options.Network != "" && common.Contains(networks, N.NetworkUDP) {
+			return nil, E.New("SOCKS", version, " does not support UDP, enable udp_over_tcp or set network to tcp")
+		}
+		networks = common.Filter(networks, func(it string) bool {
+			return it != N.NetworkUDP
+		})
+	}
 	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
 	if err != nil {
 		return nil, err
 	}
 	outbound := &Outbound{
-		Adapter:   outbound.NewAdapterWithDialerOptions(C.TypeSOCKS, tag, options.Network.Build(), options.DialerOptions),
+		Adapter:   outbound.NewAdapterWithDialerOptions(C.TypeSOCKS, tag, networks, options.DialerOptions),
 		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
 		logger:    logger,
 		client:    socks.NewClient(outboundDialer, options.ServerOptions.Build(), version, options.Username, options.Password),

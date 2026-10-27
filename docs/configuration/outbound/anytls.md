@@ -19,6 +19,7 @@ icon: material/new-box
   "min_idle_session": 5,
   "client_metadata": "",
   "disable_reuse": false,
+  "network": "tcp",
   "tls": {},
 
   ... // Dial Fields
@@ -68,6 +69,14 @@ When omitted, sends `sing-anytls/0.0.13 sing-box/<version>` for compatibility. T
 #### disable_reuse
 
 Disable TLS connection reuse. Default: false.
+
+#### network
+
+Enabled network
+
+One of `tcp` `udp`.
+
+Both is enabled by default. UDP is carried over the AnyTLS session (UDP over TCP). The `udp` field of Clash subscriptions maps to this option.
 
 #### tls
 

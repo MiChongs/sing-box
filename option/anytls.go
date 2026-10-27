@@ -26,4 +26,5 @@ type AnyTLSOutboundOptions struct {
 	MinIdleSession           int                `json:"min_idle_session,omitempty"`
 	ClientMetadata           *string            `json:"client_metadata,omitempty"`
 	DisableReuse             bool               `json:"disable_reuse,omitempty"`
+	Network                  NetworkList        `json:"network,omitempty"`
 }

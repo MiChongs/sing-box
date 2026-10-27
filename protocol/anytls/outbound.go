@@ -43,7 +43,7 @@ type Outbound struct {
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AnyTLSOutboundOptions) (adapter.Outbound, error) {
 	outbound := &Outbound{
-		Adapter:      outbound.NewAdapterWithDialerOptions(C.TypeAnyTLS, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+		Adapter:      outbound.NewAdapterWithDialerOptions(C.TypeAnyTLS, tag, options.Network.Build(), options.DialerOptions),
 		server:       options.ServerOptions.Build(),
 		logger:       logger,
 		disableReuse: options.DisableReuse,

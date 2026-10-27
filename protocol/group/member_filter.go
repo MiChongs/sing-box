@@ -12,14 +12,20 @@ import (
 	"github.com/sagernet/sing/service"
 )
 
-// Short names accepted by include_type / exclude_type, following the
-// spellings used by Clash subscriptions.
+// Other names accepted by include_type / exclude_type: the type names used by
+// Clash / mihomo subscriptions and common short forms. Every other registered
+// outbound or endpoint type is accepted under its own name.
 var memberTypeAliases = map[string]string{
-	"ss":     "shadowsocks",
-	"socks5": "socks",
-	"hy":     "hysteria",
-	"hy2":    "hysteria2",
-	"wg":     "wireguard",
+	"ss":         "shadowsocks",
+	"socks5":     "socks",
+	"hy":         "hysteria",
+	"hy1":        "hysteria",
+	"hy2":        "hysteria2",
+	"wg":         "wireguard",
+	"naiveproxy": "naive",
+	"shadow-tls": "shadowtls",
+	"openvpn":    "openvpn-client",
+	"masque":     "masque-client",
 }
 
 // memberFilter decides which provider nodes join a group. Nodes listed in

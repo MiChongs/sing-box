@@ -71,7 +71,7 @@ Include regular expression to filter `providers` nodes.
 
 List of outbound types to keep among `providers` nodes, such as `vless` or `hysteria2`.
 
-Case-insensitive. The aliases `ss`, `socks5`, `hy`, `hy2` and `wg` are accepted. Unknown types are rejected at startup.
+Case-insensitive. Every outbound and endpoint type of the build is accepted, together with the Clash names and short forms `ss`, `socks5`, `hy`, `hy1`, `hy2`, `wg`, `naiveproxy`, `shadow-tls`, `openvpn` and `masque`. Unknown types are rejected at startup.
 
 #### exclude_type
 
@@ -83,7 +83,16 @@ List of outbound types to drop from `providers` nodes. Takes precedence over `in
 
 Keep only `providers` nodes that support every listed network. The capability comes from the node itself, for example `"network": "tcp"` on a Shadowsocks node or `udp: false` in a Clash subscription, not from its name.
 
-`http` outbounds always declare UDP because they can relay it with CONNECT-UDP (MASQUE), which most plain HTTP proxy servers do not support. Add `"exclude_type": ["http"]` when that matters.
+How each protocol reports UDP:
+
+| Protocol | UDP |
+|---|---|
+| `shadowsocks` `vmess` `vless` `trojan` `socks` `snell` `anytls` `quicx` | from its `network` field, the Clash `udp` flag for subscriptions |
+| `hysteria` `hysteria2` `tuic` | yes, unless `network` is `tcp`; always yes from Clash subscriptions, as in Clash |
+| `socks` version `4` / `4a`, `naive` | only with `udp_over_tcp` |
+| `http` | from its `network` field (CONNECT-UDP); always no from Clash subscriptions |
+| `ssh` `shadowtls` `tor` | no |
+| `wireguard` `tailscale` `tailcat` `nowhere` and other endpoints | yes |
 
 !!! note ""
 

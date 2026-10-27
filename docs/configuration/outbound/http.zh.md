@@ -13,6 +13,7 @@
   "password": "admin",
   "path": "",
   "headers": {},
+  "network": "tcp",
   "version": 0,
   "disable_version_fallback": false,
   "tls": {},
@@ -51,6 +52,16 @@ HTTP 请求路径。
 #### headers
 
 HTTP 请求的额外标头。
+
+#### network
+
+启用的网络协议
+
+`tcp` 或 `udp`。
+
+默认所有。UDP 通过 CONNECT-UDP（MASQUE，RFC 9298）转发，普通 HTTP 代理服务端通常不支持：对这类服务端请设为 `tcp`，这样 UDP 连接不会被路由到此出站，按 `network` 筛选的分组也会把它视为仅 TCP。
+
+从 Clash 订阅解析出的节点始终为仅 TCP，与 Clash 一致。
 
 #### version
 

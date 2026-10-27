@@ -56,6 +56,8 @@ One of `tcp` `udp`.
 
 Both is enabled by default.
 
+SOCKS4 and SOCKS4a have no UDP: without `udp_over_tcp` the outbound is TCP only, and setting `network` to `udp` is an error.
+
 #### udp_over_tcp
 
 UDP over TCP protocol settings.

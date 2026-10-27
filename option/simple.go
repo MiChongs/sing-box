@@ -96,6 +96,7 @@ type _HTTPOutboundOptions struct {
 	OutboundTLSOptionsContainer
 	Path                   string               `json:"path,omitempty"`
 	Headers                badoption.HTTPHeader `json:"headers,omitempty"`
+	Network                NetworkList          `json:"network,omitempty"`
 	Version                int                  `json:"version,omitempty" enum:"0,1,2,3"`
 	DisableVersionFallback bool                 `json:"disable_version_fallback,omitempty"`
 	HTTP2Options           HTTP2Options         `json:"-"`

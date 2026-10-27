@@ -19,6 +19,7 @@ icon: material/new-box
   "min_idle_session": 5,
   "client_metadata": "",
   "disable_reuse": false,
+  "network": "tcp",
   "tls": {},
 
   ... // 拨号字段
@@ -68,6 +69,14 @@ AnyTLS 密码。
 #### disable_reuse
 
 禁用 TLS 连接复用。默认值：false。
+
+#### network
+
+启用的网络协议
+
+`tcp` 或 `udp`。
+
+默认所有。UDP 经由 AnyTLS 会话传输（UDP over TCP）。Clash 订阅中的 `udp` 字段对应此选项。
 
 #### tls
 
