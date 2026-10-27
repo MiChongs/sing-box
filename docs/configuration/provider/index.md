@@ -24,6 +24,7 @@ List of subscription providers.
             "url": "",
             "interval": "",
             "timeout": "",
+            "udp": {}
           },
           "override_dialer": {},
           "override_tls": {},
@@ -46,6 +47,7 @@ List of subscription providers.
             "url": "",
             "interval": "",
             "timeout": "",
+            "udp": {}
           },
           "url": "",
           "path": "",
@@ -80,6 +82,7 @@ List of subscription providers.
             "url": "",
             "interval": "",
             "timeout": "",
+            "udp": {}
           },
           "outbounds": [],
           "endpoints": []
@@ -125,6 +128,32 @@ Health check interval. The minimum value is `1m`, the default value is `10m`.
 ##### health_check.timeout
 
 Health check timeout. the default value is `3s`.
+
+##### health_check.udp
+
+Probe the real UDP support of nodes on every health check round, independently of `health_check.enabled`:
+
+```json
+{
+  "enabled": true,
+  "server": "1.1.1.1:53",
+  "domain": "www.gstatic.com",
+  "timeout": "5s",
+  "ttl": ""
+}
+```
+
+Each node that declares UDP sends a DNS query for `domain` over UDP to `server` through itself, resending every second until `timeout`. A matching answer proves the node relays UDP; no answer within `timeout` marks it as not relaying UDP. Nodes that only declare TCP are not probed.
+
+A result counts for `ttl`, by default three health check intervals. A failed result that is still valid:
+
+* removes the node from groups filtering on `"network": "udp"`, and puts it back once a later probe succeeds;
+* keeps urltest, loadbalance and smart groups from choosing the node for UDP connections; manual selections are kept;
+* reports the node as `udp: false` in the Clash API, which also returns the latest probe as `udpTest`.
+
+Nodes that were never probed, or whose result expired, keep their declared UDP support.
+
+The probe needs a DNS server reachable from every node; pick one the nodes do not block.
 
 ### Local or Remote Fields
 

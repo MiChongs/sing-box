@@ -617,6 +617,9 @@ func (g *LoadBalanceGroup) aliveForTestURL(proxy adapter.Outbound, network strin
 	if selectedGroup, isGroup := proxy.(adapter.OutboundGroup); isGroup {
 		return g.aliveForTestURL(selectedGroup.Selected(network), network, checked)
 	}
+	if network == N.NetworkUDP && !supportsNetwork(g.history, proxy, N.NetworkUDP) {
+		return false
+	}
 	return g.history.LoadURLTestHistory(proxy.Tag()) != nil
 }
 

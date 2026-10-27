@@ -6409,12 +6409,7 @@ func classifyShortLife(durationMS int64, upBytes, downBytes int64, firstByteSeen
 }
 
 func (s *Smart) supportsUDP(ob adapter.Outbound) bool {
-	for _, n := range ob.Network() {
-		if n == N.NetworkUDP {
-			return true
-		}
-	}
-	return false
+	return supportsNetwork(s.history, ob, N.NetworkUDP)
 }
 
 // getPriorityFactor moved to smart_priority.go.

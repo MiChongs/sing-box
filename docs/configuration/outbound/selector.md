@@ -77,7 +77,7 @@ List of transports to drop from `providers` nodes. Takes precedence over `includ
 
 `tcp`, `udp`, or a list of both.
 
-Keep only `providers` nodes that support every listed network. The capability comes from the node itself, for example `"network": "tcp"` on a Shadowsocks node or `udp: false` in a Clash subscription, not from its name.
+Keep only `providers` nodes that support every listed network. The capability comes from the node itself, for example `"network": "tcp"` on a Shadowsocks node or `udp: false` in a Clash subscription, not from its name. When the provider probes UDP (`health_check.udp`), a node whose valid probe failed is removed until a probe succeeds again.
 
 How each protocol reports UDP:
 

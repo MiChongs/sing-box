@@ -143,10 +143,23 @@ type ProviderInlineOptions struct {
 }
 
 type ProviderHealthCheckOptions struct {
-	Enabled  bool               `json:"enabled,omitempty"`
-	URL      string             `json:"url,omitempty"`
-	Interval badoption.Duration `json:"interval,omitempty"`
-	Timeout  badoption.Duration `json:"timeout,omitempty"`
+	Enabled  bool                           `json:"enabled,omitempty"`
+	URL      string                         `json:"url,omitempty"`
+	Interval badoption.Duration             `json:"interval,omitempty"`
+	Timeout  badoption.Duration             `json:"timeout,omitempty"`
+	UDP      *ProviderUDPHealthCheckOptions `json:"udp,omitempty"`
+}
+
+// ProviderUDPHealthCheckOptions probes the real UDP support of provider nodes
+// by sending a DNS query over UDP through each of them.
+type ProviderUDPHealthCheckOptions struct {
+	Enabled bool `json:"enabled,omitempty"`
+	// DNS server queried through the node, host:port.
+	Server  string             `json:"server,omitempty"`
+	Domain  string             `json:"domain,omitempty"`
+	Timeout badoption.Duration `json:"timeout,omitempty"`
+	// How long a result counts; afterwards the node is unknown again.
+	TTL badoption.Duration `json:"ttl,omitempty"`
 }
 
 type OverrideAnyTLSOptions struct {

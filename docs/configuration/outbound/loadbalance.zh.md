@@ -92,7 +92,7 @@
 
 `tcp`、`udp` 或二者组成的列表。
 
-只保留支持全部所列网络的 `providers` 节点。能力取自节点本身，例如 Shadowsocks 节点上的 `"network": "tcp"`、Clash 订阅中的 `udp: false`，而不是节点名称。
+只保留支持全部所列网络的 `providers` 节点。能力取自节点本身，例如 Shadowsocks 节点上的 `"network": "tcp"`、Clash 订阅中的 `udp: false`，而不是节点名称。若订阅源开启了 UDP 探测（`health_check.udp`），探测失败且结果仍有效的节点会被移除，直到再次探测成功。
 
 各协议的 UDP 能力：
 

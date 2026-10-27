@@ -237,7 +237,11 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	}
 	info.Put("type", clashType)
 	info.Put("name", detour.Tag())
-	info.Put("udp", common.Contains(detour.Network(), N.NetworkUDP))
+	udpTag := group.RealTag(detour, N.NetworkUDP)
+	info.Put("udp", common.Contains(detour.Network(), N.NetworkUDP) && !urltest.UDPUnavailable(server.urlTestHistory, udpTag))
+	if udpHistory := server.urlTestHistory.LoadUDPTestHistory(udpTag); udpHistory != nil {
+		info.Put("udpTest", udpHistory)
+	}
 	delayHistory := server.urlTestHistory.LoadURLTestHistory(group.RealTag(detour, N.NetworkTCP))
 	if delayHistory != nil {
 		info.Put("history", []*adapter.URLTestHistory{delayHistory})

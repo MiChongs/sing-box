@@ -24,6 +24,7 @@
             "url": "",
             "interval": "",
             "timeout": "",
+            "udp": {}
           },
           "override_dialer": {},
           "override_tls": {},
@@ -46,6 +47,7 @@
             "url": "",
             "interval": "",
             "timeout": "",
+            "udp": {}
           },
           "url": "",
           "path": "",
@@ -80,6 +82,7 @@
             "url": "",
             "interval": "",
             "timeout": "",
+            "udp": {}
           },
           "outbounds": [],
           "endpoints": []
@@ -125,6 +128,32 @@
 ##### health_check.timeout
 
 健康检查的超时时间。默认为 `3s`。
+
+##### health_check.udp
+
+在每轮健康检查中探测节点真实的 UDP 能力，与 `health_check.enabled` 相互独立：
+
+```json
+{
+  "enabled": true,
+  "server": "1.1.1.1:53",
+  "domain": "www.gstatic.com",
+  "timeout": "5s",
+  "ttl": ""
+}
+```
+
+每个声明支持 UDP 的节点会经由自身向 `server` 发送一次 `domain` 的 UDP DNS 查询，在 `timeout` 内每秒重发一次。收到匹配的应答即证明节点能转发 UDP；`timeout` 内无应答则判定为不能转发 UDP。只声明 TCP 的节点不参与探测。
+
+结果在 `ttl` 内有效，默认为三个健康检查间隔。仍有效的失败结果会：
+
+* 把节点移出 `"network": "udp"` 的分组，之后探测成功时再加回；
+* 让 urltest、loadbalance、smart 分组不再为 UDP 连接选择该节点，手动选择保持不变；
+* 在 Clash API 中将节点显示为 `udp: false`，并以 `udpTest` 返回最近一次探测结果。
+
+从未探测或结果已过期的节点仍按声明的 UDP 能力处理。
+
+探测需要一个所有节点都能访问的 DNS 服务器，请选择节点不会屏蔽的地址。
 
 ### 本地或远程字段
 

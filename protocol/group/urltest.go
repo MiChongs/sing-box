@@ -918,7 +918,7 @@ func (g *URLTestGroup) selectFallback(network string) (adapter.Outbound, bool) {
 		fallbackIgnoreOutboundDelay uint16
 	)
 	for _, detour := range st.outbounds {
-		if !common.Contains(detour.Network(), network) {
+		if !supportsNetwork(g.history, detour, network) {
 			continue
 		}
 		history := g.history.LoadURLTestHistory(RealTag(detour, network))
@@ -944,7 +944,7 @@ func (g *URLTestGroup) selectFallback(network string) (adapter.Outbound, bool) {
 		return fallbackIgnoreOutbound, true
 	}
 	for _, detour := range st.outbounds {
-		if common.Contains(detour.Network(), network) {
+		if supportsNetwork(g.history, detour, network) {
 			return detour, false
 		}
 	}
@@ -961,7 +961,7 @@ func (g *URLTestGroup) selectFullScan(st *groupState, network string) (adapter.O
 		anyAvailable adapter.Outbound
 	)
 	for _, detour := range st.outbounds {
-		if !common.Contains(detour.Network(), network) {
+		if !supportsNetwork(g.history, detour, network) {
 			continue
 		}
 		if anyAvailable == nil {
@@ -1080,7 +1080,7 @@ func (g *URLTestGroup) rebuildRankedCandidates() {
 			if common.Contains(detour.Network(), N.NetworkTCP) {
 				tcpRanked = append(tcpRanked, r)
 			}
-			if common.Contains(detour.Network(), N.NetworkUDP) {
+			if supportsNetwork(g.history, detour, N.NetworkUDP) {
 				udpRanked = append(udpRanked, r)
 			}
 		}

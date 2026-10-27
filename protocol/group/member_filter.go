@@ -7,9 +7,11 @@ import (
 	"strings"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/service"
 )
 
@@ -41,6 +43,8 @@ type memberFilter struct {
 	excludeTransport []string
 	// every listed network must be supported by the node itself
 	networks []string
+	// UDP probe results of provider health checks
+	history adapter.URLTestHistoryStorage
 }
 
 func newMemberFilter(ctx context.Context, options option.GroupCommonOption) (*memberFilter, error) {
@@ -74,6 +78,7 @@ func newMemberFilter(ctx context.Context, options option.GroupCommonOption) (*me
 		includeTransport: includeTransport,
 		excludeTransport: excludeTransport,
 		networks:         networks,
+		history:          groupHistory(ctx),
 	}, nil
 }
 
@@ -183,13 +188,27 @@ func (f *memberFilter) Match(detour adapter.Outbound) bool {
 			return false
 		}
 	}
-	if len(f.networks) > 0 {
-		supported := detour.Network()
-		for _, network := range f.networks {
-			if !slices.Contains(supported, network) {
-				return false
-			}
+	for _, network := range f.networks {
+		if !supportsNetwork(f.history, detour, network) {
+			return false
 		}
 	}
 	return true
+}
+
+// supportsNetwork reports whether detour can carry network: it must declare
+// the network, and for UDP its latest valid probe must not have failed.
+// Nodes never probed keep their declared support.
+func supportsNetwork(history adapter.URLTestHistoryStorage, detour adapter.Outbound, network string) bool {
+	if !slices.Contains(detour.Network(), network) {
+		return false
+	}
+	return network != N.NetworkUDP || !urltest.UDPUnavailable(history, RealTag(detour, N.NetworkUDP))
+}
+
+func groupHistory(ctx context.Context) adapter.URLTestHistoryStorage {
+	if history := service.PtrFromContext[urltest.HistoryStorage](ctx); history != nil {
+		return history
+	}
+	return service.FromContext[adapter.URLTestHistoryStorage](ctx)
 }

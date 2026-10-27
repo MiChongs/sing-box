@@ -49,10 +49,14 @@ func UnifiedDelayFromContext(ctx context.Context) bool {
 
 // ════════════════ HistoryStorage ════════════════
 
-var _ adapter.URLTestHistoryStorage = (*HistoryStorage)(nil)
+var (
+	_ adapter.URLTestHistoryStorage = (*HistoryStorage)(nil)
+	_ adapter.UDPTestHistoryStorage = (*HistoryStorage)(nil)
+)
 
 type HistoryStorage struct {
 	delayHistory sync.Map
+	udpHistory   sync.Map
 	updateHooks  []*observable.Subscriber[struct{}]
 	hookAccess   sync.Mutex
 
@@ -108,6 +112,27 @@ func (s *HistoryStorage) DeleteURLTestHistory(tag string) {
 
 func (s *HistoryStorage) StoreURLTestHistory(tag string, h *adapter.URLTestHistory) {
 	s.delayHistory.Store(tag, h)
+	s.notifyUpdated()
+}
+
+func (s *HistoryStorage) LoadUDPTestHistory(tag string) *adapter.UDPTestHistory {
+	if s == nil {
+		return nil
+	}
+	v, ok := s.udpHistory.Load(tag)
+	if !ok {
+		return nil
+	}
+	return v.(*adapter.UDPTestHistory)
+}
+
+func (s *HistoryStorage) StoreUDPTestHistory(tag string, h *adapter.UDPTestHistory) {
+	s.udpHistory.Store(tag, h)
+	s.notifyUpdated()
+}
+
+func (s *HistoryStorage) DeleteUDPTestHistory(tag string) {
+	s.udpHistory.Delete(tag)
 	s.notifyUpdated()
 }
 
