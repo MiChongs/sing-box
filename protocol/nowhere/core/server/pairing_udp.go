@@ -132,6 +132,7 @@ func udpHalfTransport(header wire.FlowHeader, half udpHalf) string {
 func closeUDPHalfWithError(half udpHalf, err error) {
 	if half.Uplink != nil {
 		if value, ok := half.Uplink.(*tcpUDPUplink); ok {
+			value.stop()
 			closeConnWithError(value.conn, err)
 		} else {
 			_ = half.Uplink.Close()
@@ -148,27 +149,83 @@ func closeUDPHalfWithError(half udpHalf, err error) {
 
 // --- TCP UoT halves ---
 
+// tcpUDPUplink reads UoT frames on a background goroutine so ReadPacket can
+// honour read deadlines without abandoning a frame half way through. The
+// router's UDP sniff sets a short read deadline before the flow is ready; a
+// blocking frame read used to ignore it and stall the flow forever.
 type tcpUDPUplink struct {
-	conn net.Conn
-	mu   sync.Mutex
+	conn      net.Conn
+	startOnce sync.Once
+	packets   chan []byte
+	readDone  chan struct{}
+	readErr   error
+	stopOnce  sync.Once
+	stopped   chan struct{}
+	readDL    deadlineSignal
 }
 
-func newTCPUDPUplink(conn net.Conn) udpUplink { return &tcpUDPUplink{conn: conn} }
+func newTCPUDPUplink(conn net.Conn) udpUplink {
+	return &tcpUDPUplink{
+		conn:     conn,
+		packets:  make(chan []byte),
+		readDone: make(chan struct{}),
+		stopped:  make(chan struct{}),
+	}
+}
+
+func (u *tcpUDPUplink) readLoop() {
+	defer close(u.readDone)
+	for {
+		payload, err := wire.ReadUDPPacket(u.conn)
+		if err == nil && payload == nil {
+			err = io.EOF
+		}
+		if err != nil {
+			u.readErr = err
+			return
+		}
+		select {
+		case u.packets <- payload:
+		case <-u.stopped:
+			u.readErr = net.ErrClosed
+			return
+		}
+	}
+}
 
 func (u *tcpUDPUplink) ReadPacket() ([]byte, error) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
-	payload, err := wire.ReadUDPPacket(u.conn)
-	if err != nil {
-		return nil, err
+	u.startOnce.Do(func() { go u.readLoop() })
+	select {
+	case payload := <-u.packets:
+		return payload, nil
+	default:
 	}
-	if payload == nil {
-		return nil, io.EOF
+	select {
+	case payload := <-u.packets:
+		return payload, nil
+	case <-u.readDone:
+		return nil, u.readErr
+	case <-u.readDL.wait():
+		return nil, deadlineError()
 	}
-	return payload, nil
 }
 
-func (u *tcpUDPUplink) Close() error { return u.conn.Close() }
+func (u *tcpUDPUplink) SetReadDeadline(value time.Time) error {
+	u.readDL.set(value)
+	return nil
+}
+
+func (u *tcpUDPUplink) stop() {
+	u.stopOnce.Do(func() {
+		close(u.stopped)
+		u.readDL.stop()
+	})
+}
+
+func (u *tcpUDPUplink) Close() error {
+	u.stop()
+	return u.conn.Close()
+}
 
 type tcpUDPDownlink struct {
 	conn net.Conn

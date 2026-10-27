@@ -40,6 +40,12 @@ SingBox 路由（除非通过 `next` 链式转发到另一个 Portal）。
 
 不允许明文入站，必须启用 TLS。
 
+!!! note "路由 sniff"
+
+    Nowhere 客户端要等 Portal 返回 READY 才发送 UDP 数据，而 READY 在路由出站建立之后
+    才会发出。因此入站 UDP flow 上的 `sniff` 拿不到任何载荷，只会等满嗅探超时
+    （默认 300ms）后按原目标继续。服务端无需按域名分流时，不要给 Nowhere 入站配置 `sniff`。
+
 这是 Nowhere 2.1（`nw2`）实现：仅协商 `nw2` ALPN，与旧版 1.8 端点不互通。
 认证使用绑定 TLS exporter 的 AuthFrame；FlowHeader 为 5 字节，携带 0..7 的
 HOPS 转发预算；QUIC UDP 头为打包格式。AuthFrame 之后，入站 TLS 会自动识别

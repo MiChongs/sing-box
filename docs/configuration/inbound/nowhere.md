@@ -41,6 +41,14 @@ Portal via `next`).
 
 Plaintext inbound is not allowed. TLS must be enabled.
 
+!!! note "Route sniff"
+
+    Nowhere clients wait for the Portal's READY result before sending UDP data, and
+    READY is only sent after the routed outbound is established. A `sniff` action on
+    inbound UDP flows therefore never sees a payload; it waits for the sniff timeout
+    (300ms by default) and then continues with the original destination. Do not
+    configure `sniff` for Nowhere inbounds unless domain-based routing is needed.
+
 This is a Nowhere 2.1 (`nw2`) implementation. It negotiates the `nw2` ALPN
 only and does not interoperate with legacy 1.8 peers. Authentication is an
 exporter-bound AuthFrame, the FlowHeader is 5 bytes and carries a HOPS

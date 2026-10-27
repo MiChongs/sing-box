@@ -726,6 +726,36 @@ func TestNowhereStressBaseline(t *testing.T) {
 	}
 }
 
+// TestNowhereInboundSniffUDP covers a `sniff` route action on the Nowhere
+// inbound: the packet sniffer reads with a deadline before the flow is ready,
+// which used to stall UDP-over-TCP flows forever.
+func TestNowhereInboundSniffUDP(t *testing.T) {
+	matrices := []struct {
+		name, up, down string
+		network        option.NetworkList
+	}{
+		{"tcp-tcp", "tcp", "tcp", option.NetworkList(N.NetworkTCP)},
+		{"udp-udp", "udp", "udp", option.NetworkList(N.NetworkUDP)},
+		{"tcp-udp", "tcp", "udp", option.NetworkList(N.NetworkTCP + "\n" + N.NetworkUDP)},
+		{"udp-tcp", "udp", "tcp", option.NetworkList(N.NetworkTCP + "\n" + N.NetworkUDP)},
+	}
+	for _, tc := range matrices {
+		t.Run(tc.name, func(t *testing.T) {
+			options := nowhereInstanceOptions(t, tc.up, tc.down, tc.network, "", "nowhere-h3-secret", "nowhere-h3-secret", option.QUICOptions{})
+			sniffRule := option.Rule{
+				Type: C.RuleTypeDefault,
+				DefaultOptions: option.DefaultRule{
+					RawDefaultRule: option.RawDefaultRule{Inbound: []string{"nowhere-in"}},
+					RuleAction:     option.RuleAction{Action: C.RuleActionTypeSniff},
+				},
+			}
+			options.Route.Rules = append([]option.Rule{sniffRule}, options.Route.Rules...)
+			startInstance(t, options)
+			testNowhereBasicTCPUDP(t, clientPort, testPort)
+		})
+	}
+}
+
 func testNowhereMatrix(t *testing.T, up, down string, inboundNetwork option.NetworkList, congestionControl string, suit func(*testing.T, uint16, uint16)) {
 	startNowhereInstance(t, up, down, inboundNetwork, congestionControl, "nowhere-h3-secret", "nowhere-h3-secret")
 	suit(t, clientPort, testPort)
@@ -751,8 +781,20 @@ func startNowhereInstanceWithQUICOptions(
 	outboundQUICOptions option.QUICOptions,
 ) *box.Box {
 	t.Helper()
+	return startInstance(t, nowhereInstanceOptions(t, up, down, inboundNetwork, congestionControl, inboundPassword, outboundPassword, outboundQUICOptions))
+}
+
+func nowhereInstanceOptions(
+	t *testing.T,
+	up, down string,
+	inboundNetwork option.NetworkList,
+	congestionControl string,
+	inboundPassword, outboundPassword string,
+	outboundQUICOptions option.QUICOptions,
+) option.Options {
+	t.Helper()
 	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
-	return startInstance(t, option.Options{
+	return option.Options{
 		Inbounds: []option.Inbound{
 			{
 				Type: C.TypeMixed,
@@ -837,7 +879,7 @@ func startNowhereInstanceWithQUICOptions(
 				},
 			},
 		},
-	})
+	}
 }
 
 func startNowhereServerBox(t *testing.T, certPem, keyPem string) *box.Box {
