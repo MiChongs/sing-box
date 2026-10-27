@@ -36,6 +36,9 @@ type memberFilter struct {
 	exclude     *regexp.Regexp
 	includeType []string
 	excludeType []string
+	// transports of TransportOutbound nodes, see adapter.TransportOutbound
+	includeTransport []string
+	excludeTransport []string
 	// every listed network must be supported by the node itself
 	networks []string
 }
@@ -49,6 +52,14 @@ func newMemberFilter(ctx context.Context, options option.GroupCommonOption) (*me
 	if err != nil {
 		return nil, err
 	}
+	includeTransport, err := normalizeMemberTransports("include_transport", options.IncludeTransport)
+	if err != nil {
+		return nil, err
+	}
+	excludeTransport, err := normalizeMemberTransports("exclude_transport", options.ExcludeTransport)
+	if err != nil {
+		return nil, err
+	}
 	var networks []string
 	// Build() of an empty list means "tcp and udp", but an unset field must not
 	// filter anything here.
@@ -56,11 +67,13 @@ func newMemberFilter(ctx context.Context, options option.GroupCommonOption) (*me
 		networks = options.Network.Build()
 	}
 	return &memberFilter{
-		include:     (*regexp.Regexp)(options.Include),
-		exclude:     (*regexp.Regexp)(options.Exclude),
-		includeType: includeType,
-		excludeType: excludeType,
-		networks:    networks,
+		include:          (*regexp.Regexp)(options.Include),
+		exclude:          (*regexp.Regexp)(options.Exclude),
+		includeType:      includeType,
+		excludeType:      excludeType,
+		includeTransport: includeTransport,
+		excludeTransport: excludeTransport,
+		networks:         networks,
 	}, nil
 }
 
@@ -77,6 +90,39 @@ func normalizeMemberTypes(ctx context.Context, field string, types []string) ([]
 		}
 		if known != nil && !slices.Contains(known, name) {
 			return nil, E.New(field, ": unknown outbound type: ", memberType)
+		}
+		if !slices.Contains(normalized, name) {
+			normalized = append(normalized, name)
+		}
+	}
+	return normalized, nil
+}
+
+// Other names accepted by include_transport / exclude_transport, mostly the
+// Clash network names.
+var memberTransportAliases = map[string]string{
+	"websocket": C.V2RayTransportTypeWebsocket,
+	"h2":        C.V2RayTransportTypeHTTP,
+	"gun":       C.V2RayTransportTypeGRPC,
+	"raw":       "tcp",
+	"none":      "tcp",
+	"splithttp": "xhttp",
+}
+
+func normalizeMemberTransports(field string, transports []string) ([]string, error) {
+	if len(transports) == 0 {
+		return nil, nil
+	}
+	known := append([]string{"tcp", C.V2RayTransportTypeHTTP, C.V2RayTransportTypeWebsocket, C.V2RayTransportTypeQUIC,
+		C.V2RayTransportTypeGRPC, C.V2RayTransportTypeHTTPUpgrade}, option.V2RayTransportPluginTypes()...)
+	normalized := make([]string, 0, len(transports))
+	for _, transport := range transports {
+		name := strings.ToLower(strings.TrimSpace(transport))
+		if alias, loaded := memberTransportAliases[name]; loaded {
+			name = alias
+		}
+		if !slices.Contains(known, name) {
+			return nil, E.New(field, ": unknown transport: ", transport)
 		}
 		if !slices.Contains(normalized, name) {
 			normalized = append(normalized, name)
@@ -120,6 +166,20 @@ func (f *memberFilter) Match(detour adapter.Outbound) bool {
 			return false
 		}
 		if len(f.includeType) > 0 && !slices.Contains(f.includeType, memberType) {
+			return false
+		}
+	}
+	if len(f.includeTransport) > 0 || len(f.excludeTransport) > 0 {
+		// Nodes without a pluggable transport (hysteria2, wireguard ...)
+		// have none: include_transport drops them, exclude_transport keeps them.
+		var transport string
+		if transportOutbound, isTransport := detour.(adapter.TransportOutbound); isTransport {
+			transport = transportOutbound.TransportType()
+		}
+		if slices.Contains(f.excludeTransport, transport) {
+			return false
+		}
+		if len(f.includeTransport) > 0 && !slices.Contains(f.includeTransport, transport) {
 			return false
 		}
 	}

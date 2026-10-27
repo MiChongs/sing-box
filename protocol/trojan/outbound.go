@@ -42,6 +42,7 @@ type Outbound struct {
 	tlsConfig       tls.Config
 	tlsDialer       tls.Dialer
 	transport       adapter.V2RayClientTransport
+	transportType   string
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.TrojanOutboundOptions) (adapter.Outbound, error) {
@@ -50,11 +51,12 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	outbound := &Outbound{
-		Adapter:    outbound.NewAdapterWithDialerOptions(C.TypeTrojan, tag, options.Network.Build(), options.DialerOptions),
-		logger:     logger,
-		dialer:     outboundDialer,
-		serverAddr: options.ServerOptions.Build(),
-		key:        trojan.Key(options.Password),
+		Adapter:       outbound.NewAdapterWithDialerOptions(C.TypeTrojan, tag, options.Network.Build(), options.DialerOptions),
+		transportType: option.V2RayTransportType(options.Transport),
+		logger:        logger,
+		dialer:        outboundDialer,
+		serverAddr:    options.ServerOptions.Build(),
+		key:           trojan.Key(options.Password),
 	}
 	if options.TLS != nil {
 		outbound.tlsConfig, err = tls.NewClientWithOptions(tls.ClientOptions{
@@ -200,4 +202,8 @@ func (h *trojanDialer) ListenPacket(ctx context.Context, destination M.Socksaddr
 		return nil, err
 	}
 	return conn.(net.PacketConn), nil
+}
+
+func (h *Outbound) TransportType() string {
+	return h.transportType
 }

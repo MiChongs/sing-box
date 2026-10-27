@@ -21,6 +21,17 @@ func RegisterV2RayTransportOptions(name string, factory V2RayTransportOptionFact
 	v2rayTransportOptionFactoryMap[name] = factory
 }
 
+// V2RayTransportPluginTypes lists the registered plugin transport types.
+func V2RayTransportPluginTypes() []string {
+	v2rayTransportOptionFactoryAccess.RLock()
+	defer v2rayTransportOptionFactoryAccess.RUnlock()
+	types := make([]string, 0, len(v2rayTransportOptionFactoryMap))
+	for name := range v2rayTransportOptionFactoryMap {
+		types = append(types, name)
+	}
+	return types
+}
+
 func lookupV2RayTransportOptionFactory(name string) (V2RayTransportOptionFactory, bool) {
 	v2rayTransportOptionFactoryAccess.RLock()
 	defer v2rayTransportOptionFactoryAccess.RUnlock()

@@ -135,3 +135,43 @@ func TestMemberFilterValidatesInsideRegistry(t *testing.T) {
 		t.Fatal("group constructor deadlocked on the outbound registry")
 	}
 }
+
+type transportTestOutbound struct {
+	filterTestOutbound
+	transport string
+}
+
+func (o *transportTestOutbound) TransportType() string { return o.transport }
+
+func TestMemberFilterTransport(t *testing.T) {
+	t.Parallel()
+	option.RegisterV2RayTransportOptions("xhttp", func() any { return &struct{}{} })
+	udp := []string{N.NetworkTCP, N.NetworkUDP}
+	nodes := []adapter.Outbound{
+		&transportTestOutbound{filterTestOutbound{tag: "vless-xhttp", typ: "vless", networks: udp}, "xhttp"},
+		&transportTestOutbound{filterTestOutbound{tag: "vless-ws", typ: "vless", networks: udp}, "ws"},
+		&transportTestOutbound{filterTestOutbound{tag: "vless-raw", typ: "vless", networks: udp}, "tcp"},
+		&transportTestOutbound{filterTestOutbound{tag: "trojan-grpc", typ: "trojan", networks: udp}, "grpc"},
+		&filterTestOutbound{tag: "hy2", typ: "hysteria2", networks: udp},
+	}
+	match := func(content string) []string {
+		filter, err := newMemberFilter(context.Background(), parseGroupOptions(t, content))
+		require.NoError(t, err)
+		var tags []string
+		for _, node := range nodes {
+			if filter.Match(node) {
+				tags = append(tags, node.Tag())
+			}
+		}
+		return tags
+	}
+	require.Equal(t, []string{"vless-xhttp"}, match(`{"include_type":"vless","include_transport":"xhttp"}`))
+	require.Equal(t, []string{"vless-ws", "trojan-grpc"}, match(`{"include_transport":["WebSocket","gun"]}`))
+	require.Equal(t, []string{"vless-raw"}, match(`{"include_transport":"raw"}`))
+	require.Equal(t, []string{"vless-xhttp", "vless-raw", "trojan-grpc", "hy2"}, match(`{"exclude_transport":"ws"}`),
+		"nodes without a transport stay when only excluding")
+	require.Equal(t, []string{"vless-xhttp"}, match(`{"include_transport":["xhttp","ws"],"exclude_transport":"ws"}`))
+
+	_, err := newMemberFilter(context.Background(), parseGroupOptions(t, `{"include_transport":"kcp"}`))
+	require.ErrorContains(t, err, "include_transport: unknown transport: kcp")
+}

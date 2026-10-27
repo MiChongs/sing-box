@@ -45,6 +45,7 @@ type Outbound struct {
 	tlsConfig       tls.Config
 	tlsDialer       tls.Dialer
 	transport       adapter.V2RayClientTransport
+	transportType   string
 	packetAddr      bool
 	xudp            bool
 }
@@ -55,10 +56,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	outbound := &Outbound{
-		Adapter:    outbound.NewAdapterWithDialerOptions(C.TypeVLESS, tag, options.Network.Build(), options.DialerOptions),
-		logger:     logger,
-		dialer:     outboundDialer,
-		serverAddr: options.ServerOptions.Build(),
+		Adapter:       outbound.NewAdapterWithDialerOptions(C.TypeVLESS, tag, options.Network.Build(), options.DialerOptions),
+		transportType: option.V2RayTransportType(options.Transport),
+		logger:        logger,
+		dialer:        outboundDialer,
+		serverAddr:    options.ServerOptions.Build(),
 	}
 	if options.TLS != nil {
 		outbound.tlsConfig, err = tls.NewClientWithOptions(tls.ClientOptions{
@@ -280,4 +282,8 @@ func (h *vlessDialer) dialServer(ctx context.Context) (net.Conn, error) {
 		return nil, E.Cause(err, "VLESS encryption handshake")
 	}
 	return encryptedConn, nil
+}
+
+func (h *Outbound) TransportType() string {
+	return h.transportType
 }

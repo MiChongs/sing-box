@@ -42,6 +42,7 @@ type Outbound struct {
 	plugin          sip003.Plugin
 	uotClient       *uot.Client
 	multiplexDialer *mux.Client
+	transportType   string
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.ShadowsocksOutboundOptions) (adapter.Outbound, error) {
@@ -62,6 +63,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		method:     method,
 		serverAddr: options.ServerOptions.Build(),
 	}
+	outbound.transportType = shadowsocksTransportType(options.Plugin, options.PluginOptions)
 	if options.Plugin != "" {
 		outbound.plugin, err = sip003.CreatePlugin(ctx, options.Plugin, options.PluginOptions, router, outbound.dialer, outbound.serverAddr)
 		if err != nil {
@@ -227,4 +229,26 @@ func (h *shadowsocksDialer) ListenPacket(ctx context.Context, destination M.Sock
 		return nil, err
 	}
 	return h.method.DialPacketConn(outConn), nil
+}
+
+func (h *Outbound) TransportType() string {
+	return h.transportType
+}
+
+// shadowsocksTransportType reports v2ray-plugin as the V2Ray transport it
+// runs; obfs-local only disguises the raw TCP stream.
+func shadowsocksTransportType(plugin string, pluginOptions string) string {
+	if plugin != "v2ray-plugin" {
+		return "tcp"
+	}
+	mode := "websocket"
+	if args, err := sip003.ParsePluginOptions(pluginOptions); err == nil {
+		if value, loaded := args.Get("mode"); loaded {
+			mode = value
+		}
+	}
+	if mode == "websocket" {
+		return C.V2RayTransportTypeWebsocket
+	}
+	return mode
 }

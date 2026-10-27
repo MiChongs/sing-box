@@ -43,6 +43,7 @@ type Outbound struct {
 	tlsConfig       tls.Config
 	tlsDialer       tls.Dialer
 	transport       adapter.V2RayClientTransport
+	transportType   string
 	packetAddr      bool
 	xudp            bool
 }
@@ -53,10 +54,11 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		return nil, err
 	}
 	outbound := &Outbound{
-		Adapter:    outbound.NewAdapterWithDialerOptions(C.TypeVMess, tag, options.Network.Build(), options.DialerOptions),
-		logger:     logger,
-		dialer:     outboundDialer,
-		serverAddr: options.ServerOptions.Build(),
+		Adapter:       outbound.NewAdapterWithDialerOptions(C.TypeVMess, tag, options.Network.Build(), options.DialerOptions),
+		transportType: option.V2RayTransportType(options.Transport),
+		logger:        logger,
+		dialer:        outboundDialer,
+		serverAddr:    options.ServerOptions.Build(),
 	}
 	if options.TLS != nil {
 		outbound.tlsConfig, err = tls.NewClient(ctx, logger, options.Server, common.PtrValueOrDefault(options.TLS))
@@ -246,4 +248,8 @@ func (h *vmessDialer) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	} else {
 		return h.client.DialEarlyPacketConn(conn, destination), nil
 	}
+}
+
+func (h *Outbound) TransportType() string {
+	return h.transportType
 }

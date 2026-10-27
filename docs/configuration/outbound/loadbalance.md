@@ -23,6 +23,8 @@ results. This keeps their on-demand dependencies available for selection.
   "include": "",
   "include_type": [],
   "exclude_type": [],
+  "include_transport": [],
+  "exclude_transport": [],
   "network": "",
   "url": "",
   "interval": "",
@@ -77,6 +79,16 @@ Case-insensitive. Every outbound and endpoint type of the build is accepted, tog
 
 List of outbound types to drop from `providers` nodes. Takes precedence over `include_type`.
 
+#### include_transport
+
+List of transports to keep among `providers` nodes: `tcp` (no transport), `ws`, `httpupgrade`, `http`, `grpc`, `quic`, `xhttp` and other registered plugin transports. The Clash names `websocket`, `h2`, `gun`, `raw` and `splithttp` are accepted.
+
+Only `vmess`, `vless`, `trojan` and `shadowsocks` (whose `v2ray-plugin` counts as `ws` or `quic`) have a transport. Other nodes match neither list: `include_transport` drops them and `exclude_transport` keeps them.
+
+#### exclude_transport
+
+List of transports to drop from `providers` nodes. Takes precedence over `include_transport`.
+
 #### network
 
 `tcp`, `udp`, or a list of both.
@@ -96,7 +108,7 @@ How each protocol reports UDP:
 
 !!! note ""
 
-    `include`, `exclude`, `include_type`, `exclude_type` and `network` all apply to `providers` nodes only, and a node must pass every one of them. Members listed in `outbounds` are always kept.
+    `include`, `exclude`, `include_type`, `exclude_type`, `include_transport`, `exclude_transport` and `network` behave the same in selector, urltest, loadbalance and smart groups, are applied again on every provider update, and all apply to `providers` nodes only, and a node must pass every one of them. Members listed in `outbounds` are always kept.
 
 #### url
 

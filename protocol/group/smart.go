@@ -1990,11 +1990,14 @@ func (s *Smart) Now() string {
 	if v, ok := s.lastSelectedTag.Load().(string); ok && v != "" {
 		return v
 	}
-	// Second-best: use the ranking cache's top entry.
+	// Second-best: use the ranking cache's top entry. The cache may predate
+	// the current members (subscription update, changed filters), so only a
+	// node that is still a member counts.
 	if s.store != nil {
 		if ranking, err := s.store.GetNodeWeightRankingCache(s.Tag(), smartConfigName); err == nil {
+			snap := s.state.Load()
 			for _, r := range ranking {
-				if r.Weight > 0 {
+				if r.Weight > 0 && snap != nil && slices.Contains(snap.tags, r.Name) {
 					return r.Name
 				}
 			}
@@ -2950,9 +2953,11 @@ func (s *Smart) fillProxies(target string, names []string, weights []float64, al
 	}
 
 	if len(selected) == 0 {
-		// Last resort: any alive outbound not blocked for this target
+		// Last resort: any alive outbound not blocked for this target. The
+		// network still has to match: a TCP-only member cannot carry UDP,
+		// so returning nothing beats a dial that is bound to fail.
 		for _, ob := range all {
-			if s.isAlive(ob.Tag()) && !s.isTargetDebargoed(target, ob.Tag()) {
+			if s.isAlive(ob.Tag()) && !s.isTargetDebargoed(target, ob.Tag()) && (!isUDP || s.supportsUDP(ob)) {
 				selected = append(selected, ob)
 				if len(selected) >= minCount {
 					break
@@ -2961,6 +2966,9 @@ func (s *Smart) fillProxies(target string, names []string, weights []float64, al
 		}
 		if len(selected) == 0 {
 			for _, ob := range all {
+				if isUDP && !s.supportsUDP(ob) {
+					continue
+				}
 				selected = append(selected, ob)
 				if len(selected) >= minCount {
 					break

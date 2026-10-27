@@ -26,6 +26,15 @@ type _V2RayTransportOptions struct {
 
 type V2RayTransportOptions _V2RayTransportOptions
 
+// V2RayTransportType returns the transport type of an outbound, "tcp" when it
+// has no transport.
+func V2RayTransportType(options *V2RayTransportOptions) string {
+	if options == nil || options.Type == "" {
+		return "tcp"
+	}
+	return options.Type
+}
+
 func (o V2RayTransportOptions) MarshalJSON() ([]byte, error) {
 	var v any
 	switch o.Type {

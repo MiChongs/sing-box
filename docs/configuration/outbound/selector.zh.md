@@ -18,6 +18,8 @@
   "include": "",
   "include_type": [],
   "exclude_type": [],
+  "include_transport": [],
+  "exclude_transport": [],
   "network": "",
   "default": "proxy-c",
   "use_all_providers": false,
@@ -57,6 +59,16 @@
 
 从 `providers` 节点中排除的出站类型列表，优先于 `include_type`。
 
+#### include_transport
+
+`providers` 节点中保留的传输方式列表：`tcp`（无传输层）、`ws`、`httpupgrade`、`http`、`grpc`、`quic`、`xhttp` 以及其他已注册的插件传输。接受 Clash 名称 `websocket`、`h2`、`gun`、`raw`、`splithttp`。
+
+只有 `vmess`、`vless`、`trojan` 和 `shadowsocks`（其 `v2ray-plugin` 视为 `ws` 或 `quic`）有传输方式。其他节点不属于任何传输：`include_transport` 会排除它们，`exclude_transport` 会保留它们。
+
+#### exclude_transport
+
+从 `providers` 节点中排除的传输方式列表，优先于 `include_transport`。
+
 #### network
 
 `tcp`、`udp` 或二者组成的列表。
@@ -76,7 +88,7 @@
 
 !!! note ""
 
-    `include`、`exclude`、`include_type`、`exclude_type`、`network` 都只作用于 `providers` 节点，节点需全部满足才会加入；`outbounds` 中列出的成员始终保留。
+    `include`、`exclude`、`include_type`、`exclude_type`、`include_transport`、`exclude_transport`、`network` 在 selector、urltest、loadbalance、smart 分组中行为一致，每次订阅更新后重新应用，且都只作用于 `providers` 节点，节点需全部满足才会加入；`outbounds` 中列出的成员始终保留。
 
 #### default
 
