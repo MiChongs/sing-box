@@ -67,13 +67,34 @@ List of subscription providers.
     }
     ```
 
+=== "Inline"
+
+    ```json
+    {
+      "providers": [
+        {
+          "type": "inline",
+          "tag": "provider",
+          "health_check": {
+            "enabled": false,
+            "url": "",
+            "interval": "",
+            "timeout": "",
+          },
+          "outbounds": [],
+          "endpoints": []
+        }
+      ]
+    }
+    ```
+
 ### Fields
 
 #### type
 
 ==Required==
 
-Type of the provider. `local` or `remote`.
+Type of the provider. `local`, `remote` or `inline`.
 
 #### tag
 
@@ -83,7 +104,7 @@ Tag of the provider.
 
 The node `node_name` from `provider` will be tagged as `provider/node_name`.
 
-### Local or Remote Fields
+### Common Fields
 
 #### health_check
 
@@ -105,15 +126,17 @@ Health check interval. The minimum value is `1m`, the default value is `10m`.
 
 Health check timeout. the default value is `3s`.
 
-##### override_anytls
+### Local or Remote Fields
+
+#### override_anytls
 
 Override AnyTLS fields of outbounds in provider, see [AnyTLS Fields Override](/configuration/provider/override_anytls/) for details.
 
-##### override_dialer
+#### override_dialer
 
 Override dialer fields of outbounds in provider, see [Dialer Fields Override](/configuration/provider/override_dialer/) for details.
 
-##### override_tls
+#### override_tls
 
 Override TLS fields of outbounds in provider, see [TLS Fields Override](/configuration/provider/override_tls/) for details.
 
@@ -128,6 +151,18 @@ Override TLS fields of outbounds in provider, see [TLS Fields Override](/configu
     Will be automatically reloaded if file modified since sing-box 1.10.0.
 
 Local file path.
+
+### Inline Fields
+
+#### outbounds
+
+List of [Outbound](/configuration/outbound/) written directly in the configuration.
+
+A `detour` that points to another node of the same provider is rewritten to `provider/node_name`; any other `detour` is kept as is, so inline nodes can be chained through a group defined in `outbounds`.
+
+#### endpoints
+
+List of [Endpoint](/configuration/endpoint/) written directly in the configuration.
 
 ### Remote Fields
 
@@ -156,6 +191,8 @@ Conflicts with `path`.
 #### exclude
 
 Exclude regular expression to filter nodes.
+
+The filter is also applied when the provider is restored from `path` or `cache.db`. If `include`, `exclude` or any `override_*` field changed since the cache was written, the cached nodes are served with the current filter and the provider is refreshed in the background once, ignoring the cached ETag.
 
 #### include
 

@@ -63,6 +63,8 @@ type ProviderRemote struct {
 	downloadDetour    string
 	url               string
 	urlHash           [32]byte
+	optionsHash       [32]byte
+	optionsChanged    bool
 	path              string
 	initialPath       string
 	userAgent         string
@@ -133,6 +135,8 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 	endpointMgr := service.FromContext[adapter.EndpointManager](ctx)
 	logger := logFactory.NewLogger(F.ToString("provider/remote", "[", tag, "]"))
 	url := options.URL
+	exclude := (*regexp.Regexp)(options.Exclude)
+	include := (*regexp.Regexp)(options.Include)
 	return &ProviderRemote{
 		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeRemote, options.HealthCheck),
 		ctx:      ctx,
@@ -144,12 +148,13 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		httpClientOptions: options.HTTPClient,
 		url:               url,
 		urlHash:           sha256.Sum256([]byte(url)),
+		optionsHash:       processOptionsHash(include, exclude, options.OverrideDialer, options.OverrideTLS, options.OverrideAnyTLS),
 		path:              path,
 		initialPath:       initialPath,
 		userAgent:         userAgent,
 		updateInterval:    updateInterval,
-		exclude:           (*regexp.Regexp)(options.Exclude),
-		include:           (*regexp.Regexp)(options.Include),
+		exclude:           exclude,
+		include:           include,
 
 		overrideDialer: options.OverrideDialer,
 		overrideTLS:    options.OverrideTLS,
@@ -189,6 +194,11 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 		if err != nil {
 			s.logger.Warn(E.Cause(err, "initial outbound provider fetch failed, starting empty: ", s.Tag()))
 		}
+	} else if s.optionsChanged {
+		// The cache was filtered and overridden with different options. Keep
+		// serving it (re-filtered) and refresh in the background so overrides
+		// that were changed or removed are rebuilt from the subscription.
+		go s.updateOnce()
 	}
 	s.ticker = time.NewTicker(s.updateInterval)
 	go s.loopUpdate()
@@ -295,7 +305,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 					}
 				}
 				saveSub.LastUpdated = s.lastUpdated
-				saveSub.URLHash = s.urlHash[:]
+				saveSub.URLHash = s.cacheKey()
 				if err := s.cacheFile.SaveSubscription(s.Tag(), saveSub); err != nil {
 					s.logger.Error("save outbound provider cache file: ", err)
 				}
@@ -358,7 +368,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 			saveSub := &adapter.SavedBinary{
 				LastUpdated: s.lastUpdated,
 				LastEtag:    s.lastEtag,
-				URLHash:     s.urlHash[:],
+				URLHash:     s.cacheKey(),
 			}
 			if s.path != "" {
 				saveSub.Hash = s.hash
@@ -382,9 +392,16 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	var staleRecord bool
 	if s.cacheFile != nil {
 		if saveSub = s.cacheFile.LoadSubscription(s.Tag()); saveSub != nil {
-			if len(saveSub.URLHash) > 0 && !bytes.Equal(saveSub.URLHash, s.urlHash[:]) {
-				s.logger.Info("cached outbound provider was downloaded from another URL, will refetch")
-				return false, nil
+			if len(saveSub.URLHash) > 0 {
+				if !bytes.HasPrefix(saveSub.URLHash, s.urlHash[:]) {
+					s.logger.Info("cached outbound provider was downloaded from another URL, will refetch")
+					return false, nil
+				}
+				if !bytes.Equal(saveSub.URLHash, s.cacheKey()) {
+					// include / exclude / override_* changed since the cache was
+					// written, or it was written by a build without the options hash.
+					s.optionsChanged = true
+				}
 			}
 			s.hash = saveSub.Hash
 		}
@@ -439,12 +456,18 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	}
 	s.UpdateGroups()
 	s.lastUpdated, s.lastEtag = lastUpdated, lastEtag
+	if s.optionsChanged {
+		s.logger.Info("outbound provider options changed since it was cached, will refresh")
+		// A 304 would keep the content processed with the old options.
+		s.lastEtag = ""
+		staleRecord = false
+	}
 	if staleRecord {
 		s.logger.Info("outbound provider file ", s.path, " changed since it was cached, loaded it from disk")
 		err := s.cacheFile.SaveSubscription(s.Tag(), &adapter.SavedBinary{
 			Hash:        s.hash,
 			LastUpdated: lastUpdated,
-			URLHash:     s.urlHash[:],
+			URLHash:     s.cacheKey(),
 		})
 		if err != nil {
 			s.logger.Error("save outbound provider cache file: ", err)
@@ -473,6 +496,9 @@ func (s *ProviderRemote) loadFromContent(contentRaw []byte) error {
 	if err != nil {
 		return err
 	}
+	// The cache holds already processed options, but include / exclude may
+	// have been changed in the configuration since then.
+	outboundOpts, endpointOpts = s.filter(outboundOpts, endpointOpts)
 	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
 	s.lastOutOpts = outboundOpts
 	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
@@ -563,17 +589,55 @@ func (s *ProviderRemote) updateProviderFromContent(content string) error {
 	if err != nil {
 		return err
 	}
-	outboundOpts = common.Filter(outboundOpts, func(it option.Outbound) bool {
-		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
-	})
-	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool {
-		return (s.exclude == nil || !s.exclude.MatchString(it.Tag)) && (s.include == nil || s.include.MatchString(it.Tag))
-	})
+	outboundOpts, endpointOpts = s.filter(outboundOpts, endpointOpts)
 	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
 	s.lastOutOpts = outboundOpts
 	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
 	s.lastEPOpts = endpointOpts
+	s.optionsChanged = false
 	return nil
+}
+
+func (s *ProviderRemote) filter(outboundOpts []option.Outbound, endpointOpts []option.Endpoint) ([]option.Outbound, []option.Endpoint) {
+	match := func(tag string) bool {
+		return (s.exclude == nil || !s.exclude.MatchString(tag)) && (s.include == nil || s.include.MatchString(tag))
+	}
+	outboundOpts = common.Filter(outboundOpts, func(it option.Outbound) bool {
+		return match(it.Tag)
+	})
+	endpointOpts = common.Filter(endpointOpts, func(it option.Endpoint) bool {
+		return match(it.Tag)
+	})
+	return outboundOpts, endpointOpts
+}
+
+// cacheKey is stored as SavedBinary.URLHash: sha256(url) followed by the hash
+// of the options that shape the cached content. Builds that only know the URL
+// hash see a mismatch and refetch once.
+func (s *ProviderRemote) cacheKey() []byte {
+	key := make([]byte, 0, len(s.urlHash)+len(s.optionsHash))
+	key = append(key, s.urlHash[:]...)
+	return append(key, s.optionsHash[:]...)
+}
+
+func processOptionsHash(include, exclude *regexp.Regexp, overrideDialer *option.OverrideDialerOptions, overrideTLS *option.OverrideTLSOptions, overrideAnyTLS *option.OverrideAnyTLSOptions) [32]byte {
+	regexString := func(it *regexp.Regexp) string {
+		if it == nil {
+			return ""
+		}
+		return it.String()
+	}
+	content, err := json.Marshal(struct {
+		Include        string                        `json:"include"`
+		Exclude        string                        `json:"exclude"`
+		OverrideDialer *option.OverrideDialerOptions `json:"override_dialer"`
+		OverrideTLS    *option.OverrideTLSOptions    `json:"override_tls"`
+		OverrideAnyTLS *option.OverrideAnyTLSOptions `json:"override_anytls"`
+	}{regexString(include), regexString(exclude), overrideDialer, overrideTLS, overrideAnyTLS})
+	if err != nil {
+		content = []byte(fmt.Sprintf("%s\x00%s\x00%+v\x00%+v\x00%+v", regexString(include), regexString(exclude), overrideDialer, overrideTLS, overrideAnyTLS))
+	}
+	return sha256.Sum256(content)
 }
 
 func getFirstLine(content string) (string, string) {

@@ -64,3 +64,27 @@ func TestOverrideAnyTLSOptions(t *testing.T) {
 		})
 	}
 }
+
+func TestOverrideDialerKeepsDomainResolver(t *testing.T) {
+	resolver := &option.DomainResolveOptions{Server: "remote-dns"}
+	detour := "front"
+	outbounds := overrideOutbounds([]option.Outbound{{
+		Type: C.TypeSOCKS,
+		Tag:  "node",
+		Options: &option.SOCKSOutboundOptions{
+			DialerOptions: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{DomainResolver: resolver}},
+		},
+	}}, &option.OverrideDialerOptions{Detour: &detour}, nil, nil, []string{"node"}, "provider")
+	options := outbounds[0].Options.(*option.SOCKSOutboundOptions)
+	require.Equal(t, "front", options.Detour)
+	require.Equal(t, resolver, options.DomainResolver, "override without domain_resolver must keep the node's own")
+
+	override := &option.DomainResolveOptions{Server: "override-dns"}
+	outbounds = overrideOutbounds([]option.Outbound{{
+		Type: C.TypeSOCKS,
+		Options: &option.SOCKSOutboundOptions{
+			DialerOptions: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{DomainResolver: resolver}},
+		},
+	}}, &option.OverrideDialerOptions{DomainResolver: override}, nil, nil, nil, "")
+	require.Equal(t, override, outbounds[0].Options.(*option.SOCKSOutboundOptions).DomainResolver)
+}

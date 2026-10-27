@@ -67,13 +67,34 @@
     }
     ```
 
+=== "内联"
+
+    ```json
+    {
+      "providers": [
+        {
+          "type": "inline",
+          "tag": "provider",
+          "health_check": {
+            "enabled": false,
+            "url": "",
+            "interval": "",
+            "timeout": "",
+          },
+          "outbounds": [],
+          "endpoints": []
+        }
+      ]
+    }
+    ```
+
 ### 字段
 
 #### type
 
 ==必填==
 
-订阅源的类型。`local` 或 `remote`。
+订阅源的类型。`local`、`remote` 或 `inline`。
 
 #### tag
 
@@ -83,7 +104,7 @@
 
 来自 `provider` 的节点 `node_name`，导入后的标签为 `provider/node_name`。
 
-### 本地或远程字段
+### 通用字段
 
 #### health_check
 
@@ -105,15 +126,17 @@
 
 健康检查的超时时间。默认为 `3s`。
 
-##### override_anytls
+### 本地或远程字段
+
+#### override_anytls
 
 覆写订阅内容的 AnyTLS 字段，参阅 [AnyTLS 字段覆写](/zh/configuration/provider/override_anytls/)。
 
-##### override_dialer
+#### override_dialer
 
 覆写订阅内容的拨号字段, 参阅 [拨号字段覆写](/zh/configuration/provider/override_dialer/)。
 
-##### override_tls
+#### override_tls
 
 覆写订阅内容的 TLS 字段, 参阅 [TLS 字段覆写](/zh/configuration/provider/override_tls/)。
 
@@ -128,6 +151,18 @@
     自 sing-box 1.10.0 起， 文件更改将自动重新加载。
 
 本地文件路径。
+
+### 内联字段
+
+#### outbounds
+
+直接写在配置中的 [出站](/zh/configuration/outbound/) 列表。
+
+指向同一订阅源内其他节点的 `detour` 会被改写为 `provider/node_name`；其他 `detour` 保持不变，因此内联节点可以经由 `outbounds` 中定义的分组做链式代理。
+
+#### endpoints
+
+直接写在配置中的 [端点](/zh/configuration/endpoint/) 列表。
 
 ### 远程字段
 
@@ -156,6 +191,8 @@
 #### exclude
 
 排除节点的正则表达式。
+
+从 `path` 或 `cache.db` 恢复订阅时同样会应用该过滤。若缓存写入后 `include`、`exclude` 或任一 `override_*` 字段发生变化，会先按当前过滤规则提供缓存节点，并在后台忽略缓存的 ETag 重新拉取一次。
 
 #### include
 

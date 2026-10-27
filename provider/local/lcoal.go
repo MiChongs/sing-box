@@ -107,7 +107,11 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 }
 
 func (s *ProviderLocal) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
-	if s.path != "" {
+	if s.path == "" {
+		// Inline outbounds are created in the constructor, before any group
+		// has registered its callback, so groups must be told about them here.
+		s.UpdateGroups()
+	} else {
 		err := s.reloadFile(s.path)
 		if err != nil {
 			return err

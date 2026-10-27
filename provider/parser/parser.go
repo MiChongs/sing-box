@@ -207,7 +207,9 @@ func overrideDialerOption(options option.DialerOptions, overrideDialerOptions *o
 	if overrideDialerOptions.UDPFragment != nil {
 		options.UDPFragment = overrideDialerOptions.UDPFragment
 	}
-	options.DomainResolver = overrideDialerOptions.DomainResolver
+	if overrideDialerOptions.DomainResolver != nil {
+		options.DomainResolver = overrideDialerOptions.DomainResolver
+	}
 	if overrideDialerOptions.NetworkStrategy != nil {
 		options.NetworkStrategy = overrideDialerOptions.NetworkStrategy
 	}
