@@ -2,7 +2,6 @@ package group
 
 import (
 	"maps"
-	"regexp"
 	"sync"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -48,8 +47,7 @@ func collectProviderOutbounds(
 	providers map[string]adapter.Provider,
 	providerTags []string,
 	outboundsCache map[string][]adapter.Outbound,
-	exclude *regexp.Regexp,
-	include *regexp.Regexp,
+	filter *memberFilter,
 ) ([]string, []adapter.Outbound, map[string][]adapter.Outbound, error) {
 	if _, loaded := providers[updatedTag]; !loaded {
 		return nil, nil, nil, E.New("outbound provider not found: ", updatedTag)
@@ -84,13 +82,10 @@ func collectProviderOutbounds(
 		}
 		cachedOutbounds := make([]adapter.Outbound, 0)
 		for _, detour := range provider.Outbounds() {
+			if !filter.Match(detour) {
+				continue
+			}
 			tag := detour.Tag()
-			if exclude != nil && exclude.MatchString(tag) {
-				continue
-			}
-			if include != nil && !include.MatchString(tag) {
-				continue
-			}
 			tags = append(tags, tag)
 			outbounds = append(outbounds, detour)
 			cachedOutbounds = append(cachedOutbounds, detour)

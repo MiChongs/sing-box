@@ -411,8 +411,7 @@ type Smart struct {
 	outboundsCacheMu sync.Mutex
 	outboundsCache   map[string][]adapter.Outbound
 	providerTags     []string
-	exclude          *regexp.Regexp
-	include          *regexp.Regexp
+	filter           *memberFilter
 	useAllProviders  bool
 
 	history adapter.URLTestHistoryStorage
@@ -622,6 +621,10 @@ func newSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		networks = append(networks, N.NetworkUDP)
 	}
 
+	filter, err := newMemberFilter(ctx, options.GroupCommonOption)
+	if err != nil {
+		return nil, err
+	}
 	s := &Smart{
 		Adapter:     outbound.NewAdapter(outboundType, tag, networks, options.Outbounds),
 		ctx:         ctx,
@@ -642,8 +645,7 @@ func newSmart(ctx context.Context, router adapter.Router, logger log.ContextLogg
 		providers:       make(map[string]adapter.Provider),
 		outboundsCache:  make(map[string][]adapter.Outbound),
 		providerTags:    options.Providers,
-		exclude:         (*regexp.Regexp)(options.Exclude),
-		include:         (*regexp.Regexp)(options.Include),
+		filter:          filter,
 		useAllProviders: options.UseAllProviders,
 
 		useLightGBM:        options.UseLightGBM,
@@ -6503,13 +6505,10 @@ func (s *Smart) onProviderUpdated(tag string) error {
 		provider := s.providers[providerTag]
 		var cache []adapter.Outbound
 		for _, detour := range provider.Outbounds() {
+			if !s.filter.Match(detour) {
+				continue
+			}
 			t := detour.Tag()
-			if s.exclude != nil && s.exclude.MatchString(t) {
-				continue
-			}
-			if s.include != nil && !s.include.MatchString(t) {
-				continue
-			}
 			tags = append(tags, t)
 			cache = append(cache, detour)
 		}

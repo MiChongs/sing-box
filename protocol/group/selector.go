@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"net"
-	"regexp"
 	"slices"
 	"sync"
 
@@ -52,8 +51,7 @@ type Selector struct {
 	outboundsCache map[string][]adapter.Outbound
 
 	providerTags    []string
-	exclude         *regexp.Regexp
-	include         *regexp.Regexp
+	filter          *memberFilter
 	useAllProviders bool
 
 	hidden bool
@@ -61,6 +59,10 @@ type Selector struct {
 }
 
 func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SelectorOutboundOptions) (adapter.Outbound, error) {
+	filter, err := newMemberFilter(ctx, options.GroupCommonOption)
+	if err != nil {
+		return nil, err
+	}
 	outbound := &Selector{
 		Adapter:                      outbound.NewAdapter(C.TypeSelector, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:                          ctx,
@@ -78,8 +80,7 @@ func NewSelector(ctx context.Context, router adapter.Router, logger log.ContextL
 		outboundsCache: make(map[string][]adapter.Outbound),
 
 		providerTags:    options.Providers,
-		exclude:         (*regexp.Regexp)(options.Exclude),
-		include:         (*regexp.Regexp)(options.Include),
+		filter:          filter,
 		useAllProviders: options.UseAllProviders,
 		hidden:          options.Hidden,
 		icon:            options.Icon,
@@ -266,8 +267,7 @@ func (s *Selector) onProviderUpdated(tag string) error {
 		s.providers,
 		s.providerTags,
 		s.outboundsCache,
-		s.exclude,
-		s.include,
+		s.filter,
 	)
 	if err != nil {
 		s.providerAccess.Unlock()

@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"net"
-	"regexp"
 	"slices"
 	"sort"
 	"sync"
@@ -126,8 +125,7 @@ type URLTest struct {
 	outboundsCache map[string][]adapter.Outbound
 
 	providerTags    []string
-	exclude         *regexp.Regexp
-	include         *regexp.Regexp
+	filter          *memberFilter
 	useAllProviders bool
 	hidden          bool
 	icon            string
@@ -139,6 +137,10 @@ type URLTestFallback struct {
 }
 
 func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.URLTestOutboundOptions) (adapter.Outbound, error) {
+	filter, err := newMemberFilter(ctx, options.GroupCommonOption)
+	if err != nil {
+		return nil, err
+	}
 	outbound := &URLTest{
 		Adapter:                      outbound.NewAdapter(C.TypeURLTest, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
 		ctx:                          ctx,
@@ -156,8 +158,7 @@ func NewURLTest(ctx context.Context, router adapter.Router, logger log.ContextLo
 		outboundsCache: make(map[string][]adapter.Outbound),
 
 		providerTags:    options.Providers,
-		exclude:         (*regexp.Regexp)(options.Exclude),
-		include:         (*regexp.Regexp)(options.Include),
+		filter:          filter,
 		useAllProviders: options.UseAllProviders,
 		hidden:          options.Hidden,
 		icon:            options.Icon,
@@ -566,8 +567,7 @@ func (s *URLTest) onProviderUpdated(tag string) error {
 		s.providers,
 		s.providerTags,
 		s.outboundsCache,
-		s.exclude,
-		s.include,
+		s.filter,
 	)
 	if err != nil {
 		s.providerAccess.Unlock()

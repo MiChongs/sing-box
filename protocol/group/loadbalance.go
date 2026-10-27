@@ -7,7 +7,6 @@ import (
 	"maps"
 	"net"
 	"net/netip"
-	"regexp"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -70,8 +69,7 @@ type LoadBalance struct {
 	outboundsCache map[string][]adapter.Outbound
 
 	providerTags    []string
-	exclude         *regexp.Regexp
-	include         *regexp.Regexp
+	filter          *memberFilter
 	useAllProviders bool
 
 	hidden bool
@@ -87,6 +85,10 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 	case StrategyRoundRobin, StrategyConsistentHashing, StrategyStickySessions:
 	default:
 		return nil, E.New("load-balance strategy not found: ", strategy)
+	}
+	filter, err := newMemberFilter(ctx, options.GroupCommonOption)
+	if err != nil {
+		return nil, err
 	}
 	outbound := &LoadBalance{
 		Adapter:     outbound.NewAdapter(C.TypeLoadBalance, tag, []string{N.NetworkTCP, N.NetworkUDP}, options.Outbounds),
@@ -105,8 +107,7 @@ func NewLoadBalance(ctx context.Context, router adapter.Router, logger log.Conte
 		outboundsCache: make(map[string][]adapter.Outbound),
 
 		providerTags:    options.Providers,
-		exclude:         (*regexp.Regexp)(options.Exclude),
-		include:         (*regexp.Regexp)(options.Include),
+		filter:          filter,
 		useAllProviders: options.UseAllProviders,
 		hidden:          options.Hidden,
 		icon:            options.Icon,
@@ -309,8 +310,7 @@ func (s *LoadBalance) onProviderUpdated(tag string) error {
 		s.providers,
 		s.providerTags,
 		s.outboundsCache,
-		s.exclude,
-		s.include,
+		s.filter,
 	)
 	if err != nil {
 		s.providerAccess.Unlock()

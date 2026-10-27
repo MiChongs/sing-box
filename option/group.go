@@ -20,13 +20,16 @@ type URLTestOutboundOptions struct {
 }
 
 type GroupCommonOption struct {
-	Outbounds       []string          `json:"outbounds" reference:"outbound"`
-	Providers       []string          `json:"providers" reference:"provider"`
-	Exclude         *badoption.Regexp `json:"exclude,omitempty"`
-	Include         *badoption.Regexp `json:"include,omitempty"`
-	UseAllProviders bool              `json:"use_all_providers,omitempty"`
-	Hidden          bool              `json:"hidden,omitempty"`
-	Icon            string            `json:"icon,omitempty"`
+	Outbounds       []string                   `json:"outbounds" reference:"outbound"`
+	Providers       []string                   `json:"providers" reference:"provider"`
+	Exclude         *badoption.Regexp          `json:"exclude,omitempty"`
+	Include         *badoption.Regexp          `json:"include,omitempty"`
+	IncludeType     badoption.Listable[string] `json:"include_type,omitempty"`
+	ExcludeType     badoption.Listable[string] `json:"exclude_type,omitempty"`
+	Network         NetworkList                `json:"network,omitempty"`
+	UseAllProviders bool                       `json:"use_all_providers,omitempty"`
+	Hidden          bool                       `json:"hidden,omitempty"`
+	Icon            string                     `json:"icon,omitempty"`
 }
 
 type URLTestFallbackOptions struct {

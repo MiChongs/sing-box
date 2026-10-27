@@ -21,6 +21,9 @@ results. This keeps their on-demand dependencies available for selection.
   ],
   "exclude": "",
   "include": "",
+  "include_type": [],
+  "exclude_type": [],
+  "network": "",
   "url": "",
   "interval": "",
   "idle_timeout": "",
@@ -63,6 +66,28 @@ Exclude regular expression to filter `providers` nodes.
 #### include
 
 Include regular expression to filter `providers` nodes.
+
+#### include_type
+
+List of outbound types to keep among `providers` nodes, such as `vless` or `hysteria2`.
+
+Case-insensitive. The aliases `ss`, `socks5`, `hy`, `hy2` and `wg` are accepted. Unknown types are rejected at startup.
+
+#### exclude_type
+
+List of outbound types to drop from `providers` nodes. Takes precedence over `include_type`.
+
+#### network
+
+`tcp`, `udp`, or a list of both.
+
+Keep only `providers` nodes that support every listed network. The capability comes from the node itself, for example `"network": "tcp"` on a Shadowsocks node or `udp: false` in a Clash subscription, not from its name.
+
+`http` outbounds always declare UDP because they can relay it with CONNECT-UDP (MASQUE), which most plain HTTP proxy servers do not support. Add `"exclude_type": ["http"]` when that matters.
+
+!!! note ""
+
+    `include`, `exclude`, `include_type`, `exclude_type` and `network` all apply to `providers` nodes only, and a node must pass every one of them. Members listed in `outbounds` are always kept.
 
 #### url
 
