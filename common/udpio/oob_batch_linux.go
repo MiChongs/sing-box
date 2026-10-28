@@ -131,12 +131,13 @@ func (w *oobPacketBatchReadWaiter) WaitReadOOBPackets() (buffers []*buf.Buffer, 
 	if w.readFunc == nil {
 		return nil, nil, nil, os.ErrInvalid
 	}
-	defer w.releaseBuffers()
 	err = w.rawConn.Read(w.readFunc)
 	if err != nil {
+		w.releaseBuffers()
 		return
 	}
 	if w.readErr != nil {
+		w.releaseBuffers()
 		if w.readErr == io.EOF {
 			return nil, nil, nil, io.EOF
 		}
@@ -145,9 +146,14 @@ func (w *oobPacketBatchReadWaiter) WaitReadOOBPackets() (buffers []*buf.Buffer, 
 	clear(w.returned)
 	buffers = w.returned[:w.readN]
 	sources = w.sources[:w.readN]
+	// Slots the kernel did not fill keep their untouched buffers for the next
+	// wait. A wake-up usually carries a single datagram, so releasing them
+	// here would allocate and pool-cycle a whole batch per packet.
 	for index := 0; index < w.readN; index++ {
 		buffers[index] = w.buffers[index]
 		w.buffers[index] = nil
+		w.iovecs[index] = unix.Iovec{}
+		w.messages[index] = mmsghdr{}
 	}
 	oobs = w.oobs[:w.readN]
 	w.readN = 0

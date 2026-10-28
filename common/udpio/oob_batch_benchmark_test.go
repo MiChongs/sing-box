@@ -52,3 +52,41 @@ func BenchmarkOOBBatchReceive(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkOOBBatchReceiveSparse models the listener's production shape: a
+// 64-slot batch reader that usually wakes for a single datagram.
+func BenchmarkOOBBatchReceiveSparse(b *testing.B) {
+	receiver, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer receiver.Close()
+	sender, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sender.Close()
+	reader, ok := NewOOBPacketBatchReadWaiter(receiver, 256)
+	if !ok {
+		b.Fatal("no batch reader")
+	}
+	reader.InitializeReadWaiter(N.ReadWaitOptions{BatchSize: 64})
+	if err = receiver.SetReadDeadline(time.Now().Add(time.Minute)); err != nil {
+		b.Fatal(err)
+	}
+	target := receiver.LocalAddr().(*net.UDPAddr).AddrPort()
+	payload := make([]byte, 512)
+	b.ReportAllocs()
+	b.SetBytes(int64(len(payload)))
+	b.ResetTimer()
+	for b.Loop() {
+		if _, err := sender.WriteToUDPAddrPort(payload, target); err != nil {
+			b.Fatal(err)
+		}
+		buffers, _, _, err := reader.WaitReadOOBPackets()
+		if err != nil {
+			b.Fatal(err)
+		}
+		buf.ReleaseMulti(buffers)
+	}
+}
