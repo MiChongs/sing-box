@@ -21,13 +21,21 @@ const (
 	socketDiagResponseMinSize   = 72
 	socketDiagByFamily          = 20
 	socketDiagTimeout           = 100 * time.Millisecond
+	socketDiagBufferSize        = 64 << 10
 )
+
+// Every connection lookup reads at least one netlink response, so receive
+// buffers are pooled instead of allocating 64 KiB per query.
+var socketDiagBufferPool = sync.Pool{
+	New: func() any { return new([socketDiagBufferSize]byte) },
+}
 
 type socketDiagConn struct {
 	access   sync.Mutex
 	family   uint8
 	protocol uint8
 	fd       int
+	request  [sizeOfSocketDiagRequest]byte
 }
 
 type socketDiagEntry struct {
@@ -77,7 +85,8 @@ func (c *socketDiagConn) Close() error {
 func (c *socketDiagConn) query(source netip.AddrPort, destination netip.AddrPort) (inode, uid uint32, err error) {
 	c.access.Lock()
 	defer c.access.Unlock()
-	request := packSocketDiagRequest(c.family, c.protocol, source, destination, false)
+	request := c.request[:]
+	packSocketDiagRequestTo(request, c.family, c.protocol, source, destination, false)
 	for range 2 {
 		err = c.ensureOpenLocked()
 		if err != nil {
@@ -138,9 +147,8 @@ func (c *socketDiagConn) closeLocked() error {
 	return err
 }
 
-func packSocketDiagRequest(family, protocol byte, source netip.AddrPort, destination netip.AddrPort, dump bool) []byte {
-	request := make([]byte, sizeOfSocketDiagRequest)
-
+func packSocketDiagRequestTo(request []byte, family, protocol byte, source netip.AddrPort, destination netip.AddrPort, dump bool) {
+	clear(request)
 	binary.NativeEndian.PutUint32(request[0:4], sizeOfSocketDiagRequest)
 	binary.NativeEndian.PutUint16(request[4:6], socketDiagByFamily)
 	flags := uint16(syscall.NLM_F_REQUEST)
@@ -179,7 +187,6 @@ func packSocketDiagRequest(family, protocol byte, source netip.AddrPort, destina
 	}
 	binary.NativeEndian.PutUint32(request[60:64], 0)
 	binary.NativeEndian.PutUint64(request[64:72], 0xFFFFFFFFFFFFFFFF)
-	return request
 }
 
 func querySocketDiag(fd int, request []byte) (inode, uid uint32, err error) {
@@ -187,30 +194,57 @@ func querySocketDiag(fd int, request []byte) (inode, uid uint32, err error) {
 	if err != nil {
 		return 0, 0, E.Cause(err, "write netlink request")
 	}
-	buffer := make([]byte, 64<<10)
-	n, err := syscall.Read(fd, buffer)
+	pooled := socketDiagBufferPool.Get().(*[socketDiagBufferSize]byte)
+	defer socketDiagBufferPool.Put(pooled)
+	n, err := syscall.Read(fd, pooled[:])
 	if err != nil {
 		return 0, 0, E.Cause(err, "read netlink response")
 	}
-	messages, err := syscall.ParseNetlinkMessage(buffer[:n])
-	if err != nil {
-		return 0, 0, E.Cause(err, "parse netlink message")
-	}
-	for _, message := range messages {
-		switch message.Header.Type {
+	var found bool
+	err = walkNetlinkMessages(pooled[:n], func(messageType uint16, data []byte) bool {
+		switch messageType {
 		case syscall.NLMSG_ERROR:
-			err = unpackSocketDiagError(&message)
-			if err != nil {
-				return 0, 0, err
-			}
+			err = unpackSocketDiagError(data)
+			return err == nil
 		case socketDiagByFamily:
-			entry, valid := unpackSocketDiagEntry(&message)
+			entry, valid := unpackSocketDiagEntry(data)
 			if valid && (entry.inode != 0 || entry.uid != 0) {
-				return entry.inode, entry.uid, nil
+				inode, uid, found = entry.inode, entry.uid, true
+				return false
 			}
 		}
+		return true
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	if found {
+		return inode, uid, nil
 	}
 	return 0, 0, ErrNotFound
+}
+
+var errNetlinkMessageInvalid = E.New("parse netlink message: invalid message")
+
+// walkNetlinkMessages visits each message in a netlink datagram without the
+// per-message allocations of syscall.ParseNetlinkMessage. A false return from
+// visit stops the walk. A visit-reported error is stored by the caller.
+func walkNetlinkMessages(buffer []byte, visit func(messageType uint16, data []byte) bool) error {
+	for len(buffer) >= syscall.NLMSG_HDRLEN {
+		length := int(binary.NativeEndian.Uint32(buffer[0:4]))
+		if length < syscall.NLMSG_HDRLEN || length > len(buffer) {
+			return errNetlinkMessageInvalid
+		}
+		if !visit(binary.NativeEndian.Uint16(buffer[4:6]), buffer[syscall.NLMSG_HDRLEN:length]) {
+			return nil
+		}
+		aligned := (length + syscall.NLMSG_ALIGNTO - 1) &^ (syscall.NLMSG_ALIGNTO - 1)
+		if aligned >= len(buffer) {
+			return nil
+		}
+		buffer = buffer[aligned:]
+	}
+	return nil
 }
 
 // The dump only filters by port (inet_diag_dump_icsk, udp_dump), so every socket
@@ -236,56 +270,53 @@ func dumpSocketDiagFamily(family, protocol uint8, source netip.AddrPort, destina
 		return 0, 0, E.Cause(err, "dial netlink")
 	}
 	defer syscall.Close(fd)
-	_, err = syscall.Write(fd, packSocketDiagRequest(family, protocol, source, netip.AddrPort{}, true))
+	var request [sizeOfSocketDiagRequest]byte
+	packSocketDiagRequestTo(request[:], family, protocol, source, netip.AddrPort{}, true)
+	_, err = syscall.Write(fd, request[:])
 	if err != nil {
 		return 0, 0, E.Cause(err, "write netlink request")
 	}
+	pooled := socketDiagBufferPool.Get().(*[socketDiagBufferSize]byte)
+	defer socketDiagBufferPool.Put(pooled)
 	var (
 		localMatch       socketDiagEntry
 		hasLocalMatch    bool
 		wildcardMatch    socketDiagEntry
 		hasWildcardMatch bool
-		buffer           = make([]byte, 64<<10)
+		exactMatch       socketDiagEntry
+		hasExactMatch    bool
+		done             bool
 		n                int
-		messages         []syscall.NetlinkMessage
 	)
 	for {
-		n, err = syscall.Read(fd, buffer)
+		n, err = syscall.Read(fd, pooled[:])
 		if err != nil {
 			return 0, 0, E.Cause(err, "read netlink response")
 		}
-		messages, err = syscall.ParseNetlinkMessage(buffer[:n])
-		if err != nil {
-			return 0, 0, E.Cause(err, "parse netlink message")
-		}
-		if len(messages) == 0 {
+		if n < syscall.NLMSG_HDRLEN {
 			return 0, 0, E.New("empty netlink response")
 		}
-		for _, message := range messages {
-			switch message.Header.Type {
+		err = walkNetlinkMessages(pooled[:n], func(messageType uint16, data []byte) bool {
+			switch messageType {
 			case syscall.NLMSG_DONE:
-				if hasLocalMatch {
-					return localMatch.inode, localMatch.uid, nil
-				}
-				if hasWildcardMatch {
-					return wildcardMatch.inode, wildcardMatch.uid, nil
-				}
-				return 0, 0, ErrNotFound
+				done = true
+				return false
 			case syscall.NLMSG_ERROR:
-				err = unpackSocketDiagError(&message)
-				if err != nil {
-					return 0, 0, err
-				}
+				err = unpackSocketDiagError(data)
+				return err == nil
 			case socketDiagByFamily:
-				entry, valid := unpackSocketDiagEntry(&message)
+				entry, valid := unpackSocketDiagEntry(data)
 				if !valid || (entry.inode == 0 && entry.uid == 0) || entry.source.Port() != source.Port() {
-					continue
+					return true
 				}
 				if entry.source.Addr() == source.Addr() && (!destination.IsValid() || entry.destination == destination) {
-					return entry.inode, entry.uid, nil
+					hasExactMatch = true
+					exactMatch = entry
+					done = true
+					return false
 				}
 				if protocol != syscall.IPPROTO_UDP {
-					continue
+					return true
 				}
 				if !hasLocalMatch && entry.source.Addr() == source.Addr() {
 					hasLocalMatch = true
@@ -296,15 +327,31 @@ func dumpSocketDiagFamily(family, protocol uint8, source netip.AddrPort, destina
 					wildcardMatch = entry
 				}
 			}
+			return true
+		})
+		if err != nil {
+			return 0, 0, err
+		}
+		if !done {
+			continue
+		}
+		switch {
+		case hasExactMatch:
+			return exactMatch.inode, exactMatch.uid, nil
+		case hasLocalMatch:
+			return localMatch.inode, localMatch.uid, nil
+		case hasWildcardMatch:
+			return wildcardMatch.inode, wildcardMatch.uid, nil
+		default:
+			return 0, 0, ErrNotFound
 		}
 	}
 }
 
-func unpackSocketDiagEntry(msg *syscall.NetlinkMessage) (socketDiagEntry, bool) {
-	if len(msg.Data) < socketDiagResponseMinSize {
+func unpackSocketDiagEntry(data []byte) (socketDiagEntry, bool) {
+	if len(data) < socketDiagResponseMinSize {
 		return socketDiagEntry{}, false
 	}
-	data := msg.Data
 	var sourceAddr, destinationAddr netip.Addr
 	switch data[0] {
 	case syscall.AF_INET:
@@ -324,11 +371,11 @@ func unpackSocketDiagEntry(msg *syscall.NetlinkMessage) (socketDiagEntry, bool) 
 	}, true
 }
 
-func unpackSocketDiagError(msg *syscall.NetlinkMessage) error {
-	if len(msg.Data) < 4 {
+func unpackSocketDiagError(data []byte) error {
+	if len(data) < 4 {
 		return E.New("netlink message: NLMSG_ERROR")
 	}
-	errno := int32(binary.NativeEndian.Uint32(msg.Data[:4]))
+	errno := int32(binary.NativeEndian.Uint32(data[:4]))
 	if errno == 0 {
 		return nil
 	}

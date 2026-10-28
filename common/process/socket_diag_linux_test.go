@@ -4,6 +4,7 @@ package process
 
 import (
 	"context"
+	"encoding/binary"
 	"net"
 	"net/netip"
 	"os"
@@ -105,4 +106,37 @@ func TestLinuxSearcherFindProcessInfo(t *testing.T) {
 	info, err = searcher.FindProcessInfo(context.Background(), N.NetworkUDP, netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), M.AddrPortFromNet(udpConn.LocalAddr()).Port()), netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 53))
 	require.NoError(t, err)
 	require.Equal(t, []string{executable}, info.ProcessPaths)
+}
+
+func TestWalkNetlinkMessages(t *testing.T) {
+	t.Parallel()
+	message := func(messageType uint16, payload ...byte) []byte {
+		length := syscall.NLMSG_HDRLEN + len(payload)
+		data := make([]byte, (length+syscall.NLMSG_ALIGNTO-1)&^(syscall.NLMSG_ALIGNTO-1))
+		binary.NativeEndian.PutUint32(data[0:4], uint32(length))
+		binary.NativeEndian.PutUint16(data[4:6], messageType)
+		copy(data[syscall.NLMSG_HDRLEN:], payload)
+		return data
+	}
+	buffer := append(message(socketDiagByFamily, 1, 2, 3), message(syscall.NLMSG_DONE)...)
+	var types []uint16
+	var payloads [][]byte
+	require.NoError(t, walkNetlinkMessages(buffer, func(messageType uint16, data []byte) bool {
+		types = append(types, messageType)
+		payloads = append(payloads, data)
+		return true
+	}))
+	require.Equal(t, []uint16{socketDiagByFamily, syscall.NLMSG_DONE}, types)
+	require.Equal(t, [][]byte{{1, 2, 3}, {}}, payloads)
+
+	var visited int
+	require.NoError(t, walkNetlinkMessages(buffer, func(uint16, []byte) bool {
+		visited++
+		return false
+	}))
+	require.Equal(t, 1, visited)
+
+	malformed := message(socketDiagByFamily, 1)
+	binary.NativeEndian.PutUint32(malformed[0:4], uint32(len(malformed)+4))
+	require.ErrorIs(t, walkNetlinkMessages(malformed, func(uint16, []byte) bool { return true }), errNetlinkMessageInvalid)
 }
