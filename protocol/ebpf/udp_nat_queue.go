@@ -85,9 +85,13 @@ func (q *udpNATPacketQueue) pop() (*N.PacketBuffer, bool) {
 	q.count--
 	q.bytes -= packet.Buffer.Cap()
 	if q.count == 0 {
-		// Drop the backing array once a burst is drained so an idle session
-		// does not keep the slots it needed at its peak.
-		q.packets = nil
+		// Drop a grown backing array once a burst is drained so an idle
+		// session does not keep the slots it needed at its peak. The initial
+		// array stays: a reader that keeps up drains the queue on every
+		// packet, and reallocating it each time dominated UDP allocations.
+		if len(q.packets) > udpNATQueueInitialSize {
+			q.packets = nil
+		}
 		q.head = 0
 		q.bytes = 0
 	}

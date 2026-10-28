@@ -318,6 +318,32 @@ func TestUDPNATQueueHoldsSmallPacketsUpToPacketLimit(t *testing.T) {
 	}
 }
 
+func TestUDPNATQueueSteadyFlowKeepsInitialSlots(t *testing.T) {
+	queue := newUDPNATPacketQueue()
+	buffer := buf.NewSize(1)
+	defer buffer.Release()
+	packet := &N.PacketBuffer{Buffer: buffer}
+	cycle := func() {
+		if !queue.push(packet) {
+			t.Fatal("packet was rejected")
+		}
+		if _, loaded := queue.pop(); !loaded {
+			t.Fatal("packet is missing")
+		}
+		select {
+		case <-queue.notify:
+		default:
+		}
+	}
+	cycle()
+	if allocs := testing.AllocsPerRun(100, cycle); allocs != 0 {
+		t.Fatalf("push/pop of a drained queue allocated %.1f times", allocs)
+	}
+	if len(queue.packets) != udpNATQueueInitialSize || queue.bytes != 0 {
+		t.Fatalf("drained queue has %d slots and %d bytes", len(queue.packets), queue.bytes)
+	}
+}
+
 func TestUDPNATQueueWakesWaitingReader(t *testing.T) {
 	connections := make(chan udpNATTestConnection, 1)
 	service := newUDPNATService(
