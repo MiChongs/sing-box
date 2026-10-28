@@ -55,7 +55,7 @@ func TestLookupOwnerSkipsProcForNewSockets(t *testing.T) {
 	defer raw.Close()
 	s := raw.(*linuxSearcher)
 	var scans atomic.Int32
-	s.processPathCache.build = func(ctx context.Context, uid uint32) (map[uint32][]string, error) {
+	s.processPathCache.build = func(ctx context.Context, uid uint32) (processPathIndex, error) {
 		scans.Add(1)
 		return buildProcessPaths(ctx, uid)
 	}

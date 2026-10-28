@@ -8,9 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
-	"slices"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"unsafe"
 
@@ -29,19 +27,49 @@ var (
 
 	errInvalidDirent = errors.New("invalid directory entry")
 
-	// processPathsSizeHint presizes the next all-users snapshot so a scan
-	// does not regrow its map from empty every time.
-	processPathsSizeHint atomic.Int64
-
 	procScannerPool = sync.Pool{New: func() any {
 		return &procScanner{
 			procDirents: make([]byte, procDirentBufferSize),
 			fdDirents:   make([]byte, procDirentBufferSize),
 			exe:         make([]byte, syscall.PathMax),
 			link:        make([]byte, syscall.PathMax),
+			pathLists:   make(map[string][]string),
 		}
 	}}
 )
+
+const (
+	processPathsSizeHintCapacity = 64
+	procScannerPathListCapacity  = 1024
+)
+
+type processPathsSizeHint struct {
+	entries int
+	lists   int
+}
+
+// processPathsSizeHints presizes the next snapshot of a scope so a scan does
+// not regrow its slices from empty every time. The counts are taken before
+// shared sockets are merged, which is what the builder appends.
+var processPathsSizeHints struct {
+	access sync.Mutex
+	sizes  map[uint32]processPathsSizeHint
+}
+
+func loadProcessPathsSizeHint(scope uint32) processPathsSizeHint {
+	processPathsSizeHints.access.Lock()
+	defer processPathsSizeHints.access.Unlock()
+	return processPathsSizeHints.sizes[scope]
+}
+
+func storeProcessPathsSizeHint(scope uint32, hint processPathsSizeHint) {
+	processPathsSizeHints.access.Lock()
+	defer processPathsSizeHints.access.Unlock()
+	if processPathsSizeHints.sizes == nil || len(processPathsSizeHints.sizes) >= processPathsSizeHintCapacity {
+		processPathsSizeHints.sizes = make(map[uint32]processPathsSizeHint)
+	}
+	processPathsSizeHints.sizes[scope] = hint
+}
 
 // procScanner walks procfs with descriptor-relative syscalls and reused
 // buffers. A snapshot visits every descriptor of every process, so the
@@ -52,25 +80,33 @@ type procScanner struct {
 	fdDirents   []byte
 	exe         []byte
 	link        []byte
+	// pathLists interns the single-path list of each executable across
+	// scans. Snapshot lists are read-only and have no spare capacity.
+	pathLists map[string][]string
+	builder   processPathIndexBuilder
 }
 
-func buildProcessPaths(ctx context.Context, uid uint32) (map[uint32][]string, error) {
+func buildProcessPaths(ctx context.Context, uid uint32) (processPathIndex, error) {
 	scanner := procScannerPool.Get().(*procScanner)
 	defer procScannerPool.Put(scanner)
 	return scanner.build(ctx, uid)
 }
 
-func (s *procScanner) build(ctx context.Context, uid uint32) (map[uint32][]string, error) {
+func (s *procScanner) build(ctx context.Context, uid uint32) (processPathIndex, error) {
 	procFD, err := openDirectory(unix.AT_FDCWD, pathProc)
 	if err != nil {
-		return nil, &os.PathError{Op: "open", Path: pathProc, Err: err}
+		return processPathIndex{}, &os.PathError{Op: "open", Path: pathProc, Err: err}
 	}
 	defer unix.Close(procFD)
-	var processPaths map[uint32][]string
-	if uid == processPathsAllUsers {
-		processPaths = make(map[uint32][]string, processPathsSizeHint.Load())
-	} else {
-		processPaths = make(map[uint32][]string)
+	if len(s.pathLists) > procScannerPathListCapacity {
+		clear(s.pathLists)
+	}
+	// The builder's slices become the published snapshot, so each scan
+	// starts from fresh backing arrays sized by the previous result.
+	hint := loadProcessPathsSizeHint(uid)
+	s.builder = processPathIndexBuilder{
+		entries: make([]processPathEntry, 0, hint.entries+hint.entries/8),
+		lists:   make([][]string, 0, hint.lists+hint.lists/8),
 	}
 	err = walkDirents(procFD, s.procDirents, func(name []byte, nameZ *byte, direntType uint8) error {
 		if direntType != unix.DT_DIR && direntType != unix.DT_UNKNOWN || !isPid(name) {
@@ -79,18 +115,29 @@ func (s *procScanner) build(ctx context.Context, uid uint32) (map[uint32][]strin
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		return s.scanProcess(procFD, nameZ, uid, processPaths)
+		return s.scanProcess(procFD, nameZ, uid)
 	})
 	if err != nil {
-		return nil, err
+		s.builder = processPathIndexBuilder{}
+		return processPathIndex{}, err
 	}
-	if uid == processPathsAllUsers {
-		processPathsSizeHint.Store(int64(len(processPaths)))
-	}
-	return processPaths, nil
+	storeProcessPathsSizeHint(uid, processPathsSizeHint{entries: len(s.builder.entries), lists: len(s.builder.lists)})
+	index := s.builder.build()
+	s.builder = processPathIndexBuilder{}
+	return index, nil
 }
 
-func (s *procScanner) scanProcess(procFD int, pid *byte, uid uint32, processPaths map[uint32][]string) error {
+func (s *procScanner) pathList(exe []byte) []string {
+	if paths, loaded := s.pathLists[string(exe)]; loaded {
+		return paths
+	}
+	path := string(exe)
+	paths := []string{path}
+	s.pathLists[path] = paths
+	return paths
+}
+
+func (s *procScanner) scanProcess(procFD int, pid *byte, uid uint32) error {
 	processFD, err := openatDirectory(procFD, pid)
 	if err != nil {
 		if isIgnorableProcError(err) {
@@ -123,9 +170,9 @@ func (s *procScanner) scanProcess(procFD int, pid *byte, uid uint32, processPath
 		return nil
 	}
 	defer unix.Close(fdFD)
-	// The executable path is materialized once per process and only when it
+	// The executable path list is resolved once per process and only when it
 	// owns a socket; most processes in the walk hold none.
-	var exePaths []string
+	list := -1
 	_ = walkDirents(fdFD, s.fdDirents, func(name []byte, nameZ *byte, _ uint8) error {
 		if len(name) == 0 || name[0] == '.' {
 			return nil
@@ -138,16 +185,10 @@ func (s *procScanner) scanProcess(procFD int, pid *byte, uid uint32, processPath
 		if !ok {
 			return nil
 		}
-		if exePaths == nil {
-			exePaths = []string{string(s.exe[:exeLength])}
+		if list < 0 {
+			list = int(s.builder.addList(s.pathList(s.exe[:exeLength])))
 		}
-		paths, loaded := processPaths[inode]
-		if !loaded {
-			// Shared with full capacity: an append for a second owner copies.
-			processPaths[inode] = exePaths[:1:1]
-		} else if !slices.Contains(paths, exePaths[0]) {
-			processPaths[inode] = append(paths, exePaths[0])
-		}
+		s.builder.add(inode, uint32(list))
 		return nil
 	})
 	return nil

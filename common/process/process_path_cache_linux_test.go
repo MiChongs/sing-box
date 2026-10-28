@@ -15,12 +15,12 @@ import (
 
 func TestProcessPathGlobalHitSkipsUIDScan(t *testing.T) {
 	var scopes []uint32
-	c := newProcessPathCache(func(_ context.Context, uid uint32) (map[uint32][]string, error) {
+	c := newProcessPathCache(func(_ context.Context, uid uint32) (processPathIndex, error) {
 		scopes = append(scopes, uid)
 		if uid == processPathsAllUsers {
-			return map[uint32][]string{1: {"netd"}, 2: {"netd", "helper"}}, nil
+			return pathIndex(map[uint32][]string{1: {"netd"}, 2: {"netd", "helper"}}), nil
 		}
-		return nil, nil
+		return processPathIndex{}, nil
 	})
 	defer c.close()
 	_, err := c.find(context.Background(), 1, 10001, true)
@@ -33,12 +33,12 @@ func TestProcessPathGlobalHitSkipsUIDScan(t *testing.T) {
 
 func TestProcessPathNewInodeAndLoggingBudget(t *testing.T) {
 	var calls atomic.Int32
-	c := newProcessPathCache(func(_ context.Context, uid uint32) (map[uint32][]string, error) {
+	c := newProcessPathCache(func(_ context.Context, uid uint32) (processPathIndex, error) {
 		calls.Add(1)
 		if uid == processPathsAllUsers {
-			return map[uint32][]string{uint32(calls.Load()): {"netd"}}, nil
+			return pathIndex(map[uint32][]string{uint32(calls.Load()): {"netd"}}), nil
 		}
-		return nil, nil
+		return processPathIndex{}, nil
 	})
 	defer c.close()
 	_, err := c.find(context.Background(), 2, 10001, false)
@@ -56,7 +56,7 @@ func TestProcessPathNewInodeAndLoggingBudget(t *testing.T) {
 func TestProcessPathNegativeCache(t *testing.T) {
 	var calls atomic.Int32
 	var clock atomic.Int64
-	c := newProcessPathCache(func(context.Context, uint32) (map[uint32][]string, error) { calls.Add(1); return nil, nil })
+	c := newProcessPathCache(func(context.Context, uint32) (processPathIndex, error) { calls.Add(1); return processPathIndex{}, nil })
 	c.now = func() time.Time { return time.Unix(0, clock.Load()) }
 	defer c.close()
 	for range 2 {
@@ -78,12 +78,12 @@ func TestProcessPathConcurrentScanAndCancellation(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var calls atomic.Int32
-	c := newProcessPathCache(func(context.Context, uint32) (map[uint32][]string, error) {
+	c := newProcessPathCache(func(context.Context, uint32) (processPathIndex, error) {
 		if calls.Add(1) == 1 {
 			close(started)
 		}
 		<-release
-		return map[uint32][]string{1: {"one"}, 2: {"two"}}, nil
+		return pathIndex(map[uint32][]string{1: {"one"}, 2: {"two"}}), nil
 	})
 	defer c.close()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -108,13 +108,13 @@ func TestProcessPathConcurrentScanAndCancellation(t *testing.T) {
 func TestProcessPathResetDiscardsOldScan(t *testing.T) {
 	started, release := make(chan struct{}), make(chan struct{})
 	var calls atomic.Int32
-	c := newProcessPathCache(func(_ context.Context, _ uint32) (map[uint32][]string, error) {
+	c := newProcessPathCache(func(_ context.Context, _ uint32) (processPathIndex, error) {
 		if calls.Add(1) == 1 {
 			close(started)
 			<-release
-			return map[uint32][]string{1: {"old"}}, nil
+			return pathIndex(map[uint32][]string{1: {"old"}}), nil
 		}
-		return map[uint32][]string{1: {"new"}}, nil
+		return pathIndex(map[uint32][]string{1: {"new"}}), nil
 	})
 	defer c.close()
 	result := make(chan error, 1)
@@ -139,11 +139,11 @@ func TestProcessPathResetDiscardsOldScan(t *testing.T) {
 func TestProcessPathScanErrorIsNotNegativeCached(t *testing.T) {
 	var calls atomic.Int32
 	failure := errors.New("procfs unavailable")
-	c := newProcessPathCache(func(context.Context, uint32) (map[uint32][]string, error) {
+	c := newProcessPathCache(func(context.Context, uint32) (processPathIndex, error) {
 		if calls.Add(1) == 1 {
-			return nil, failure
+			return processPathIndex{}, failure
 		}
-		return map[uint32][]string{1: {"ok"}}, nil
+		return pathIndex(map[uint32][]string{1: {"ok"}}), nil
 	})
 	defer c.close()
 	_, err := c.find(context.Background(), 1, 42, true)
@@ -154,7 +154,8 @@ func TestProcessPathScanErrorIsNotNegativeCached(t *testing.T) {
 }
 
 func TestProcessPathCacheCapacity(t *testing.T) {
-	c := newProcessPathCache(func(context.Context, uint32) (map[uint32][]string, error) { return nil, nil })
+	c := newProcessPathCache(func(context.Context, uint32) (processPathIndex, error) { return processPathIndex{}, nil })
+	c.scanInterval = 0
 	defer c.close()
 	for i := range uint32(processPathMissCapacity + 10) {
 		_, err := c.find(context.Background(), i, i, true)
@@ -164,4 +165,65 @@ func TestProcessPathCacheCapacity(t *testing.T) {
 	defer c.access.Unlock()
 	require.LessOrEqual(t, len(c.snapshots), processPathCapacity)
 	require.LessOrEqual(t, len(c.misses), processPathMissCapacity)
+	require.LessOrEqual(t, len(c.scanStarts), processPathCapacity)
+}
+
+func TestProcessPathScansAreSpacedAndShared(t *testing.T) {
+	var (
+		calls  atomic.Int32
+		starts = make(chan time.Time, 8)
+	)
+	c := newProcessPathCache(func(_ context.Context, uid uint32) (processPathIndex, error) {
+		calls.Add(1)
+		starts <- time.Now()
+		return pathIndex(map[uint32][]string{uint32(calls.Load()): {"netd"}}), nil
+	})
+	c.scanInterval = 100 * time.Millisecond
+	defer c.close()
+	// The first required miss scans at once.
+	_, err := c.find(context.Background(), 1, processPathsAllUsers, true)
+	require.NoError(t, err)
+	first := <-starts
+	// Misses right after it wait for the next slot and share one scan,
+	// which still starts after each of them arrived.
+	requested := time.Now()
+	var group sync.WaitGroup
+	for range 16 {
+		group.Go(func() {
+			paths, findErr := c.find(context.Background(), 2, processPathsAllUsers, true)
+			require.NoError(t, findErr)
+			require.Equal(t, []string{"netd"}, paths)
+		})
+	}
+	group.Wait()
+	second := <-starts
+	require.EqualValues(t, 2, calls.Load())
+	require.GreaterOrEqual(t, second.Sub(first), c.scanInterval-5*time.Millisecond)
+	require.True(t, second.After(requested))
+}
+
+func TestProcessPathDelayedScanCanceledByReset(t *testing.T) {
+	var calls atomic.Int32
+	c := newProcessPathCache(func(context.Context, uint32) (processPathIndex, error) {
+		calls.Add(1)
+		return processPathIndex{}, nil
+	})
+	c.scanInterval = time.Hour
+	defer c.close()
+	_, err := c.find(context.Background(), 1, 42, true)
+	require.ErrorIs(t, err, ErrNotFound)
+	require.EqualValues(t, 2, calls.Load())
+	result := make(chan error, 1)
+	go func() { _, findErr := c.find(context.Background(), 2, 42, true); result <- findErr }()
+	require.Eventually(t, func() bool {
+		c.access.Lock()
+		defer c.access.Unlock()
+		return c.scans[42] != nil
+	}, time.Second, time.Millisecond)
+	c.reset()
+	require.ErrorIs(t, <-result, context.Canceled)
+	// After a reset the scope is scanned again without waiting.
+	_, err = c.find(context.Background(), 2, 42, true)
+	require.ErrorIs(t, err, ErrNotFound)
+	require.EqualValues(t, 4, calls.Load())
 }

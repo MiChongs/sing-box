@@ -84,14 +84,14 @@ func TestBuildProcessPathsMatchesReference(t *testing.T) {
 		require.NoError(t, err)
 		for _, conn := range sockets {
 			inode := socketInode(t, conn)
-			require.Contains(t, paths[inode], executable)
-			require.Equal(t, reference[inode], paths[inode])
+			require.Contains(t, paths.lookup(inode), executable)
+			require.Equal(t, reference[inode], paths.lookup(inode))
 		}
 		// Other processes may open or close sockets between the two walks;
 		// the snapshots must still agree on nearly every inode.
 		var matched int
 		for inode, referencePaths := range reference {
-			if slices.Equal(paths[inode], referencePaths) {
+			if slices.Equal(paths.lookup(inode), referencePaths) {
 				matched++
 			}
 		}
