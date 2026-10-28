@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"testing"
 
@@ -294,7 +295,7 @@ uri = "tcp://198.51.100.10:11010"
 
 func TestWebClientOptions(t *testing.T) {
 	t.Parallel()
-	options, err := newWebClientOptions(option.EasyTierEndpointOptions{
+	options, err := newWebClientOptions(context.Background(), option.EasyTierEndpointOptions{
 		Hostname: "node",
 		Web:      &option.EasyTierWebOptions{Server: "udp://127.0.0.1:22020/user"},
 	}, "easytier")
@@ -302,11 +303,11 @@ func TestWebClientOptions(t *testing.T) {
 	parsed, err := uuid.FromString(options.MachineID)
 	require.NoError(t, err)
 	require.Equal(t, byte(5), parsed.Version())
-	require.Equal(t, defaultMachineID("easytier"), options.MachineID)
-	require.NotEqual(t, defaultMachineID("other"), options.MachineID)
+	require.Equal(t, defaultMachineID(context.Background(), "easytier"), options.MachineID)
+	require.NotEqual(t, defaultMachineID(context.Background(), "other"), options.MachineID)
 	require.Equal(t, "node", options.Hostname)
 
-	options, err = newWebClientOptions(option.EasyTierEndpointOptions{
+	options, err = newWebClientOptions(context.Background(), option.EasyTierEndpointOptions{
 		Web: &option.EasyTierWebOptions{Server: "tcp://config.example.com:22020/user", MachineID: "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", Hostname: "web"},
 	}, "easytier")
 	require.NoError(t, err)
@@ -314,10 +315,10 @@ func TestWebClientOptions(t *testing.T) {
 	require.Equal(t, "web", options.Hostname)
 
 	for _, server := range []string{"", "user", "ws://config.example.com/user", "udp://config.example.com:22020", "udp:///user"} {
-		_, err = newWebClientOptions(option.EasyTierEndpointOptions{Web: &option.EasyTierWebOptions{Server: server}}, "easytier")
+		_, err = newWebClientOptions(context.Background(), option.EasyTierEndpointOptions{Web: &option.EasyTierWebOptions{Server: server}}, "easytier")
 		require.Error(t, err, server)
 	}
-	_, err = newWebClientOptions(option.EasyTierEndpointOptions{Web: &option.EasyTierWebOptions{Server: "udp://config.example.com:22020/user", MachineID: "machine"}}, "easytier")
+	_, err = newWebClientOptions(context.Background(), option.EasyTierEndpointOptions{Web: &option.EasyTierWebOptions{Server: "udp://config.example.com:22020/user", MachineID: "machine"}}, "easytier")
 	require.Error(t, err)
 }
 
@@ -373,4 +374,26 @@ func TestDatagramConnUnmapsPeer(t *testing.T) {
 	_, peer, err := conn.ReadFrom(buffer)
 	require.NoError(t, err)
 	require.Len(t, peer.(*net.UDPAddr).IP, net.IPv4len)
+}
+
+func TestPersistentMachineSeed(t *testing.T) {
+	directory := t.TempDir()
+	t.Chdir(directory)
+	ctx := context.Background()
+	seed, err := persistentMachineSeed(ctx)
+	require.NoError(t, err)
+	require.Len(t, seed, 32)
+	again, err := persistentMachineSeed(ctx)
+	require.NoError(t, err)
+	require.Equal(t, seed, again, "the seed survives restarts")
+	info, err := os.Stat(machineSeedFile)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+
+	// A damaged seed file is replaced instead of yielding a shared ID.
+	require.NoError(t, os.WriteFile(machineSeedFile, []byte("localhost\n"), 0o600))
+	replaced, err := persistentMachineSeed(ctx)
+	require.NoError(t, err)
+	require.Len(t, replaced, 32)
+	require.NotEqual(t, seed, replaced)
 }

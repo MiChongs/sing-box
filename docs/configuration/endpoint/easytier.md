@@ -276,7 +276,7 @@ The configuration server, as a `tcp://` or `udp://` URL whose path is the user n
 
 UUID identifying this machine on the configuration server. It must stay the same across restarts.
 
-By default it is derived from the operating system's machine ID (`/etc/machine-id`), or the hostname where none exists, and the endpoint tag.
+By default it is derived from the endpoint tag and the operating system's machine ID (`/etc/machine-id`). Without one, the hostname is used, unless it is generic like `localhost` (as on Android): then a random seed is generated once and kept in `easytier-machine-seed` in the working directory, so that devices do not share an ID.
 
 #### hostname
 

@@ -2,10 +2,12 @@ package easytier
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
+	"github.com/sagernet/sing/service/filemanager"
 
 	corehost "github.com/easytier/easytier/easytier-go"
 	"github.com/gofrs/uuid/v5"
@@ -20,7 +23,7 @@ import (
 
 const webInstanceScanInterval = time.Second
 
-func newWebClientOptions(options option.EasyTierEndpointOptions, tag string) (*corehost.WebClientOptions, error) {
+func newWebClientOptions(ctx context.Context, options option.EasyTierEndpointOptions, tag string) (*corehost.WebClientOptions, error) {
 	webOptions := options.Web
 	if webOptions == nil {
 		return nil, nil
@@ -40,7 +43,7 @@ func newWebClientOptions(options option.EasyTierEndpointOptions, tag string) (*c
 	}
 	machineID := webOptions.MachineID
 	if machineID == "" {
-		machineID = defaultMachineID(tag)
+		machineID = defaultMachineID(ctx, tag)
 	} else {
 		parsed, err := uuid.FromString(machineID)
 		if err != nil {
@@ -60,33 +63,75 @@ func newWebClientOptions(options option.EasyTierEndpointOptions, tag string) (*c
 	}, nil
 }
 
-// defaultMachineID derives a stable machine UUID from the operating system's
-// machine identifier, or the hostname where none is available, and the
+// machineSeedFile holds a random seed for systems without a machine ID or a
+// distinguishing hostname.
+const machineSeedFile = "easytier-machine-seed"
+
+// genericHostnames are hostnames shared by every device of a kind. Android
+// has no machine ID and reports "localhost", so deriving from them gave every
+// Android device the same machine UUID and they replaced each other on the
+// configuration server.
+var genericHostnames = []string{"", "localhost", "localhost.localdomain", "android"}
+
+// defaultMachineID derives a stable machine UUID from a machine seed and the
 // endpoint tag, so that the configuration server recognizes the endpoint
 // across restarts.
-func defaultMachineID(tag string) string {
-	seed := ""
-	for _, path := range []string{"/etc/machine-id", "/var/lib/dbus/machine-id"} {
-		content, err := os.ReadFile(path)
-		if err == nil {
-			seed = strings.TrimSpace(string(content))
-			if seed != "" {
-				break
-			}
-		}
-	}
-	if seed == "" {
-		seed, _ = os.Hostname()
-	}
-	sum := sha256.Sum256([]byte("sing-box/easytier/" + seed + "/" + tag))
+func defaultMachineID(ctx context.Context, tag string) string {
+	sum := sha256.Sum256([]byte("sing-box/easytier/" + machineSeed(ctx) + "/" + tag))
 	sum[6] = sum[6]&0x0f | 0x50
 	sum[8] = sum[8]&0x3f | 0x80
 	encoded := hex.EncodeToString(sum[:16])
 	return encoded[0:8] + "-" + encoded[8:12] + "-" + encoded[12:16] + "-" + encoded[16:20] + "-" + encoded[20:32]
 }
 
-// runWebClient keeps the instances created by the configuration server
-// attached to the endpoint until the endpoint closes.
+// machineSeed returns the operating system's machine identifier, else a
+// distinguishing hostname, else a random seed persisted in the working
+// directory.
+func machineSeed(ctx context.Context) string {
+	for _, path := range []string{"/etc/machine-id", "/var/lib/dbus/machine-id"} {
+		content, err := os.ReadFile(path)
+		if err == nil {
+			if seed := strings.TrimSpace(string(content)); seed != "" {
+				return seed
+			}
+		}
+	}
+	hostname, _ := os.Hostname()
+	if !slices.Contains(genericHostnames, strings.ToLower(hostname)) {
+		return hostname
+	}
+	seed, err := persistentMachineSeed(ctx)
+	if err != nil {
+		return hostname
+	}
+	return seed
+}
+
+func persistentMachineSeed(ctx context.Context) (string, error) {
+	path := filemanager.BasePath(ctx, machineSeedFile)
+	content, err := os.ReadFile(path)
+	if err == nil {
+		if seed := strings.TrimSpace(string(content)); len(seed) == 32 {
+			if _, decodeErr := hex.DecodeString(seed); decodeErr == nil {
+				return seed, nil
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return "", err
+	}
+	var random [16]byte
+	_, err = rand.Read(random[:])
+	if err != nil {
+		return "", err
+	}
+	seed := hex.EncodeToString(random[:])
+	err = filemanager.WriteFile(ctx, path, []byte(seed+"\n"), 0o600)
+	if err != nil {
+		return "", err
+	}
+	return seed, nil
+}
+
 func (e *Endpoint) runWebClient(host *corehost.Host, local *corehost.Instance) {
 	client, err := host.ConnectWebClient(e.ctx, *e.webOptions)
 	if err != nil {

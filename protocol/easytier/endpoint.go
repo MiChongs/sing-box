@@ -126,7 +126,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 	if err != nil {
 		return nil, E.Cause(err, "tld_dns_zone")
 	}
-	webOptions, err := newWebClientOptions(options, tag)
+	webOptions, err := newWebClientOptions(ctx, options, tag)
 	if err != nil {
 		return nil, err
 	}

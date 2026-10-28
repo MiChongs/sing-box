@@ -276,7 +276,7 @@ Base64 编码的 X25519 私钥。
 
 在配置服务器上标识本机的 UUID，重启后必须保持不变。
 
-默认由操作系统的机器 ID（`/etc/machine-id`，不存在时使用主机名）和端点标签派生。
+默认由端点标签和操作系统的机器 ID（`/etc/machine-id`）派生。没有机器 ID 时使用主机名；主机名是 `localhost` 这类通用名称时（如 Android），会生成一次随机种子并保存在工作目录的 `easytier-machine-seed` 中，避免多台设备共用同一个 ID。
 
 #### hostname
 
