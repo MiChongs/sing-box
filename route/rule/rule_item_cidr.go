@@ -21,6 +21,8 @@ type IPCIDRItem struct {
 	description string
 	// 仅顶层规则保留配置原值，供 Clash API 按配置展示；规则集条目不保留，避免大列表常驻内存
 	prefixes []*badoption.Prefixable
+	// 配置条目数，二进制规则集为 0，按需从 ipSet 展开
+	entryCount uint64
 }
 
 func NewIPCIDRItem(isSource bool, prefixables []*badoption.Prefixable) (*IPCIDRItem, error) {
@@ -52,6 +54,7 @@ func NewIPCIDRItem(isSource bool, prefixables []*badoption.Prefixable) (*IPCIDRI
 		ipSet:       ipset.FromIPSet(ipSet),
 		isSource:    isSource,
 		description: description,
+		entryCount:  uint64(len(prefixables)),
 	}, nil
 }
 

@@ -32,6 +32,8 @@ type abstractRuleSet struct {
 	format      string
 	rules       []adapter.HeadlessRule
 	ruleCount   uint64
+	behavior    string
+	counted     bool // ruleCount / behavior 是否已按当前 rules 计算
 	metadata    adapter.RuleSetMetadata
 	lastUpdated time.Time
 	callbacks   list.List[adapter.RuleSetUpdateCallback]
@@ -51,9 +53,40 @@ func (s *abstractRuleSet) Format() string {
 }
 
 func (s *abstractRuleSet) RuleCount() uint64 {
-	s.access.RLock()
-	defer s.access.RUnlock()
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.countRules()
 	return s.ruleCount
+}
+
+// Behavior 返回 mihomo 口径的 rule-provider behavior（Domain / IPCIDR / Classical）。
+func (s *abstractRuleSet) Behavior() string {
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.countRules()
+	return s.behavior
+}
+
+// countRules 需持有写锁。二进制规则集计数要展开压缩结构，故只在首次查询时计算。
+func (s *abstractRuleSet) countRules() {
+	if s.counted {
+		return
+	}
+	var ruleCount uint64
+	for _, rule := range s.rules {
+		ruleCount += rule.RuleCount()
+	}
+	s.ruleCount = ruleCount
+	s.behavior = ruleSetBehavior(s.rules)
+	s.counted = true
+}
+
+// dropRules 释放未被引用规则集的规则，释放前先算好计数，Clash API 仍能展示真实条目数。
+func (s *abstractRuleSet) dropRules() {
+	s.access.Lock()
+	defer s.access.Unlock()
+	s.countRules()
+	s.rules = nil
 }
 
 func (s *abstractRuleSet) UpdatedTime() time.Time {
@@ -96,7 +129,7 @@ func (s *abstractRuleSet) DecRef() {
 
 func (s *abstractRuleSet) Cleanup() {
 	if s.refs.Load() == 0 {
-		s.rules = nil
+		s.dropRules()
 	}
 }
 
@@ -141,14 +174,12 @@ func (s *abstractRuleSet) loadBytes(content []byte, ruleset adapter.RuleSet) err
 func (s *abstractRuleSet) reloadRules(headlessRules []option.HeadlessRule, ruleSet adapter.RuleSet) error {
 	rules := make([]adapter.HeadlessRule, len(headlessRules))
 	var err error
-	var ruleCount uint64
 	for i, ruleOptions := range headlessRules {
 		rule, err := NewHeadlessRule(s.ctx, ruleOptions)
 		if err != nil {
 			return E.Cause(err, "parse rule_set.rules.[", i, "]")
 		}
 		rules[i] = rule
-		ruleCount += rule.RuleCount()
 	}
 	metadata := buildRuleSetMetadata(headlessRules)
 	err = validateRuleSetMetadataUpdate(s.ctx, s.tag, metadata)
@@ -157,7 +188,7 @@ func (s *abstractRuleSet) reloadRules(headlessRules []option.HeadlessRule, ruleS
 	}
 	s.access.Lock()
 	s.rules = rules
-	s.ruleCount = ruleCount
+	s.counted = false
 	s.metadata = metadata
 	callbacks := s.callbacks.Array()
 	s.access.Unlock()

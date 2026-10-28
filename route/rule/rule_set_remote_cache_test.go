@@ -86,7 +86,7 @@ func TestRemoteRuleSetLoadsFileReplacedBehindRecord(t *testing.T) {
 	loaded, err := ruleSet.loadCacheFile()
 	require.NoError(t, err)
 	require.True(t, loaded)
-	require.Equal(t, uint64(1), ruleSet.ruleCount)
+	require.Equal(t, uint64(1), ruleSet.RuleCount())
 	require.Equal(t, modTime, ruleSet.lastUpdated)
 	require.Empty(t, ruleSet.lastEtag, "the old ETag describes another file")
 	require.Equal(t, hash.MakeHash(content), ruleSet.hash)

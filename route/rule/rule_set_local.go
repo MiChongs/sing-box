@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/sagernet/fswatch"
 	"github.com/sagernet/sing-box/adapter"
@@ -44,6 +45,8 @@ func NewLocalRuleSet(ctx context.Context, logger logger.ContextLogger, tag strin
 		if err != nil {
 			return nil, err
 		}
+		// 对齐 mihomo inline provider：updatedAt 取创建时间
+		ruleSet.lastUpdated = time.Now()
 	} else {
 		path, err := ruleSet.getPath(ctx, strings.ReplaceAll(options.Path, C.RuleSetTagPlaceholder, tag))
 		if err != nil {

@@ -146,7 +146,7 @@ func (s *RemoteRuleSet) update() {
 	if err != nil {
 		s.logger.ErrorContext(ctx, "fetch rule-set ", s.tag, ": ", err)
 	} else if s.refs.Load() == 0 {
-		s.rules = nil
+		s.dropRules()
 	}
 }
 
@@ -155,7 +155,7 @@ func (s *RemoteRuleSet) Update(ctx context.Context) error {
 	if err != nil {
 		return err
 	} else if s.refs.Load() == 0 {
-		s.rules = nil
+		s.dropRules()
 	}
 	return nil
 }

@@ -19,6 +19,8 @@ type DomainItem struct {
 	// 仅顶层规则保留配置原值，供 Clash API 按配置展示；规则集条目不保留，避免大列表常驻内存
 	domains        []string
 	domainSuffixes []string
+	// 配置条目数（domain + domain_suffix），二进制规则集为 0，按需从 matcher 展开
+	entryCount uint64
 }
 
 func NewDomainItem(domains []string, domainSuffixes []string, domainMatchStrategy C.DomainMatchStrategy) (*DomainItem, error) {
@@ -54,6 +56,7 @@ func NewDomainItem(domains []string, domainSuffixes []string, domainMatchStrateg
 		matcher:             domain.NewMatcher(domains, domainSuffixes, false),
 		description:         description,
 		domainMatchStrategy: domainMatchStrategy,
+		entryCount:          uint64(len(domains) + len(domainSuffixes)),
 	}, nil
 }
 

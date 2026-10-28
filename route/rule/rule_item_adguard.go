@@ -13,19 +13,22 @@ var _ RuleItem = (*AdGuardDomainItem)(nil)
 type AdGuardDomainItem struct {
 	matcher             *domain.AdGuardMatcher
 	domainMatchStrategy C.DomainMatchStrategy
+	// 配置条目数，二进制规则集为 0，按需从 matcher 展开
+	entryCount uint64
 }
 
 func NewAdGuardDomainItem(ruleLines []string, domainMatchStrategy C.DomainMatchStrategy) *AdGuardDomainItem {
 	return &AdGuardDomainItem{
-		domain.NewAdGuardMatcher(ruleLines),
-		domainMatchStrategy,
+		matcher:             domain.NewAdGuardMatcher(ruleLines),
+		domainMatchStrategy: domainMatchStrategy,
+		entryCount:          uint64(len(ruleLines)),
 	}
 }
 
 func NewRawAdGuardDomainItem(matcher *domain.AdGuardMatcher, domainMatchStrategy C.DomainMatchStrategy) *AdGuardDomainItem {
 	return &AdGuardDomainItem{
-		matcher,
-		domainMatchStrategy,
+		matcher:             matcher,
+		domainMatchStrategy: domainMatchStrategy,
 	}
 }
 

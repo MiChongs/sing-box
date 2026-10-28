@@ -3,9 +3,10 @@ package clashapi
 import (
 	"context"
 	"net/http"
-	"strings"
 
 	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
+	R "github.com/sagernet/sing-box/route/rule"
 	F "github.com/sagernet/sing/common/format"
 	"github.com/sagernet/sing/common/json/badjson"
 
@@ -25,15 +26,51 @@ func ruleProviderRouter(router adapter.Router) http.Handler {
 	return r
 }
 
+// ruleSetInfo 对齐 mihomo rule-provider 的 JSON：behavior 按内容推断，
+// format 沿用 mihomo 的 xxxRule 命名，ruleCount 为完整展开后的条目数。
 func ruleSetInfo(ruleSet adapter.RuleSet) *badjson.JSONObject {
 	var info badjson.JSONObject
 	info.Put("name", ruleSet.Name())
 	info.Put("type", "Rule")
-	info.Put("vehicleType", strings.ToUpper(ruleSet.Type()))
-	info.Put("behavior", strings.ToUpper(ruleSet.Format()))
+	info.Put("vehicleType", ruleSetVehicleType(ruleSet.Type()))
+	info.Put("behavior", ruleSetBehavior(ruleSet))
+	if ruleSet.Type() != C.RuleSetTypeInline {
+		info.Put("format", ruleSetFormat(ruleSet.Format()))
+	}
 	info.Put("ruleCount", ruleSet.RuleCount())
 	info.Put("updatedAt", ruleSet.UpdatedTime().Format("2006-01-02T15:04:05.999999999-07:00"))
 	return &info
+}
+
+func ruleSetVehicleType(ruleSetType string) string {
+	switch ruleSetType {
+	case C.RuleSetTypeRemote:
+		return "HTTP"
+	case C.RuleSetTypeLocal:
+		return "File"
+	case C.RuleSetTypeInline:
+		return "Inline"
+	default:
+		return "Unknown"
+	}
+}
+
+func ruleSetFormat(format string) string {
+	switch format {
+	case C.RuleSetFormatSource:
+		return "JsonRule"
+	case C.RuleSetFormatBinary:
+		return "SrsRule"
+	default:
+		return "Unknown"
+	}
+}
+
+func ruleSetBehavior(ruleSet adapter.RuleSet) string {
+	if behaviorRuleSet, isBehavior := ruleSet.(interface{ Behavior() string }); isBehavior {
+		return behaviorRuleSet.Behavior()
+	}
+	return R.RuleSetBehaviorClassical
 }
 
 func getRuleProviders(router adapter.Router) func(w http.ResponseWriter, r *http.Request) {
