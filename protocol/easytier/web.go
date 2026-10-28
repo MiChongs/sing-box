@@ -132,13 +132,20 @@ func persistentMachineSeed(ctx context.Context) (string, error) {
 	return seed, nil
 }
 
-func (e *Endpoint) runWebClient(host *corehost.Host, local *corehost.Instance) {
+// runWebClient serves the instances assigned by the Web server until the
+// endpoint closes or the host fails. The local instance, when configured,
+// runs beside them; its unexpected stop restarts the host like in local mode.
+func (e *Endpoint) runWebClient(host *corehost.Host, local *corehost.Instance, attachedLocal *attachedInstance) error {
 	client, err := host.ConnectWebClient(e.ctx, *e.webOptions)
 	if err != nil {
-		e.logger.Error(E.Cause(err, "connect EasyTier Web"))
-		return
+		return E.Cause(err, "connect EasyTier Web")
 	}
 	defer closeWithTimeout(client.Close)
+	e.setHostState(hostRunning, nil)
+	var localDone <-chan struct{}
+	if attachedLocal != nil {
+		localDone = attachedLocal.done
+	}
 	e.logger.Info("connecting to EasyTier Web ", e.webOptions.Endpoint, " as machine ", e.webOptions.MachineID)
 	attached := make(map[*corehost.Instance]*attachedInstance)
 	defer func() {
@@ -161,7 +168,9 @@ func (e *Endpoint) runWebClient(host *corehost.Host, local *corehost.Instance) {
 		e.syncWebInstances(host, local, attached)
 		select {
 		case <-e.ctx.Done():
-			return
+			return nil
+		case <-localDone:
+			return E.New("EasyTier network ", e.localName, " stopped")
 		case <-ticker.C:
 		}
 	}

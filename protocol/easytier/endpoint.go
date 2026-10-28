@@ -40,6 +40,24 @@ const packetIngressWorkers = 32
 // state without synchronization.
 var hostAccess sync.Mutex
 
+// The core host is restarted when it stops on its own: the library never
+// restarts an instance, and a trapped guest may leave the shared module
+// unusable, so recovery recreates the whole host. With the compiled core
+// cached that takes about 100ms.
+const (
+	hostRestartMinimumDelay = time.Second
+	hostRestartMaximumDelay = time.Minute
+	// A host that ran this long failed for a new reason; it is restarted
+	// with the minimum delay again.
+	hostStableDuration = time.Minute
+)
+
+const (
+	hostStarting int32 = iota
+	hostRunning
+	hostFailed
+)
+
 var (
 	_ adapter.OutboundWithPreferredRoutes = (*Endpoint)(nil)
 	_ adapter.FlowOutboundDomainResolver  = (*Endpoint)(nil)
@@ -81,12 +99,15 @@ type Endpoint struct {
 	dnsTable             atomic.Pointer[magicDNSTable]
 	dnsTransport         atomic.Pointer[DNSTransport]
 	ingress              chan ingressPacket
-	ready                chan struct{}
-	readyOnce            sync.Once
-	readyErr             error
-	done                 chan struct{}
-	proxyNATAccess       sync.Mutex
-	proxyNATListeners    map[uint16]*proxyNATListener
+	// hostState and hostErr describe the current host attempt. stateNotify
+	// is closed and replaced, under stateAccess, whenever they or the
+	// routing snapshot change.
+	hostState         atomic.Int32
+	hostErr           atomic.Pointer[error]
+	stateNotify       chan struct{}
+	done              chan struct{}
+	proxyNATAccess    sync.Mutex
+	proxyNATListeners map[uint16]*proxyNATListener
 }
 
 type ingressPacket struct {
@@ -165,7 +186,7 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		webOptions:           webOptions,
 		mtu:                  mtu,
 		ingress:              make(chan ingressPacket, packetIngressWorkers*4),
-		ready:                make(chan struct{}),
+		stateNotify:          make(chan struct{}),
 		done:                 make(chan struct{}),
 		proxyNATListeners:    make(map[uint16]*proxyNATListener),
 	}
@@ -260,14 +281,7 @@ func (e *Endpoint) close() error {
 
 func (e *Endpoint) run() {
 	defer close(e.done)
-	err := e.runHost()
-	if err != nil && e.ctx.Err() == nil {
-		e.logger.Error(err)
-	}
-	if err == nil {
-		err = net.ErrClosed
-	}
-	e.setReady(err)
+	e.superviseHost(e.runHost, hostRestartMinimumDelay)
 	for {
 		select {
 		case packet := <-e.ingress:
@@ -278,6 +292,58 @@ func (e *Endpoint) run() {
 	}
 }
 
+// superviseHost runs hosts until the endpoint closes, restarting a stopped
+// host after an exponentially growing delay.
+func (e *Endpoint) superviseHost(runHost func() error, minimumDelay time.Duration) {
+	delay := minimumDelay
+	for {
+		e.setHostState(hostStarting, nil)
+		started := time.Now()
+		err := runHost()
+		if e.ctx.Err() != nil {
+			break
+		}
+		if err == nil {
+			err = E.New("EasyTier host stopped")
+		}
+		if time.Since(started) >= hostStableDuration {
+			delay = minimumDelay
+		}
+		e.setHostState(hostFailed, err)
+		e.logger.Error(err, ", restarting in ", delay)
+		timer := time.NewTimer(delay)
+		select {
+		case <-e.ctx.Done():
+			timer.Stop()
+		case <-timer.C:
+		}
+		if e.ctx.Err() != nil {
+			break
+		}
+		delay = min(delay*2, hostRestartMaximumDelay)
+	}
+	e.setHostState(hostFailed, net.ErrClosed)
+}
+
+func (e *Endpoint) setHostState(state int32, err error) {
+	e.stateAccess.Lock()
+	defer e.stateAccess.Unlock()
+	e.hostState.Store(state)
+	if err != nil {
+		e.hostErr.Store(&err)
+	} else {
+		e.hostErr.Store(nil)
+	}
+	e.notifyStateLocked()
+}
+
+func (e *Endpoint) notifyStateLocked() {
+	close(e.stateNotify)
+	e.stateNotify = make(chan struct{})
+}
+
+// runHost runs one core host until the endpoint closes or the host can no
+// longer serve its configuration, which it reports as an error.
 func (e *Endpoint) runHost() error {
 	compileCtx, closeCache := e.coreCompileContext(e.ctx)
 	defer closeCache()
@@ -319,14 +385,15 @@ func (e *Endpoint) runHost() error {
 		if local != nil {
 			localInstance = local.instance
 		}
-		e.runWebClient(host, localInstance)
-		return nil
+		return e.runWebClient(host, localInstance, local)
 	}
+	e.setHostState(hostRunning, nil)
 	select {
 	case <-e.ctx.Done():
+		return nil
 	case <-local.done:
+		return E.New("EasyTier network ", e.localName, " stopped")
 	}
-	return nil
 }
 
 func (e *Endpoint) startLocalInstance(host *corehost.Host) (*corehost.Instance, error) {
@@ -367,9 +434,7 @@ func (e *Endpoint) updateDeviceLocked() error {
 	snapshot := newRoutingSnapshot(e.instances)
 	e.snapshot.Store(snapshot)
 	e.dnsTable.Store(e.newDNSTable(e.instances))
-	if len(snapshot.instances) > 0 {
-		e.setReady(nil)
-	}
+	e.notifyStateLocked()
 	if len(snapshot.localAddresses) == 0 {
 		return nil
 	}
@@ -398,32 +463,36 @@ func (e *Endpoint) applyDeviceAddressesLocked(addresses []netip.Prefix) error {
 	return nil
 }
 
-func (e *Endpoint) setReady(err error) {
-	e.readyOnce.Do(func() {
-		e.readyErr = err
-		close(e.ready)
-	})
-}
-
+// waitReady waits up to the TCP timeout for a configured instance while the
+// host is starting or running, and fails at once while it waits to restart.
 func (e *Endpoint) waitReady(ctx context.Context) error {
-	select {
-	case <-e.ready:
-	default:
-		waitCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
-		defer cancel()
+	if len(e.snapshot.Load().instances) > 0 {
+		return nil
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, C.TCPTimeout)
+	defer cancel()
+	for {
+		e.stateAccess.Lock()
+		notify := e.stateNotify
+		e.stateAccess.Unlock()
+		if len(e.snapshot.Load().instances) > 0 {
+			return nil
+		}
+		if e.hostState.Load() == hostFailed {
+			if err := e.hostErr.Load(); err != nil {
+				return E.Cause(*err, "EasyTier endpoint is not running")
+			}
+			return E.New("EasyTier endpoint is not running")
+		}
 		select {
-		case <-e.ready:
+		case <-notify:
 		case <-waitCtx.Done():
+			if e.hostState.Load() == hostRunning {
+				return E.New("no EasyTier instance is running")
+			}
 			return E.New("EasyTier endpoint is not ready yet")
 		}
 	}
-	if e.readyErr != nil {
-		return e.readyErr
-	}
-	if len(e.snapshot.Load().instances) == 0 {
-		return E.New("no EasyTier instance is running")
-	}
-	return nil
 }
 
 func (e *Endpoint) loopIngress(ctx context.Context) {
