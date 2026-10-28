@@ -279,8 +279,10 @@ func (e *Endpoint) run() {
 }
 
 func (e *Endpoint) runHost() error {
+	compileCtx, closeCache := e.coreCompileContext(e.ctx)
+	defer closeCache()
 	hostAccess.Lock()
-	host, err := corehost.New(e.ctx, corehost.Options{Platform: e.services})
+	host, err := corehost.New(compileCtx, corehost.Options{Platform: e.services})
 	hostAccess.Unlock()
 	if err != nil {
 		return E.Cause(err, "create EasyTier host")

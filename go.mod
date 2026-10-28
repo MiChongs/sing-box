@@ -31,6 +31,7 @@ require (
 	github.com/mdlayher/netlink v1.11.2
 	github.com/mdlayher/wifi v0.9.0
 	github.com/metacubex/utls v1.8.7
+	github.com/metacubex/wazero v0.0.0-20260628025728-9ae6bdcf2a7d
 	github.com/mholt/acmez/v3 v3.1.6
 	github.com/miekg/dns v1.1.72
 	github.com/openai/openai-go/v3 v3.26.0
@@ -91,12 +92,11 @@ require (
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/metacubex/wazero v0.0.0-20260628025728-9ae6bdcf2a7d // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 )
 
 replace (
-	github.com/metacubex/wazero => github.com/MiChongs/wazero v0.0.0-20261028014906-f2902761d9ee
+	github.com/metacubex/wazero => github.com/MiChongs/wazero v0.0.0-20261028025247-74f12660e962
 	github.com/sagernet/quic-go => github.com/MiChongs/quic-go v0.0.0-20261025190959-1f4c68673e6c
 	github.com/sagernet/sing => github.com/reF1nd/sing v0.9.7-0.20261025115535-d4dda9140332
 	github.com/sagernet/sing-anytls => github.com/reF1nd/sing-anytls v0.0.0-20260924145214-2a81df5d3e9f
