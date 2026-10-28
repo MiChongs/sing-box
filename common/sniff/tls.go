@@ -13,12 +13,18 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 )
 
+// errTLSClientHelloCaptured stops the server handshake as soon as the
+// ClientHello is parsed. Returning a nil config instead lets crypto/tls go on
+// to the key exchange, which for X25519MLKEM768 key shares costs an ML-KEM
+// encapsulation and several KB of allocations per sniffed connection.
+var errTLSClientHelloCaptured = errors.New("tls client hello captured")
+
 func TLSClientHello(ctx context.Context, metadata *adapter.InboundContext, reader io.Reader) error {
 	var clientHello *tls.ClientHelloInfo
 	err := tls.Server(bufio.NewReadOnlyConn(reader), &tls.Config{
 		GetConfigForClient: func(argHello *tls.ClientHelloInfo) (*tls.Config, error) {
 			clientHello = argHello
-			return nil, nil
+			return nil, errTLSClientHelloCaptured
 		},
 	}).HandshakeContext(ctx)
 	if clientHello != nil {
