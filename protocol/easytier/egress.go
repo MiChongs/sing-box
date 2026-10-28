@@ -49,15 +49,18 @@ type egressPacket struct {
 }
 
 // egressPacketConn is the UDP socket the core uses to reach real
-// destinations. The first datagram opens a sing-box routed session; a new
-// session is opened when the router closes the previous one, for example
-// after the UDP timeout.
+// destinations. The core keeps one socket per proxied client and sends
+// through it to every destination that client talks to, so each destination
+// gets its own sing-box routed session: routing rules, sniffing and the
+// outbound are chosen per destination, not by the first datagram of the
+// socket. A new session is opened when the router closes the previous one,
+// for example after the UDP timeout.
 type egressPacketConn struct {
 	endpoint     *Endpoint
 	ctx          context.Context
 	cancel       context.CancelFunc
 	access       sync.Mutex
-	session      *egressPacketSession
+	sessions     map[M.Socksaddr]*egressPacketSession
 	responses    chan egressPacket
 	readDeadline pipe.Deadline
 }
@@ -68,6 +71,7 @@ func (e *Endpoint) newEgressPacketConn() *egressPacketConn {
 		endpoint:     e,
 		ctx:          ctx,
 		cancel:       cancel,
+		sessions:     make(map[M.Socksaddr]*egressPacketSession),
 		responses:    make(chan egressPacket, egressPacketQueueSize),
 		readDeadline: pipe.MakeDeadline(),
 	}
@@ -79,24 +83,34 @@ func (c *egressPacketConn) currentSession(destination M.Socksaddr) *egressPacket
 	if c.ctx.Err() != nil {
 		return nil
 	}
-	if c.session != nil && c.session.ctx.Err() == nil {
-		return c.session
+	if session := c.sessions[destination]; session != nil && session.ctx.Err() == nil {
+		return session
 	}
 	ctx, cancel := context.WithCancel(log.ContextWithNewID(c.ctx))
 	session := &egressPacketSession{
 		conn:         c,
+		destination:  destination,
 		ctx:          ctx,
 		cancel:       cancel,
 		requests:     make(chan egressPacket, egressPacketQueueSize),
 		readDeadline: pipe.MakeDeadline(),
 	}
-	c.session = session
+	c.sessions[destination] = session
 	endpoint := c.endpoint
 	endpoint.logger.InfoContext(ctx, "inbound packet connection from EasyTier core to ", destination)
 	go endpoint.router.RoutePacketConnectionEx(ctx, session, endpoint.egressMetadata(N.NetworkUDP, destination), func(error) {
 		cancel()
+		c.removeSession(session)
 	})
 	return session
+}
+
+func (c *egressPacketConn) removeSession(session *egressPacketSession) {
+	c.access.Lock()
+	defer c.access.Unlock()
+	if c.sessions[session.destination] == session {
+		delete(c.sessions, session.destination)
+	}
 }
 
 func (c *egressPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
@@ -145,6 +159,9 @@ func (c *egressPacketConn) deliver(packet egressPacket) error {
 
 func (c *egressPacketConn) Close() error {
 	c.cancel()
+	c.access.Lock()
+	clear(c.sessions)
+	c.access.Unlock()
 	for {
 		select {
 		case packet := <-c.responses:
@@ -177,6 +194,7 @@ func (c *egressPacketConn) SetWriteDeadline(time.Time) error {
 // the core's datagrams and writes the responses back to the core.
 type egressPacketSession struct {
 	conn         *egressPacketConn
+	destination  M.Socksaddr
 	ctx          context.Context
 	cancel       context.CancelFunc
 	requests     chan egressPacket
