@@ -20,6 +20,11 @@ const (
 	// cache miss: each worker adds about 30MB to the compilation peak, and
 	// two halve the time of a single one.
 	coreCompilationWorkers = 2
+	// coreCacheGeneration changes whenever the core is compiled differently
+	// for the same embedded core, such as when the host started enforcing
+	// guest termination, so that stale machine code is pruned with its
+	// directory instead of lingering beside the new entry.
+	coreCacheGeneration = "t1"
 )
 
 // coreCompileContext returns ctx carrying an on-disk cache of the compiled
@@ -34,7 +39,7 @@ func (e *Endpoint) coreCompileContext(ctx context.Context) (context.Context, fun
 	// One directory per embedded core: the wazero version and CPU features
 	// are part of each cached entry, but a replaced core would otherwise
 	// leave its predecessor's machine code on disk.
-	cacheName := runtime.GOARCH + "-" + coreCacheKey(corehost.CoreInfo().SHA256)
+	cacheName := runtime.GOARCH + "-" + coreCacheKey(corehost.CoreInfo().SHA256) + "-" + coreCacheGeneration
 	cacheDirectory := filepath.Join(baseDirectory, cacheName)
 	err := filemanager.MkdirAll(e.ctx, cacheDirectory, 0o700)
 	if err != nil {

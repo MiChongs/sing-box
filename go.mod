@@ -96,7 +96,8 @@ require (
 )
 
 replace (
-	github.com/metacubex/wazero => github.com/MiChongs/wazero v0.0.0-20261028025247-74f12660e962
+	github.com/easytier/easytier/easytier-go => github.com/MiChongs/easytier-go v0.0.0-20261028041007-78dad22f2199
+	github.com/metacubex/wazero => github.com/MiChongs/wazero v0.0.0-20261028034105-3ae26daa8d18
 	github.com/sagernet/quic-go => github.com/MiChongs/quic-go v0.0.0-20261025190959-1f4c68673e6c
 	github.com/sagernet/sing => github.com/reF1nd/sing v0.9.7-0.20261025115535-d4dda9140332
 	github.com/sagernet/sing-anytls => github.com/reF1nd/sing-anytls v0.0.0-20260924145214-2a81df5d3e9f
