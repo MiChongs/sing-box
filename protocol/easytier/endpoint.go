@@ -31,9 +31,15 @@ import (
 	"github.com/easytier/easytier/easytier-go/platform"
 )
 
-// The core batches up to 32 concurrent packet submissions into one guest
-// turn, so ingress uses the same number of submitters.
-const packetIngressWorkers = 32
+// packetIngressBatch is the largest batch of device packets handed to an
+// instance in one guest turn.
+const packetIngressBatch = 64
+
+// packetBatches recycles the packet slices passed to SendPackets.
+var packetBatches = sync.Pool{New: func() any {
+	batch := make([][]byte, 0, packetIngressBatch)
+	return &batch
+}}
 
 // hostAccess serializes creation of core hosts: compiling the embedded core
 // peaks at about 100MB of heap, and wazero lazily initializes process-wide
@@ -98,7 +104,6 @@ type Endpoint struct {
 	snapshot             atomic.Pointer[routingSnapshot]
 	dnsTable             atomic.Pointer[magicDNSTable]
 	dnsTransport         atomic.Pointer[DNSTransport]
-	ingress              chan ingressPacket
 	// hostState and hostErr describe the current host attempt. stateNotify
 	// is closed and replaced, under stateAccess, whenever they or the
 	// routing snapshot change.
@@ -108,11 +113,6 @@ type Endpoint struct {
 	done              chan struct{}
 	proxyNATAccess    sync.Mutex
 	proxyNATListeners map[uint16]*proxyNATListener
-}
-
-type ingressPacket struct {
-	instance *attachedInstance
-	buffer   *buf.Buffer
 }
 
 func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.EasyTierEndpointOptions) (adapter.Endpoint, error) {
@@ -185,7 +185,6 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
 		localDNSZone:         localDNSZone,
 		webOptions:           webOptions,
 		mtu:                  mtu,
-		ingress:              make(chan ingressPacket, packetIngressWorkers*4),
 		stateNotify:          make(chan struct{}),
 		done:                 make(chan struct{}),
 		proxyNATListeners:    make(map[uint16]*proxyNATListener),
@@ -282,14 +281,6 @@ func (e *Endpoint) close() error {
 func (e *Endpoint) run() {
 	defer close(e.done)
 	e.superviseHost(e.runHost, hostRestartMinimumDelay)
-	for {
-		select {
-		case packet := <-e.ingress:
-			packet.buffer.Release()
-		default:
-			return
-		}
-	}
 }
 
 // superviseHost runs hosts until the endpoint closes, restarting a stopped
@@ -354,18 +345,6 @@ func (e *Endpoint) runHost() error {
 		return E.Cause(err, "create EasyTier host")
 	}
 	defer closeWithTimeout(host.Close)
-
-	workerCtx, workerCancel := context.WithCancel(e.ctx)
-	var workers sync.WaitGroup
-	defer func() {
-		workerCancel()
-		workers.Wait()
-	}()
-	for range packetIngressWorkers {
-		workers.Go(func() {
-			e.loopIngress(workerCtx)
-		})
-	}
 
 	var local *attachedInstance
 	if e.localConfig != "" {
@@ -495,21 +474,6 @@ func (e *Endpoint) waitReady(ctx context.Context) error {
 	}
 }
 
-func (e *Endpoint) loopIngress(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case packet := <-e.ingress:
-			err := packet.instance.instance.SendPacket(ctx, packet.buffer.Bytes())
-			packet.buffer.Release()
-			if err != nil && ctx.Err() == nil {
-				e.logger.Trace(E.Cause(err, packet.instance.logPrefix(), "send packet"))
-			}
-		}
-	}
-}
-
 // writeInbound delivers packets received from an instance to the device.
 func (e *Endpoint) writeInbound(packetBuffers []*buf.Buffer) {
 	if !e.deviceStarted.Load() {
@@ -524,31 +488,51 @@ func (e *Endpoint) writeInbound(packetBuffers []*buf.Buffer) {
 }
 
 // writePacketBuffers dispatches packets leaving the device to the instance
-// owning their source or destination.
+// owning their source or destination. Consecutive packets of one instance are
+// submitted in one guest turn, and the guest has copied them when
+// SendPackets returns.
 func (e *Endpoint) writePacketBuffers(packetBuffers []*buf.Buffer) error {
+	defer buf.ReleaseMulti(packetBuffers)
 	snapshot := e.snapshot.Load()
 	if len(snapshot.instances) == 0 {
-		buf.ReleaseMulti(packetBuffers)
 		return E.New("no EasyTier instance is running")
 	}
-	for i, packetBuffer := range packetBuffers {
-		source, destination, valid := packetAddresses(packetBuffer.Bytes())
-		var instance *attachedInstance
-		if valid {
-			instance = snapshot.outgoingInstance(source, destination)
-		}
-		if instance == nil {
-			packetBuffer.Release()
+	batchPointer := packetBatches.Get().(*[][]byte)
+	batch := (*batchPointer)[:0]
+	var batchInstance *attachedInstance
+	for _, packetBuffer := range packetBuffers {
+		packet := packetBuffer.Bytes()
+		source, destination, valid := packetAddresses(packet)
+		if !valid {
 			continue
 		}
-		select {
-		case e.ingress <- ingressPacket{instance: instance, buffer: packetBuffer}:
-		case <-e.done:
-			buf.ReleaseMulti(packetBuffers[i:])
-			return net.ErrClosed
+		instance := snapshot.outgoingInstance(source, destination)
+		if instance == nil {
+			continue
 		}
+		if instance != batchInstance || len(batch) == packetIngressBatch {
+			e.sendPackets(batchInstance, batch)
+			clear(batch)
+			batch = batch[:0]
+			batchInstance = instance
+		}
+		batch = append(batch, packet)
 	}
+	e.sendPackets(batchInstance, batch)
+	clear(batch)
+	*batchPointer = batch[:0]
+	packetBatches.Put(batchPointer)
 	return nil
+}
+
+func (e *Endpoint) sendPackets(instance *attachedInstance, packets [][]byte) {
+	if instance == nil || len(packets) == 0 {
+		return
+	}
+	err := instance.instance.SendPackets(instance.ctx, packets)
+	if err != nil && instance.ctx.Err() == nil {
+		e.logger.Trace(E.Cause(err, instance.logPrefix(), "send packets"))
+	}
 }
 
 func (e *Endpoint) WritePackets(packets [][]byte) error {

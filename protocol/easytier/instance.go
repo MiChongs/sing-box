@@ -127,28 +127,28 @@ func (a *attachedInstance) logPrefix() string {
 }
 
 func (a *attachedInstance) loopEgress() {
-	// A cancelled context makes ReceivePacket return only already queued
-	// packets, which lets one wakeup drain a batch.
-	drainCtx, drainCancel := context.WithCancel(a.ctx)
-	drainCancel()
+	packets := make([][]byte, packetEgressBatch)
+	packetBuffers := make([]*buf.Buffer, 0, packetEgressBatch)
 	for {
-		packet, err := a.instance.ReceivePacket(a.ctx)
+		n, err := a.instance.ReceivePackets(a.ctx, packets)
 		if err != nil {
 			if a.ctx.Err() == nil {
 				a.endpoint.logger.Debug(E.Cause(err, a.logPrefix(), "receive packet"))
 			}
 			return
 		}
-		packetBuffers := make([]*buf.Buffer, 1, packetEgressBatch)
-		packetBuffers[0] = buf.As(packet)
-		for len(packetBuffers) < packetEgressBatch {
-			packet, err = a.instance.ReceivePacket(drainCtx)
-			if err != nil {
-				break
-			}
+		packetBuffers = packetBuffers[:0]
+		for _, packet := range packets[:n] {
 			packetBuffers = append(packetBuffers, buf.As(packet))
 		}
+		// The device copies the packets, so their pooled buffers go back to
+		// the core once it returns.
 		a.endpoint.writeInbound(packetBuffers)
+		clear(packetBuffers)
+		for index, packet := range packets[:n] {
+			corehost.ReleasePacket(packet)
+			packets[index] = nil
+		}
 	}
 }
 
