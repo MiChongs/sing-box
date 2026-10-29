@@ -29,7 +29,10 @@ func RegisterProviderInline(registry *provider.Registry) {
 	provider.Register[option.ProviderInlineOptions](registry, C.ProviderTypeInline, NewProviderInline)
 }
 
-var _ adapter.Provider = (*ProviderLocal)(nil)
+var (
+	_ adapter.Provider        = (*ProviderLocal)(nil)
+	_ adapter.ProviderUpdater = (*ProviderLocal)(nil)
+)
 
 type ProviderLocal struct {
 	provider.Adapter
@@ -90,13 +93,23 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 		overrideTransport: options.OverrideTransport,
 	}
 	filePath := filemanager.BasePath(ctx, options.Path)
-	provider.path, _ = filepath.Abs(filePath)
+	absPath, _ := filepath.Abs(filePath)
+	provider.path = absPath
+
+	dir := filepath.Dir(absPath)
+	targetFile := filepath.Base(absPath)
+
 	watcher, err := fswatch.NewWatcher(fswatch.Options{
-		Path: []string{filePath},
-		Callback: func(path string) {
-			uErr := provider.reloadFile(path)
-			if uErr != nil {
-				logger.Error(E.Cause(uErr, "reload provider ", tag))
+		Path: []string{absPath, dir},
+		Callback: func(eventPath string) {
+			if filepath.Base(eventPath) == targetFile || eventPath == absPath {
+				uErr := provider.reloadFile(absPath)
+				if uErr != nil {
+					logger.Error(E.Cause(uErr, "reload provider ", tag))
+				} else {
+					logger.Info("reloaded local provider ", tag)
+				}
+				provider.UpdateGroups()
 			}
 			provider.UpdateGroups()
 		},
@@ -127,6 +140,18 @@ func (s *ProviderLocal) StartContext(ctx context.Context, startContext *adapter.
 		}
 	}
 	return s.Adapter.Start()
+}
+
+func (s *ProviderLocal) Update() error {
+	if s.path == "" {
+		return nil
+	}
+	err := s.reloadFile(s.path)
+	if err != nil {
+		return err
+	}
+	s.UpdateGroups()
+	return nil
 }
 
 func (s *ProviderLocal) UpdatedAt() time.Time {
