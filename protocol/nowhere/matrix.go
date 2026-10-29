@@ -2,11 +2,10 @@ package nowhere
 
 import (
 	"fmt"
-	"time"
 
-	"github.com/sagernet/sing-box/protocol/nowhere/core/bundle"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/carrier/tcptls"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/wire"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/bundle"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/tcptls"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/wire"
 )
 
 const (
@@ -19,30 +18,27 @@ const (
 // MatrixInputs is the host-facing carrier/mux/pool policy before it is mapped
 // onto a nw2 core bundle.BundleOptions.
 type MatrixInputs struct {
-	Up                 string
-	Down               string
-	Pool               *int
-	Mux                *int
-	MixFallbackTimeout time.Duration
+	Up   string
+	Down string
+	Pool *int
+	Mux  *int
 }
 
-// Matrix is the resolved Nowhere 2.1 client route: concrete or mixed carriers,
-// TLS Mux, and the dedicated tcp/tcp warm pool.
+// Matrix is the resolved Nowhere 2.2.1 client route: concrete carriers, TLS Mux,
+// and the dedicated tcp/tcp warm pool.
 type Matrix struct {
-	Up, Down           string
-	MixUp, MixDown     bool
-	Pool               int
-	Mux                bundle.MuxMode
-	MixFallbackTimeout time.Duration
-	Asymmetric         bool
-	NeedsQUIC          bool
-	NeedsTCP           bool
-	warnings           []string
+	Up, Down   string
+	Pool       int
+	Mux        bundle.MuxMode
+	Asymmetric bool
+	NeedsQUIC  bool
+	NeedsTCP   bool
+	warnings   []string
 }
 
-// ResolveMatrix applies Nowhere 2.1 outbound defaults and pool/mux rules.
+// ResolveMatrix applies Nowhere 2.2.1 outbound defaults and pool/mux rules.
 //
-// Carriers default to udp/udp. mix is a client-only policy resolved per flow.
+// Carriers default to udp/udp and must be tcp or udp; mix is not a carrier.
 // mux=1 enables TLS Mux when TCP is possible; udp/udp&mux=1 canonicalizes to 0.
 // The warm pool applies only to dedicated (mux=0) tcp/tcp.
 func ResolveMatrix(in MatrixInputs) (Matrix, error) {
@@ -52,6 +48,9 @@ func ResolveMatrix(in MatrixInputs) (Matrix, error) {
 	}
 	if (up == "") != (down == "") {
 		return Matrix{}, fmt.Errorf("nowhere: up and down must both be set or both omitted")
+	}
+	if up == "mix" || down == "mix" {
+		return Matrix{}, fmt.Errorf("nowhere: mix is not a carrier; up and down must be tcp or udp")
 	}
 	if !isCarrierMode(up) || !isCarrierMode(down) {
 		return Matrix{}, fmt.Errorf("nowhere: invalid carrier selector up=%q down=%q", up, down)
@@ -73,12 +72,10 @@ func ResolveMatrix(in MatrixInputs) (Matrix, error) {
 
 	m := Matrix{
 		Up: up, Down: down,
-		MixUp: up == "mix", MixDown: down == "mix",
-		Mux:                mux,
-		MixFallbackTimeout: in.MixFallbackTimeout,
-		Asymmetric:         up != down,
-		NeedsQUIC:          needsQUIC,
-		NeedsTCP:           needsTCP,
+		Mux:        mux,
+		Asymmetric: up != down,
+		NeedsQUIC:  needsQUIC,
+		NeedsTCP:   needsTCP,
 	}
 	if mux == bundle.MuxEnabled && !needsTCP {
 		m.warnings = append(m.warnings, "nowhere: mux=1 is canonicalized to 0 for udp/udp")
@@ -109,28 +106,19 @@ func ResolveMatrix(in MatrixInputs) (Matrix, error) {
 	return m, nil
 }
 
-// MixEnabled reports whether either direction uses the mix policy.
-func (m Matrix) MixEnabled() bool { return m.MixUp || m.MixDown }
-
 // Warnings returns non-fatal canonicalization messages.
 func (m Matrix) Warnings() []string { return m.warnings }
 
-// UpCarrier is the bundle uplink selector. Mix uplink is 0.
+// UpCarrier is the bundle uplink selector.
 func (m Matrix) UpCarrier() wire.Carrier {
-	if m.MixUp {
-		return 0
-	}
 	if m.Up == "tcp" {
 		return wire.CarrierTLSTCP
 	}
 	return wire.CarrierQUIC
 }
 
-// DownCarrier is the bundle downlink selector. Mix downlink is 0.
+// DownCarrier is the bundle downlink selector.
 func (m Matrix) DownCarrier() wire.Carrier {
-	if m.MixDown {
-		return 0
-	}
 	if m.Down == "tcp" {
 		return wire.CarrierTLSTCP
 	}
@@ -138,7 +126,7 @@ func (m Matrix) DownCarrier() wire.Carrier {
 }
 
 func isCarrierMode(s string) bool {
-	return s == "tcp" || s == "udp" || s == "mix"
+	return s == "tcp" || s == "udp"
 }
 
 // RequiresFlowEnvelope reports whether asymmetric FLOW_OPEN/FLOW_ATTACH must be used.

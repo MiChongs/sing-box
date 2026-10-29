@@ -13,11 +13,11 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/bundle"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/carrier"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/carrier/tcptls"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/diagnostic"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/wire"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/bundle"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/tcptls"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/diagnostic"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/wire"
 	"github.com/sagernet/sing-box/protocol/nowhere/internal/quicsettings"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
@@ -196,18 +196,15 @@ func (p *carrierDialPlan) newBundle() (*bundle.CarrierBundle, error) {
 
 func (p *carrierDialPlan) buildBundle(prewarmOnStart bool) (*bundle.CarrierBundle, error) {
 	bundleCfg := bundle.BundleOptions{
-		TCP:                p.tcpCfg,
-		Credentials:        p.credentials,
-		ALPN:               p.alpn,
-		Observer:           p.observer,
-		PoolSize:           p.matrix.Pool,
-		PrewarmOnStart:     prewarmOnStart,
-		Up:                 p.matrix.UpCarrier(),
-		Down:               p.matrix.DownCarrier(),
-		MixUp:              p.matrix.MixUp,
-		MixDown:            p.matrix.MixDown,
-		MixFallbackTimeout: p.matrix.MixFallbackTimeout,
-		Mux:                p.matrix.Mux,
+		TCP:            p.tcpCfg,
+		Credentials:    p.credentials,
+		ALPN:           p.alpn,
+		Observer:       p.observer,
+		PoolSize:       p.matrix.Pool,
+		PrewarmOnStart: prewarmOnStart,
+		Up:             p.matrix.UpCarrier(),
+		Down:           p.matrix.DownCarrier(),
+		Mux:            p.matrix.Mux,
 	}
 	if p.newQUICBackend != nil {
 		bundleCfg.QUIC = p.newQUICBackend()
@@ -216,6 +213,16 @@ func (p *carrierDialPlan) buildBundle(prewarmOnStart bool) (*bundle.CarrierBundl
 }
 
 func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.NowhereOutboundOptions) (adapter.Outbound, error) {
+	stack, err := resolveNowhereStack(nowhereOutboundALPN(&options))
+	if err != nil {
+		return nil, err
+	}
+	if stack == nowhereStackNw3 {
+		return NewOutboundV3(ctx, router, logger, tag, options)
+	}
+	if err := validateNowhereNw2OutboundOptions(&options); err != nil {
+		return nil, err
+	}
 	if options.Password == "" {
 		return nil, E.New("nowhere: missing password")
 	}
@@ -235,7 +242,6 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 
 	matrix, err := ResolveMatrix(MatrixInputs{
 		Up: options.Up, Down: options.Down, Pool: options.Pool, Mux: options.Mux,
-		MixFallbackTimeout: options.MixFallbackTimeout.Build(),
 	})
 	if err != nil {
 		return nil, err
@@ -257,7 +263,7 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	if options.MaxConcurrentDials != nil {
 		maxConcurrentDials = *options.MaxConcurrentDials
 	}
-	morphSharedKey := MorphSharedKey(options.Morph, options.Password)
+	morphSharedKey := MorphSharedKey(resolveNowhereMorph(options.Morph, nowhereStackNw2), options.Password)
 	plan, err := newCarrierDialPlan(ctx, logger, carrierDialOptions{
 		matrix:             matrix,
 		credentials:        credentials,

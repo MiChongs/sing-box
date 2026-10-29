@@ -1,0 +1,31 @@
+{
+  "protocol": "nw3",
+  "upstream_version": "3.1.0",
+  "upstream_commit": "000006531ca60321a02b50d270ab2e22f37701e3",
+  "exporter_version": "nowhere-vector-export/5",
+  "notes": [
+    "upstream Nowhere ships no fixed Morph vectors; these are derived from the wire contract in Nowhere/src/transport/morph.rs (MORPH_ROOT_SALT + HMAC-SHA256 expand with a 0x01 info terminator)",
+    "root = HMAC-SHA256(key=\"nowhere/nw3/morph\", msg=shared_key_text_bytes)",
+    "key(info) = HMAC-SHA256(key=root, msg=info || 0x01)",
+    "shared_key_text enters the KDF as text bytes, without hex decoding",
+    "the same derivation covers nw2-independent nw3 only; nw2 morph uses a different schedule"
+  ],
+  "cases": [
+    {
+      "id": "hex-shared-key",
+      "shared_key_text": "0123456789abcdef0123456789abcdef",
+      "tcp_c2s_hex": "cd35d648f7dfedb4425de8608ad73bba0b8c974b7722c853614ee36a4680e40b",
+      "tcp_s2c_hex": "047cd9198f3fa68299adc69f4952e98901cd630dd425349f2a5fe79670d59eef",
+      "udp_c2s_hex": "961246cb4710feaa71845d248abd8fc9ce570148f051a8fb6ca443b270a5bd58",
+      "udp_s2c_hex": "904a1c1c3fb1c1b0a18d38deab91b371a3b09f32315c0107a85c58f261a37bce"
+    },
+    {
+      "id": "text-shared-key",
+      "shared_key_text": "shared",
+      "tcp_c2s_hex": "bbac6d7e3714299bd873175ae3dafbfd91de57e21f55b6af85b57455bbb076be",
+      "tcp_s2c_hex": "4a604a9e7bf22a0efaa1831d3636e8a94c6357e2bc433cea79c4c50c54f9aa86",
+      "udp_c2s_hex": "5cdb39b023172c93299a746eea146c1737b50e92de92a6c2c3cfe48091ee69ad",
+      "udp_s2c_hex": "5d6e82826bd97591cff4b9af218410478e0cc715f6f89fde3d1caadc6850a3c4"
+    }
+  ]
+}

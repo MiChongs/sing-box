@@ -7,8 +7,8 @@ import (
 	"errors"
 	"sync"
 
-	"github.com/sagernet/sing-box/protocol/nowhere/core/carrier/dialgate"
-	nwquic "github.com/sagernet/sing-box/protocol/nowhere/core/carrier/quic"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/dialgate"
+	nwquic "github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/quic"
 )
 
 // Client caches one handshaked Session per proxy behind the shared dial gate.

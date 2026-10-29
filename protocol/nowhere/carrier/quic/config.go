@@ -9,8 +9,8 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
-	nwquic "github.com/sagernet/sing-box/protocol/nowhere/core/carrier/quic"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/diagnostic"
+	nwquic "github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/quic"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/diagnostic"
 	N "github.com/sagernet/sing/common/network"
 )
 

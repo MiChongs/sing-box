@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/protocol/nowhere/core/internal/vectors"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/wire"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/wire"
 )
 
 // CheckDir validates all known vector files under dir. Returns the number of

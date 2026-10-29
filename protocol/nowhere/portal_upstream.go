@@ -7,9 +7,9 @@ import (
 	"sync"
 
 	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/bundle"
-	nwserver "github.com/sagernet/sing-box/protocol/nowhere/core/server"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/wire"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/bundle"
+	nwserver "github.com/sagernet/sing-box/protocol/nowhere/core/nw2/server"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/wire"
 )
 
 // portalUpstreamManager keeps native Portal forwarding usable across network

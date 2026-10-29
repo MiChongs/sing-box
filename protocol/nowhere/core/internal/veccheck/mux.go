@@ -7,7 +7,7 @@ import (
 	"strconv"
 
 	"github.com/sagernet/sing-box/protocol/nowhere/core/internal/vectors"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/wire"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/wire"
 )
 
 func checkMux(path string) (int, error) {

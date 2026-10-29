@@ -12,7 +12,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/bundle"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/bundle"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -72,7 +72,7 @@ func TestNewOutboundRejectsUnknownQUICCongestionControlForTCPOnly(t *testing.T) 
 		Down:                  "tcp",
 		QUICCongestionControl: "BBR",
 		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
-			TLS: &option.OutboundTLSOptions{Enabled: true, Insecure: true},
+			TLS: &option.OutboundTLSOptions{Enabled: true, Insecure: true, ALPN: badoption.Listable[string]{"nw2"}},
 		},
 	})
 	require.ErrorContains(t, err, "unknown quic congestion control")
@@ -89,7 +89,7 @@ func TestNewOutboundAcceptsPoolWithinRustLimit(t *testing.T) {
 		Down:          "tcp",
 		Pool:          &pool,
 		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
-			TLS: &option.OutboundTLSOptions{Enabled: true, Insecure: true},
+			TLS: &option.OutboundTLSOptions{Enabled: true, Insecure: true, ALPN: badoption.Listable[string]{"nw2"}},
 		},
 	})
 	require.NoError(t, err)
@@ -112,7 +112,7 @@ func TestNewOutboundWarnsWhenPoolIsIgnoredForUDP(t *testing.T) {
 		Down:          "udp",
 		Pool:          &pool,
 		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
-			TLS: &option.OutboundTLSOptions{Enabled: true, Insecure: true},
+			TLS: &option.OutboundTLSOptions{Enabled: true, Insecure: true, ALPN: badoption.Listable[string]{"nw2"}},
 		},
 	})
 	require.NoError(t, err)
@@ -209,7 +209,7 @@ func (l *warningLogger) Warnings() []string {
 	return append([]string(nil), l.warnings...)
 }
 
-func TestNewOutboundConstructsMixAndMux(t *testing.T) {
+func TestNewOutboundConstructsMux(t *testing.T) {
 	t.Parallel()
 	logger := log.NewNOPFactory().Logger()
 	mux := 1
@@ -227,24 +227,5 @@ func TestNewOutboundConstructsMixAndMux(t *testing.T) {
 	nw := out.(*Outbound)
 	require.Equal(t, 0, nw.matrix.Pool)
 	require.True(t, nw.matrix.Mux == 1)
-	require.NoError(t, nw.Close())
-
-	if !quicIncluded {
-		t.Skip("mix requires with_quic")
-	}
-	out, err = NewOutbound(context.Background(), nil, logger, "nw-mix", option.NowhereOutboundOptions{
-		ServerOptions: option.ServerOptions{Server: "127.0.0.1", ServerPort: 2077},
-		Password:      "secret",
-		Up:            "mix",
-		Down:          "mix",
-		OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
-			TLS: &option.OutboundTLSOptions{Enabled: true, Insecure: true, ALPN: badoption.Listable[string]{"nw2"}},
-		},
-	})
-	require.NoError(t, err)
-	nw = out.(*Outbound)
-	require.True(t, nw.matrix.MixEnabled())
-	require.True(t, nw.matrix.NeedsTCP)
-	require.True(t, nw.matrix.NeedsQUIC)
 	require.NoError(t, nw.Close())
 }

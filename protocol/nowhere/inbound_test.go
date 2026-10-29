@@ -8,7 +8,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
-
+	"github.com/sagernet/sing/common/json/badoption"
 	"github.com/stretchr/testify/require"
 )
 
@@ -21,10 +21,10 @@ func TestNewInboundRejectsUnknownQUICCongestionControlForTCPOnly(t *testing.T) {
 	t.Parallel()
 	logger := log.NewNOPFactory().Logger()
 	_, err := NewInbound(context.Background(), nil, logger, "nw", option.NowhereInboundOptions{
-		Password:              "secret",
+		Password:              testPortalKey,
 		QUICCongestionControl: "BBR",
 		InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
-			TLS: &option.InboundTLSOptions{Enabled: true},
+			TLS: &option.InboundTLSOptions{Enabled: true, ALPN: badoption.Listable[string]{"nw2"}},
 		},
 	})
 	require.ErrorContains(t, err, "unknown quic congestion control")

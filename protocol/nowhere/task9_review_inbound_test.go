@@ -12,8 +12,8 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	boxTLS "github.com/sagernet/sing-box/common/tls"
-	nwserver "github.com/sagernet/sing-box/protocol/nowhere/core/server"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/wire"
+	nwserver "github.com/sagernet/sing-box/protocol/nowhere/core/nw2/server"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/wire"
 	"github.com/sagernet/sing-box/protocol/nowhere/server"
 )
 

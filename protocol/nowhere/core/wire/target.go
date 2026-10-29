@@ -3,328 +3,198 @@ package wire
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/netip"
-)
-
-// SOCKS5-compatible address types.
-const (
-	TargetIPv4   byte = 0x01
-	TargetDomain byte = 0x03
-	TargetIPv6   byte = 0x04
+	"strconv"
 )
 
 const (
-	targetIPv4Len = 1 + 4 + 2
-	targetIPv6Len = 1 + 16 + 2
-	// DomainLenMax is the largest accepted wire hostname length.
-	DomainLenMax    = 253
-	targetDomainMin = 1 + 1 + 1 + 2
-	targetMaxLen    = 1 + 1 + DomainLenMax + 2
+	atypIPv4   = 0x01
+	atypDomain = 0x03
+	atypIPv6   = 0x04
+
+	domainLenMax = 253
+	targetMaxLen = 1 + 1 + domainLenMax + 2
 )
 
-// TargetType is the wire address type discriminator.
-type TargetType uint8
-
-const (
-	// TargetTypeIPv4 identifies an IPv4 target.
-	TargetTypeIPv4 TargetType = 0x01
-	// TargetTypeDomain identifies an unresolved ASCII/IDNA hostname.
-	TargetTypeDomain TargetType = 0x03
-	// TargetTypeIPv6 identifies an IPv6 target.
-	TargetTypeIPv6 TargetType = 0x04
-)
-
-// Target is a binary destination address carried after an opening flow header.
-// Public fields are exposed for low-cost host conversion, but codec callers
-// must use the constructors and Validate; the encoder never trusts the fields.
+// Target is a SOCKS-shaped destination. Port zero is invalid.
 type Target struct {
-	Type TargetType
 	Addr netip.Addr
 	Host string
 	Port uint16
 }
 
-// NewIPTarget constructs a validated IP target. IPv4-in-6 mapped addresses are
-// preserved as IPv6 and encoded with ATYP 0x04; callers holding an explicit
-// IPv4 address should keep it IPv4 before construction.
+// NewIPTarget constructs an IP target. IPv4-mapped IPv6 addresses are rejected.
 func NewIPTarget(addr netip.Addr, port uint16) (Target, error) {
-	if !addr.IsValid() {
-		return Target{}, errors.New("nowhere: invalid ip target address")
+	if !addr.IsValid() || addr.Is4In6() || port == 0 {
+		return Target{}, errors.New("nw3: invalid ip target")
 	}
-	if addr.Is4In6() {
-		return Target{}, errors.New("nowhere: ipv4-in-6 mapped address must be unmapped")
-	}
-	if port == 0 {
-		return Target{}, errors.New("nowhere: zero target port")
-	}
-	t := Target{Port: port}
-	if addr.Is4() {
-		t.Type = TargetTypeIPv4
-	} else {
-		t.Type = TargetTypeIPv6
-	}
-	t.Addr = addr
-	return t, nil
+	return Target{Addr: addr, Port: port}, nil
 }
 
-// NewDomainTarget constructs a validated unresolved domain target. The host
-// must already be in ASCII/IDNA wire form; the codec does no DNS resolution or
-// punycode conversion.
+// NewDomainTarget constructs an ASCII/IDNA domain target.
 func NewDomainTarget(host string, port uint16) (Target, error) {
-	if port == 0 {
-		return Target{}, errors.New("nowhere: zero target port")
+	if err := validateDomain(host); err != nil || port == 0 {
+		return Target{}, errors.New("nw3: invalid domain target")
 	}
-	if err := validateDomainName(host); err != nil {
-		return Target{}, err
-	}
-	return Target{Type: TargetTypeDomain, Host: host, Port: port}, nil
+	return Target{Host: host, Port: port}, nil
 }
 
-// Validate enforces the constructor invariants. Codec entry points call this.
-func (t Target) Validate() error {
-	switch t.Type {
-	case TargetTypeIPv4:
-		if !t.Addr.IsValid() || !t.Addr.Is4() || t.Port == 0 {
-			return ErrInvalidTarget
-		}
-	case TargetTypeIPv6:
-		if !t.Addr.IsValid() || t.Addr.Is4() || t.Addr.Is4In6() || t.Port == 0 {
-			return ErrInvalidTarget
-		}
-	case TargetTypeDomain:
-		if t.Port == 0 {
-			return ErrInvalidTarget
-		}
-		if err := validateDomainName(t.Host); err != nil {
-			return err
-		}
-		if t.Addr.IsValid() {
-			return errors.New("nowhere: domain target must not carry an ip")
-		}
-	default:
-		return ErrInvalidTarget
+// IsIP reports whether the target is an IP literal.
+func (t Target) IsIP() bool { return t.Addr.IsValid() }
+
+// HostPort is the dial address.
+func (t Target) HostPort() string {
+	host := t.Host
+	if t.Addr.IsValid() {
+		host = t.Addr.String()
 	}
-	// Cross-field consistency: IP types must not set Host, domain must not set Addr.
-	if t.Type != TargetTypeDomain && t.Host != "" {
-		return ErrInvalidTarget
-	}
-	return nil
+	return net.JoinHostPort(host, strconv.Itoa(int(t.Port)))
 }
 
-// EncodedLen returns the on-wire length after validation.
-func (t Target) EncodedLen() (int, error) {
-	if err := t.Validate(); err != nil {
-		return 0, err
-	}
-	switch t.Type {
-	case TargetTypeIPv4:
-		return targetIPv4Len, nil
-	case TargetTypeIPv6:
-		return targetIPv6Len, nil
-	default:
-		return 1 + 1 + len(t.Host) + 2, nil
-	}
-}
+func (t Target) String() string { return t.HostPort() }
 
-// EncodeTarget writes a validated target into a right-sized buffer.
-func EncodeTarget(t Target) ([]byte, error) {
-	if err := t.Validate(); err != nil {
+// AppendTarget encodes the target onto dst.
+func AppendTarget(dst []byte, t Target) ([]byte, error) {
+	if err := t.validate(); err != nil {
 		return nil, err
 	}
-	n, err := t.EncodedLen()
-	if err != nil {
-		return nil, err
+	if t.Addr.Is4() {
+		dst = append(dst, atypIPv4)
+		ip := t.Addr.As4()
+		dst = append(dst, ip[:]...)
+	} else if t.Addr.IsValid() {
+		dst = append(dst, atypIPv6)
+		ip := t.Addr.As16()
+		dst = append(dst, ip[:]...)
+	} else {
+		dst = append(dst, atypDomain, byte(len(t.Host)))
+		dst = append(dst, t.Host...)
 	}
-	out := make([]byte, n)
-	if _, err := encodeTargetInto(t, out); err != nil {
-		return nil, err
-	}
-	return out, nil
+	var port [2]byte
+	binary.BigEndian.PutUint16(port[:], t.Port)
+	return append(dst, port[:]...), nil
 }
 
-// EncodeTargetInto writes the target into the provided buffer and returns the
-// number of bytes written. The buffer must be at least EncodedLen bytes.
-func EncodeTargetInto(t Target, out []byte) (int, error) {
-	if err := t.Validate(); err != nil {
-		return 0, err
-	}
-	n, err := t.EncodedLen()
-	if err != nil {
-		return 0, err
-	}
-	if len(out) < n {
-		return 0, errors.New("nowhere: target output buffer too short")
-	}
-	return encodeTargetInto(t, out)
-}
-
-func encodeTargetInto(t Target, out []byte) (int, error) {
-	switch t.Type {
-	case TargetTypeIPv4:
-		out[0] = TargetIPv4
-		addr4 := t.Addr.As4()
-		copy(out[1:5], addr4[:])
-		binary.BigEndian.PutUint16(out[5:7], t.Port)
-		return targetIPv4Len, nil
-	case TargetTypeIPv6:
-		out[0] = TargetIPv6
-		addr16 := t.Addr.As16()
-		copy(out[1:17], addr16[:])
-		binary.BigEndian.PutUint16(out[17:19], t.Port)
-		return targetIPv6Len, nil
-	case TargetTypeDomain:
-		out[0] = TargetDomain
-		out[1] = byte(len(t.Host))
-		copy(out[2:2+len(t.Host)], t.Host)
-		binary.BigEndian.PutUint16(out[2+len(t.Host):2+len(t.Host)+2], t.Port)
-		return 1 + 1 + len(t.Host) + 2, nil
-	default:
-		return 0, ErrInvalidTarget
-	}
-}
-
-// DecodeTarget decodes one target prefix and reports how many bytes it consumed.
-func DecodeTarget(input []byte) (Target, int, error) {
-	if len(input) == 0 {
-		return Target{}, 0, ErrInvalidTarget
-	}
-	switch input[0] {
-	case TargetIPv4:
-		if len(input) < targetIPv4Len {
-			return Target{}, 0, ErrTruncated
-		}
-		addr := netip.AddrFrom4([4]byte{input[1], input[2], input[3], input[4]})
-		port := binary.BigEndian.Uint16(input[5:7])
-		t, err := NewIPTarget(addr, port)
-		if err != nil {
-			return Target{}, 0, err
-		}
-		return t, targetIPv4Len, nil
-	case TargetIPv6:
-		if len(input) < targetIPv6Len {
-			return Target{}, 0, ErrTruncated
-		}
-		var raw [16]byte
-		copy(raw[:], input[1:17])
-		addr := netip.AddrFrom16(raw)
-		if addr.Is4In6() {
-			return Target{}, 0, ErrInvalidTarget
-		}
-		port := binary.BigEndian.Uint16(input[17:19])
-		t, err := NewIPTarget(addr, port)
-		if err != nil {
-			return Target{}, 0, err
-		}
-		return t, targetIPv6Len, nil
-	case TargetDomain:
-		if len(input) < 2 {
-			return Target{}, 0, ErrTruncated
-		}
-		domainLen := int(input[1])
-		encodedLen := 1 + 1 + domainLen + 2
-		if domainLen == 0 || domainLen > DomainLenMax {
-			return Target{}, 0, ErrInvalidTarget
-		}
-		if len(input) < encodedLen {
-			return Target{}, 0, ErrTruncated
-		}
-		host := string(input[2 : 2+domainLen])
-		port := binary.BigEndian.Uint16(input[encodedLen-2 : encodedLen])
-		t, err := NewDomainTarget(host, port)
-		if err != nil {
-			return Target{}, 0, err
-		}
-		return t, encodedLen, nil
-	default:
-		return Target{}, 0, ErrInvalidTarget
-	}
-}
-
-// ReadTarget reads one target, leaving any following initial payload untouched.
+// ReadTarget reads one target from r.
 func ReadTarget(r io.Reader) (Target, error) {
 	var atyp [1]byte
 	if _, err := io.ReadFull(r, atyp[:]); err != nil {
 		return Target{}, err
 	}
 	switch atyp[0] {
-	case TargetIPv4:
-		var buf [targetIPv4Len - 1]byte
+	case atypIPv4:
+		var buf [6]byte
 		if _, err := io.ReadFull(r, buf[:]); err != nil {
 			return Target{}, err
 		}
-		full := append([]byte{TargetIPv4}, buf[:]...)
-		t, _, err := DecodeTarget(full)
-		return t, err
-	case TargetIPv6:
-		var buf [targetIPv6Len - 1]byte
+		addr, ok := netip.AddrFromSlice(buf[:4])
+		if !ok {
+			return Target{}, errors.New("nw3: invalid ipv4 target")
+		}
+		return NewIPTarget(addr, binary.BigEndian.Uint16(buf[4:]))
+	case atypIPv6:
+		var buf [18]byte
 		if _, err := io.ReadFull(r, buf[:]); err != nil {
 			return Target{}, err
 		}
-		full := append([]byte{TargetIPv6}, buf[:]...)
-		t, _, err := DecodeTarget(full)
-		return t, err
-	case TargetDomain:
-		var lenByte [1]byte
-		if _, err := io.ReadFull(r, lenByte[:]); err != nil {
+		addr, ok := netip.AddrFromSlice(buf[:16])
+		if !ok {
+			return Target{}, errors.New("nw3: invalid ipv6 target")
+		}
+		return NewIPTarget(addr, binary.BigEndian.Uint16(buf[16:]))
+	case atypDomain:
+		var nbuf [1]byte
+		if _, err := io.ReadFull(r, nbuf[:]); err != nil {
 			return Target{}, err
 		}
-		domainLen := int(lenByte[0])
-		if domainLen == 0 || domainLen > DomainLenMax {
-			return Target{}, ErrInvalidTarget
+		n := int(nbuf[0])
+		if n == 0 || n > domainLenMax {
+			return Target{}, errors.New("nw3: invalid domain length")
 		}
-		encodedLen := 1 + 1 + domainLen + 2
-		buf := make([]byte, encodedLen)
-		buf[0] = TargetDomain
-		buf[1] = lenByte[0]
-		if _, err := io.ReadFull(r, buf[2:encodedLen]); err != nil {
+		buf := make([]byte, n+2)
+		if _, err := io.ReadFull(r, buf); err != nil {
 			return Target{}, err
 		}
-		t, _, err := DecodeTarget(buf)
-		return t, err
+		return NewDomainTarget(string(buf[:n]), binary.BigEndian.Uint16(buf[n:]))
 	default:
-		return Target{}, ErrInvalidTarget
+		return Target{}, fmt.Errorf("nw3: unknown address type %d", atyp[0])
 	}
 }
 
-// validateDomainName mirrors nowhere::protocol::util::validate_domain_bytes:
-// ASCII/IDNA wire form, 1..253 bytes, each label 1..63, labels are
-// alphanumeric or '-' and must not begin/end with '-'.
-func validateDomainName(host string) error {
-	if len(host) == 0 || len(host) > DomainLenMax {
-		return ErrInvalidTarget
+// WriteFlowRequest writes FlowStart and Target.
+func WriteFlowRequest(w io.Writer, kind FlowKind, target Target) error {
+	if err := WriteFlowStart(w, kind); err != nil {
+		return err
 	}
-	for i := 0; i < len(host); i++ {
-		if host[i] >= 0x80 {
-			return ErrInvalidTarget
-		}
+	buf, err := AppendTarget(nil, target)
+	if err != nil {
+		return err
 	}
-	// reject trailing dot and empty labels here; per-label checks below.
-	start := 0
-	for i := 0; i <= len(host); i++ {
-		if i == len(host) || host[i] == '.' {
-			label := host[start:i]
-			if len(label) == 0 || len(label) > 63 {
-				return ErrInvalidTarget
-			}
-			if !validLabel(label) {
-				return ErrInvalidTarget
-			}
-			start = i + 1
+	_, err = w.Write(buf)
+	return err
+}
+
+// ReadFlowRequest reads FlowStart and Target. ok is false on a clean EOF
+// before FlowStart (QUIC authentication-only stream).
+func ReadFlowRequest(r io.Reader) (FlowKind, Target, bool, error) {
+	kind, ok, err := ReadFlowStart(r)
+	if err != nil || !ok {
+		return 0, Target{}, ok, err
+	}
+	target, err := ReadTarget(r)
+	if err != nil {
+		return 0, Target{}, false, err
+	}
+	return kind, target, true, nil
+}
+
+func (t Target) validate() error {
+	if t.Port == 0 {
+		return errors.New("nw3: zero target port")
+	}
+	if t.Addr.IsValid() {
+		if t.Host != "" || t.Addr.Is4In6() {
+			return errors.New("nw3: invalid ip target")
 		}
+		return nil
+	}
+	if err := validateDomain(t.Host); err != nil {
+		return err
 	}
 	return nil
 }
 
-func validLabel(label string) bool {
-	if label[0] == '-' || label[len(label)-1] == '-' {
-		return false
+func validateDomain(host string) error {
+	if len(host) == 0 || len(host) > domainLenMax {
+		return errors.New("nw3: invalid domain length")
 	}
-	for i := 0; i < len(label); i++ {
-		c := label[i]
-		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-') {
-			return false
+	for i := 0; i < len(host); i++ {
+		if host[i] > 127 {
+			return errors.New("nw3: domain is not ASCII")
 		}
 	}
-	return true
+	start := 0
+	for i := 0; i <= len(host); i++ {
+		if i != len(host) && host[i] != '.' {
+			continue
+		}
+		label := host[start:i]
+		if len(label) == 0 || len(label) > 63 {
+			return errors.New("nw3: invalid DNS label length")
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return errors.New("nw3: DNS label begins or ends with hyphen")
+		}
+		for j := 0; j < len(label); j++ {
+			c := label[j]
+			if (c < '0' || c > '9') && (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && c != '-' {
+				return errors.New("nw3: invalid DNS label bytes")
+			}
+		}
+		start = i + 1
+	}
+	return nil
 }

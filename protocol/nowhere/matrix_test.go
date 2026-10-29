@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sagernet/sing-box/protocol/nowhere/core/bundle"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/bundle"
 )
 
 func TestResolveMatrixDefaultsAndPool(t *testing.T) {
@@ -20,7 +20,6 @@ func TestResolveMatrixDefaultsAndPool(t *testing.T) {
 		wantAsym    bool
 		wantQUIC    bool
 		wantTCP     bool
-		wantMix     bool
 		wantWarning bool
 		wantErr     bool
 	}{
@@ -36,9 +35,10 @@ func TestResolveMatrixDefaultsAndPool(t *testing.T) {
 		{name: "one-sided-up", in: MatrixInputs{Up: "tcp"}, wantErr: true},
 		{name: "one-sided-down", in: MatrixInputs{Down: "udp"}, wantErr: true},
 		{name: "bad-carrier", in: MatrixInputs{Up: "quic", Down: "tcp"}, wantErr: true},
+		{name: "mix-rejected", in: MatrixInputs{Up: "mix", Down: "mix"}, wantErr: true},
+		{name: "mix-up-rejected", in: MatrixInputs{Up: "mix", Down: "udp"}, wantErr: true},
 		{name: "negative-pool", in: MatrixInputs{Up: "tcp", Down: "tcp", Pool: intPtr(-1)}, wantErr: true},
 		{name: "negative-pool-udp-ignored", in: MatrixInputs{Up: "udp", Down: "udp", Pool: intPtr(-1)}, wantUp: "udp", wantDown: "udp", wantQUIC: true, wantWarning: true},
-		{name: "mix-mix", in: MatrixInputs{Up: "mix", Down: "mix"}, wantUp: "mix", wantDown: "mix", wantTCP: true, wantQUIC: true, wantMix: true},
 		{name: "tcp-tcp-mux", in: MatrixInputs{Up: "tcp", Down: "tcp", Mux: intPtr(1), Pool: intPtr(5)}, wantUp: "tcp", wantDown: "tcp", wantTCP: true, wantMux: bundle.MuxEnabled, wantWarning: true},
 		{name: "udp-udp-mux-canonicalized", in: MatrixInputs{Up: "udp", Down: "udp", Mux: intPtr(1)}, wantUp: "udp", wantDown: "udp", wantQUIC: true, wantWarning: true},
 		{name: "invalid-mux", in: MatrixInputs{Mux: intPtr(2)}, wantErr: true},
@@ -70,9 +70,6 @@ func TestResolveMatrixDefaultsAndPool(t *testing.T) {
 			}
 			if got.NeedsQUIC != tc.wantQUIC || got.NeedsTCP != tc.wantTCP {
 				t.Fatalf("needs quic/tcp = %v/%v, want %v/%v", got.NeedsQUIC, got.NeedsTCP, tc.wantQUIC, tc.wantTCP)
-			}
-			if got.MixEnabled() != tc.wantMix {
-				t.Fatalf("mix = %v, want %v", got.MixEnabled(), tc.wantMix)
 			}
 			if (len(got.Warnings()) > 0) != tc.wantWarning {
 				t.Fatalf("warnings = %v, want warning=%v", got.Warnings(), tc.wantWarning)

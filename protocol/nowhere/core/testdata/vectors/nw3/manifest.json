@@ -1,0 +1,33 @@
+{
+  "protocol": "nowhere-v3",
+  "upstream_version": "3.1.0",
+  "upstream_commit": "000006531ca60321a02b50d270ab2e22f37701e3",
+  "exporter_version": "nowhere-vector-export/5",
+  "sources": {
+    "protocol_md": "Nowhere/docs/protocol.md",
+    "rust_vectors": "Nowhere/src/tests/protocol/vectors.json",
+    "rust_flow": "Nowhere/src/tests/protocol/flow.rs",
+    "rust_request": "Nowhere/src/tests/protocol/request.rs",
+    "rust_auth": "Nowhere/src/protocol/auth.rs",
+    "rust_morph": "Nowhere/src/transport/morph.rs + Nowhere/src/transport/morph/tcp.rs"
+  },
+  "files": [
+    "vectors.json",
+    "morph.json",
+    "prelude.json"
+  ],
+  "notes": [
+    "nowhere-go/testdata/vectors/nw3 is the module-local nw3 conformance corpus",
+    "vectors.json is a provenance-annotated export of Nowhere/src/tests/protocol/vectors.json at the pinned commit; the upstream blob is byte-identical modulo the four provenance keys",
+    "morph.json is derived from the wire contract: upstream ships no fixed Morph vectors, so these are computed with the documented HMAC-SHA256 schedule and pinned here",
+    "UPSTREAM.lock vector_tree_sha256 is sha256-tree-v1 over this directory, mirroring UPSTREAM-nw2.lock over testdata/vectors",
+    "complete wire hex tables must not be maintained by hand",
+    "nw3 auth salt is SHA-256(\"nowhere/nw3/auth-root\"); role_key = HMAC(HMAC(salt, shared_key_text), role_info || 0x01); tag = HMAC-SHA256(role_key, transport || exporter)[0:16]",
+    "FlowStart is one byte: bit 0 selects TCP (0) or UDP (1); senders MUST zero bits 1-7 and receivers MUST ignore them",
+    "UDP flow id is (quic_stream_id >> 2) + 1 after direction checks, in [1, 2^30-1]",
+    "setup result is a single byte (0..4); registration result is a single byte (0..1)",
+    "Morph TCP bootstrap is prelude[64] || nonce[12] with fade (default), full8 or low7 sender policy. Nowhere 3.1 authenticates a Vector identity and counter in the low 7 bits of the tail. A Portal accepts one fresh counter when the tag matches, and still accepts a tag mismatch on the 3.0 path without consulting the replay registry. That fallback is transitional.",
+    "fade samples A in [8,12] and B in [16,32], writes printable ASCII on [0,A), low7 on [A,B), full8 on [B,64), using rejection sampling to avoid modulo bias",
+    "nw3 has no Mux"
+  ]
+}

@@ -10,7 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	nwquic "github.com/sagernet/sing-box/protocol/nowhere/core/carrier/quic"
+	nwquic "github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/quic"
 )
 
 // preparedStream owns an opened QUIC stream until setup bytes are committed.

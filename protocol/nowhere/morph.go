@@ -3,7 +3,7 @@ package nowhere
 import (
 	"net"
 
-	"github.com/sagernet/sing-box/protocol/nowhere/core/carrier/morph"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/morph"
 )
 
 // MorphSharedKey returns the hop password as a Morph key when enabled.

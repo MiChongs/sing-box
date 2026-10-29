@@ -33,6 +33,7 @@
 | `anytls`      | [AnyTLS](./anytls/)           | TCP              |
 | `quicx`       | [QUICX](./quicx/)             | :material-close: |
 | `nowhere`     | [Nowhere](./nowhere/)         | TCP              |
+| `nowhere-egress` | [Nowhere Egress](./nowhere-egress/) | :material-close: |
 | `snell`       | [Snell](./snell/)             | TCP / UDP (v5)   |
 | `tun`         | [Tun](./tun/)                 | :material-close: |
 | `redirect`    | [Redirect](./redirect/)       | :material-close: |

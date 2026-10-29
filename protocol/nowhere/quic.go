@@ -4,7 +4,7 @@ package nowhere
 
 import (
 	quic "github.com/sagernet/sing-box/protocol/nowhere/carrier/quic"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/carrier"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier"
 )
 
 const quicIncluded = true

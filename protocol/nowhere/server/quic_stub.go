@@ -9,7 +9,7 @@ import (
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/diagnostic"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/diagnostic"
 	"github.com/sagernet/sing-box/protocol/nowhere/internal/quicsettings"
 )
 

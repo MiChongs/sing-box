@@ -15,9 +15,9 @@ import (
 	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/option"
-	nwquic "github.com/sagernet/sing-box/protocol/nowhere/core/carrier/quic"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/diagnostic"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/wire"
+	nwquic "github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/quic"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/diagnostic"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/wire"
 	qtls "github.com/sagernet/sing-quic"
 	M "github.com/sagernet/sing/common/metadata"
 )
@@ -291,7 +291,15 @@ func (s *Session) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 		err = errSessionClosed
 	}
 	if err != nil && !isCallerContextError(ctx, err) {
-		s.emit(ctx, diagnostic.LevelWarn, "quic_datagram_receive_failed", err, "")
+		level := diagnostic.LevelWarn
+		var appErr *quic.ApplicationError
+		if (errors.As(err, &appErr) && appErr.ErrorCode == 0) ||
+			errors.Is(err, errSessionClosed) ||
+			errors.Is(err, net.ErrClosed) ||
+			s.IsClosed() {
+			level = diagnostic.LevelDebug
+		}
+		s.emit(ctx, level, "quic_datagram_receive_failed", err, "")
 		s.maybeFailSession(err)
 	}
 	return data, err

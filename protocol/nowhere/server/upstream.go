@@ -7,9 +7,9 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/diagnostic"
-	nwserver "github.com/sagernet/sing-box/protocol/nowhere/core/server"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/wire"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/diagnostic"
+	nwserver "github.com/sagernet/sing-box/protocol/nowhere/core/nw2/server"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/wire"
 	"github.com/sagernet/sing/common/bufio"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"

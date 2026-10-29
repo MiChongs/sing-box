@@ -1,7 +1,7 @@
 {
   "protocol": "nowhere-v2",
-  "upstream_version": "2.1.0",
-  "upstream_commit": "568031335b72a925e4904f15f8e39053ffc32866",
+  "upstream_version": "2.2.1",
+  "upstream_commit": "0000696910dc9ee56c3ec87995a0b1ca8e4fc11b",
   "exporter_version": "nowhere-vector-export/4",
   "sources": {
     "protocol_md": "Nowhere/docs/protocol.md",
@@ -30,9 +30,9 @@
     "nw2 auth salt is SHA-256(\"nowhere/nw2/auth-root\"); tag = HMAC-SHA256(auth_key, transport || exporter || session_id)[0:16]",
     "FlowHeader remains 5 bytes; flags high three bits carry HOPS 0..7 and flow_id is a 30-bit BE integer",
     "OPEN/ATTACH may use equal carriers; Vector still emits DUPLEX when both directions match",
-    "mix is a client policy only; FlowHeader still carries TT, TQ, QT, or QQ",
+    "FlowHeader still carries TT, TQ, QT, or QQ; mix was a client carrier policy and never reached the wire",
     "TLS Mux marker is 0xff after AuthFrame; MuxHeader is 7 bytes kind|value u16|flow_id u32",
-    "Morph TCP bootstrap is prelude[64] || nonce[12] with low7 (default) or full8 sender policy; UDP keys are directional udp c2s / udp s2c; incompatible with 2.0.x morph",
+    "Morph TCP bootstrap is prelude[64] || nonce[12] with full8 (default) or low7 sender policy; UDP keys are directional udp c2s / udp s2c; incompatible with 2.0.x morph",
     "setup result is a single byte (0..7); no magic/version prefix",
     "UoT is u16 BE length + payload (no type byte)",
     "QUIC UDP DATA/CLOSE are 4-byte packed headers, FRAGMENT is 12 bytes"

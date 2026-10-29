@@ -1,294 +1,365 @@
 package wire
 
 import (
+	"encoding/binary"
 	"errors"
-	"fmt"
-)
-
-// UDPFrameDATA / FRAGMENT / CLOSE occupy the high two bits of the packed
-// 32-bit header word. flow_id occupies the low 30 bits.
-const (
-	UDPFrameDATA     byte = 0
-	UDPFrameFRAGMENT byte = 1
-	UDPFrameCLOSE    byte = 2
+	"io"
+	"time"
 )
 
 const (
-	udpFrameTypeShift uint32 = 30
-	udpFrameTypeMask  uint32 = 0b11 << udpFrameTypeShift
+	udpHeaderLen         = 4
+	udpFragmentHeaderLen = 12
+	udpPacketMax         = 65535
 
-	// UDPHeaderLen is the common unfragmented DATA / CLOSE header length.
-	UDPHeaderLen = 4
-	// UDPFragmentHeaderLen is the FRAGMENT header length.
-	UDPFragmentHeaderLen = 12
-	// UDPPacketMax is the largest UDP payload representable by the protocol.
-	UDPPacketMax = 0xffff
+	frameData      = 0
+	frameFragment  = 1
+	frameClose     = 2
+	frameTypeShift = 30
 )
 
-// UDPFragment carries metadata for one fragment of a larger UDP packet.
-type UDPFragment struct {
-	PacketID      uint32
-	FragmentIndex uint8
-	FragmentCount uint8
-	TotalLen      uint16
-	Payload       []byte
+// Datagram is one decoded QUIC UDP frame.
+type Datagram struct {
+	Type     uint8
+	FlowID   uint32
+	Payload  []byte
+	PacketID uint32
+	Index    uint8
+	Count    uint8
+	Total    uint16
 }
 
-// UDPFrameType is the decoded frame type.
-type UDPFrameType uint8
-
-const (
-	// UDPFrameTypeData carries one complete UDP packet.
-	UDPFrameTypeData UDPFrameType = 0
-	// UDPFrameTypeFragment carries one fragment of a larger UDP packet.
-	UDPFrameTypeFragment UDPFrameType = 1
-	// UDPFrameTypeClose releases a UDP flow.
-	UDPFrameTypeClose UDPFrameType = 2
-)
-
-// UDPFrame is one decoded QUIC DATAGRAM frame.
-type UDPFrame struct {
-	Type     UDPFrameType
-	FlowID   FlowID
-	Payload  []byte // DATA only
-	Fragment UDPFragment
-}
-
-// EncodeUDPDataHeader encodes a 4-byte unfragmented DATA header.
-func EncodeUDPDataHeader(flowID FlowID) ([UDPHeaderLen]byte, error) {
-	return encodeUDPBaseHeader(UDPFrameDATA, flowID)
-}
-
-// EncodeUDPClose encodes a 4-byte CLOSE frame.
-func EncodeUDPClose(flowID FlowID) ([UDPHeaderLen]byte, error) {
-	return encodeUDPBaseHeader(UDPFrameCLOSE, flowID)
-}
-
-// EncodeUDPFragmentHeader encodes a validated 12-byte FRAGMENT header.
-func EncodeUDPFragmentHeader(flowID FlowID, fragment UDPFragment) ([UDPFragmentHeaderLen]byte, error) {
-	if err := validateFlowID(flowID); err != nil {
-		return [UDPFragmentHeaderLen]byte{}, err
+// EncodeData encodes one complete UDP payload. An empty payload is valid.
+func EncodeData(flowID uint32, payload []byte) ([]byte, error) {
+	if err := validateFlow(flowID); err != nil {
+		return nil, err
 	}
-	if err := validatePacketID(fragment.PacketID); err != nil {
-		return [UDPFragmentHeaderLen]byte{}, err
+	if len(payload) > udpPacketMax {
+		return nil, errors.New("nw3: UDP payload too large")
 	}
-	if err := validateFragmentMetadata(fragment); err != nil {
-		return [UDPFragmentHeaderLen]byte{}, err
-	}
-	word, err := encodeUDPBaseWord(UDPFrameFRAGMENT, flowID)
-	if err != nil {
-		return [UDPFragmentHeaderLen]byte{}, err
-	}
-	var out [UDPFragmentHeaderLen]byte
-	encodeUint32BE(out[0:4], word)
-	encodeUint32BE(out[4:8], fragment.PacketID)
-	out[8] = fragment.FragmentIndex
-	out[9] = fragment.FragmentCount
-	out[10] = byte(fragment.TotalLen >> 8)
-	out[11] = byte(fragment.TotalLen)
+	out := make([]byte, udpHeaderLen+len(payload))
+	binary.BigEndian.PutUint32(out[:4], (uint32(frameData)<<frameTypeShift)|flowID)
+	copy(out[4:], payload)
 	return out, nil
 }
 
-// EncodeUDPData encodes one complete unfragmented DATA frame (header+payload).
-// A zero-length payload is a legal UDP packet and must use DATA, never FRAGMENT.
-func EncodeUDPData(flowID FlowID, payload []byte) ([]byte, error) {
-	if err := validateFlowID(flowID); err != nil {
+// EncodeClose encodes a 4-byte CLOSE frame.
+func EncodeClose(flowID uint32) ([]byte, error) {
+	if err := validateFlow(flowID); err != nil {
 		return nil, err
 	}
-	if err := validateUDPPayload(payload); err != nil {
-		return nil, err
-	}
-	header, err := encodeUDPBaseHeader(UDPFrameDATA, flowID)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]byte, UDPHeaderLen+len(payload))
-	copy(out[:UDPHeaderLen], header[:])
-	copy(out[UDPHeaderLen:], payload)
-	return out, nil
+	var out [udpHeaderLen]byte
+	binary.BigEndian.PutUint32(out[:], (uint32(frameClose)<<frameTypeShift)|flowID)
+	return out[:], nil
 }
 
-// EncodeUDPDataFragments returns either one minimal DATA frame or the required
-// FRAGMENT frames. A packet that fits in one DATAGRAM must never be fragmented.
-func EncodeUDPDataFragments(flowID FlowID, packetID uint32, payload []byte, maxDatagramSize int) ([][]byte, error) {
-	frames := make([][]byte, 0, 1)
-	err := EncodeUDPDataFragmentsYield(flowID, packetID, payload, maxDatagramSize, func(frame []byte) error {
-		frames = append(frames, frame)
-		return nil
-	})
-	if err != nil {
+// EncodePacket returns DATA when the payload fits, otherwise FRAGMENT frames.
+// packetID must be nonzero when fragmentation is required. maxDatagram is the
+// peer DATAGRAM limit including headers.
+func EncodePacket(flowID, packetID uint32, payload []byte, maxDatagram int) ([][]byte, error) {
+	if err := validateFlow(flowID); err != nil {
 		return nil, err
 	}
-	return frames, nil
-}
-
-// EncodeUDPDataFragmentsYield lazily encodes a packet and yields one owned
-// frame at a time. Packet ID is required only when the packet actually needs
-// fragmentation.
-func EncodeUDPDataFragmentsYield(flowID FlowID, packetID uint32, payload []byte, maxDatagramSize int, yield func([]byte) error) error {
-	if err := validateFlowID(flowID); err != nil {
-		return err
+	if len(payload) > udpPacketMax {
+		return nil, errors.New("nw3: UDP payload too large")
 	}
-	if err := validateUDPPayload(payload); err != nil {
-		return err
+	if maxDatagram < udpHeaderLen {
+		return nil, errors.New("nw3: DATAGRAM limit has no payload capacity")
 	}
-	if maxDatagramSize < UDPHeaderLen {
-		return fmt.Errorf("nowhere: datagram size %d smaller than header %d", maxDatagramSize, UDPHeaderLen)
-	}
-	if len(payload) <= maxDatagramSize-UDPHeaderLen {
-		frame, err := EncodeUDPData(flowID, payload)
+	if len(payload) <= maxDatagram-udpHeaderLen {
+		frame, err := EncodeData(flowID, payload)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		return yield(frame)
+		return [][]byte{frame}, nil
 	}
-	if err := validatePacketID(packetID); err != nil {
-		return err
+	if packetID == 0 {
+		return nil, errors.New("nw3: zero packet id")
 	}
-	return yieldUDPFragments(flowID, packetID, payload, maxDatagramSize, yield)
-}
-
-func yieldUDPFragments(flowID FlowID, packetID uint32, payload []byte, maxDatagramSize int, yield func([]byte) error) error {
-	capacity := maxDatagramSize - UDPFragmentHeaderLen
+	capacity := maxDatagram - udpFragmentHeaderLen
 	if capacity <= 0 {
-		return errors.New("nowhere: no fragment payload capacity")
+		return nil, errors.New("nw3: DATAGRAM limit has no fragment payload capacity")
 	}
 	count := (len(payload) + capacity - 1) / capacity
 	if count < 2 || count > 255 {
-		return fmt.Errorf("nowhere: invalid fragment count %d", count)
+		return nil, errors.New("nw3: invalid fragment count")
 	}
-	totalLen := uint16(len(payload))
-	for i := 0; i < count; i++ {
-		start := i * capacity
+	frames := make([][]byte, 0, count)
+	for index := 0; index < count; index++ {
+		start := index * capacity
 		end := start + capacity
 		if end > len(payload) {
 			end = len(payload)
 		}
-		header, err := EncodeUDPFragmentHeader(flowID, UDPFragment{
-			PacketID:      packetID,
-			FragmentIndex: uint8(i),
-			FragmentCount: uint8(count),
-			TotalLen:      totalLen,
-			Payload:       payload[start:end],
-		})
-		if err != nil {
-			return err
+		piece := payload[start:end]
+		frame := make([]byte, udpFragmentHeaderLen+len(piece))
+		binary.BigEndian.PutUint32(frame[:4], (uint32(frameFragment)<<frameTypeShift)|flowID)
+		binary.BigEndian.PutUint32(frame[4:8], packetID)
+		frame[8] = byte(index)
+		frame[9] = byte(count)
+		binary.BigEndian.PutUint16(frame[10:12], uint16(len(payload)))
+		copy(frame[12:], piece)
+		if err := validateFragment(frame[8], frame[9], binary.BigEndian.Uint16(frame[10:12]), piece); err != nil {
+			return nil, err
 		}
-		frame := make([]byte, UDPFragmentHeaderLen+(end-start))
-		copy(frame[:UDPFragmentHeaderLen], header[:])
-		copy(frame[UDPFragmentHeaderLen:], payload[start:end])
-		if err := yield(frame); err != nil {
-			return err
-		}
+		frames = append(frames, frame)
 	}
-	return nil
+	return frames, nil
 }
 
-// DecodeUDPFrame decodes one complete QUIC DATAGRAM frame.
-func DecodeUDPFrame(buf []byte) (UDPFrame, error) {
-	if len(buf) < UDPHeaderLen {
-		return UDPFrame{}, ErrInvalidFrame
+// DecodeDatagram decodes one QUIC UDP frame. The payload aliases input.
+func DecodeDatagram(input []byte) (Datagram, error) {
+	if len(input) < udpHeaderLen {
+		return Datagram{}, errors.New("nw3: short datagram header")
 	}
-	base := decodeUint32BE(buf[:4])
-	frameType := byte((base & udpFrameTypeMask) >> udpFrameTypeShift)
+	base := binary.BigEndian.Uint32(input[:4])
+	frameType := byte((base >> frameTypeShift) & 0b11)
 	flowID := base & MaxFlowID
-	if err := validateFlowID(flowID); err != nil {
-		return UDPFrame{}, ErrInvalidFrame
+	if err := validateFlow(flowID); err != nil {
+		return Datagram{}, err
 	}
 	switch frameType {
-	case UDPFrameDATA:
-		payload := buf[UDPHeaderLen:]
-		if err := validateUDPPayload(payload); err != nil {
-			return UDPFrame{}, ErrInvalidFrame
+	case frameData:
+		payload := input[udpHeaderLen:]
+		if len(payload) > udpPacketMax {
+			return Datagram{}, errors.New("nw3: UDP payload too large")
 		}
-		return UDPFrame{Type: UDPFrameTypeData, FlowID: flowID, Payload: payload}, nil
-	case UDPFrameFRAGMENT:
-		return decodeUDPFragmentFrame(buf, flowID)
-	case UDPFrameCLOSE:
-		if len(buf) != UDPHeaderLen {
-			return UDPFrame{}, ErrInvalidFrame
+		return Datagram{Type: frameData, FlowID: flowID, Payload: payload}, nil
+	case frameClose:
+		if len(input) != udpHeaderLen {
+			return Datagram{}, errors.New("nw3: CLOSE payload")
 		}
-		return UDPFrame{Type: UDPFrameTypeClose, FlowID: flowID}, nil
+		return Datagram{Type: frameClose, FlowID: flowID}, nil
+	case frameFragment:
+		if len(input) < udpFragmentHeaderLen {
+			return Datagram{}, errors.New("nw3: short fragment header")
+		}
+		payload := input[udpFragmentHeaderLen:]
+		d := Datagram{
+			Type:     frameFragment,
+			FlowID:   flowID,
+			Payload:  payload,
+			PacketID: binary.BigEndian.Uint32(input[4:8]),
+			Index:    input[8],
+			Count:    input[9],
+			Total:    binary.BigEndian.Uint16(input[10:12]),
+		}
+		if d.PacketID == 0 {
+			return Datagram{}, errors.New("nw3: zero packet id")
+		}
+		if err := validateFragment(d.Index, d.Count, d.Total, payload); err != nil {
+			return Datagram{}, err
+		}
+		return d, nil
 	default:
-		return UDPFrame{}, ErrInvalidFrame
+		return Datagram{}, errors.New("nw3: invalid datagram type")
 	}
 }
 
-func decodeUDPFragmentFrame(buf []byte, flowID FlowID) (UDPFrame, error) {
-	if len(buf) < UDPFragmentHeaderLen {
-		return UDPFrame{}, ErrInvalidFrame
-	}
-	packetID := decodeUint32BE(buf[4:8])
-	if err := validatePacketID(packetID); err != nil {
-		return UDPFrame{}, ErrInvalidFrame
-	}
-	fragment := UDPFragment{
-		PacketID:      packetID,
-		FragmentIndex: buf[8],
-		FragmentCount: buf[9],
-		TotalLen:      uint16(buf[10])<<8 | uint16(buf[11]),
-		Payload:       buf[UDPFragmentHeaderLen:],
-	}
-	if err := validateFragmentMetadata(fragment); err != nil {
-		return UDPFrame{}, ErrInvalidFrame
-	}
-	if len(fragment.Payload) == 0 ||
-		len(fragment.Payload)+int(fragment.FragmentCount)-1 > int(fragment.TotalLen) {
-		return UDPFrame{}, ErrInvalidFrame
-	}
-	return UDPFrame{Type: UDPFrameTypeFragment, FlowID: flowID, Fragment: fragment}, nil
-}
-
-func encodeUDPBaseHeader(frameType byte, flowID FlowID) ([UDPHeaderLen]byte, error) {
-	word, err := encodeUDPBaseWord(frameType, flowID)
-	if err != nil {
-		return [UDPHeaderLen]byte{}, err
-	}
-	var out [UDPHeaderLen]byte
-	encodeUint32BE(out[:], word)
-	return out, nil
-}
-
-func encodeUDPBaseWord(frameType byte, flowID FlowID) (uint32, error) {
-	if err := validateFlowID(flowID); err != nil {
-		return 0, err
-	}
-	if frameType > UDPFrameCLOSE {
-		return 0, errors.New("nowhere: invalid udp frame type")
-	}
-	return (uint32(frameType) << udpFrameTypeShift) | flowID, nil
-}
-
-func validateFlowID(flowID FlowID) error {
-	if flowID == 0 || flowID > MaxFlowID {
-		return errors.New("nowhere: flow id out of range")
+func validateFlow(id uint32) error {
+	if id == 0 || id > MaxFlowID {
+		return errors.New("nw3: flow id out of range")
 	}
 	return nil
 }
 
-func validatePacketID(packetID uint32) error {
-	if packetID == 0 {
-		return errors.New("nowhere: zero packet id")
+func validateFragment(index, count byte, total uint16, payload []byte) error {
+	if count < 2 || index >= count || total == 0 || total < uint16(count) {
+		return errors.New("nw3: invalid fragment metadata")
+	}
+	if len(payload) == 0 || len(payload)+int(count)-1 > int(total) {
+		return errors.New("nw3: invalid fragment payload length")
 	}
 	return nil
 }
 
-func validateUDPPayload(payload []byte) error {
-	if len(payload) > UDPPacketMax {
-		return fmt.Errorf("nowhere: udp payload too large: %d", len(payload))
+// WriteUoT writes one length-prefixed UDP payload. Zero length is an empty datagram.
+func WriteUoT(w io.Writer, payload []byte) error {
+	if len(payload) > udpPacketMax {
+		return errors.New("nw3: UDP payload too large")
 	}
-	return nil
+	var hdr [2]byte
+	binary.BigEndian.PutUint16(hdr[:], uint16(len(payload)))
+	if _, err := w.Write(hdr[:]); err != nil {
+		return err
+	}
+	_, err := w.Write(payload)
+	return err
 }
 
-func validateFragmentMetadata(fragment UDPFragment) error {
-	if fragment.FragmentCount < 2 || fragment.FragmentIndex >= fragment.FragmentCount {
-		return errors.New("nowhere: invalid fragment index or count")
+// ReadUoT reads one length-prefixed UDP payload.
+// A clean EOF before the length ends the flow. EOF inside a frame is truncation.
+func ReadUoT(r io.Reader) ([]byte, error) {
+	var hdr [2]byte
+	if _, err := io.ReadFull(r, hdr[:]); err != nil {
+		return nil, err
 	}
-	if fragment.TotalLen == 0 {
-		return errors.New("nowhere: zero fragmented packet length")
+	n := int(binary.BigEndian.Uint16(hdr[:]))
+	buf := make([]byte, n)
+	if n == 0 {
+		return buf, nil
 	}
-	if fragment.TotalLen < uint16(fragment.FragmentCount) {
-		return errors.New("nowhere: total length smaller than fragment count")
+	if _, err := io.ReadFull(r, buf); err != nil {
+		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		return nil, err
 	}
-	return nil
+	return buf, nil
+}
+
+// Reassembler collects FRAGMENT frames. Slots are bounded.
+type Reassembler struct {
+	maxSlots int
+	maxBytes int
+	ttl      time.Duration
+	slots    map[reKey]*reSlot
+	reserved int
+}
+
+type reKey struct {
+	flow uint32
+	pkt  uint32
+}
+
+type reSlot struct {
+	created time.Time
+	count   int
+	total   int
+	parts   [][]byte
+	got     int
+	bytes   int
+}
+
+// NewReassembler builds a reassembler. Zero options use 64 slots, 4 MiB and 10s.
+func NewReassembler(slots, maxBytes int, ttl time.Duration) *Reassembler {
+	if slots <= 0 {
+		slots = 64
+	}
+	if maxBytes <= 0 {
+		maxBytes = 4 << 20
+	}
+	if ttl <= 0 {
+		ttl = 10 * time.Second
+	}
+	return &Reassembler{
+		maxSlots: slots,
+		maxBytes: maxBytes,
+		ttl:      ttl,
+		slots:    map[reKey]*reSlot{},
+	}
+}
+
+// Push adds one fragment. A non-nil payload is the completed datagram.
+func (r *Reassembler) Push(d Datagram, now time.Time) ([]byte, error) {
+	if d.Type != frameFragment {
+		return nil, errors.New("nw3: not a fragment")
+	}
+	r.expire(now)
+	key := reKey{d.FlowID, d.PacketID}
+	if slot, ok := r.slots[key]; ok {
+		if slot.count != int(d.Count) || slot.total != int(d.Total) {
+			r.drop(key)
+			return nil, errors.New("nw3: fragment metadata conflict")
+		}
+		idx := int(d.Index)
+		if slot.parts[idx] != nil {
+			if string(slot.parts[idx]) != string(d.Payload) {
+				r.drop(key)
+				return nil, errors.New("nw3: conflicting fragment")
+			}
+			return nil, nil
+		}
+		if slot.bytes+len(d.Payload) > slot.total {
+			r.drop(key)
+			return nil, errors.New("nw3: fragment length overflow")
+		}
+		slot.parts[idx] = append([]byte(nil), d.Payload...)
+		slot.got++
+		slot.bytes += len(d.Payload)
+		if slot.got < slot.count {
+			return nil, nil
+		}
+		if slot.bytes != slot.total {
+			r.drop(key)
+			return nil, errors.New("nw3: incomplete fragment length")
+		}
+		out := make([]byte, 0, slot.total)
+		for _, part := range slot.parts {
+			out = append(out, part...)
+		}
+		r.drop(key)
+		return out, nil
+	}
+	need := int(d.Total)
+	if len(r.slots) >= r.maxSlots {
+		r.evictOldest()
+	}
+	if r.reserved+need > r.maxBytes {
+		return nil, errors.New("nw3: reassembly byte limit")
+	}
+	slot := &reSlot{
+		created: now,
+		count:   int(d.Count),
+		total:   need,
+		parts:   make([][]byte, d.Count),
+	}
+	slot.parts[d.Index] = append([]byte(nil), d.Payload...)
+	slot.got = 1
+	slot.bytes = len(d.Payload)
+	r.slots[key] = slot
+	r.reserved += need
+	if slot.count == 1 {
+		return nil, errors.New("nw3: invalid fragment metadata")
+	}
+	return nil, nil
+}
+
+// RemoveFlow drops every partial packet for a flow.
+func (r *Reassembler) RemoveFlow(flow uint32) {
+	for key, slot := range r.slots {
+		if key.flow == flow {
+			r.reserved -= slot.total
+			delete(r.slots, key)
+		}
+	}
+	if r.reserved < 0 {
+		r.reserved = 0
+	}
+}
+
+func (r *Reassembler) drop(key reKey) {
+	slot := r.slots[key]
+	if slot == nil {
+		return
+	}
+	r.reserved -= slot.total
+	if r.reserved < 0 {
+		r.reserved = 0
+	}
+	delete(r.slots, key)
+}
+
+func (r *Reassembler) expire(now time.Time) {
+	for key, slot := range r.slots {
+		if now.Sub(slot.created) > r.ttl {
+			r.drop(key)
+		}
+	}
+}
+
+func (r *Reassembler) evictOldest() {
+	var oldest reKey
+	var when time.Time
+	first := true
+	for key, slot := range r.slots {
+		if first || slot.created.Before(when) {
+			oldest = key
+			when = slot.created
+			first = false
+		}
+	}
+	if !first {
+		r.drop(oldest)
+	}
 }

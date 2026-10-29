@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"net"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json"
 	M "github.com/sagernet/sing/common/metadata"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/protocol/socks"
 
 	"github.com/stretchr/testify/require"
@@ -66,16 +68,28 @@ func TestUnixSocketListenAndDial(t *testing.T) {
 	_, err = os.Stat(relaySocket)
 	require.NoError(t, err)
 
-	rawConn, err := net.DialTimeout("unix", entrySocket, 5*time.Second)
+	client := socks.NewClient(unixSocketDialer(entrySocket), M.Socksaddr{Fqdn: entrySocket}, socks.Version5, "", "")
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	rawConn, err := client.DialContext(ctx, N.NetworkTCP, M.SocksaddrFromNet(echoListener.Addr()))
 	require.NoError(t, err)
 	defer rawConn.Close()
 	rawConn.SetDeadline(time.Now().Add(10 * time.Second))
-	_, err = socks.ClientHandshake5(rawConn, socks.CommandConnect, M.SocksaddrFromNet(echoListener.Addr()), "", "")
-	require.NoError(t, err)
 	_, err = rawConn.Write([]byte("unix socket"))
 	require.NoError(t, err)
 	response := make([]byte, len("unix socket"))
 	_, err = io.ReadFull(rawConn, response)
 	require.NoError(t, err)
 	require.Equal(t, "unix socket", string(response))
+}
+
+type unixSocketDialer string
+
+func (d unixSocketDialer) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
+	var dialer net.Dialer
+	return dialer.DialContext(ctx, "unix", string(d))
+}
+
+func (d unixSocketDialer) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
+	return nil, os.ErrInvalid
 }

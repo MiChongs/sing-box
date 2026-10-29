@@ -4,8 +4,7 @@ import (
 	"testing"
 
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/wire"
-
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/wire"
 	"github.com/stretchr/testify/require"
 )
 

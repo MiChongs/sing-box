@@ -16,8 +16,8 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/carrier/quic/conformance"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/wire"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/quic/conformance"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/wire"
 )
 
 func TestOutboundSessionConformance(t *testing.T) {

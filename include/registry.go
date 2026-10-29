@@ -79,6 +79,7 @@ func InboundRegistry() *inbound.Registry {
 	anytls.RegisterInbound(registry)
 	anyx.RegisterInbound(registry)
 	nowhere.RegisterInbound(registry)
+	nowhere.RegisterEgressInbound(registry)
 
 	registerQUICInbounds(registry)
 	registerCloudflaredInbound(registry)

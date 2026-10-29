@@ -13,7 +13,7 @@ import (
 	"time"
 
 	"github.com/sagernet/quic-go"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/diagnostic"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/diagnostic"
 	qtls "github.com/sagernet/sing-quic"
 )
 

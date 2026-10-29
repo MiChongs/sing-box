@@ -5,7 +5,7 @@ package quic
 import (
 	"net"
 
-	"github.com/sagernet/sing-box/protocol/nowhere/core/carrier/morph"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/morph"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/bufio"
 )

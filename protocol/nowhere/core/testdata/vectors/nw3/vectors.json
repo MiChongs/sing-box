@@ -1,0 +1,86 @@
+{
+  "protocol": "nw3",
+  "upstream_version": "3.1.0",
+  "upstream_commit": "000006531ca60321a02b50d270ab2e22f37701e3",
+  "upstream_path": "Nowhere/src/tests/protocol/vectors.json",
+  "exporter_version": "nowhere-vector-export/5",
+  "shared_key_text": "0123456789abcdef0123456789abcdef",
+  "salt_hex": "ac19b63a0ed76832917590b43802fe8ca5b13a7e09dbb78d3a6194b5b78223e5",
+  "root_hex": "ec0a6b441f3cf02652e0e7d0c11806607bd1f74b69f83c6d3d329752c4995ff2",
+  "exporter_label": "EXPORTER-Nowhere-nw3-Auth",
+  "exporter_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+  "auth": [
+    {
+      "role": "vector",
+      "transport": 1,
+      "role_key_hex": "1b5bddc7018f44cece1942211f94e5302c86827fda2e29bb4676ab667e5c95fb",
+      "auth_frame_hex": "1a26d8eb72ead8a223b54fd1f04f8e32"
+    },
+    {
+      "role": "vector",
+      "transport": 2,
+      "role_key_hex": "1b5bddc7018f44cece1942211f94e5302c86827fda2e29bb4676ab667e5c95fb",
+      "auth_frame_hex": "7cbb323bd019bb51370c92a50a36a08f"
+    },
+    {
+      "role": "egress",
+      "transport": 1,
+      "role_key_hex": "ed65a35aa30c34a39c0c64ec1e0fd6d2d29aab3b25e9b62076caf0227566b9ce",
+      "auth_frame_hex": "4c96702866b5d287ca58c7caffef0e0e"
+    },
+    {
+      "role": "egress",
+      "transport": 2,
+      "role_key_hex": "ed65a35aa30c34a39c0c64ec1e0fd6d2d29aab3b25e9b62076caf0227566b9ce",
+      "auth_frame_hex": "6da768d4a7db51fde70970347401554c"
+    }
+  ],
+  "flow_start": {
+    "tcp_hex": "00",
+    "udp_hex": "01"
+  },
+  "udp_stream_ids": [
+    {
+      "initiator": "client",
+      "stream_id": 0,
+      "flow_id": 1
+    },
+    {
+      "initiator": "client",
+      "stream_id": 4,
+      "flow_id": 2
+    },
+    {
+      "initiator": "server",
+      "stream_id": 1,
+      "flow_id": 1
+    },
+    {
+      "initiator": "client",
+      "stream_id": 4294967288,
+      "flow_id": 1073741823
+    },
+    {
+      "initiator": "server",
+      "stream_id": 4294967289,
+      "flow_id": 1073741823
+    }
+  ],
+  "invalid_stream_ids": [
+    2,
+    3,
+    4294967292,
+    4294967293
+  ],
+  "setup_result": {
+    "READY": 0,
+    "INVALID_REQUEST": 1,
+    "FLOW_LIMIT": 2,
+    "DIAL_FAILED": 3,
+    "INTERNAL_ERROR": 4
+  },
+  "registration_result": {
+    "ACCEPTED": 0,
+    "BUSY": 1
+  }
+}

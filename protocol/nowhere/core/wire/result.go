@@ -1,114 +1,108 @@
 package wire
 
 import (
-	"fmt"
+	"errors"
 	"io"
 )
 
-// SetupResultLen is the fixed setup-result frame length.
-const SetupResultLen = 1
-
-// SetupResult is the direct wire representation of a flow setup outcome.
+// SetupResult is the one-byte flow setup outcome.
 type SetupResult uint8
 
 const (
-	// SetupResultReady indicates that the target path is established.
-	SetupResultReady SetupResult = 0
-	// SetupResultInvalidRequest rejects malformed flow metadata.
-	SetupResultInvalidRequest SetupResult = 1
-	// SetupResultMetadataConflict rejects incompatible OPEN and ATTACH halves.
-	SetupResultMetadataConflict SetupResult = 2
-	// SetupResultPairTimeout indicates that the matching split half did not arrive.
-	SetupResultPairTimeout SetupResult = 3
-	// SetupResultFlowLimit indicates that a flow or pairing limit was reached.
-	SetupResultFlowLimit SetupResult = 4
-	// SetupResultDialFailed indicates that Portal could not establish the target path.
-	SetupResultDialFailed SetupResult = 5
-	// SetupResultSessionReplaced indicates that a newer QUIC carrier replaced the session.
-	SetupResultSessionReplaced SetupResult = 6
-	// SetupResultInternalError indicates an internal setup failure.
-	SetupResultInternalError SetupResult = 7
+	// SetupReady means the target path is established.
+	SetupReady SetupResult = 0
+	// SetupInvalidRequest rejects a malformed flow.
+	SetupInvalidRequest SetupResult = 1
+	// SetupFlowLimit is resource exhaustion.
+	SetupFlowLimit SetupResult = 2
+	// SetupDialFailed is target or offline-egress failure.
+	SetupDialFailed SetupResult = 3
+	// SetupInternalError is an internal setup failure.
+	SetupInternalError SetupResult = 4
 )
 
-// SetupResult values 0..7; used for validation.
-const setupResultMax = 7
+// RegistrationResult is the one-byte Egress registration outcome.
+type RegistrationResult uint8
 
-// IsReady reports whether the result indicates a successful setup.
-func (r SetupResult) IsReady() bool { return r == SetupResultReady }
+const (
+	// RegistrationAccepted claims the vacant slot.
+	RegistrationAccepted RegistrationResult = 0
+	// RegistrationBusy leaves the current owner in place.
+	RegistrationBusy RegistrationResult = 1
+)
 
-// Validate rejects values that are not defined by the one-byte v1 result
-// space.
-func (r SetupResult) Validate() error {
-	if r > setupResultMax {
-		return ErrInvalidSetupResult
+// ParseSetupResult rejects values outside 0..4.
+func ParseSetupResult(b byte) (SetupResult, error) {
+	if b > byte(SetupInternalError) {
+		return 0, errors.New("nw3: invalid setup result")
 	}
-	return nil
+	return SetupResult(b), nil
 }
 
-// String returns a stable human label for diagnostics.
-func (r SetupResult) String() string {
-	switch r {
-	case SetupResultReady:
-		return "ready"
-	case SetupResultInvalidRequest:
-		return "invalid request"
-	case SetupResultMetadataConflict:
-		return "metadata conflict"
-	case SetupResultPairTimeout:
-		return "pair timeout"
-	case SetupResultFlowLimit:
-		return "flow limit"
-	case SetupResultDialFailed:
-		return "dial failed"
-	case SetupResultSessionReplaced:
-		return "session replaced"
-	case SetupResultInternalError:
-		return "internal error"
-	default:
-		return "unknown"
-	}
-}
-
-// EncodeSetupResult encodes a setup result as a single byte.
-func EncodeSetupResult(r SetupResult) ([SetupResultLen]byte, error) {
-	if err := r.Validate(); err != nil {
-		return [SetupResultLen]byte{}, err
-	}
-	return [SetupResultLen]byte{byte(r)}, nil
-}
-
-// DecodeSetupResult decodes exactly one byte into a setup result.
-func DecodeSetupResult(b []byte) (SetupResult, error) {
-	if len(b) != SetupResultLen {
-		return 0, ErrInvalidSetupResult
-	}
-	return parseSetupResult(b[0])
-}
-
-func parseSetupResult(v byte) (SetupResult, error) {
-	if v > setupResultMax {
-		return 0, ErrInvalidSetupResult
-	}
-	return SetupResult(v), nil
-}
-
-// WriteSetupResult writes a single-byte setup result.
-func WriteSetupResult(w io.Writer, r SetupResult) error {
-	frame, err := EncodeSetupResult(r)
-	if err != nil {
-		return err
-	}
-	if err := WriteFull(w, frame[:]); err != nil {
-		return fmt.Errorf("nowhere: write setup result: %w", err)
-	}
-	return nil
-}
-
-// ReadSetupResult reads a single-byte setup result.
+// ReadSetupResult reads one setup byte.
 func ReadSetupResult(r io.Reader) (SetupResult, error) {
-	var b [SetupResultLen]byte
+	var b [1]byte
 	if _, err := io.ReadFull(r, b[:]); err != nil {
 		return 0, err
 	}
-	return parseSetupResult(b[0])
+	return ParseSetupResult(b[0])
 }
+
+// WriteSetupResult writes one setup byte.
+func WriteSetupResult(w io.Writer, result SetupResult) error {
+	if _, err := ParseSetupResult(byte(result)); err != nil {
+		return err
+	}
+	_, err := w.Write([]byte{byte(result)})
+	return err
+}
+
+// ParseRegistrationResult rejects values other than ACCEPTED or BUSY.
+func ParseRegistrationResult(b byte) (RegistrationResult, error) {
+	switch RegistrationResult(b) {
+	case RegistrationAccepted, RegistrationBusy:
+		return RegistrationResult(b), nil
+	default:
+		return 0, errors.New("nw3: invalid registration result")
+	}
+}
+
+// WriteRegistrationResult writes ACCEPTED or BUSY.
+func WriteRegistrationResult(w io.Writer, result RegistrationResult) error {
+	if _, err := ParseRegistrationResult(byte(result)); err != nil {
+		return err
+	}
+	_, err := w.Write([]byte{byte(result)})
+	return err
+}
+
+// ReadRegistrationResult reads one registration byte.
+func ReadRegistrationResult(r io.Reader) (RegistrationResult, error) {
+	var b [1]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		return 0, err
+	}
+	return ParseRegistrationResult(b[0])
+}
+
+func (r SetupResult) Error() string {
+	switch r {
+	case SetupReady:
+		return "ready"
+	case SetupInvalidRequest:
+		return "invalid request"
+	case SetupFlowLimit:
+		return "flow limit"
+	case SetupDialFailed:
+		return "dial failed"
+	case SetupInternalError:
+		return "internal error"
+	default:
+		return "invalid setup result"
+	}
+}
+
+// SetupError is a rejected setup result returned to callers.
+type SetupError struct{ Result SetupResult }
+
+func (e SetupError) Error() string { return "nw3: " + e.Result.Error() }

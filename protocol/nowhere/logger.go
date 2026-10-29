@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/sagernet/sing-box/log"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/diagnostic"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/diagnostic"
 )
 
 type SingObserver struct{ L log.ContextLogger }

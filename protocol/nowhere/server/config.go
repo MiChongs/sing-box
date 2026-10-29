@@ -2,8 +2,9 @@ package server
 
 import (
 	"github.com/sagernet/sing-box/option"
-	nwserver "github.com/sagernet/sing-box/protocol/nowhere/core/server"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/wire"
+	nwserver "github.com/sagernet/sing-box/protocol/nowhere/core/nw2/server"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/wire"
+	"github.com/sagernet/sing/common"
 	N "github.com/sagernet/sing/common/network"
 )
 
@@ -51,9 +52,10 @@ func NewConfig(options option.NowhereInboundOptions) (*Config, error) {
 		alpn = string(options.TLS.ALPN[0])
 	}
 	// MorphSharedKey mirrors nowhere.MorphSharedKey inline: package server
-	// cannot import package nowhere (import cycle).
+	// cannot import package nowhere (import cycle). Nowhere 2 leaves Morph off
+	// unless the endpoint opts in.
 	var morphSharedKey []byte
-	if options.Morph && options.Password != "" {
+	if common.PtrValueOrDefault(options.Morph) && options.Password != "" {
 		morphSharedKey = []byte(options.Password)
 	}
 	return nwserver.NewConfig(nwserver.ConfigOptions{

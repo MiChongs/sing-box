@@ -6,8 +6,9 @@ import (
 	"context"
 	"net"
 
+	nwquic "github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/quic"
+
 	quic "github.com/sagernet/sing-box/protocol/nowhere/carrier/quic"
-	nwquic "github.com/sagernet/sing-box/protocol/nowhere/core/carrier/quic"
 )
 
 // QuicBackend wires the sing-box QUIC transport primitives into the vendored

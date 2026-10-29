@@ -19,7 +19,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
-	"github.com/sagernet/sing-box/protocol/nowhere/core/carrier/dialgate"
+	"github.com/sagernet/sing-box/protocol/nowhere/core/nw2/carrier/dialgate"
 	"github.com/sagernet/sing/common"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
@@ -27,6 +27,14 @@ import (
 	"github.com/sagernet/sing/protocol/socks"
 
 	"github.com/stretchr/testify/require"
+)
+
+// Portal-admitted test keys: 32 lowercase hexadecimal characters, matching the
+// Nowhere 2.2.1 Portal key rule enforced by the nowhere inbound.
+const (
+	nowhereTestPortalKey = "0123456789abcdef0123456789abcdef"
+	nowhereTestServerKey = "1123456789abcdef0123456789abcdef"
+	nowhereTestClientKey = "2123456789abcdef0123456789abcdef"
 )
 
 // TestNowherePortalLoopback is the H3 gate.
@@ -57,13 +65,13 @@ func TestNowhereQUICCongestionControl(t *testing.T) {
 
 func TestNowhereAuthenticationFailures(t *testing.T) {
 	t.Run("wrong-password-tcp", func(t *testing.T) {
-		startNowhereInstance(t, "tcp", "tcp", option.NetworkList(N.NetworkTCP), "", "server-secret", "client-secret")
+		startNowhereInstance(t, "tcp", "tcp", option.NetworkList(N.NetworkTCP), "", nowhereTestServerKey, nowhereTestClientKey)
 		expectNowhereDialFailure(t)
 	})
 }
 
 func TestNowhereQUICInterfaceUpdate(t *testing.T) {
-	instance := startNowhereInstance(t, "udp", "udp", option.NetworkList(N.NetworkUDP), "", "nowhere-h3-secret", "nowhere-h3-secret")
+	instance := startNowhereInstance(t, "udp", "udp", option.NetworkList(N.NetworkUDP), "", nowhereTestPortalKey, nowhereTestPortalKey)
 	testNowhereBasicTCPUDP(t, clientPort, testPort)
 
 	inbound, loaded := instance.Inbound().Get("nowhere-in")
@@ -77,11 +85,11 @@ func TestNowhereQUICInterfaceUpdate(t *testing.T) {
 }
 
 func TestNowhereServiceRestart(t *testing.T) {
-	first := startNowhereInstance(t, "udp", "udp", option.NetworkList(N.NetworkUDP), "", "nowhere-h3-secret", "nowhere-h3-secret")
+	first := startNowhereInstance(t, "udp", "udp", option.NetworkList(N.NetworkUDP), "", nowhereTestPortalKey, nowhereTestPortalKey)
 	testNowhereBasicTCPUDP(t, clientPort, testPort)
 	require.NoError(t, first.Close())
 
-	startNowhereInstance(t, "udp", "udp", option.NetworkList(N.NetworkUDP), "", "nowhere-h3-secret", "nowhere-h3-secret")
+	startNowhereInstance(t, "udp", "udp", option.NetworkList(N.NetworkUDP), "", nowhereTestPortalKey, nowhereTestPortalKey)
 	testNowhereBasicTCPUDP(t, clientPort, testPort)
 }
 
@@ -350,7 +358,7 @@ func startNowhereLifecycleEcho(t *testing.T, tcpFlowCount int) M.Socksaddr {
 }
 
 func TestNowhereConcurrentQUICFlows(t *testing.T) {
-	instance := startNowhereInstance(t, "udp", "udp", option.NetworkList(N.NetworkUDP), "", "nowhere-h3-secret", "nowhere-h3-secret")
+	instance := startNowhereInstance(t, "udp", "udp", option.NetworkList(N.NetworkUDP), "", nowhereTestPortalKey, nowhereTestPortalKey)
 	outbound, loaded := instance.Outbound().Outbound("nowhere-out")
 	require.True(t, loaded)
 	testNowhereConcurrentTCPUDP(t, outbound, 32)
@@ -379,8 +387,8 @@ func TestNowhereTCPQUICCanceledFlowChurn(t *testing.T) {
 		"udp",
 		option.NetworkList(N.NetworkTCP+"\n"+N.NetworkUDP),
 		"",
-		"nowhere-h3-secret",
-		"nowhere-h3-secret",
+		nowhereTestPortalKey,
+		nowhereTestPortalKey,
 		outboundQUICOptions,
 	)
 	outbound, loaded := instance.Outbound().Outbound("nowhere-out")
@@ -653,7 +661,7 @@ func TestNowhereConcurrentFourMatrixBurst(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			instance := startNowhereInstance(t, tc.up, tc.down, tc.inboundNetwork, "", "nowhere-h3-secret", "nowhere-h3-secret")
+			instance := startNowhereInstance(t, tc.up, tc.down, tc.inboundNetwork, "", nowhereTestPortalKey, nowhereTestPortalKey)
 			outbound, loaded := instance.Outbound().Outbound("nowhere-out")
 			require.True(t, loaded)
 			testNowhereConcurrentBurst(t, outbound, tc.tcpCount, tc.udpCount)
@@ -702,7 +710,7 @@ func TestNowhereStressBaseline(t *testing.T) {
 	}
 	for _, tc := range matrices {
 		t.Run(tc.name, func(t *testing.T) {
-			instance := startNowhereInstance(t, tc.up, tc.down, tc.inboundNetwork, "", "nowhere-h3-secret", "nowhere-h3-secret")
+			instance := startNowhereInstance(t, tc.up, tc.down, tc.inboundNetwork, "", nowhereTestPortalKey, nowhereTestPortalKey)
 			outbound, loaded := instance.Outbound().Outbound("nowhere-out")
 			require.True(t, loaded)
 
@@ -741,7 +749,7 @@ func TestNowhereInboundSniffUDP(t *testing.T) {
 	}
 	for _, tc := range matrices {
 		t.Run(tc.name, func(t *testing.T) {
-			options := nowhereInstanceOptions(t, tc.up, tc.down, tc.network, "", "nowhere-h3-secret", "nowhere-h3-secret", option.QUICOptions{})
+			options := nowhereInstanceOptions(t, tc.up, tc.down, tc.network, "", nowhereTestPortalKey, nowhereTestPortalKey, option.QUICOptions{})
 			sniffRule := option.Rule{
 				Type: C.RuleTypeDefault,
 				DefaultOptions: option.DefaultRule{
@@ -756,8 +764,94 @@ func TestNowhereInboundSniffUDP(t *testing.T) {
 	}
 }
 
+// TestNowhereV3DefaultStackForwarding runs a full Nowhere 3 endpoint pair
+// through the box with no ALPN configured anywhere: both endpoints must select
+// the default nw3 stack and forward TCP flows end to end.
+func TestNowhereV3DefaultStackForwarding(t *testing.T) {
+	_, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
+	instance := startInstance(t, option.Options{
+		Inbounds: []option.Inbound{
+			{
+				Type: C.TypeMixed,
+				Tag:  "mixed-in",
+				Options: &option.HTTPMixedInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
+						ListenPort: clientPort,
+					},
+				},
+			},
+			{
+				Type: C.TypeNowhere,
+				Tag:  "nowhere-in",
+				Options: &option.NowhereInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
+						ListenPort: serverPort,
+					},
+					Password: nowhereTestPortalKey,
+					Network:  option.NetworkList(N.NetworkTCP),
+					InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
+						TLS: &option.InboundTLSOptions{
+							Enabled:         true,
+							ServerName:      "example.org",
+							CertificatePath: certPem,
+							KeyPath:         keyPem,
+						},
+					},
+				},
+			},
+		},
+		Outbounds: []option.Outbound{
+			{
+				Type: C.TypeDirect,
+			},
+			{
+				Type: C.TypeNowhere,
+				Tag:  "nowhere-out",
+				Options: &option.NowhereOutboundOptions{
+					ServerOptions: option.ServerOptions{
+						Server:     "127.0.0.1",
+						ServerPort: serverPort,
+					},
+					Password: nowhereTestPortalKey,
+					Net:      "tcp",
+					OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
+						TLS: &option.OutboundTLSOptions{
+							Enabled:    true,
+							ServerName: "example.org",
+							Insecure:   true,
+						},
+					},
+				},
+			},
+		},
+		Route: &option.RouteOptions{
+			Rules: []option.Rule{
+				{
+					Type: C.RuleTypeDefault,
+					DefaultOptions: option.DefaultRule{
+						RawDefaultRule: option.RawDefaultRule{
+							Inbound: []string{"mixed-in"},
+						},
+						RuleAction: option.RuleAction{
+							Action: C.RuleActionTypeRoute,
+							RouteOptions: option.RouteActionOptions{
+								Outbound: "nowhere-out",
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	outbound, loaded := instance.Outbound().Outbound("nowhere-out")
+	require.True(t, loaded)
+	testNowhereSequentialTCP(t, outbound, 3)
+}
+
 func testNowhereMatrix(t *testing.T, up, down string, inboundNetwork option.NetworkList, congestionControl string, suit func(*testing.T, uint16, uint16)) {
-	startNowhereInstance(t, up, down, inboundNetwork, congestionControl, "nowhere-h3-secret", "nowhere-h3-secret")
+	startNowhereInstance(t, up, down, inboundNetwork, congestionControl, nowhereTestPortalKey, nowhereTestPortalKey)
 	suit(t, clientPort, testPort)
 }
 
@@ -899,7 +993,7 @@ func startNowhereServerBoxWithContext(t *testing.T, parent context.Context, cert
 						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
 						ListenPort: serverPort,
 					},
-					Password: "nowhere-h3-secret",
+					Password: nowhereTestPortalKey,
 					Network:  network,
 					InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
 						TLS: &option.InboundTLSOptions{
@@ -951,7 +1045,7 @@ func startNowhereClientBoxWithQUICOptions(t *testing.T, certPem string, quicOpti
 						Server:     "127.0.0.1",
 						ServerPort: serverPort,
 					},
-					Password:    "nowhere-h3-secret",
+					Password:    nowhereTestPortalKey,
 					Up:          "udp",
 					Down:        "udp",
 					QUICOptions: quicOptions,
