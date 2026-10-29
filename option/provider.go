@@ -163,8 +163,14 @@ type ProviderUDPHealthCheckOptions struct {
 }
 
 type OverrideAnyTLSOptions struct {
-	ClientMetadata *string `json:"client_metadata,omitempty"`
-	DisableReuse   *bool   `json:"disable_reuse,omitempty"`
+	UseAnyX               *bool                       `json:"use_anyx,omitempty"`
+	ClientMetadata        *string                     `json:"client_metadata,omitempty"`
+	DisableReuse          *bool                       `json:"disable_reuse,omitempty"`
+	PaddingScheme         *badoption.Listable[string] `json:"padding_scheme,omitempty"`
+	PaddingSchemeInterval *badoption.Duration         `json:"padding_scheme_interval,omitempty"`
+	MinIdleSession        *int                        `json:"min_idle_session,omitempty"`
+	IdleSessionTimeout    *badoption.Duration         `json:"idle_session_timeout,omitempty"`
+	IdleSessionMinTimeout *badoption.Duration         `json:"idle_session_min_timeout,omitempty"`
 }
 
 type OverrideDialerOptions struct {

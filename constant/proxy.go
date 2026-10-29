@@ -24,6 +24,7 @@ const (
 	TypeSSH                = "ssh"
 	TypeShadowTLS          = "shadowtls"
 	TypeAnyTLS             = "anytls"
+	TypeAnyX               = "anyx"
 	TypeShadowsocksR       = "shadowsocksr"
 	TypeVLESS              = "vless"
 	TypeTUIC               = "tuic"
@@ -122,6 +123,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "Nowhere"
 	case TypeAnyTLS:
 		return "AnyTLS"
+	case TypeAnyX:
+		return "AnyX"
 	case TypeOpenConnect:
 		return "OpenConnect"
 	case TypeOpenVPNClient:

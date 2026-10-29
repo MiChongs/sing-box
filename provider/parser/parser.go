@@ -102,16 +102,50 @@ func overrideOutbounds(outbounds []option.Outbound, overrideDialerOptions *optio
 			options.OutboundTLSOptionsContainer.TLS = overrideTLSOption(options.OutboundTLSOptionsContainer.TLS, overrideTLSOptions)
 			outbound.Options = options
 		case C.TypeAnyTLS:
-			options := outbound.Options.(*option.AnyTLSOutboundOptions)
+			anytlsOptions := outbound.Options.(*option.AnyTLSOutboundOptions)
+			dialerOptions := overrideDialerOption(anytlsOptions.DialerOptions, overrideDialerOptions, tags, providerTag)
+			tlsOptions := overrideTLSOption(anytlsOptions.OutboundTLSOptionsContainer.TLS, overrideTLSOptions)
+			if overrideAnyTLSOptions != nil && overrideAnyTLSOptions.UseAnyX != nil && *overrideAnyTLSOptions.UseAnyX {
+				anyxOptions := &option.AnyXOutboundOptions{
+					DialerOptions:               dialerOptions,
+					ServerOptions:               anytlsOptions.ServerOptions,
+					OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{TLS: tlsOptions},
+					Password:                    anytlsOptions.Password,
+					IdleSessionCheckInterval:    anytlsOptions.IdleSessionCheckInterval,
+					IdleSessionTimeout:          anytlsOptions.IdleSessionTimeout,
+					MinIdleSession:              anytlsOptions.MinIdleSession,
+					ClientMetadata:              anytlsOptions.ClientMetadata,
+					DisableReuse:                anytlsOptions.DisableReuse,
+					Network:                     anytlsOptions.Network,
+				}
+				overrideAnyXOptions(anyxOptions, overrideAnyTLSOptions)
+				outbound.Type = C.TypeAnyX
+				outbound.Options = anyxOptions
+			} else {
+				anytlsOptions.DialerOptions = dialerOptions
+				anytlsOptions.OutboundTLSOptionsContainer.TLS = tlsOptions
+				if overrideAnyTLSOptions != nil {
+					if overrideAnyTLSOptions.ClientMetadata != nil {
+						anytlsOptions.ClientMetadata = overrideAnyTLSOptions.ClientMetadata
+					}
+					if overrideAnyTLSOptions.DisableReuse != nil {
+						anytlsOptions.DisableReuse = *overrideAnyTLSOptions.DisableReuse
+					}
+					if overrideAnyTLSOptions.MinIdleSession != nil {
+						anytlsOptions.MinIdleSession = *overrideAnyTLSOptions.MinIdleSession
+					}
+					if overrideAnyTLSOptions.IdleSessionTimeout != nil {
+						anytlsOptions.IdleSessionTimeout = *overrideAnyTLSOptions.IdleSessionTimeout
+					}
+				}
+				outbound.Options = anytlsOptions
+			}
+		case C.TypeAnyX:
+			options := outbound.Options.(*option.AnyXOutboundOptions)
 			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
 			options.OutboundTLSOptionsContainer.TLS = overrideTLSOption(options.OutboundTLSOptionsContainer.TLS, overrideTLSOptions)
 			if overrideAnyTLSOptions != nil {
-				if overrideAnyTLSOptions.ClientMetadata != nil {
-					options.ClientMetadata = overrideAnyTLSOptions.ClientMetadata
-				}
-				if overrideAnyTLSOptions.DisableReuse != nil {
-					options.DisableReuse = *overrideAnyTLSOptions.DisableReuse
-				}
+				overrideAnyXOptions(options, overrideAnyTLSOptions)
 			}
 			outbound.Options = options
 		case C.TypeShadowsocks:
@@ -309,5 +343,29 @@ func ContextWithWarnHandler(ctx context.Context, handler func(args ...any)) cont
 func warn(ctx context.Context, args ...any) {
 	if handler, loaded := ctx.Value(warnHandlerKey{}).(func(args ...any)); loaded {
 		handler(args...)
+	}
+}
+
+func overrideAnyXOptions(options *option.AnyXOutboundOptions, overrideOptions *option.OverrideAnyTLSOptions) {
+	if overrideOptions.ClientMetadata != nil {
+		options.ClientMetadata = overrideOptions.ClientMetadata
+	}
+	if overrideOptions.DisableReuse != nil {
+		options.DisableReuse = *overrideOptions.DisableReuse
+	}
+	if overrideOptions.PaddingScheme != nil {
+		options.PaddingScheme = *overrideOptions.PaddingScheme
+	}
+	if overrideOptions.PaddingSchemeInterval != nil {
+		options.PaddingSchemeInterval = *overrideOptions.PaddingSchemeInterval
+	}
+	if overrideOptions.MinIdleSession != nil {
+		options.MinIdleSession = *overrideOptions.MinIdleSession
+	}
+	if overrideOptions.IdleSessionTimeout != nil {
+		options.IdleSessionTimeout = *overrideOptions.IdleSessionTimeout
+	}
+	if overrideOptions.IdleSessionMinTimeout != nil {
+		options.IdleSessionMinTimeout = *overrideOptions.IdleSessionMinTimeout
 	}
 }

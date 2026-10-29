@@ -21,6 +21,7 @@ import (
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing-box/protocol/anytls"
+	"github.com/sagernet/sing-box/protocol/anyx"
 	"github.com/sagernet/sing-box/protocol/block"
 	"github.com/sagernet/sing-box/protocol/bridge"
 	"github.com/sagernet/sing-box/protocol/direct"
@@ -76,6 +77,7 @@ func InboundRegistry() *inbound.Registry {
 	shadowtls.RegisterInbound(registry)
 	vless.RegisterInbound(registry)
 	anytls.RegisterInbound(registry)
+	anyx.RegisterInbound(registry)
 	nowhere.RegisterInbound(registry)
 
 	registerQUICInbounds(registry)
@@ -124,6 +126,7 @@ func OutboundRegistry() *outbound.Registry {
 	shadowtls.RegisterOutbound(registry)
 	vless.RegisterOutbound(registry)
 	anytls.RegisterOutbound(registry)
+	anyx.RegisterOutbound(registry)
 	nowhere.RegisterOutbound(registry)
 
 	registerQUICOutbounds(registry)
