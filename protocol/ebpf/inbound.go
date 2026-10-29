@@ -37,8 +37,8 @@ var (
 		netip.MustParsePrefix("127.64.0.0/10"),
 	}
 	redirectIPv6Candidates = []netip.Prefix{
-		netip.MustParsePrefix("2001:db8:2030:2026::/64"),
-		netip.MustParsePrefix("2001:db8:2030:0729::/64"),
+		netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
+		netip.MustParsePrefix("fd53:696e:672d:6270::/64"),
 	}
 )
 
