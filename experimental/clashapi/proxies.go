@@ -221,6 +221,8 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 	switch detour.Type() {
 	case C.TypeBlock:
 		clashType = "Reject"
+	case C.TypeNested:
+		clashType = "Nested"
 	default:
 		clashType = C.ProxyDisplayName(detour.Type())
 	}
@@ -431,9 +433,15 @@ func updateProxy(w http.ResponseWriter, r *http.Request) {
 			render.JSON(w, r, newError("URLTest update error: not found"))
 			return
 		}
+	case *group.Nested:
+		if !p.SelectOutbound(req.Name) {
+			render.Status(r, http.StatusBadRequest)
+			render.JSON(w, r, newError("Nested update error: not found"))
+			return
+		}
 	default:
 		render.Status(r, http.StatusBadRequest)
-		render.JSON(w, r, newError("Must be a Selector, Smart, smart-region, or URLTest"))
+		render.JSON(w, r, newError("Must be a Selector, Nested, Smart, smart-region, or URLTest"))
 		return
 	}
 

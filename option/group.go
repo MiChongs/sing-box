@@ -47,3 +47,8 @@ type LoadBalanceOutboundOptions struct {
 	TTL         badoption.Duration `json:"ttl,omitempty"`
 	Strategy    string             `json:"strategy,omitempty"`
 }
+
+type NestedOutboundOptions struct {
+	SelectorOutboundOptions
+	Detour string `json:"detour,omitempty" reference:"outbound"`
+}

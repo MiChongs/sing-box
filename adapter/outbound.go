@@ -63,6 +63,9 @@ type OutboundManager interface {
 	Outbound(tag string) (Outbound, bool)
 	Default() Outbound
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, outboundType string, options any) error
+	OutboundOption(tag string) (option.Outbound, bool)
+	RegisterOutbound(outbound Outbound) error
+	UnregisterOutbound(tag string) error
 }
 
 type IdleConnectionKeeper interface {

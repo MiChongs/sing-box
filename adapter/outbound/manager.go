@@ -8,6 +8,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/log"
+	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 )
@@ -25,6 +26,7 @@ type Manager struct {
 	access                  sync.RWMutex
 	outbounds               []adapter.Outbound
 	outboundByTag           map[string]adapter.Outbound
+	outboundOptionByTag     map[string]option.Outbound
 	defaultOutbound         adapter.Outbound
 	defaultOutboundFallback func() (adapter.Outbound, error)
 	// scope is set once the manager starts; outbounds created after that
@@ -35,11 +37,12 @@ type Manager struct {
 
 func NewManager(registry adapter.OutboundRegistry, endpoint adapter.EndpointManager, defaultTag string) *Manager {
 	return &Manager{
-		registry:      registry,
-		endpoint:      endpoint,
-		defaultTag:    defaultTag,
-		outboundByTag: make(map[string]adapter.Outbound),
-		runtime:       make(map[adapter.Outbound]struct{}),
+		registry:            registry,
+		endpoint:            endpoint,
+		defaultTag:          defaultTag,
+		outboundByTag:       make(map[string]adapter.Outbound),
+		outboundOptionByTag: make(map[string]option.Outbound),
+		runtime:             make(map[adapter.Outbound]struct{}),
 	}
 }
 
@@ -188,7 +191,43 @@ func (m *Manager) Create(ctx context.Context, router adapter.Router, logger log.
 	if err != nil {
 		return err
 	}
-	return m.add(tag, outbound, false)
+	err = m.add(tag, outbound, false)
+	if err != nil {
+		return err
+	}
+	m.access.Lock()
+	if m.outboundByTag[tag] == outbound {
+		m.outboundOptionByTag[tag] = option.Outbound{Type: inboundType, Tag: tag, Options: options}
+	}
+	m.access.Unlock()
+	return nil
+}
+
+// OutboundOption returns the options an outbound was created with through Create
+// (static outbounds and provider nodes), so groups such as nested can derive
+// variants of it.
+func (m *Manager) OutboundOption(tag string) (option.Outbound, bool) {
+	m.access.RLock()
+	defer m.access.RUnlock()
+	options, found := m.outboundOptionByTag[tag]
+	return options, found
+}
+
+// RegisterOutbound adds an outbound built by a group at runtime (nested shadow
+// outbounds), replacing one with the same tag.
+func (m *Manager) RegisterOutbound(outbound adapter.Outbound) error {
+	return m.AddOutbound(outbound)
+}
+
+// UnregisterOutbound removes a runtime outbound; a missing tag is not an error.
+func (m *Manager) UnregisterOutbound(tag string) error {
+	m.access.RLock()
+	_, loaded := m.outboundByTag[tag]
+	m.access.RUnlock()
+	if !loaded {
+		return nil
+	}
+	return m.Remove(tag)
 }
 
 // AddOutbound registers an outbound its owner constructed itself (the region
@@ -234,6 +273,7 @@ func (m *Manager) add(tag string, outbound adapter.Outbound, generated bool) err
 	}
 	m.outbounds = append(m.outbounds, outbound)
 	m.outboundByTag[tag] = outbound
+	delete(m.outboundOptionByTag, tag)
 	if scope != nil {
 		m.runtime[outbound] = struct{}{}
 	}
@@ -256,6 +296,7 @@ func (m *Manager) Remove(tag string) error {
 		return os.ErrInvalid
 	}
 	delete(m.outboundByTag, tag)
+	delete(m.outboundOptionByTag, tag)
 	delete(m.runtime, outbound)
 	m.outbounds = common.Filter(m.outbounds, func(it adapter.Outbound) bool {
 		return it != outbound

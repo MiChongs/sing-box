@@ -61,6 +61,7 @@ const (
 	TypeSmart            = "smart"
 	TypeSmartLoadBalance = "smart-loadbalance"
 	TypeSmartRegion      = "smart-region"
+	TypeNested           = "nested"
 )
 
 func ProxyDisplayName(proxyType string) string {
@@ -149,6 +150,8 @@ func ProxyDisplayName(proxyType string) string {
 		return "URLTest"
 	case TypeLoadBalance:
 		return "LoadBalance"
+	case TypeNested:
+		return "Nested"
 	case TypeSmart, TypeSmartLoadBalance, TypeSmartRegion:
 		return "Smart"
 	default:
