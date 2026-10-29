@@ -28,7 +28,8 @@
           },
           "override_dialer": {},
           "override_tls": {},
-          "override_anytls": {}
+          "override_anytls": {},
+          "override_transport": {}
         }
       ]
     }
@@ -60,6 +61,7 @@
           "override_tls": {},
 
           "override_anytls": {},
+          "override_transport": {},
 
           // Deprecated
 
@@ -164,6 +166,10 @@
 #### override_dialer
 
 覆写订阅内容的拨号字段, 参阅 [拨号字段覆写](/zh/configuration/provider/override_dialer/)。
+
+#### override_transport
+
+覆写 provider 中出站的传输层字段，参阅 [传输层字段覆写](/zh/configuration/provider/override_transport/)。
 
 #### override_tls
 

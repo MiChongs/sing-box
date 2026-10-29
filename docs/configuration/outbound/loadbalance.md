@@ -129,3 +129,8 @@ The time to live used for `sticky-sessions` strategy  timeout. `10m` will be use
 #### use_all_providers
 
 Whether to use all providers for testing. `false` will be used if empty.
+
+### Health check behavior
+
+* **Startup**: members are probed once after startup. When none answers (the network is not ready yet), the probe is retried 15s, 35s and 60s after startup, never later than `interval`, until a member is available or the group goes idle.
+* **Failed connections**: a member that fails a connection is probed alone 3s later. If it answers it is trusted for one minute; otherwise its delay record is dropped, so the strategy stops picking it, and the connections through it are closed (resource downloads excepted). When no member is left alive, every member is probed again, at most once every 90s.

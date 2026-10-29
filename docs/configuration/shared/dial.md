@@ -69,6 +69,10 @@ icon: material/new-box
 
     You can ignore the JSON Array [] tag when the content is only one item
 
+!!! note "Unix domain socket"
+
+    The `server` of an outbound can be a unix domain socket path (`/path`, `./path`, `unix:/path` or a name ending in `.sock`): the outbound then dials that socket over TCP and ignores `server_port`.
+
 ### Fields
 
 #### detour

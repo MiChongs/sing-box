@@ -108,7 +108,43 @@ icon: material/new-box
     "short_id": [
       "0123456789abcdef"
     ],
-    "max_time_difference": "1m"
+    "max_time_difference": "1m",
+    "mldsa65_seed": "",
+    "key_share": "hybrid",
+    "fallback": {
+      "enabled": true,
+      "server": "",
+      "server_port": 0,
+      "timeout": "30s",
+      "qos": "20kb/s",
+      "max_conn": "10"
+    }
+  },
+  "phantom": {
+    "enabled": false,
+    "password": [],
+    "ca_certificate": [],
+    "ca_certificate_path": "",
+    "ca_key": [],
+    "ca_key_path": "",
+    "certificate_domains": [],
+    "certificate_validity": "2160h",
+    "leaf_type": "ecdsa",
+    "leaf_der_size": 0,
+    "chain_der_size": 0,
+    "target_entropy": 7.4,
+    "reject_unknown_sni": false,
+    "time_tolerance": "30s",
+    "replay_cache_size": 65536,
+    "handshake_timeout": "",
+    "fallback": {
+      "enabled": true,
+      "server": "",
+      "server_port": 443,
+      "qos": "",
+      "qps": 0,
+      "timeout": "10s"
+    }
   }
 }
 ```
@@ -162,7 +198,15 @@ icon: material/new-box
   "reality": {
     "enabled": false,
     "public_key": "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0",
-    "short_id": "0123456789abcdef"
+    "short_id": "0123456789abcdef",
+    "key_share": "hybrid",
+    "mldsa65_verify": "",
+    "version": "26.3.27"
+  },
+  "phantom": {
+    "enabled": false,
+    "password": "",
+    "handshake_timeout": ""
   }
 }
 ```
@@ -868,3 +912,140 @@ ACME DNS01 验证字段。如果配置，将禁用其他验证方法。
 服务器和客户端之间的最大时间差。
 
 如果为空则禁用检查。
+
+#### mldsa65_seed
+
+==仅服务器==
+
+ML-DSA-65 种子（base64 或 hex，即 `sing-box generate mldsa65` 或 `xray mldsa65` 输出的 `Seed`；也接受 4032 字节的完整私钥）。
+
+设置后，临时证书会携带对握手的 ML-DSA-65 签名，格式与 Xray 一致，配置了 `mldsa65_verify` 的客户端可以校验。证书因此增大约 3.3 KB，握手目标站的证书链必须比它大，常见网站都满足。
+
+#### mldsa65_verify
+
+==仅客户端==
+
+ML-DSA-65 公钥（`sing-box generate mldsa65` 或 `xray mldsa65` 输出的 `Verify`）。服务端未给出有效签名时握手失败。
+
+#### key_share
+
+密钥交换策略，默认 `hybrid`。
+
+| 值          | 客户端                                                                                                          | 服务端                                                                                   |
+|-------------|-----------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------|
+| `hybrid`    | 发送指纹自带的 `X25519MLKEM768` key share。新版 Xray 服务端会拒绝不带它的 ClientHello，因此需要它；所用指纹必须带有 `X25519MLKEM768`。 | 跟随握手目标站：客户端和目标站都支持时使用 `X25519MLKEM768`，否则使用 `X25519`。 |
+| `classical` | 去掉 `X25519MLKEM768`，只发送 `X25519`。                                                                         | 只要客户端带了 `X25519` key share 就使用 `X25519`。                                       |
+
+#### version
+
+==仅客户端==
+
+写入 SessionID 的客户端版本，格式为 `X.Y.Z`，默认 `26.3.27`。Xray 服务端可以用 `minClientVer` / `maxClientVer` 限制客户端版本。
+
+#### fallback
+
+==仅服务器==
+
+把 REALITY 认证失败的连接（探测、非 REALITY 流量）重放已收到的数据后转发到回落目标。不配置时，未认证连接只在握手超时时间内镜像到握手目标站。
+
+| 字段          | 说明                                                                                                  |
+|---------------|-------------------------------------------------------------------------------------------------------|
+| `enabled`     | 配置了该对象即启用，设为 `false` 时关闭。                                                           |
+| `server`      | 回落地址：IP、域名或 unix socket 路径（`/path` 或 `unix:/path`）。为空时使用握手目标站。           |
+| `server_port` | 回落端口。为空时使用握手目标站端口；unix socket 时忽略。`server` 为主机时必填。                     |
+| `timeout`     | 转发连接的空闲超时，默认 `30s`。                                                                     |
+| `qos`         | 每个方向的带宽限制，例如 `20kb/s`、`10mb/s`。默认 `20kb/s`。                                         |
+| `max_conn`    | 每秒允许回落的新连接数：`10`、`10/s`、`600/m` 或 `3600/h`。默认 `10`，超出的连接直接关闭。          |
+
+### Phantom 字段
+
+幻影 TLS（PTLS）在标准 TLS 1.3 握手内完成客户端认证：客户端把由预共享密钥和 ClientHello random 派生的认证标签与时间戳织入 SessionID（QUIC 下织入 ClientHello random，并绑定初始目标连接 ID）。服务端无状态验签；认证失败、时钟偏差过大或重放的连接会重放首包，转发到回落目标。PTLS 同时支持 TCP 与 QUIC。
+
+PTLS 替代常规 TLS 实现，只能与以下 TLS 字段同时使用——服务端：`server_name`、`server_names`、`alpn`、`min_version`、`max_version`、`cipher_suites`、`curve_preferences`、`certificate`、`certificate_path`、`key`、`key_path`、`client_authentication`、`client_certificate`、`client_certificate_path`、`handshake_timeout`、`reject_unknown_sni`；客户端：`server_name`、`certificate_server_name`、`disable_sni`、`insecure`、`alpn`、`min_version`、`max_version`、`cipher_suites`、`curve_preferences`、`certificate`、`certificate_path`、`client_certificate`、`client_certificate_path`、`client_key`、`client_key_path`、`handshake_timeout`、`utls`。不能与 ECH、REALITY、kTLS 同时使用。
+
+`server_name` 与 `server_names` 支持 `*.example.com` 这样的单级泛域名。
+
+#### enabled
+
+启用幻影 TLS。
+
+#### password
+
+==必填==
+
+预共享密钥：64 位 hex、32 字节的 base64（标准或 URL 安全），或任意口令（以 PBKDF2-HMAC-SHA256 迭代 30000 次派生）。
+
+服务端可以填列表，按顺序逐个尝试；客户端只填一个。
+
+#### ca_certificate / ca_certificate_path / ca_key / ca_key_path
+
+==仅服务器==
+
+在内存中签发叶子证书所用的私有根 CA（PEM）。叶子证书剩余 1/3 有效期时在后台自动轮转。
+
+不配置 CA 时，使用 TLS 字段中的静态 `certificate` / `key`。客户端把 `certificate` / `certificate_path` 设为该 CA 证书即可完成链式校验，无需 `insecure`。
+
+#### certificate_domains
+
+==仅服务器==
+
+签发证书的 SAN 域名（可用泛域名），第一个作为 CommonName。为空时使用 `server_name` / `server_names`。
+
+#### certificate_validity
+
+==仅服务器==
+
+签发叶子证书的有效期，默认 `2160h`（90 天）。
+
+#### leaf_type
+
+==仅服务器==
+
+签发叶子证书的密钥类型：`ecdsa`（P-256，默认）或 `rsa`（2048 位）。应与伪装目标站一致。
+
+#### leaf_der_size / chain_der_size / target_entropy
+
+==仅服务器==
+
+把签发的叶子证书 / 整条证书链的 DER 大小填充到指定字节数，并逼近指定的香农信息熵（每字节比特数，`5.5`–`7.85`，默认 `7.4`），使证书形态接近伪装目标站。可以用 `sing-box tools inspect-cert example.com:443` 测量目标站（HTTP/3 用 `-m udp`）。
+
+#### reject_unknown_sni
+
+==仅服务器==
+
+SNI 不匹配 `server_name` / `server_names` 时直接关闭连接，而不是回落。与 TLS 字段的 `reject_unknown_sni` 等效。QUIC 下这类 Initial 包被静默丢弃。
+
+#### time_tolerance
+
+==仅服务器==
+
+允许的时钟偏差，默认 `30s`。
+
+#### replay_cache_size
+
+==仅服务器==
+
+防重放过滤器的容量，默认 `65536`。
+
+#### handshake_timeout
+
+握手超时。为空时使用 TLS 字段的 `handshake_timeout`，两者都未设置时为 `15s`。
+
+#### fallback
+
+==仅服务器==
+
+认证失败连接的转发目标。
+
+| 字段          | 说明                                                                  |
+|---------------|-----------------------------------------------------------------------|
+| `enabled`     | 默认启用，设为 `false` 时认证失败的连接直接关闭。                    |
+| `server`      | 回落地址：IP、域名或 unix socket 路径。为空时使用 `server_name`。    |
+| `server_port` | 回落端口，默认 `443`；unix socket 时忽略。                           |
+| `qos`         | 转发连接的带宽限制，例如 `10mb/s`。为空时不限制。                    |
+| `qps`         | 每秒允许回落的新连接数。为 `0` 时不限制。                            |
+| `timeout`     | 转发的拨号与空闲超时，默认 `10s`。                                   |
+
+!!! note "Naive"
+
+    naive 出站仅在 HTTP/2 下支持幻影 TLS（不能与 `quic` 同时使用）：由 libcronet 实现，只使用 `password`。

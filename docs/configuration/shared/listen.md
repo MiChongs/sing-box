@@ -66,6 +66,8 @@ icon: material/new-box
 
 Listen address.
 
+A unix domain socket path (`/path`, `./path`, `unix:/path` or a name ending in `.sock`) listens on that socket instead; `listen_port` is then ignored. Append `,mode` to set the socket file permissions in octal, such as `/run/sing-box.sock,0600` (`0660` by default). The socket file is removed on close. TCP only: protocols listening on UDP, and `set_system_proxy`, are not available on a socket.
+
 #### listen_port
 
 Listen port.

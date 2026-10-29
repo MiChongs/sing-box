@@ -183,8 +183,10 @@ nav:
           - TUIC: configuration/inbound/tuic.md
           - Hysteria2: configuration/inbound/hysteria2.md
           - AnyTLS: configuration/inbound/anytls.md
+          - AnyX: configuration/inbound/anyx.md
           - QUICX: configuration/inbound/quicx.md
           - Nowhere: configuration/inbound/nowhere.md
+          - Nowhere Egress: configuration/inbound/nowhere-egress.md
           - Snell: configuration/inbound/snell.md
           - Tun: configuration/inbound/tun.md
           - eBPF: configuration/inbound/ebpf.md
@@ -210,6 +212,7 @@ nav:
           - TUIC: configuration/outbound/tuic.md
           - Hysteria2: configuration/outbound/hysteria2.md
           - AnyTLS: configuration/outbound/anytls.md
+          - AnyX: configuration/outbound/anyx.md
           - QUICX: configuration/outbound/quicx.md
           - Nowhere: configuration/outbound/nowhere.md
           - Snell: configuration/outbound/snell.md
@@ -219,11 +222,13 @@ nav:
           - DNS: configuration/outbound/dns.md
           - Selector: configuration/outbound/selector.md
           - URLTest: configuration/outbound/urltest.md
+          - Nested: configuration/outbound/nested.md
       - Provider:
           - configuration/provider/index.md
           - Dialer Fields Override: configuration/provider/override_dialer.md
           - TLS Fields Override: configuration/provider/override_tls.md
           - AnyTLS Fields Override: configuration/provider/override_anytls.md
+          - Transport Fields Override: configuration/provider/override_transport.md
       - Service:
           - configuration/service/index.md
           - sing-box API: configuration/service/api.md

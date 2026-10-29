@@ -66,6 +66,8 @@ icon: material/new-box
 
 监听地址。
 
+填写 unix domain socket 路径（`/path`、`./path`、`unix:/path` 或以 `.sock` 结尾的名称）时改为监听该 socket，此时忽略 `listen_port`。追加 `,权限` 可用八进制指定 socket 文件权限，例如 `/run/sing-box.sock,0600`（默认 `0660`）。关闭时删除 socket 文件。仅支持 TCP：监听 UDP 的协议以及 `set_system_proxy` 不能用于 socket。
+
 #### listen_port
 
 监听端口。

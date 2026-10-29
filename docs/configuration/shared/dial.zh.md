@@ -69,6 +69,10 @@ icon: material/new-box
 
     当内容只有一项时，可以忽略 JSON 数组 [] 标签
 
+!!! note "Unix domain socket"
+
+    出站的 `server` 可以填 unix domain socket 路径（`/path`、`./path`、`unix:/path` 或以 `.sock` 结尾的名称）：此时出站通过 TCP 拨号该 socket，并忽略 `server_port`。
+
 ### 字段
 
 #### detour

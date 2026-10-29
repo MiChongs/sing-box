@@ -127,7 +127,9 @@ The initial QUIC session receive window.
 
 TLS configuration, see [TLS](/configuration/shared/tls/#outbound).
 
-Only `server_name`, `certificate`, `certificate_path` and `ech` are supported.
+Only `server_name`, `certificate`, `certificate_path`, `ech` and `phantom` are supported.
+
+`phantom` enables [Phantom TLS](/configuration/shared/tls/#phantom-fields) (only `password` is used) and cannot be combined with `quic`. It requires a libcronet built with the PTLS patch, which this fork's builds include.
 
 Self-signed certificates change traffic behavior significantly, which defeats the purpose of NaiveProxy's design to resist traffic analysis, and should not be used in production.
 

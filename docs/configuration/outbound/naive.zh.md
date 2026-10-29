@@ -127,7 +127,9 @@ QUIC 初始会话接收窗口。
 
 TLS 配置, 参阅 [TLS](/zh/configuration/shared/tls/#出站)。
 
-只有 `server_name`、`certificate`、`certificate_path` 和 `ech` 是被支持的。
+只有 `server_name`、`certificate`、`certificate_path`、`ech` 和 `phantom` 是被支持的。
+
+`phantom` 启用 [幻影 TLS](/zh/configuration/shared/tls/#phantom-字段)（只使用 `password`），不能与 `quic` 同时使用。需要打了 PTLS 补丁的 libcronet，本分支的构建已包含。
 
 自签名证书会显著改变流量行为，违背了 NaiveProxy 旨在抵抗流量分析的设计初衷，不应该在生产环境中使用。
 

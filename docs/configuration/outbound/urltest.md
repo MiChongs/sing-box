@@ -142,3 +142,11 @@ An outbound whose delay exceeds this value is skipped. If every available outbou
 Interrupt existing connections when the selected outbound has changed.
 
 Only inbound connections are affected by this setting, internal connections will always be interrupted.
+
+### Health check behavior
+
+* **Selection**: the fastest member is found first; the current member is kept while its delay is within `tolerance` of it.
+* **Cold start**: until members are measured, a random member supporting the network is picked and kept, so the first connections are not all sent to the first member.
+* **Startup**: members are probed once after startup. When none answers (the network is not ready yet), the probe is retried 15s, 35s and 60s after startup, never later than `interval`, until a member is available or the group goes idle.
+* **Failed connections**: a failing member is retried on the best measured other members. When no other member is measured, the failed member is probed alone 3s later: if it answers it is trusted for one minute, otherwise it is dropped and another member is selected. When no member is left alive, every member is probed again, at most once every 90s.
+* **Manual selection**: selecting a member through the Clash API probes it first and is rejected when it does not answer. The selection is kept by health checks and failures; it is released by a user-triggered speed test or by selecting an empty name.

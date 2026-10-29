@@ -28,7 +28,8 @@ List of subscription providers.
           },
           "override_dialer": {},
           "override_tls": {},
-          "override_anytls": {}
+          "override_anytls": {},
+          "override_transport": {}
         }
       ]
     }
@@ -60,6 +61,7 @@ List of subscription providers.
           "override_tls": {},
 
           "override_anytls": {},
+          "override_transport": {},
 
           // Deprecated
 
@@ -164,6 +166,10 @@ Override AnyTLS fields of outbounds in provider, see [AnyTLS Fields Override](/c
 #### override_dialer
 
 Override dialer fields of outbounds in provider, see [Dialer Fields Override](/configuration/provider/override_dialer/) for details.
+
+#### override_transport
+
+Override transport fields of outbounds in provider, see [Transport Fields Override](/configuration/provider/override_transport/) for details.
 
 #### override_tls
 

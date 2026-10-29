@@ -108,7 +108,43 @@ icon: material/new-box
     "short_id": [
       "0123456789abcdef"
     ],
-    "max_time_difference": "1m"
+    "max_time_difference": "1m",
+    "mldsa65_seed": "",
+    "key_share": "hybrid",
+    "fallback": {
+      "enabled": true,
+      "server": "",
+      "server_port": 0,
+      "timeout": "30s",
+      "qos": "20kb/s",
+      "max_conn": "10"
+    }
+  },
+  "phantom": {
+    "enabled": false,
+    "password": [],
+    "ca_certificate": [],
+    "ca_certificate_path": "",
+    "ca_key": [],
+    "ca_key_path": "",
+    "certificate_domains": [],
+    "certificate_validity": "2160h",
+    "leaf_type": "ecdsa",
+    "leaf_der_size": 0,
+    "chain_der_size": 0,
+    "target_entropy": 7.4,
+    "reject_unknown_sni": false,
+    "time_tolerance": "30s",
+    "replay_cache_size": 65536,
+    "handshake_timeout": "",
+    "fallback": {
+      "enabled": true,
+      "server": "",
+      "server_port": 443,
+      "qos": "",
+      "qps": 0,
+      "timeout": "10s"
+    }
   }
 }
 ```
@@ -162,7 +198,15 @@ icon: material/new-box
   "reality": {
     "enabled": false,
     "public_key": "jNXHt1yRo0vDuchQlIP6Z0ZvjT3KtzVI-T4E7RoLJS0",
-    "short_id": "0123456789abcdef"
+    "short_id": "0123456789abcdef",
+    "key_share": "hybrid",
+    "mldsa65_verify": "",
+    "version": "26.3.27"
+  },
+  "phantom": {
+    "enabled": false,
+    "password": "",
+    "handshake_timeout": ""
   }
 }
 ```
@@ -877,3 +921,140 @@ A hexadecimal string with zero to eight digits.
 The maximum time difference between the server and the client.
 
 Check disabled if empty.
+
+#### mldsa65_seed
+
+==Server only==
+
+ML-DSA-65 seed (base64 or hex, the `Seed` printed by `sing-box generate mldsa65` or `xray mldsa65`; a 4032-byte private key is also accepted).
+
+When set, the temporary certificate carries an ML-DSA-65 signature over the handshake in the same format as Xray, so clients with `mldsa65_verify` can verify it. The certificate grows by about 3.3 KB: the handshake target's certificate chain must be larger than that, which is the case for usual websites.
+
+#### mldsa65_verify
+
+==Client only==
+
+ML-DSA-65 public key (the `Verify` printed by `sing-box generate mldsa65` or `xray mldsa65`). The handshake fails when the server does not present a valid signature.
+
+#### key_share
+
+Key exchange policy, `hybrid` by default.
+
+| Value       | Client                                                                                                  | Server                                                                                                       |
+|-------------|---------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| `hybrid`    | Sends the fingerprint's `X25519MLKEM768` key share. Required by recent Xray servers, which reject Client Hellos without it. The fingerprint must carry an `X25519MLKEM768` share. | Follows the handshake target: `X25519MLKEM768` when the client and the target support it, `X25519` otherwise. |
+| `classical` | Removes `X25519MLKEM768` and only sends `X25519`.                                                       | Uses `X25519` whenever the client sent an `X25519` key share.                                                |
+
+#### version
+
+==Client only==
+
+Client version carried in the session ID, in `X.Y.Z` form, `26.3.27` by default. Xray servers can restrict accepted client versions with `minClientVer` / `maxClientVer`.
+
+#### fallback
+
+==Server only==
+
+Relay connections that fail REALITY authentication (probes, non-REALITY traffic) to a fallback target, replaying the bytes already received. Without it, unauthenticated connections are mirrored to the handshake target only for the duration of the handshake timeout.
+
+| Field         | Description                                                                                                         |
+|---------------|---------------------------------------------------------------------------------------------------------------------|
+| `enabled`     | Enabled when the object is present, unless set to `false`.                                                         |
+| `server`      | Fallback address: an IP, a domain or a unix socket path (`/path` or `unix:/path`). The handshake target when empty. |
+| `server_port` | Fallback port. The handshake target port when empty; ignored for unix sockets. Required when `server` is a host.   |
+| `timeout`     | Idle timeout of a relayed connection, `30s` by default.                                                             |
+| `qos`         | Bandwidth limit of each direction, such as `20kb/s` or `10mb/s`. `20kb/s` by default.                               |
+| `max_conn`    | New fallback connections allowed per second: `10`, `10/s`, `600/m` or `3600/h`. `10` by default; excess connections are closed. |
+
+### Phantom Fields
+
+Phantom TLS (PTLS) authenticates clients inside a standard TLS 1.3 handshake: the client packs an authentication tag and a timestamp, derived from a pre-shared key and the Client Hello random, into the session ID (QUIC: into the Client Hello random, bound to the initial destination connection ID). The server verifies it statelessly; clients that fail authentication, drift in time or replay are relayed to a fallback target with their first bytes replayed. PTLS works over TCP and QUIC.
+
+PTLS replaces the regular TLS stack, so only these TLS fields can be combined with it — server: `server_name`, `server_names`, `alpn`, `min_version`, `max_version`, `cipher_suites`, `curve_preferences`, `certificate`, `certificate_path`, `key`, `key_path`, `client_authentication`, `client_certificate`, `client_certificate_path`, `handshake_timeout`, `reject_unknown_sni`; client: `server_name`, `certificate_server_name`, `disable_sni`, `insecure`, `alpn`, `min_version`, `max_version`, `cipher_suites`, `curve_preferences`, `certificate`, `certificate_path`, `client_certificate`, `client_certificate_path`, `client_key`, `client_key_path`, `handshake_timeout`, `utls`. ECH, REALITY and kTLS are not available.
+
+`server_name` and `server_names` accept a single-level wildcard such as `*.example.com`.
+
+#### enabled
+
+Enable Phantom TLS.
+
+#### password
+
+==Required==
+
+Pre-shared key: 64 hex characters, base64 (standard or URL-safe) of 32 bytes, or any passphrase, which is derived with PBKDF2-HMAC-SHA256 (30000 iterations).
+
+The server accepts a list and tries each key in order; the client takes a single key.
+
+#### ca_certificate / ca_certificate_path / ca_key / ca_key_path
+
+==Server only==
+
+Private root CA (PEM) used to issue leaf certificates in memory. Leaf certificates are renewed in the background when a third of their validity remains.
+
+Without a CA, the static `certificate` / `key` of the TLS options are served. Clients verify the chain with `certificate` / `certificate_path` set to the CA certificate; `insecure` is not needed.
+
+#### certificate_domains
+
+==Server only==
+
+SAN domains of issued certificates (wildcards allowed), the first one is the common name. `server_name` / `server_names` when empty.
+
+#### certificate_validity
+
+==Server only==
+
+Validity of issued leaf certificates, `2160h` (90 days) by default.
+
+#### leaf_type
+
+==Server only==
+
+Key type of issued leaf certificates: `ecdsa` (P-256, default) or `rsa` (2048 bits). Use the type of the site being imitated.
+
+#### leaf_der_size / chain_der_size / target_entropy
+
+==Server only==
+
+Pad the issued leaf certificate / whole chain to this DER size in bytes and aim for this Shannon entropy (bits per byte, `5.5`–`7.85`, `7.4` by default), so the certificate looks like the imitated site's. Measure a site with `sing-box tools inspect-cert example.com:443` (`-m udp` for HTTP/3).
+
+#### reject_unknown_sni
+
+==Server only==
+
+Close connections whose SNI does not match `server_name` / `server_names` instead of falling back. Same as the TLS `reject_unknown_sni`. Over QUIC, such Initial packets are dropped silently.
+
+#### time_tolerance
+
+==Server only==
+
+Accepted clock difference, `30s` by default.
+
+#### replay_cache_size
+
+==Server only==
+
+Size of the replay filter, `65536` by default.
+
+#### handshake_timeout
+
+Handshake timeout. The TLS `handshake_timeout` when empty, `15s` if neither is set.
+
+#### fallback
+
+==Server only==
+
+Where to relay connections that fail authentication.
+
+| Field         | Description                                                                                         |
+|---------------|-----------------------------------------------------------------------------------------------------|
+| `enabled`     | Enabled unless set to `false`; when disabled, failed connections are closed.                       |
+| `server`      | Fallback address: an IP, a domain or a unix socket path. `server_name` when empty.                 |
+| `server_port` | Fallback port, `443` by default; ignored for unix sockets.                                          |
+| `qos`         | Bandwidth limit of the relayed connection, such as `10mb/s`. Unlimited when empty.                 |
+| `qps`         | New fallback connections allowed per second. Unlimited when `0`.                                   |
+| `timeout`     | Dial and idle timeout of the relay, `10s` by default.                                              |
+
+!!! note "Naive"
+
+    The naive outbound supports Phantom TLS over HTTP/2 only (not with `quic`): it is applied by libcronet, and only `password` is used.

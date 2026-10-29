@@ -31,6 +31,7 @@
 | `hysteria2`   | [Hysteria2](./hysteria2/)     | :material-close: |
 | `vless`       | [VLESS](./vless/)             | TCP              |
 | `anytls`      | [AnyTLS](./anytls/)           | TCP              |
+| `anyx`        | [AnyX](./anyx/)               | TCP              |
 | `quicx`       | [QUICX](./quicx/)             | :material-close: |
 | `nowhere`     | [Nowhere](./nowhere/)         | TCP              |
 | `nowhere-egress` | [Nowhere Egress](./nowhere-egress/) | :material-close: |
