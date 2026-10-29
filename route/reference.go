@@ -20,8 +20,8 @@ var _ adapter.LifecycleService = (*ReferenceManager)(nil)
 type ReferenceManager struct {
 	ctx                    context.Context
 	logger                 log.ContextLogger
-	rules                  []option.Rule
-	dnsRules               []option.DNSRule
+	rules                  []routeReferenceRule
+	dnsRules               []dnsReferenceRule
 	staticOutbounds        []string
 	staticTransports       []string
 	subscriber             *observable.Subscriber[struct{}]
@@ -58,8 +58,8 @@ func NewReferenceManager(ctx context.Context, logger log.ContextLogger, options 
 	return &ReferenceManager{
 		ctx:              ctx,
 		logger:           logger,
-		rules:            rules,
-		dnsRules:         dnsRules,
+		rules:            compileRouteReferenceRules(rules),
+		dnsRules:         compileDNSReferenceRules(dnsRules),
 		staticOutbounds:  staticOutbounds,
 		staticTransports: staticTransports,
 		pauseManager:     service.FromContext[pause.Manager](ctx),
@@ -354,15 +354,26 @@ func (m *ReferenceManager) CloseIdleConnections() {
 }
 
 // Fall back to all configured rules until runtime initialization is complete.
+// The options slice is returned as-is when no rule is disabled.
 func enabledRuleOptions[O any, R adapter.Rule](options []O, runtime []R) []O {
 	if len(options) != len(runtime) {
 		return options
 	}
-	enabled := make([]O, 0, len(options))
+	var enabled []O
 	for i, rule := range runtime {
-		if !rule.Disabled() {
+		if rule.Disabled() {
+			if enabled == nil {
+				enabled = make([]O, i, len(options))
+				copy(enabled, options[:i])
+			}
+			continue
+		}
+		if enabled != nil {
 			enabled = append(enabled, options[i])
 		}
+	}
+	if enabled == nil {
+		return options
 	}
 	return enabled
 }

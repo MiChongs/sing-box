@@ -34,11 +34,11 @@ func TestPassFallsThroughMatchingAndReferences(t *testing.T) {
 			require.Equal(t, destination, metadata.Destination)
 			rules := []option.Rule{{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultRule{RuleAction: option.RuleAction{Action: C.RuleActionTypeRoute, RouteOptions: option.RouteActionOptions{Outbound: tag}}}}}
 			var outbounds, transports []string
-			require.False(t, collectRuleReferences(rules, "", manager, &outbounds, &transports), "pass must keep the default reachable")
+			require.False(t, collectRuleReferences(compileRouteReferenceRules(rules), "", manager, &outbounds, &transports), "pass must keep the default reachable")
 			require.Equal(t, []string{tag}, outbounds)
 			rules = append(rules, option.Rule{Type: C.RuleTypeDefault, DefaultOptions: option.DefaultRule{RuleAction: option.RuleAction{Action: C.RuleActionTypeRoute, RouteOptions: option.RouteActionOptions{Outbound: "next"}}}})
 			outbounds = nil
-			require.True(t, collectRuleReferences(rules, "", manager, &outbounds, &transports))
+			require.True(t, collectRuleReferences(compileRouteReferenceRules(rules), "", manager, &outbounds, &transports))
 			require.Equal(t, []string{tag, "next"}, outbounds)
 		})
 	}

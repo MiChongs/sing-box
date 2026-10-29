@@ -42,19 +42,38 @@ func evaluateClashMode(clashModes []string, mode string, invert bool, otherCondi
 	return match
 }
 
-func evaluateLogical(matches []staticMatch, logicalMode string, invert bool) staticMatch {
+// staticCondition is the clash-mode-only view of a rule's conditions, compiled
+// once so reference collection does not deep-compare rule options on every
+// outbound or clash-mode change.
+type staticCondition struct {
+	clashModes      []string
+	invert          bool
+	otherConditions bool
+	logicalMode     string
+	subRules        []staticCondition
+	unknown         bool
+}
+
+func (c *staticCondition) evaluate(mode string) staticMatch {
+	if c.unknown {
+		return staticMatchUnknown
+	}
+	if c.logicalMode == "" {
+		return evaluateClashMode(c.clashModes, mode, c.invert, c.otherConditions)
+	}
 	var match staticMatch
-	if logicalMode == C.LogicalTypeAnd {
+	if c.logicalMode == C.LogicalTypeAnd {
 		match = staticMatchAlways
 	} else {
 		match = staticMatchNever
 	}
-	for _, ruleMatch := range matches {
-		if logicalMode == C.LogicalTypeAnd && ruleMatch == staticMatchNever {
+	for i := range c.subRules {
+		ruleMatch := c.subRules[i].evaluate(mode)
+		if c.logicalMode == C.LogicalTypeAnd && ruleMatch == staticMatchNever {
 			match = staticMatchNever
 			break
 		}
-		if logicalMode == C.LogicalTypeOr && ruleMatch == staticMatchAlways {
+		if c.logicalMode == C.LogicalTypeOr && ruleMatch == staticMatchAlways {
 			match = staticMatchAlways
 			break
 		}
@@ -62,61 +81,113 @@ func evaluateLogical(matches []staticMatch, logicalMode string, invert bool) sta
 			match = staticMatchUnknown
 		}
 	}
-	if invert {
+	if c.invert {
 		match = match.invert()
 	}
 	return match
 }
 
-func evaluateRule(rule option.Rule, mode string) staticMatch {
+func compileRuleCondition(rule option.Rule) staticCondition {
 	switch rule.Type {
 	case C.RuleTypeDefault:
 		conditions := rule.DefaultOptions.RawDefaultRule
 		conditions.ClashMode = nil
 		conditions.Invert = false
-		return evaluateClashMode(rule.DefaultOptions.ClashMode, mode, rule.DefaultOptions.Invert, !reflect.DeepEqual(conditions, option.RawDefaultRule{}))
-	case C.RuleTypeLogical:
-		matches := make([]staticMatch, 0, len(rule.LogicalOptions.Rules))
-		for _, subRule := range rule.LogicalOptions.Rules {
-			matches = append(matches, evaluateRule(subRule, mode))
+		return staticCondition{
+			clashModes:      rule.DefaultOptions.ClashMode,
+			invert:          rule.DefaultOptions.Invert,
+			otherConditions: !reflect.DeepEqual(conditions, option.RawDefaultRule{}),
 		}
-		return evaluateLogical(matches, rule.LogicalOptions.Mode, rule.LogicalOptions.Invert)
+	case C.RuleTypeLogical:
+		subRules := make([]staticCondition, 0, len(rule.LogicalOptions.Rules))
+		for _, subRule := range rule.LogicalOptions.Rules {
+			subRules = append(subRules, compileRuleCondition(subRule))
+		}
+		return staticCondition{
+			invert:      rule.LogicalOptions.Invert,
+			logicalMode: rule.LogicalOptions.Mode,
+			subRules:    subRules,
+		}
 	default:
-		return staticMatchUnknown
+		return staticCondition{unknown: true}
 	}
 }
 
-func evaluateDNSRule(rule option.DNSRule, mode string) staticMatch {
+func compileDNSRuleCondition(rule option.DNSRule) staticCondition {
 	switch rule.Type {
 	case C.RuleTypeDefault:
 		conditions := rule.DefaultOptions.RawDefaultDNSRule
 		conditions.ClashMode = nil
 		conditions.Invert = false
-		return evaluateClashMode(rule.DefaultOptions.ClashMode, mode, rule.DefaultOptions.Invert, !reflect.DeepEqual(conditions, option.RawDefaultDNSRule{}))
-	case C.RuleTypeLogical:
-		matches := make([]staticMatch, 0, len(rule.LogicalOptions.Rules))
-		for _, subRule := range rule.LogicalOptions.Rules {
-			matches = append(matches, evaluateDNSRule(subRule, mode))
+		return staticCondition{
+			clashModes:      rule.DefaultOptions.ClashMode,
+			invert:          rule.DefaultOptions.Invert,
+			otherConditions: !reflect.DeepEqual(conditions, option.RawDefaultDNSRule{}),
 		}
-		return evaluateLogical(matches, rule.LogicalOptions.Mode, rule.LogicalOptions.Invert)
+	case C.RuleTypeLogical:
+		subRules := make([]staticCondition, 0, len(rule.LogicalOptions.Rules))
+		for _, subRule := range rule.LogicalOptions.Rules {
+			subRules = append(subRules, compileDNSRuleCondition(subRule))
+		}
+		return staticCondition{
+			invert:      rule.LogicalOptions.Invert,
+			logicalMode: rule.LogicalOptions.Mode,
+			subRules:    subRules,
+		}
 	default:
-		return staticMatchUnknown
+		return staticCondition{unknown: true}
 	}
 }
 
-func collectRuleReferences(rules []option.Rule, mode string, manager adapter.OutboundManager, outbounds *[]string, transports *[]string) (shadowed bool) {
-	for _, rule := range rules {
-		match := evaluateRule(rule, mode)
+type routeReferenceRule struct {
+	condition staticCondition
+	action    *option.RuleAction
+}
+
+type dnsReferenceRule struct {
+	condition staticCondition
+	action    *option.DNSRuleAction
+}
+
+func compileRouteReferenceRules(rules []option.Rule) []routeReferenceRule {
+	compiled := make([]routeReferenceRule, len(rules))
+	for i := range rules {
+		compiled[i].condition = compileRuleCondition(rules[i])
+		switch rules[i].Type {
+		case C.RuleTypeDefault:
+			compiled[i].action = &rules[i].DefaultOptions.RuleAction
+		case C.RuleTypeLogical:
+			compiled[i].action = &rules[i].LogicalOptions.RuleAction
+		default:
+			compiled[i].action = &option.RuleAction{}
+		}
+	}
+	return compiled
+}
+
+func compileDNSReferenceRules(rules []option.DNSRule) []dnsReferenceRule {
+	compiled := make([]dnsReferenceRule, len(rules))
+	for i := range rules {
+		compiled[i].condition = compileDNSRuleCondition(rules[i])
+		switch rules[i].Type {
+		case C.RuleTypeDefault:
+			compiled[i].action = &rules[i].DefaultOptions.DNSRuleAction
+		case C.RuleTypeLogical:
+			compiled[i].action = &rules[i].LogicalOptions.DNSRuleAction
+		default:
+			compiled[i].action = &option.DNSRuleAction{}
+		}
+	}
+	return compiled
+}
+
+func collectRuleReferences(rules []routeReferenceRule, mode string, manager adapter.OutboundManager, outbounds *[]string, transports *[]string) (shadowed bool) {
+	for i := range rules {
+		match := rules[i].condition.evaluate(mode)
 		if match == staticMatchNever {
 			continue
 		}
-		var action option.RuleAction
-		switch rule.Type {
-		case C.RuleTypeDefault:
-			action = rule.DefaultOptions.RuleAction
-		case C.RuleTypeLogical:
-			action = rule.LogicalOptions.RuleAction
-		}
+		action := rules[i].action
 		var final bool
 		switch action.Action {
 		case C.RuleActionTypeRoute:
@@ -139,19 +210,13 @@ func collectRuleReferences(rules []option.Rule, mode string, manager adapter.Out
 	return false
 }
 
-func collectDNSRuleReferences(rules []option.DNSRule, mode string, transports *[]string) (shadowed bool) {
-	for _, rule := range rules {
-		match := evaluateDNSRule(rule, mode)
+func collectDNSRuleReferences(rules []dnsReferenceRule, mode string, transports *[]string) (shadowed bool) {
+	for i := range rules {
+		match := rules[i].condition.evaluate(mode)
 		if match == staticMatchNever {
 			continue
 		}
-		var action option.DNSRuleAction
-		switch rule.Type {
-		case C.RuleTypeDefault:
-			action = rule.DefaultOptions.DNSRuleAction
-		case C.RuleTypeLogical:
-			action = rule.LogicalOptions.DNSRuleAction
-		}
+		action := rules[i].action
 		var final bool
 		switch action.Action {
 		case C.RuleActionTypeRoute:
