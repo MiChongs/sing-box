@@ -243,10 +243,10 @@ func closeAllConnections(ctx context.Context, network adapter.NetworkManager, tr
 	}
 }
 
-// smartBlockConnection closes the connection identified by id and, if it was
-// routed through a Smart group, additionally marks the selected node as
-// blocked within that group. Looks up the group and its downstream node via
-// the connection's RealOutboundChain.
+// smartBlockConnection closes the connection identified by id and blocks
+// the member that carried it for the connection's target, until flushed
+// (mihomo DELETE /connections/smart/{id}). The node is the chain slot after
+// the Smart group (recorded by the dial trace).
 func smartBlockConnection(ctx context.Context, trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := uuid.FromStringOrNil(chi.URLParam(r, "id"))
@@ -262,19 +262,9 @@ func smartBlockConnection(ctx context.Context, trafficManager *trafficcontrol.Ma
 			return
 		}
 		target := tracker.Metadata()
-		tracker.Close()
-		if target == nil {
-			render.Status(r, http.StatusNotFound)
-			render.JSON(w, r, ErrNotFound)
-			return
-		}
-
-		// Walk the chain looking for a Smart group. The slot immediately after
-		// the Smart tag is the node it dialed for this connection (recorded by
-		// the dial trace); Now() is only a fallback when the dial left no trace.
-		chain := common.Map(target.ResolvedOutboundChain(), adapter.Outbound.Tag)
 		outboundMgr := service.FromContext[adapter.OutboundManager](ctx)
-		if outboundMgr == nil {
+		if target == nil || outboundMgr == nil {
+			tracker.Close()
 			render.NoContent(w, r)
 			return
 		}
@@ -282,6 +272,7 @@ func smartBlockConnection(ctx context.Context, trafficManager *trafficcontrol.Ma
 			Group string `json:"group,omitempty"`
 			Node  string `json:"node,omitempty"`
 		}
+		chain := common.Map(target.ResolvedOutboundChain(), adapter.Outbound.Tag)
 		for i, tag := range chain {
 			ob, ok := outboundMgr.Outbound(tag)
 			if !ok {
@@ -289,30 +280,26 @@ func smartBlockConnection(ctx context.Context, trafficManager *trafficcontrol.Ma
 			}
 			sg, ok := ob.(*group.Smart)
 			if !ok {
-				// A smart-region outbound blocks the node in its group.
 				region, isRegion := ob.(*group.SmartRegion)
 				if !isRegion || region.Parent() == nil {
 					continue
 				}
 				sg = region.Parent()
 			}
-			nodeTag := ""
-			if i+1 < len(chain) {
-				nodeTag = chain[i+1]
-			}
-			if nodeTag == "" {
-				nodeTag = sg.Now()
-			}
-			if nodeTag == "" {
+			if i+1 >= len(chain) {
 				break
 			}
-			if err := sg.MarkBlocked(nodeTag, group.DefaultBlockDuration); err == nil {
-				blocked.Group = tag
-				blocked.Node = nodeTag
+			metadata := target.Metadata
+			host := metadata.Domain
+			if metadata.Destination.IsDomain() {
+				host = metadata.Destination.Fqdn
+			}
+			if sg.BlockConnection(metadata.Destination, host, metadata.SmartTarget, chain[i+1]) {
+				blocked.Group, blocked.Node = tag, chain[i+1]
 			}
 			break
 		}
-
+		tracker.Close()
 		render.JSON(w, r, blocked)
 	}
 }

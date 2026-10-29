@@ -682,11 +682,7 @@ func (b *smartBalance) scheduleRefresh() {
 // ── Health and quality ─────────────────────────────────────────────────────
 
 func (b *smartBalance) blockedNodes() map[string]bool {
-	if b.s.store == nil {
-		return nil
-	}
-	blocked, _ := b.s.store.GetBlockedNodes(b.s.Tag(), smartConfigName)
-	return blocked
+	return b.s.groupBlockedTags()
 }
 
 func (b *smartBalance) nodeHealthy(ob adapter.Outbound, isUDP bool, blocked map[string]bool) bool {
@@ -703,10 +699,7 @@ func (b *smartBalance) nodeHealthy(ob adapter.Outbound, isUDP bool, blocked map[
 // an open breaker, a known-dead mark or a failed probe still count.
 func (b *smartBalance) nodeAlive(tag string) bool {
 	s := b.s
-	if s.isBreakerOpen(tag) {
-		return false
-	}
-	if deadAt, dead := s.knownDead.Load(tag); dead && time.Since(deadAt) < knownDeadTTL {
+	if s.isBreakerOpen(tag) || !s.health.alive(tag) {
 		return false
 	}
 	if s.history != nil {
@@ -754,8 +747,8 @@ func (b *smartBalance) rankMap() map[string]float64 {
 	}
 	m := make(map[string]float64, len(mem.ranking))
 	for _, rank := range mem.ranking {
-		if rank.Weight > 0 {
-			m[rank.Name] = rank.Weight
+		if rank.Quality > 0 {
+			m[rank.Name] = rank.Quality
 		}
 	}
 	b.rankCache.Store(&rankMapCache{snap: mem, m: m})
@@ -780,26 +773,17 @@ func (b *smartBalance) newScorer(meta *smartDialMeta, isUDP bool) *balanceScorer
 		return sc
 	}
 	sc.target = meta.smartTarget
-	if b.s.store != nil && meta.smartTarget != "" {
-		if names, weights, err := b.s.store.GetBestProxyForTarget(b.s.Tag(), smartConfigName, meta.smartTarget, meta.asnCode, isUDP); err == nil {
-			sc.weights = make(map[string]float64, len(names))
-			for i, name := range names {
-				if i < len(weights) {
-					sc.weights[name] = weights[i]
-				}
-			}
-		}
+	if meta.smartTarget != "" {
+		sc.weights = b.s.targetQualities(meta, isUDP)
 	}
 	return sc
 }
 
 const balanceNeutralQuality = 0.55
 
-// baseQuality returns the quality and whether it is a learned weight. Learned
-// weights (per destination, and the overall ranking averaged from them)
-// already include the policy_priority factor — recordStats passes it to
-// CalculateWeight — so only the delay-derived and neutral values still need
-// it.
+// baseQuality returns the quality and whether it is learned: the learned
+// connection quality for this target, else the node's overall quality,
+// else a value derived from its URL-test delay, else a neutral prior.
 func (sc *balanceScorer) baseQuality(tag string) (quality float64, targetWeak, learned bool) {
 	if w, ok := sc.weights[tag]; ok {
 		return w, w < smart.AllowedWeight, true
@@ -815,11 +799,11 @@ func (sc *balanceScorer) baseQuality(tag string) (quality float64, targetWeak, l
 	return balanceNeutralQuality, false, false
 }
 
+// quality is baseQuality scaled by the policy_priority factor; learned
+// qualities are stored without it.
 func (sc *balanceScorer) quality(tag string) (float64, bool) {
-	q, weak, learned := sc.baseQuality(tag)
-	if !learned {
-		q *= sc.b.s.getPriorityFactor(tag)
-	}
+	q, weak, _ := sc.baseQuality(tag)
+	q *= sc.b.s.getPriorityFactor(tag)
 	if q <= 0 {
 		q = 0.01
 	}
@@ -1621,7 +1605,7 @@ func (b *smartBalance) selectCandidates(meta *smartDialMeta, isUDP bool, bypassP
 		picked = 0
 		source = decision.source + " (last resort: no healthy node)"
 	}
-	reach := 1 + (smartMaxRetries-1)*smartParallelDials
+	reach := smartMaxCandidates
 	if len(fallbacks) > balanceFallbackSlots {
 		fallbacks = fallbacks[:balanceFallbackSlots]
 	}
@@ -1690,6 +1674,10 @@ func dialIsChainedHop(meta *smartDialMeta, destination M.Socksaddr) bool {
 	if meta == nil || meta.smartTarget == "" {
 		return false
 	}
+	wildcard := meta.wildcard
+	if wildcard == "" {
+		wildcard = meta.smartTarget
+	}
 	if destination.IsFqdn() {
 		host := strings.TrimSuffix(strings.ToLower(destination.Fqdn), ".")
 		metaHost := strings.TrimSuffix(strings.ToLower(meta.host), ".")
@@ -1703,7 +1691,7 @@ func dialIsChainedHop(meta *smartDialMeta, destination M.Socksaddr) bool {
 				return false
 			}
 		}
-		return normaliseDialTarget(host, "") != meta.smartTarget
+		return smart.GetEffectiveTarget(host, "") != wildcard
 	}
 	if !destination.Addr.IsValid() {
 		return false
@@ -1715,6 +1703,23 @@ func dialIsChainedHop(meta *smartDialMeta, destination M.Socksaddr) bool {
 		}
 	}
 	return meta.host != addr.String() && meta.smartTarget != addr.String()
+}
+
+// prepareMeta rebuilds the meta of a chained hop (the group dialing a
+// landing node's server rather than the website) and attaches the request
+// of a region outbound.
+func (b *smartBalance) prepareMeta(ctx context.Context, meta *smartDialMeta, destination M.Socksaddr) *smartDialMeta {
+	if dialIsChainedHop(meta, destination) {
+		fresh := &smartDialMeta{source: meta.source, isUDP: meta.isUDP, destPort: destination.Port}
+		if destination.IsIP() {
+			fresh.resolvedIPs = []netip.Addr{destination.Addr.Unmap()}
+		} else {
+			fresh.host = strings.ToLower(destination.Fqdn)
+		}
+		b.s.completeMeta(fresh)
+		meta = fresh
+	}
+	return b.attachRequest(ctx, meta)
 }
 
 // attachRequest copies meta with the region view's request when the dial
@@ -1825,16 +1830,7 @@ func RegisterSmartLoadBalance(registry *outbound.Registry) {
 // NewSmartLoadBalance builds a smart-loadbalance group: a Smart group whose
 // selection is replaced by region pools and per-connection distribution.
 func NewSmartLoadBalance(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.SmartLoadBalanceOutboundOptions) (adapter.Outbound, error) {
-	smartOptions := options.SmartOutboundOptions
-	if smartOptions.Algorithm != "" {
-		logger.Warn("smart-loadbalance[", tag, "]: algorithm is ignored; use balance.strategy")
-		smartOptions.Algorithm = ""
-	}
-	if smartOptions.Hysteresis > 0 {
-		logger.Warn("smart-loadbalance[", tag, "]: hysteresis is ignored; use region.sticky and balance.affinity")
-		smartOptions.Hysteresis = 0
-	}
-	s, err := newSmart(ctx, router, logger, tag, C.TypeSmartLoadBalance, smartOptions)
+	s, err := newSmart(ctx, router, logger, tag, C.TypeSmartLoadBalance, options.SmartOutboundOptions)
 	if err != nil {
 		return nil, err
 	}

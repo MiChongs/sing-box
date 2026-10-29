@@ -5,8 +5,6 @@ import (
 	"net/http"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/smart"
-	"github.com/sagernet/sing-box/protocol/group"
 	"github.com/sagernet/sing/service"
 
 	"github.com/go-chi/chi/v5"
@@ -17,11 +15,10 @@ func cacheRouter(ctx context.Context) http.Handler {
 	r := chi.NewRouter()
 	r.Post("/fakeip/flush", flushFakeip(ctx))
 	r.Post("/dns/flush", flushDNS(ctx))
-	// Smart store maintenance (mihomo parity):
-	//   POST /cache/smart/flush          — clear every Smart group's weights & prefetch
-	//   POST /cache/smart/flush/{name}   — clear one Smart group by outbound tag
-	// DELETE verbs are accepted too so "clear" buttons in Clash dashboards
-	// (metacubexd, Yacd) that send DELETE instead of POST still work.
+	// Smart learned state (mihomo parity), DELETE accepted for dashboards
+	// that send it:
+	//   POST /cache/smart/flush          — every Smart group
+	//   POST /cache/smart/flush/{name}   — one Smart group by tag
 	r.Post("/smart/flush", flushSmartAll(ctx))
 	r.Delete("/smart/flush", flushSmartAll(ctx))
 	r.Post("/smart/flush/{name}", flushSmartGroup(ctx))
@@ -29,124 +26,49 @@ func cacheRouter(ctx context.Context) http.Handler {
 	return r
 }
 
-// flushSmartAll drops persisted data for every Smart group in the current
-// config and triggers a recompute so /proxies/<tag>/weights reflects the
-// fresh state immediately (instead of waiting ~1 min for the next ranking
-// tick). The response body lists per-group deletion counts so operators
-// hitting this endpoint can confirm the operation was effective — the
-// previous `{"flushed_groups": N}` payload lacked enough signal to tell
-// "actually cleared 2000 keys" from "silent no-op because nothing was there".
+// flushSmartAll drops the learned state of every Smart group (mihomo
+// FlushAll): 204 on success.
 func flushSmartAll(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
-		outboundMgr := service.FromContext[adapter.OutboundManager](ctx)
-		if outboundMgr == nil {
+		groups, err := smartGroups(ctx)
+		if err != nil {
 			render.Status(r, http.StatusInternalServerError)
-			render.JSON(w, r, newError("outbound manager unavailable"))
+			render.JSON(w, r, newError(err.Error()))
 			return
 		}
-
-		type groupResult struct {
-			Group   string           `json:"group"`
-			Stats   smart.FlushStats `json:"deleted"`
-			Recomp  bool             `json:"recomputed"`
-			Error   string           `json:"error,omitempty"`
-		}
-		var (
-			results      []groupResult
-			total        smart.FlushStats
-			flushedGroup int
-			errorsFound  int
-		)
-
-		for _, ob := range outboundMgr.Outbounds() {
-			sg, ok := ob.(*group.Smart)
-			if !ok {
-				continue
+		for _, sg := range groups {
+			if _, err = sg.FlushStore(); err != nil {
+				render.Status(r, http.StatusInternalServerError)
+				render.JSON(w, r, newError(sg.Tag()+": "+err.Error()))
+				return
 			}
-			res := groupResult{Group: sg.Tag()}
-			stats, err := sg.FlushStore()
-			res.Stats = stats
-			if err != nil {
-				res.Error = err.Error()
-				errorsFound++
-			} else {
-				flushedGroup++
-				total.Stats += stats.Stats
-				total.Nodes += stats.Nodes
-				total.Ranking += stats.Ranking
-				total.Prefetch += stats.Prefetch
-				total.Failures += stats.Failures
-				total.Queue += stats.Queue
-			}
-			// Trigger an async recompute so the API reflects the cleared
-			// state immediately. RecomputeWeights is non-blocking.
-			if err == nil {
-				sg.RecomputeWeights()
-				res.Recomp = true
-			}
-			results = append(results, res)
 		}
-
-		status := http.StatusOK
-		if errorsFound > 0 && flushedGroup == 0 {
-			status = http.StatusInternalServerError
-		}
-		render.Status(r, status)
-		render.JSON(w, r, render.M{
-			"flushed_groups": flushedGroup,
-			"errors":         errorsFound,
-			"total":          total,
-			"groups":         results,
-		})
+		render.NoContent(w, r)
 	}
 }
 
-// flushSmartGroup drops persisted data for a single Smart group (by outbound
-// tag) and schedules an immediate recompute. Returns detailed per-bucket
-// deletion counts so the caller can confirm exactly what was purged.
+// flushSmartGroup drops the learned state of one Smart group. mihomo keys
+// this route by configuration name; a name that is no Smart group flushes
+// every group, as the one configuration holds them all.
 func flushSmartGroup(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		name := chi.URLParam(r, "name")
 		if name == "" {
 			render.Status(r, http.StatusBadRequest)
-			render.JSON(w, r, newError("group name required"))
+			render.JSON(w, r, newError("config name is required"))
 			return
 		}
-		outboundMgr := service.FromContext[adapter.OutboundManager](ctx)
-		if outboundMgr == nil {
-			render.Status(r, http.StatusInternalServerError)
-			render.JSON(w, r, newError("outbound manager unavailable"))
-			return
-		}
-		ob, loaded := outboundMgr.Outbound(name)
-		if !loaded {
-			render.Status(r, http.StatusNotFound)
-			render.JSON(w, r, ErrNotFound)
-			return
-		}
-		sg, ok := ob.(*group.Smart)
-		if !ok {
-			render.Status(r, http.StatusBadRequest)
-			render.JSON(w, r, newError("not a Smart group"))
-			return
-		}
-		stats, err := sg.FlushStore()
+		sg, err := resolveSmartGroup(ctx, name)
 		if err != nil {
-			render.Status(r, http.StatusInternalServerError)
-			render.JSON(w, r, render.M{
-				"group":   name,
-				"deleted": stats,
-				"error":   err.Error(),
-			})
+			flushSmartAll(ctx)(w, r)
 			return
 		}
-		sg.RecomputeWeights()
-		render.JSON(w, r, render.M{
-			"group":      name,
-			"deleted":    stats,
-			"total":      stats.Total(),
-			"recomputed": true,
-		})
+		if _, err = sg.FlushStore(); err != nil {
+			render.Status(r, http.StatusInternalServerError)
+			render.JSON(w, r, newError(err.Error()))
+			return
+		}
+		render.NoContent(w, r)
 	}
 }
 

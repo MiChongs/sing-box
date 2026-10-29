@@ -13611,6 +13611,27 @@
             },
             "disable_reuse": {
               "type": "boolean"
+            },
+            "network": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "tcp",
+                    "udp"
+                  ]
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "tcp",
+                      "udp"
+                    ]
+                  }
+                }
+              ]
             }
           },
           "required": [
@@ -13944,6 +13965,27 @@
             },
             "headers": {
               "$ref": "#/$defs/HTTPHeader"
+            },
+            "network": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "tcp",
+                    "udp"
+                  ]
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "tcp",
+                      "udp"
+                    ]
+                  }
+                }
+              ]
             },
             "version": {
               "type": "integer",
@@ -14554,6 +14596,79 @@
             },
             "include": {
               "type": "string"
+            },
+            "include_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "exclude_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "include_transport": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "exclude_transport": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "network": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "tcp",
+                    "udp"
+                  ]
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "tcp",
+                      "udp"
+                    ]
+                  }
+                }
+              ]
             },
             "use_all_providers": {
               "type": "boolean"
@@ -15273,6 +15388,79 @@
             "include": {
               "type": "string"
             },
+            "include_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "exclude_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "include_transport": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "exclude_transport": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "network": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "tcp",
+                    "udp"
+                  ]
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "tcp",
+                      "udp"
+                    ]
+                  }
+                }
+              ]
+            },
             "use_all_providers": {
               "type": "boolean"
             },
@@ -15687,6 +15875,79 @@
             "include": {
               "type": "string"
             },
+            "include_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "exclude_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "include_transport": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "exclude_transport": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "network": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "tcp",
+                    "udp"
+                  ]
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "tcp",
+                      "udp"
+                    ]
+                  }
+                }
+              ]
+            },
             "use_all_providers": {
               "type": "boolean"
             },
@@ -15702,6 +15963,12 @@
             "interval": {
               "$ref": "#/$defs/Duration"
             },
+            "idle_timeout": {
+              "$ref": "#/$defs/Duration"
+            },
+            "timeout": {
+              "$ref": "#/$defs/Duration"
+            },
             "expected_status": {
               "type": "string"
             },
@@ -15711,7 +15978,18 @@
             "disable_udp": {
               "type": "boolean"
             },
-            "use_asn": {
+            "max_failed_times": {
+              "type": "integer"
+            },
+            "tolerance": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "policy_priority": {
+              "type": "string"
+            },
+            "prefer_asn": {
               "type": "boolean"
             },
             "use_lightgbm": {
@@ -15722,31 +16000,6 @@
             },
             "sample_rate": {
               "type": "number"
-            },
-            "max_host_failed_times": {
-              "type": "integer"
-            },
-            "algorithm": {
-              "type": "string"
-            },
-            "hysteresis": {
-              "$ref": "#/$defs/Duration"
-            },
-            "policy_priority": {
-              "type": "string"
-            },
-            "asn_database": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
             }
           },
           "required": [
@@ -15783,6 +16036,79 @@
             "include": {
               "type": "string"
             },
+            "include_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "exclude_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "include_transport": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "exclude_transport": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "network": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "tcp",
+                    "udp"
+                  ]
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "tcp",
+                      "udp"
+                    ]
+                  }
+                }
+              ]
+            },
             "use_all_providers": {
               "type": "boolean"
             },
@@ -15798,6 +16124,12 @@
             "interval": {
               "$ref": "#/$defs/Duration"
             },
+            "idle_timeout": {
+              "$ref": "#/$defs/Duration"
+            },
+            "timeout": {
+              "$ref": "#/$defs/Duration"
+            },
             "expected_status": {
               "type": "string"
             },
@@ -15807,7 +16139,18 @@
             "disable_udp": {
               "type": "boolean"
             },
-            "use_asn": {
+            "max_failed_times": {
+              "type": "integer"
+            },
+            "tolerance": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 65535
+            },
+            "policy_priority": {
+              "type": "string"
+            },
+            "prefer_asn": {
               "type": "boolean"
             },
             "use_lightgbm": {
@@ -15818,31 +16161,6 @@
             },
             "sample_rate": {
               "type": "number"
-            },
-            "max_host_failed_times": {
-              "type": "integer"
-            },
-            "algorithm": {
-              "type": "string"
-            },
-            "hysteresis": {
-              "$ref": "#/$defs/Duration"
-            },
-            "policy_priority": {
-              "type": "string"
-            },
-            "asn_database": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              ]
             },
             "balance": {
               "$ref": "#/$defs/SmartBalanceOptions"
@@ -18130,6 +18448,79 @@
             "include": {
               "type": "string"
             },
+            "include_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "exclude_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "include_transport": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "exclude_transport": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              ]
+            },
+            "network": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "enum": [
+                    "tcp",
+                    "udp"
+                  ]
+                },
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "enum": [
+                      "tcp",
+                      "udp"
+                    ]
+                  }
+                }
+              ]
+            },
             "use_all_providers": {
               "type": "boolean"
             },
@@ -19491,6 +19882,30 @@
           "$ref": "#/$defs/Duration"
         },
         "timeout": {
+          "$ref": "#/$defs/Duration"
+        },
+        "udp": {
+          "$ref": "#/$defs/ProviderUDPHealthCheckOptions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ProviderUDPHealthCheckOptions": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "server": {
+          "type": "string"
+        },
+        "domain": {
+          "type": "string"
+        },
+        "timeout": {
+          "$ref": "#/$defs/Duration"
+        },
+        "ttl": {
           "$ref": "#/$defs/Duration"
         }
       },
@@ -22618,7 +23033,7 @@
           "type": "string"
         },
         "size_limit_mb": {
-          "type": "integer"
+          "type": "number"
         }
       },
       "additionalProperties": false

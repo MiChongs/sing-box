@@ -23,10 +23,13 @@ import (
 func groupRouter(server *Server) http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getGroups(server))
+	// mihomo Smart: every Smart group's ranking.
+	r.Get("/weights", getAllSmartWeights(server.ctx))
 	r.Route("/{name}", func(r chi.Router) {
 		r.Use(parseProxyName, findProxyByName(server))
 		r.Get("/", getGroup(server))
 		r.Get("/delay", getGroupDelay(server))
+		r.Get("/weights", getSmartGroupWeights)
 	})
 	return r
 }
@@ -87,6 +90,12 @@ func getGroupDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			result, err = urlTestGroup.URLTest(ctx)
 		} else if loadBalanceGroup, isLoadBalanceGroup := outboundGroup.(adapter.LoadBalanceGroup); isLoadBalanceGroup {
 			result, err = loadBalanceGroup.URLTest(ctx)
+		} else if smartGroup, isSmart := outboundGroup.(*group.Smart); isSmart {
+			// mihomo releases a Smart group's fixed member on a group test;
+			// the results refresh the members' health.
+			smartGroup.SelectOutbound("")
+			result = testGroupMembers(ctx, server, outboundGroup, url)
+			smartGroup.RecordDelays(result)
 		} else {
 			// Selector or other groups: test members with controlled concurrency
 			result = testGroupMembers(ctx, server, outboundGroup, url)

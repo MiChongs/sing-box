@@ -59,6 +59,9 @@ type InboundContext struct {
 	RouteRule     string
 	RouteOutbound string
 	OutboundChain []Outbound
+	// SmartTarget is the matched rule in mihomo form ("RuleSet [netflix]")
+	// when its type identifies a service; Smart groups key evidence by it.
+	SmartTarget string
 
 	// sniffer
 

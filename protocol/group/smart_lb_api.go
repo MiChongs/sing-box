@@ -8,37 +8,11 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sagernet/sing-box/common/smart"
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
 // Runtime control and introspection of smart-loadbalance groups, used by
 // the Clash API, the daemon and the group's own Now / All / SelectOutbound.
-
-// MemberTags returns the member node tags. Unlike All, it never lists the
-// region outbounds a smart-loadbalance group may present as its members.
-func (s *Smart) MemberTags() []string {
-	snap := s.state.Load()
-	if snap == nil {
-		return nil
-	}
-	return append([]string(nil), snap.tags...)
-}
-
-// FixedSelection is the Clash API `fixed` value: the pinned member, else
-// the locked region (its region outbound when the group lists them).
-func (s *Smart) FixedSelection() string {
-	if pinned := s.PinnedTag(); pinned != "" {
-		return pinned
-	}
-	if s.balance != nil {
-		return s.balance.lockDisplay()
-	}
-	return ""
-}
-
-// IsLoadBalance reports whether the group is a smart-loadbalance group.
-func (s *Smart) IsLoadBalance() bool { return s.balance != nil }
 
 // RegionLock returns the locked region code, "" when none.
 func (s *Smart) RegionLock() string {
@@ -462,14 +436,25 @@ func (b *smartBalance) reset() {
 	b.scheduleRefresh()
 }
 
+// regionStateRecord is the persisted runtime state of a smart-loadbalance
+// group.
+type regionStateRecord struct {
+	Lock      string `json:"lock,omitempty"`
+	Mode      string `json:"mode,omitempty"`
+	Strategy  string `json:"strategy,omitempty"`
+	Affinity  string `json:"affinity,omitempty"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+const (
+	smartRecordRegion  = "region"
+	smartRecordExitGeo = "exitgeo"
+)
+
 // persistRegionState stores the runtime overrides (lock, and mode /
 // strategy / affinity when they differ from the configuration).
 func (b *smartBalance) persistRegionState() {
-	store := b.s.store
-	if store == nil {
-		return
-	}
-	record := smart.RegionStateRecord{Lock: b.currentLock(), UpdatedAt: time.Now().Unix()}
+	record := regionStateRecord{Lock: b.currentLock(), UpdatedAt: time.Now().Unix()}
 	if mode := b.currentMode(); mode != b.configMode {
 		record.Mode = mode
 	}
@@ -480,38 +465,24 @@ func (b *smartBalance) persistRegionState() {
 		record.Affinity = affinity
 	}
 	if record.Lock == "" && record.Mode == "" && record.Strategy == "" && record.Affinity == "" {
-		store.AppendToGlobalQueue(smart.StoreOperation{
-			Type:   smart.OpDeleteRegionState,
-			Group:  b.s.Tag(),
-			Config: smartConfigName,
-		})
+		b.s.deleteRecord(smartRecordRegion, "")
 		return
 	}
 	data, err := json.Marshal(record)
 	if err != nil {
 		return
 	}
-	store.AppendToGlobalQueue(smart.StoreOperation{
-		Type:   smart.OpSaveRegionState,
-		Group:  b.s.Tag(),
-		Config: smartConfigName,
-		Data:   data,
-	})
+	b.s.putRecord(smartRecordRegion, "", data)
 }
 
 // hydrate restores the persisted runtime overrides and exit results.
 func (b *smartBalance) hydrate() {
 	b.hydrateExitGeo()
-	store := b.s.store
-	if store == nil {
+	if b.s.store == nil {
 		return
 	}
-	rows, err := store.GetSubBytesByPath(smart.FormatDBKey(smart.KeyTypeRegionState, smartConfigName, b.s.Tag()))
-	if err != nil {
-		return
-	}
-	for _, data := range rows {
-		var record smart.RegionStateRecord
+	for _, data := range b.s.store.Records(b.s.Tag(), smartRecordRegion) {
+		var record regionStateRecord
 		if json.Unmarshal(data, &record) != nil {
 			continue
 		}

@@ -2,7 +2,6 @@ package group
 
 import (
 	"context"
-	"errors"
 	"math"
 	"net"
 	"net/netip"
@@ -220,8 +219,6 @@ func (b *smartBalance) runRegionProbes() {
 	}
 	blocked := b.blockedNodes()
 	counts := b.healthyCounts(snap, false)
-	worker := getSmartWorker()
-	startBy := time.Now().Add(sniProbeStartWindow)
 	queued := 0
 	for _, c := range candidates {
 		sc := b.newScorer(&smartDialMeta{smartTarget: c.target}, false)
@@ -260,16 +257,15 @@ func (b *smartBalance) runRegionProbes() {
 		}
 		for _, p := range picks {
 			target, host, code, ob := c.target, c.host, p.code, p.node
-			worker.enqueueProbe("lbregion|"+host+"|"+ob.Tag(), sniProbeBudget, startBy, func(ctx context.Context) (uint16, error) {
+			if b.s.enqueueRegionProbe(func(ctx context.Context) {
 				rtt, err := b.s.probeSNIOnce(ctx, net.JoinHostPort(host, "443"), ob)
-				return uint16(min(max(rtt, 0), math.MaxUint16)), err
-			}, func(rtt uint16, err error) {
-				if errors.Is(err, errProbeSkipped) || !b.s.started.Load() {
+				if ctx.Err() != nil || !b.s.started.Load() {
 					return
 				}
-				b.recordRegionProbe(target, code, err == nil, float64(rtt))
-			})
-			queued++
+				b.recordRegionProbe(target, code, err == nil, float64(min(max(rtt, 0), math.MaxUint16)))
+			}) {
+				queued++
+			}
 		}
 	}
 	if queued > 0 {

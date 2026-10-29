@@ -2,482 +2,329 @@ package lightgbm
 
 import (
 	"encoding/csv"
-	"fmt"
 	"os"
-	"path/filepath"
-	"slices"
+	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/common/smart"
-	"github.com/sagernet/sing/common/logger"
 )
 
-// DefaultCollectorSizeMB is the default training-data file cap (100 MB).
-const DefaultCollectorSizeMB = 100
+const (
+	defaultSmartCollectorSize = 100 * 1024 * 1024
+	expectedColumns           = MaxFeatureSize + 10
+)
 
-// collectorSchemaVersion stamps every row so the offline-training pipeline
-// (Python / pandas / LightGBM) can tell v1 rows (before xiaobaf14g v2) from
-// v3 rows (after phase B TCP_INFO + long-term EWMA additions), and widen
-// the feature frame per row without silently mis-reading older CSVs.
-//
-// Bumped when the column list changes at all — new columns append to the
-// right, never insert in the middle, to keep forward-compatible string
-// parsing in downstream tools.
-const collectorSchemaVersion = "5"
+// DefaultCollectorPath is the training data file name under the working
+// directory.
+const DefaultCollectorPath = "smart_weight_data.csv"
 
-// collectorHeader names every column AddSample writes, in order: the
-// MaxFeatureSize model features (named as in the model's feature order),
-// 10 metadata columns, the xiaobaf14g phase-A block (9 raw ModelInput
-// dimensions), the phase-B block (5 more), the phase-C block (the catalog
-// features only newer model layouts read, in model space) and
-// schema_version, which must stay last. Raw columns that share a name with
-// a transformed feature carry a "_raw" suffix so every name is unique.
-//
-// Phase C feeds layouts like vernesong/mihomo's 30-feature one, whose
-// duration_minutes is current_duration_minutes here and whose
-// history_duration_minutes is this file's duration_minutes.
-var collectorHeader = buildCollectorHeader()
-
-func buildCollectorHeader() []string {
-	order := getDefaultFeatureOrder()
-	header := make([]string, 0, MaxFeatureSize+28)
-	for i := 0; i < MaxFeatureSize; i++ {
-		header = append(header, order[i])
-	}
-	return append(header,
-		// metadata
-		"group_name", "node_name",
-		"asn_raw", "host_raw", "ip_raw", "port_raw", "geoip_raw",
-		"weight", "weight_source", "timestamp",
-		// phase A
-		"latency_stddev_delta", "connect_time_stddev_delta", "active_conns_raw",
-		"tls_session_resumed", "dns_resolve_time", "tls_handshake_time_raw",
-		"http3_fallback_count", "lightgbm_confidence", "hour_bucket_raw",
-		// phase B
-		"tcp_retransmissions_raw", "tcp_losses", "path_mtu",
-		"long_rtt", "long_success_rate",
-		// phase C
-		"current_duration_minutes", "loss_rate", "cumul_loss_rate",
-		"schema_version",
-	)
-}
-
-// flushInterval caps how long buffered rows may sit in memory without being
-// written to disk. Prevents data loss if the process is killed right after
-// starting — the previous "flush every 100 rows" rule could keep ~100 samples
-// buffered for many minutes on low-traffic devices.
-const flushInterval = 30 * time.Second
-
-// CollectorMeta carries per-connection metadata needed by AddSample
-// (sing-box has no global statistic manager, so callers pass it in).
-type CollectorMeta struct {
-	DestASN   string
-	Host      string
-	DestIP    string
-	DestPort  uint16
-	DestGeoIP []string
-}
-
-// DataCollector appends training samples to a CSV file for offline training.
-// All IO errors are surfaced to the configured logger (no silent drops).
 type DataCollector struct {
-	mu          sync.Mutex
-	logger      logger.Logger
-	dataPath    string
-	file        *os.File
-	writer      *csv.Writer
-	configured  bool
-	sampleCount int
-	writtenRows atomic.Int64 // total rows successfully written since process start
-	droppedRows atomic.Int64 // samples silently dropped (size limit / init error)
-	sizeLimit   int64        // bytes
-	// limitReached latches once the file exceeds sizeLimit so AddSample
-	// drops samples without two stat syscalls each; Flush re-checks the
-	// file and clears it when the file was deleted or shrunk.
-	limitReached bool
-
-	stopCh   chan struct{}
-	stopped  atomic.Bool
-	closedCh chan struct{}
+	mutex              sync.Mutex
+	sampleCount        int
+	dataPath           string
+	file               *os.File
+	writer             *csv.Writer
+	configured         bool
+	sizeLimited        bool
+	smartCollectorSize int64
+	lastFileCheck      time.Time
+	written            int64
 }
 
-// NewDataCollector creates the collector and starts a background flusher goroutine.
-// sizeLimitMB ≤ 0 uses DefaultCollectorSizeMB. logger may be nil (falls back to a
-// no-op logger — but errors then become undetectable from outside).
-func NewDataCollector(csvPath string, sizeLimitMB int64, log logger.Logger) (*DataCollector, error) {
-	if csvPath == "" {
-		return nil, fmt.Errorf("csvPath is required")
-	}
-	if sizeLimitMB <= 0 {
-		sizeLimitMB = DefaultCollectorSizeMB
-	}
-	if log == nil {
-		log = nopLogger{}
-	}
-
-	c := &DataCollector{
-		logger:    log,
-		dataPath:  csvPath,
-		sizeLimit: sizeLimitMB * 1024 * 1024,
-		stopCh:    make(chan struct{}),
-		closedCh:  make(chan struct{}),
-	}
-
-	// Pre-flight: ensure the parent directory exists and we can write there.
-	// Previously this happened lazily in initWriterLocked() with a silent
-	// failure path; now we surface the error up front so misconfigurations
-	// fail loudly at service start instead of dropping samples forever.
-	if err := os.MkdirAll(filepath.Dir(csvPath), 0o755); err != nil {
-		return nil, fmt.Errorf("create collector directory: %v", err)
-	}
-	log.Info("smart collector: CSV at ", csvPath, " (cap ", sizeLimitMB, " MB)")
-
-	go c.flushLoop()
-	return c, nil
+// SampleMeta carries the raw columns of a training sample.
+type SampleMeta struct {
+	ASN   string
+	Host  string
+	IP    string
+	Port  uint16
+	GeoIP []string
 }
 
-// Path returns the absolute CSV path.
-func (c *DataCollector) Path() string {
+// NewDataCollector writes samples to path, stopping at sizeLimitMB (100 MB
+// when not positive).
+func NewDataCollector(path string, sizeLimitMB float64) *DataCollector {
+	size := int64(defaultSmartCollectorSize)
+	if sizeLimitMB > 0 {
+		size = int64(sizeLimitMB * 1024 * 1024)
+	}
+	return &DataCollector{dataPath: path, smartCollectorSize: size}
+}
+
+// Path returns the training data file.
+func (c *DataCollector) Path() string { return c.dataPath }
+
+// Written returns the samples written since start.
+func (c *DataCollector) Written() int64 {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	return c.written
+}
+
+func (c *DataCollector) AddSample(input *smart.ModelInput, metadata SampleMeta, actualWeight float64, weightSource string) {
 	if c == nil {
-		return ""
-	}
-	return c.dataPath
-}
-
-// WrittenRows returns the count of successfully written rows.
-func (c *DataCollector) WrittenRows() int64 {
-	if c == nil {
-		return 0
-	}
-	return c.writtenRows.Load()
-}
-
-// DroppedRows returns the count of dropped samples (size limit or init errors).
-func (c *DataCollector) DroppedRows() int64 {
-	if c == nil {
-		return 0
-	}
-	return c.droppedRows.Load()
-}
-
-func (c *DataCollector) flushLoop() {
-	defer close(c.closedCh)
-	ticker := time.NewTicker(flushInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-c.stopCh:
-			return
-		case <-ticker.C:
-			c.Flush()
-		}
-	}
-}
-
-// AddSample writes a training sample to the CSV. Errors are logged (not
-// silently dropped) and dropped rows are counted.
-func (c *DataCollector) AddSample(input *smart.ModelInput, meta *CollectorMeta, actualWeight float64, weightSource string) {
-	if c == nil || input == nil {
-		return
-	}
-	if c.stopped.Load() {
 		return
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 
-	if c.limitReached {
-		c.droppedRows.Add(1)
-		return
-	}
-
-	// Detect external deletion of file between writes (e.g. user rm'd it)
-	if c.configured {
+	if c.configured && time.Since(c.lastFileCheck) > 5*time.Second {
+		c.lastFileCheck = time.Now()
 		if _, err := os.Stat(c.dataPath); os.IsNotExist(err) {
-			c.logger.Info("smart collector: data file was deleted externally, reinitializing")
-			c.resetFileLocked()
+			infof("Data file was deleted, reinitializing collector")
+			c.configured = false
+			c.sizeLimited = false
+			if c.file != nil {
+				c.file.Close()
+				c.file = nil
+			}
+			c.writer = nil
+		} else {
+			limitReached := c.sizeLimited
+			if !limitReached && c.file != nil {
+				if stat, err := c.file.Stat(); err == nil {
+					limitReached = stat.Size() > c.smartCollectorSize
+				}
+			}
+			if limitReached {
+				c.sizeLimited = true
+				infof("Maximum file size limit reached (%d MB), stopping data collection", c.smartCollectorSize/(1024*1024))
+			}
 		}
 	}
 
-	// Enforce size cap
-	if c.file != nil {
-		if stat, err := c.file.Stat(); err == nil && stat.Size() > c.sizeLimit {
-			c.limitReached = true
-			if c.droppedRows.Add(1) == 1 {
-				c.logger.Warn("smart collector: reached size limit ", c.sizeLimit>>20, " MB; dropping further samples (delete or increase size_limit_mb to resume)")
-			}
-			return
-		}
+	if c.sizeLimited {
+		return
 	}
 
 	if !c.configured {
-		if err := c.initWriterLocked(); err != nil {
-			c.droppedRows.Add(1)
-			c.logger.Warn("smart collector: init writer failed: ", err, " (dropping sample)")
+		err := c.initializeWriter()
+		if err != nil {
+			warnf("Failed to initialize training data collector: %v", err)
 			return
 		}
 	}
 
-	catalog := fillCatalog(input, make([]float64, 0, catalogSize))
-	features := catalog[:MaxFeatureSize]
-
-	if meta == nil {
-		meta = &CollectorMeta{}
+	features := prepareFeatures(input)
+	if len(features) == 0 {
+		debugf("Feature extraction failed, skipping sample collection")
+		return
 	}
 
-	featureStrs := make([]string, len(features))
+	featureStrings := make([]string, len(features))
+	var buf [32]byte
 	for i, f := range features {
-		featureStrs[i] = fmt.Sprintf("%.6f", f)
+		featureStrings[i] = string(strconv.AppendFloat(buf[:0], f, 'f', 6, 64))
 	}
 
-	geoIPStr := "unknown"
-	if len(meta.DestGeoIP) > 0 {
-		geoIPStr = strings.Join(meta.DestGeoIP, ",")
+	var geoIPStr string
+	if metadata.GeoIP != nil {
+		geoIPStr = strings.Join(metadata.GeoIP, ",")
+	} else {
+		geoIPStr = "unknown"
 	}
+
 	dstASN := "unknown"
-	if meta.DestASN != "" {
-		dstASN = meta.DestASN
-	}
-	dstIP := "unknown"
-	if meta.DestIP != "" {
-		dstIP = meta.DestIP
-	}
-	host := "unknown"
-	if meta.Host != "" {
-		host = meta.Host
-	}
-	source := weightSource
-	if source == "" {
-		source = "unknown"
+	if metadata.ASN != "" {
+		dstASN = metadata.ASN
 	}
 
-	sample := append(featureStrs,
+	dstIP := "unknown"
+	if metadata.IP != "" {
+		dstIP = metadata.IP
+	}
+
+	host := "unknown"
+	if metadata.Host != "" {
+		host = metadata.Host
+	}
+
+	standardizedSource := weightSource
+	if standardizedSource == "" {
+		standardizedSource = "unknown"
+	}
+
+	sample := make([]string, 0, expectedColumns)
+	sample = append(sample, featureStrings...)
+	sample = append(sample,
 		input.GroupName,
 		input.NodeName,
 		dstASN,
 		host,
 		dstIP,
-		fmt.Sprintf("%d", meta.DestPort),
+		strconv.FormatUint(uint64(metadata.Port), 10),
 		geoIPStr,
-		fmt.Sprintf("%.6f", actualWeight),
-		source,
+		strconv.FormatFloat(actualWeight, 'f', 6, 64),
+		standardizedSource,
 		time.Now().Format(time.RFC3339),
 	)
 
-	// xiaobaf14g phase-A extension columns — appended to the tail so
-	// parsers reading only the features and metadata still work. Keep
-	// this list and collectorHeader in sync — column order is the
-	// training contract and must not be reshuffled.
-	sample = append(sample,
-		fmt.Sprintf("%.6f", input.LatencyStdDevDelta),
-		fmt.Sprintf("%.6f", input.ConnectTimeStdDevDelta),
-		fmt.Sprintf("%d", input.ActiveConns),
-		boolCSV(input.TLSSessionResumed),
-		fmt.Sprintf("%d", input.DNSResolveTime),
-		fmt.Sprintf("%d", input.TLSHandshakeTime),
-		fmt.Sprintf("%d", input.HTTP3FallbackCount),
-		fmt.Sprintf("%.6f", input.LightGBMConfidence),
-		fmt.Sprintf("%d", input.HourBucket),
-	)
-
-	// xiaobaf14g phase-B extension columns — kernel TCP metrics + long-
-	// term EWMA pair.
-	sample = append(sample,
-		fmt.Sprintf("%d", input.TCPRetransmissions),
-		fmt.Sprintf("%d", input.TCPLosses),
-		fmt.Sprintf("%d", input.PathMTU),
-		fmt.Sprintf("%.6f", input.LongRTT),
-		fmt.Sprintf("%.6f", input.LongSuccessRate),
-	)
-
-	// Phase C: catalog features outside the PrepareFeatures layout, then
-	// the schema version, which sits at the very tail so parsers can find
-	// it with a stable negative index. Must stay last.
-	sample = append(sample,
-		fmt.Sprintf("%.6f", catalog[slotLastDuration]),
-		fmt.Sprintf("%.6f", catalog[slotLossRate]),
-		fmt.Sprintf("%.6f", catalog[slotCumulLossRate]),
-		collectorSchemaVersion,
-	)
-
-	if expectedColumns := len(collectorHeader); len(sample) != expectedColumns {
-		c.droppedRows.Add(1)
-		c.logger.Warn("smart collector: column count mismatch (got ", len(sample), ", expected ", expectedColumns, ")")
+	if len(sample) != expectedColumns {
 		return
 	}
 
 	if err := c.writer.Write(sample); err != nil {
-		c.droppedRows.Add(1)
-		c.logger.Warn("smart collector: write failed: ", err, " — will reinit on next sample")
-		c.resetFileLocked()
+		warnf("Failed to write training data: %v", err)
+		c.configured = false
+		if c.file != nil {
+			c.file.Close()
+			c.file = nil
+		}
+		c.writer = nil
 		return
 	}
-	c.sampleCount++
-	c.writtenRows.Add(1)
 
-	// Per-100 flush keeps buffers tight on high-traffic devices;
-	// flushLoop() covers the low-traffic case.
+	c.sampleCount++
+	c.written++
+
 	if c.sampleCount%100 == 0 {
 		c.writer.Flush()
-		if err := c.writer.Error(); err != nil {
-			c.logger.Warn("smart collector: flush error: ", err)
-		}
 	}
 }
 
-// headerMatchesLocked reports whether the existing CSV starts with
-// collectorHeader. Unreadable files count as matching so they are
-// appended to rather than moved aside.
-func (c *DataCollector) headerMatchesLocked() bool {
-	f, err := os.Open(c.dataPath)
-	if err != nil {
-		return true
-	}
-	defer f.Close()
-	header, err := csv.NewReader(f).Read()
-	if err != nil {
-		return true
-	}
-	return slices.Equal(header, collectorHeader)
-}
+func (c *DataCollector) initializeWriter() error {
+	var err error
 
-func (c *DataCollector) initWriterLocked() error {
-	// Double-check parent dir (may have been deleted at runtime).
-	if err := os.MkdirAll(filepath.Dir(c.dataPath), 0o755); err != nil {
-		return fmt.Errorf("mkdir parent: %v", err)
-	}
+	infof("Initializing data collector for %s", c.dataPath)
 
-	// An empty file (e.g. truncated by the user) still needs a header.
 	fileExists := false
-	if stat, err := os.Stat(c.dataPath); err == nil && stat.Size() > 0 {
+	if _, err := os.Stat(c.dataPath); err == nil {
 		fileExists = true
 	}
 
-	// A file whose header differs from collectorHeader was written by an
-	// older schema (or under the old 37-column header that mislabelled
-	// every column from the 28th on); start a new file rather than mix
-	// layouts under one header.
-	if fileExists && !c.headerMatchesLocked() {
-		backupPath := c.dataPath + ".bak." + time.Now().Format("20060102150405")
-		if err := os.Rename(c.dataPath, backupPath); err == nil {
-			c.logger.Info("smart collector: CSV header differs from the current schema — old file backed up to ", backupPath)
-			fileExists = false
+	needUpgrade := false
+	if fileExists {
+		f, err := os.Open(c.dataPath)
+		if err == nil {
+			defer f.Close()
+			reader := csv.NewReader(f)
+			headers, err := reader.Read()
+			if err == nil {
+				hasRate, hasExit := false, false
+				for _, h := range headers {
+					switch h {
+					case "cumul_loss_rate":
+						hasRate = true
+					case "exit_region":
+						hasExit = true
+					}
+				}
+				if !hasRate || !hasExit {
+					needUpgrade = true
+				}
+			}
 		}
 	}
 
-	file, err := os.OpenFile(c.dataPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("open csv: %v", err)
+	if needUpgrade {
+		backupPath := c.dataPath + ".bak." + time.Now().Format("20060102150405")
+		os.Rename(c.dataPath, backupPath)
+		infof("Old CSV file does not match the feature schema, backup to %s and create new file", backupPath)
+		fileExists = false
 	}
+
+	file, err := os.OpenFile(c.dataPath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+
+	if fileExists {
+		if stat, err2 := file.Stat(); err2 == nil && stat.Size() > 0 {
+			last := make([]byte, 1)
+			if _, err2 = file.ReadAt(last, stat.Size()-1); err2 == nil && last[0] != '\n' {
+				const scanSize = int64(65536)
+				readStart := stat.Size() - scanSize
+				if readStart < 0 {
+					readStart = 0
+				}
+				buf := make([]byte, stat.Size()-readStart)
+				if _, err3 := file.ReadAt(buf, readStart); err3 == nil {
+					newlinePos := int64(-1)
+					for i := int64(len(buf)) - 1; i >= 0; i-- {
+						if buf[i] == '\n' {
+							newlinePos = readStart + i + 1
+							break
+						}
+					}
+					if newlinePos > 0 {
+						_ = file.Truncate(newlinePos)
+						warnf("Removed incomplete CSV row from %s", c.dataPath)
+					} else {
+						_ = file.Truncate(0)
+						fileExists = false
+						warnf("No valid CSV rows found, reinitializing %s", c.dataPath)
+					}
+				}
+			}
+		}
+	}
+
 	c.file = file
-	c.writer = csv.NewWriter(file)
+	c.writer = csv.NewWriter(c.file)
 
 	if !fileExists {
-		if err := c.writer.Write(collectorHeader); err != nil {
-			_ = c.file.Close()
-			c.file = nil
-			c.writer = nil
-			return fmt.Errorf("write headers: %v", err)
+		headers := []string{
+			"success", "failure", "connect_time", "latency",
+			"upload_mb", "history_upload_mb", "maxuploadrate_kb", "history_maxuploadrate_kb",
+			"download_mb", "history_download_mb", "maxdownloadrate_kb", "history_maxdownloadrate_kb",
+			"duration_minutes", "history_duration_minutes", "last_used_seconds",
+			"is_udp", "is_tcp",
+			"loss_rate", "cumul_loss_rate",
+			"asn_feature",
+			"country_feature",
+			"address_feature",
+			"port_feature",
+			"traffic_ratio", "traffic_density", "connection_type_feature",
+			"asn_hash", "host_hash", "ip_hash", "geoip_hash",
+			"exit_region", "exit_asn_hash",
+			"group_name", "node_name",
+			"asn_raw", "host_raw", "ip_raw", "port_raw", "geoip_raw",
+			"weight", "weight_source", "timestamp",
+		}
+
+		if err := c.writer.Write(headers); err != nil {
+			c.file.Close()
+			return err
 		}
 		c.writer.Flush()
-		if err := c.writer.Error(); err != nil {
-			_ = c.file.Close()
-			c.file = nil
-			c.writer = nil
-			return fmt.Errorf("flush headers: %v", err)
-		}
-		c.logger.Info("smart collector: created new CSV with headers at ", c.dataPath)
-	} else {
-		c.logger.Info("smart collector: appending to existing CSV at ", c.dataPath)
 	}
 
 	c.configured = true
 	return nil
 }
 
-func (c *DataCollector) resetFileLocked() {
-	c.configured = false
-	if c.file != nil {
-		_ = c.file.Close()
-		c.file = nil
-	}
-	c.writer = nil
-}
-
-// Flush writes buffered rows to disk.
-func (c *DataCollector) Flush() {
+func (c *DataCollector) Flush() error {
 	if c == nil {
-		return
+		return nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
+
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
 	if c.writer != nil {
 		c.writer.Flush()
-		if err := c.writer.Error(); err != nil {
-			c.logger.Warn("smart collector: periodic flush error: ", err)
-		}
 	}
-	if c.limitReached {
-		stat, err := os.Stat(c.dataPath)
-		switch {
-		case os.IsNotExist(err):
-			c.logger.Info("smart collector: data file was deleted externally, resuming collection")
-			c.resetFileLocked()
-			c.limitReached = false
-		case err == nil && stat.Size() <= c.sizeLimit:
-			c.limitReached = false
-		}
-	}
+
+	return nil
 }
 
-// Close flushes and closes the underlying file, and stops the flush loop.
 func (c *DataCollector) Close() error {
 	if c == nil {
 		return nil
 	}
-	if c.stopped.CompareAndSwap(false, true) {
-		close(c.stopCh)
-		<-c.closedCh
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
-	written := c.writtenRows.Load()
-	dropped := c.droppedRows.Load()
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+
 	if c.writer != nil {
 		c.writer.Flush()
 	}
+
 	if c.file != nil {
-		err := c.file.Close()
-		c.file = nil
-		c.writer = nil
-		c.configured = false
-		c.logger.Info("smart collector: closed (", written, " rows written, ", dropped, " dropped)")
-		return err
+		return c.file.Close()
 	}
+
 	return nil
 }
-
-// boolCSV renders a bool as "1"/"0" rather than "true"/"false" so pandas
-// read_csv with dtype={col: int} just works for the TLSSessionResumed column.
-func boolCSV(b bool) string {
-	if b {
-		return "1"
-	}
-	return "0"
-}
-
-// nopLogger is a minimal fallback when no logger is provided to NewDataCollector.
-type nopLogger struct{}
-
-func (nopLogger) Trace(...any) {}
-func (nopLogger) Debug(...any) {}
-func (nopLogger) Info(...any)  {}
-func (nopLogger) Warn(...any)  {}
-func (nopLogger) Error(...any) {}
-func (nopLogger) Fatal(...any) {}
-func (nopLogger) Panic(...any) {}

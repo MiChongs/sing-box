@@ -2,24 +2,37 @@ package option
 
 import "github.com/sagernet/sing/common/json/badoption"
 
+// SmartOutboundOptions configures a Smart group. It scores every member with
+// honk's comprehensive score (decayed Beta reliability first, latency,
+// goodput and connection quality as tie breakers, scoped per target, site
+// and address family) and carries vernesong/mihomo's Smart features: rule
+// aware service keys, ASN keys, policy priority, LightGBM quality, block
+// records, response and exit probes, and pinning per service.
 type SmartOutboundOptions struct {
 	GroupCommonOption
-	URL                       string                     `json:"url,omitempty"`
-	Interval                  badoption.Duration         `json:"interval,omitempty"`
-	ExpectedStatus            string                     `json:"expected_status,omitempty"`
-	InterruptExistConnections bool                       `json:"interrupt_exist_connections,omitempty"`
-	DisableUDP                bool                       `json:"disable_udp,omitempty"`
-	UseASN                    bool                       `json:"use_asn,omitempty"`
-	UseLightGBM               bool                       `json:"use_lightgbm,omitempty"`
-	CollectData               bool                       `json:"collect_data,omitempty"`
-	SampleRate                float64                    `json:"sample_rate,omitempty"`
-	MaxHostFailedTimes        int                        `json:"max_host_failed_times,omitempty"`
-	Hidden                    bool                       `json:"hidden,omitempty"`
-	Icon                      string                     `json:"icon,omitempty"`
-	Algorithm                 string                     `json:"algorithm,omitempty"`
-	Hysteresis                badoption.Duration         `json:"hysteresis,omitempty"`
-	PolicyPriority            string                     `json:"policy_priority,omitempty"`
-	ASNDatabase               badoption.Listable[string] `json:"asn_database,omitempty"`
+	// URL is the health check URL; its host's own traffic is not learned.
+	URL string `json:"url,omitempty"`
+	// Interval between health checks while the group is in use.
+	Interval badoption.Duration `json:"interval,omitempty"`
+	// IdleTimeout pauses health checks after the group was idle this long.
+	IdleTimeout badoption.Duration `json:"idle_timeout,omitempty"`
+	// Timeout caps one dial attempt.
+	Timeout                   badoption.Duration `json:"timeout,omitempty"`
+	ExpectedStatus            string             `json:"expected_status,omitempty"`
+	InterruptExistConnections bool               `json:"interrupt_exist_connections,omitempty"`
+	DisableUDP                bool               `json:"disable_udp,omitempty"`
+	// MaxFailedTimes is the error streak that blocks a node for a target.
+	MaxFailedTimes int `json:"max_failed_times,omitempty"`
+	// Tolerance treats members whose probe delays differ by at most this
+	// many milliseconds as equal when ordering fallbacks.
+	Tolerance uint16 `json:"tolerance,omitempty"`
+	// PolicyPriority is "pattern:factor;pattern:factor".
+	PolicyPriority string `json:"policy_priority,omitempty"`
+	// PreferASN keys broad rules by the destination ASN.
+	PreferASN   bool    `json:"prefer_asn,omitempty"`
+	UseLightGBM bool    `json:"use_lightgbm,omitempty"`
+	CollectData bool    `json:"collect_data,omitempty"`
+	SampleRate  float64 `json:"sample_rate,omitempty"`
 }
 
 // SmartLoadBalanceOutboundOptions configures a smart-loadbalance group: the
@@ -124,6 +137,7 @@ type SmartRegionOutboundOptions struct {
 	Icon     string `json:"icon,omitempty"`
 }
 
+// SmartOptions configures the infrastructure shared by Smart groups.
 type SmartOptions struct {
 	LightGBM  *SmartLightGBMOptions  `json:"lightgbm,omitempty"`
 	Collector *SmartCollectorOptions `json:"collector,omitempty"`
@@ -139,8 +153,8 @@ type SmartLightGBMOptions struct {
 }
 
 type SmartCollectorOptions struct {
-	Path        string `json:"path,omitempty"`
-	SizeLimitMB int    `json:"size_limit_mb,omitempty"`
+	Path        string  `json:"path,omitempty"`
+	SizeLimitMB float64 `json:"size_limit_mb,omitempty"`
 }
 
 type GeoXOptions struct {

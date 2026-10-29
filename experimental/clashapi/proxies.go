@@ -113,12 +113,9 @@ func clearProxySelection(w http.ResponseWriter, r *http.Request) {
 //
 // Query parameters:
 //
-//	?refresh=true  — force recompute from prefetch (bypass cache).
-//	?full=1        — include the per-(target, node) raw weight table in
-//	                 addition to the per-node aggregate. Use this to
-//	                 audit API output against the internal selection
-//	                 pipeline — the table matches exactly what
-//	                 GetBestProxyForTarget sees at dial time.
+//	?refresh=true  — recompute instead of serving the cached ranking.
+//	?full=1        — include the group diagnostic (selection reasons,
+//	                 serving pool, budgets, block records).
 func getSmartGroupWeights(w http.ResponseWriter, r *http.Request) {
 	proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
 	if region, isRegion := proxy.(*group.SmartRegion); isRegion {
@@ -160,21 +157,16 @@ func getSmartGroupWeights(w http.ResponseWriter, r *http.Request) {
 	}
 	payload := render.M{"weights": weights}
 	if len(weights) == 0 {
-		payload["message"] = "no weight data available for this group"
+		payload["message"] = "No weight data available for the specified group"
 	}
 	if full {
-		if store := sg.SmartStore(); store != nil {
-			payload["per_target"] = store.GetPerTargetWeights(sg.Tag(), sg.ConfigName())
-		}
+		payload["diagnostic"] = sg.Diagnostic()
 	}
 	render.JSON(w, r, payload)
 }
 
-// deleteSmartGroupWeights clears the Smart group's persisted weight / ranking /
-// prefetch / node-state data and kicks off an immediate async recompute. The
-// response reports per-bucket deletion counts so UIs can surface "N keys
-// cleared" instead of a bare 204 that leaves operators wondering whether
-// anything happened.
+// deleteSmartGroupWeights drops the Smart group's learned state and
+// reports how many evidence cells and block records were removed.
 func deleteSmartGroupWeights(w http.ResponseWriter, r *http.Request) {
 	proxy := r.Context().Value(CtxKeyProxy).(adapter.Outbound)
 	sg, ok := proxy.(*group.Smart)
@@ -193,12 +185,9 @@ func deleteSmartGroupWeights(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	sg.RecomputeWeights()
 	render.JSON(w, r, render.M{
-		"group":      sg.Tag(),
-		"deleted":    stats,
-		"total":      stats.Total(),
-		"recomputed": true,
+		"group":   sg.Tag(),
+		"deleted": stats,
 	})
 }
 
@@ -301,41 +290,18 @@ func proxyInfo(server *Server, detour adapter.Outbound) *badjson.JSONObject {
 		}
 
 		if sg, ok := detour.(*group.Smart); ok {
+			// mihomo Smart.MarshalJSON fields.
 			info.Put("testUrl", sg.TestURL())
-			info.Put("useASN", sg.UseASN())
+			info.Put("expectedStatus", sg.ExpectedStatus())
+			info.Put("fixed", sg.FixedSelection())
+			info.Put("fixedSuspended", false)
+			info.Put("fixedActive", sg.FixedSelection())
+			info.Put("policy-priority", smartPriorityString(sg))
 			info.Put("useLightGBM", sg.UseLightGBM())
 			info.Put("collectData", sg.CollectData())
-			info.Put("fixed", sg.FixedSelection())
-			// pin suspension state — true when Smart had to fall back
-			// to an algorithm-selected node because the user's pin
-			// just failed a dial (and the breaker hasn't tripped
-			// yet). The pin tag stays in `fixed` so UIs can render
-			// "pinned to A (currently unavailable, traffic on B)";
-			// `fixedActive` exposes the node traffic is actually
-			// flowing through during the suspension. When not
-			// suspended, `fixedActive` echoes `fixed` for a uniform
-			// client-side render.
-			suspended := sg.PinSuspended()
-			info.Put("fixedSuspended", suspended)
-			if suspended {
-				info.Put("fixedActive", now)
-			} else {
-				info.Put("fixedActive", sg.FixedSelection())
-			}
-			// Live algorithm + anti-flap window so /proxies dashboards
-			// can verify what's actually in effect (especially after a
-			// runtime PUT /groups/{name}/algorithm swap). Always-output
-			// even when hysteresis is 0 — matches the hidden/icon
-			// contract so front-ends never have to handle "field missing
-			// vs field present-and-zero".
-			info.Put("algorithm", sg.CurrentAlgorithm())
-			info.Put("hysteresis", sg.HysteresisDuration().String())
-			// Parsed policy_priority rules (nil when nothing configured).
-			// Surfacing the rule list — not the original raw string —
-			// lets dashboards verify that prefixes like ! / = / ~ /
-			// auto-glob were interpreted as intended.
-			info.Put("policyPriority", sg.PolicyPriorityRules())
-			info.Put("pinEndorsements", sg.PinEndorsementDebug())
+			info.Put("sampleRate", sg.SampleRate())
+			info.Put("preferASN", sg.PreferASN())
+			info.Put("tolerance", sg.Tolerance())
 			if age := sg.LGBMModelAge(); age > 0 {
 				info.Put("lgbmModelAge", age.Truncate(time.Second).String())
 			}
@@ -566,4 +532,15 @@ func getProxyDelay(server *Server) func(w http.ResponseWriter, r *http.Request) 
 			"delay": delay,
 		})
 	}
+}
+
+// smartPriorityString renders policy_priority like mihomo: "pattern:%.2f"
+// joined by ";".
+func smartPriorityString(sg *group.Smart) string {
+	rules := sg.PolicyPriority()
+	parts := make([]string, len(rules))
+	for i, rule := range rules {
+		parts[i] = rule.Pattern + ":" + strconv.FormatFloat(rule.Factor, 'f', 2, 64)
+	}
+	return strings.Join(parts, ";")
 }

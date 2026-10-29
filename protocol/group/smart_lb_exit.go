@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/smart"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
 	M "github.com/sagernet/sing/common/metadata"
@@ -285,54 +284,35 @@ func parseExitResponse(body []byte) (country, ip string) {
 	return
 }
 
+type exitGeoRecord struct {
+	Country    string `json:"country"`
+	IP         string `json:"ip,omitempty"`
+	DetectedAt int64  `json:"detected_at"`
+}
+
 func (b *smartBalance) persistExitGeo(tag, country, ip string, at time.Time) {
-	store := b.s.store
-	if store == nil {
-		return
-	}
-	data, err := json.Marshal(smart.ExitGeoRecord{Country: country, IP: ip, DetectedAt: at.Unix()})
+	data, err := json.Marshal(exitGeoRecord{Country: country, IP: ip, DetectedAt: at.Unix()})
 	if err != nil {
 		return
 	}
-	store.AppendToGlobalQueue(smart.StoreOperation{
-		Type:   smart.OpSaveExitGeo,
-		Group:  b.s.Tag(),
-		Config: smartConfigName,
-		Node:   tag,
-		Data:   data,
-	})
+	b.s.putRecord(smartRecordExitGeo, tag, data)
 }
 
 // hydrateExitGeo restores persisted exit results that are still fresh.
 func (b *smartBalance) hydrateExitGeo() {
-	store := b.s.store
-	if store == nil {
-		return
-	}
-	rows, err := store.GetSubBytesByPath(smart.FormatDBKey(smart.KeyTypeExitGeo, smartConfigName, b.s.Tag()))
-	if err != nil {
+	if b.s.store == nil {
 		return
 	}
 	now := time.Now()
 	restored := 0
-	for key, data := range rows {
-		parts := smart.SplitDBKey(key)
-		if len(parts) == 0 {
-			continue
-		}
-		tag := parts[len(parts)-1]
-		var record smart.ExitGeoRecord
+	for tag, data := range b.s.store.Records(b.s.Tag(), smartRecordExitGeo) {
+		var record exitGeoRecord
 		if json.Unmarshal(data, &record) != nil || record.Country == "" {
 			continue
 		}
 		detected := time.Unix(record.DetectedAt, 0)
 		if now.Sub(detected) > b.exit.ttl {
-			store.AppendToGlobalQueue(smart.StoreOperation{
-				Type:   smart.OpDeleteExitGeo,
-				Group:  b.s.Tag(),
-				Config: smartConfigName,
-				Node:   tag,
-			})
+			b.s.deleteRecord(smartRecordExitGeo, tag)
 			continue
 		}
 		b.exitGeo.Store(tag, exitGeoEntry{country: strings.ToUpper(record.Country), ip: record.IP, at: detected.UnixNano()})

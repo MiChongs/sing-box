@@ -505,3 +505,33 @@ func clashKeyedPrefixes[K comparable](ruleType string, prefixMap map[K][]netip.P
 	}
 	return clashStrings(ruleType, values)
 }
+
+// smartRuleTypes are the rule types whose payload identifies a service or a
+// collection of services (mihomo C.SmartRuleTypes).
+var smartRuleTypes = map[string]bool{
+	clashRuleTypeDomain:        true,
+	clashRuleTypeDomainSuffix:  true,
+	clashRuleTypeDomainKeyword: true,
+	clashRuleTypeDomainRegex:   true,
+	clashRuleTypeAdGuardDomain: true,
+	clashRuleTypeGeoIP:         true,
+	clashRuleTypeIPCIDR:        true,
+	clashRuleTypeRuleSet:       true,
+	clashRuleTypeAnd:           true,
+	clashRuleTypeOr:            true,
+	clashRuleTypeNot:           true,
+}
+
+// SmartTarget returns the Smart service key of a matched rule, mihomo's
+// "<RuleType> [<payload>]", or "" when the rule does not identify a service.
+// A GeoIP country rule names a region, not a service.
+func SmartTarget(rule adapter.HeadlessRule) string {
+	ruleType, payload := ClashRule(rule)
+	if !smartRuleTypes[ruleType] || payload == "" {
+		return ""
+	}
+	if ruleType == clashRuleTypeGeoIP && len(payload) == 2 {
+		return ""
+	}
+	return ruleType + " [" + payload + "]"
+}

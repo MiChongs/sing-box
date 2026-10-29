@@ -61,9 +61,49 @@ func newTestLoadBalance(t *testing.T, ctx context.Context, options option.SmartL
 	for i, tag := range tags {
 		outbounds[i] = &lbStub{tag: tag, udp: true}
 	}
-	s.state.Store(&smartGroupState{outbounds: outbounds, tags: tags})
+	s.engine = smart.NewEngine()
+	s.group = s.engine.Group("LB")
+	s.blocks = s.engine.Blocks()
+	smartRankings.Delete("LB")
+	s.setMembers(outbounds)
 	s.balance.rebuild()
 	return s
+}
+
+func outboundNames(outbounds []adapter.Outbound) []string {
+	names := make([]string, len(outbounds))
+	for i, ob := range outbounds {
+		names[i] = ob.Tag()
+	}
+	return names
+}
+
+func testMarkDead(s *Smart, tags ...string) {
+	for _, tag := range tags {
+		s.health.record(tag, 0, false, time.Now())
+		s.health.record(tag, 0, false, time.Now())
+	}
+	s.balance.healthTCP.Store(nil)
+	s.balance.healthUDP.Store(nil)
+}
+
+func testMarkAlive(s *Smart, tags ...string) {
+	for _, tag := range tags {
+		s.health.record(tag, 50, true, time.Now())
+	}
+	s.balance.healthTCP.Store(nil)
+	s.balance.healthUDP.Store(nil)
+}
+
+func testPublishRanking(s *Smart, ranking []smart.NodeRank) {
+	s.rankingCache().snapshot.Store(&smartRankingSnapshot{ranking: ranking, at: time.Now()})
+}
+
+func testBlockTarget(s *Smart, target, tag string) {
+	s.blocks.Update(smart.BlockUpdate{
+		Group: s.group.ID(), Key: target, Node: s.engine.NodeID(tag),
+		Failure: true, Checked: true, Code: smart.BlockLowWeight, HostLimit: 100,
+	}, time.Now())
 }
 
 func setDelays(s *Smart, delays map[string]uint16) {
@@ -270,13 +310,13 @@ func TestRegionAutoPicksBestAndSticks(t *testing.T) {
 		t.Fatalf("small improvement switched region to %s (%s)", region, source)
 	}
 	// JP goes down: the target moves.
-	s.knownDead.Store("JP01", time.Now())
-	s.knownDead.Store("JP02", time.Now())
+	testMarkDead(s, "JP01")
+	testMarkDead(s, "JP02")
 	if region, _ := regionOfFirst(t, s, meta); region != "HK" {
 		t.Fatalf("dead region kept: %s", region)
 	}
 	// A new target picks the best region directly.
-	s.knownDead.Clear()
+	s.health.reset()
 	if region, _ := regionOfFirst(t, s, &smartDialMeta{smartTarget: "*.other.org"}); region != "HK" {
 		t.Fatalf("fresh target: %s", region)
 	}
@@ -289,7 +329,7 @@ func TestRegionAutoSwitchesOnLargeImprovement(t *testing.T) {
 	if region, _ := regionOfFirst(t, s, meta); region != "JP" {
 		t.Fatalf("initial %s", region)
 	}
-	s.publishRankingSnapshot([]smart.NodeRank{{Name: "HK01", Weight: 1.1}, {Name: "JP01", Weight: 0.5}})
+	testPublishRanking(s, []smart.NodeRank{{Name: "HK01", Quality: 1.1}, {Name: "JP01", Quality: 0.5}})
 	memo, _ := s.balance.regionMemo.Load(meta.smartTarget)
 	memo.checkedAt = 0
 	s.balance.regionMemo.Store(meta.smartTarget, memo)
@@ -307,7 +347,7 @@ func TestRegionLockPriorityAndFallback(t *testing.T) {
 	if region, _ := regionOfFirst(t, s, meta); region != "SG" {
 		t.Fatalf("priority picked %s", region)
 	}
-	s.knownDead.Store("SG01", time.Now())
+	testMarkDead(s, "SG01")
 	s.balance.healthTCP.Store(nil)
 	if region, _ := regionOfFirst(t, s, meta); region != "JP" {
 		t.Fatalf("priority fallback picked %s", region)
@@ -322,7 +362,7 @@ func TestRegionLockPriorityAndFallback(t *testing.T) {
 		t.Fatal("locking a region without members must fail")
 	}
 	// A dead locked region falls back with fallback=auto …
-	s.knownDead.Store("US01", time.Now())
+	testMarkDead(s, "US01")
 	s.balance.healthTCP.Store(nil)
 	if region, _ := regionOfFirst(t, s, meta); region == "US" || region == "" {
 		t.Fatalf("dead lock not bypassed: %q", region)
@@ -334,7 +374,7 @@ func TestRegionLockPriorityAndFallback(t *testing.T) {
 		t.Fatalf("fallback none left the region: %v (%s)", outboundNames(candidates), source)
 	}
 	s.balance.fallback = regionFallbackAuto
-	s.knownDead.Clear()
+	s.health.reset()
 	s.balance.healthTCP.Store(nil)
 	if _, err := s.SetRegionLock(""); err != nil {
 		t.Fatal(err)
@@ -425,8 +465,8 @@ func TestRegionViewRequest(t *testing.T) {
 	}
 	// Without fallback a dead region is retried in place (last resort);
 	// with fallback the view moves on to a healthy region.
-	s.knownDead.Store("JP01", time.Now())
-	s.knownDead.Store("JP02", time.Now())
+	testMarkDead(s, "JP01")
+	testMarkDead(s, "JP02")
 	meta.balance.pin = ""
 	candidates, source := s.balance.selectCandidates(meta, false, false)
 	for _, ob := range candidates {
@@ -443,7 +483,7 @@ func TestRegionViewRequest(t *testing.T) {
 func TestBalanceSmartStrategySpreadsByQuality(t *testing.T) {
 	options := option.SmartLoadBalanceOutboundOptions{Region: option.SmartRegionOptions{Mode: "off"}}
 	s := newTestLoadBalance(t, context.Background(), options, "A", "B", "C")
-	s.publishRankingSnapshot([]smart.NodeRank{{Name: "A", Weight: 1.0}, {Name: "B", Weight: 1.0}, {Name: "C", Weight: 0.5}})
+	testPublishRanking(s, []smart.NodeRank{{Name: "A", Quality: 1.0}, {Name: "B", Quality: 1.0}, {Name: "C", Quality: 0.5}})
 	// Simulate long-lived connections: every pick stays open.
 	counts := make(map[string]int)
 	for range 400 {
@@ -464,7 +504,7 @@ func TestBalanceMinQualityAndCaps(t *testing.T) {
 		Balance: option.SmartBalanceOptions{MinQuality: 0.6, MaxNodes: 2, MaxConnectionsPerNode: 3},
 	}
 	s := newTestLoadBalance(t, context.Background(), options, "A", "B", "C", "D")
-	s.publishRankingSnapshot([]smart.NodeRank{{Name: "A", Weight: 1.0}, {Name: "B", Weight: 0.9}, {Name: "C", Weight: 0.8}, {Name: "D", Weight: 0.3}})
+	testPublishRanking(s, []smart.NodeRank{{Name: "A", Quality: 1.0}, {Name: "B", Quality: 0.9}, {Name: "C", Quality: 0.8}, {Name: "D", Quality: 0.3}})
 	sc := s.balance.newScorer(&smartDialMeta{smartTarget: "t"}, false)
 	pool := s.balance.buildPool("", s.balance.snapshot(), &smartDialMeta{smartTarget: "t"}, false, nil, sc)
 	if len(pool) != 2 || pool[0].tag != "A" || pool[1].tag != "B" {
@@ -584,7 +624,7 @@ func TestBalanceCandidatesFallbackReachable(t *testing.T) {
 	}
 	setDelays(s, delays)
 	candidates, _ := s.balance.selectCandidates(&smartDialMeta{smartTarget: "t"}, false, false)
-	if len(candidates) != 1+(smartMaxRetries-1)*smartParallelDials {
+	if len(candidates) != smartMaxCandidates {
 		t.Fatalf("candidate list of %d does not match the dial reach", len(candidates))
 	}
 	var tail []string
@@ -648,7 +688,7 @@ func TestSubgroupsRegisterAndSelect(t *testing.T) {
 		t.Fatalf("dependencies %v", deps)
 	}
 	outbounds := []adapter.Outbound{&lbStub{tag: "HK01"}, &lbStub{tag: "JP01"}, &lbStub{tag: "JP02"}}
-	s.state.Store(&smartGroupState{outbounds: outbounds, tags: []string{"HK01", "JP01", "JP02"}})
+	s.setMembers(outbounds)
 	s.balance.rebuild()
 
 	if all := s.All(); len(all) != 2 || all[0] != "🇯🇵 日本" || all[1] != "🇭🇰 香港" {
@@ -697,7 +737,7 @@ func TestAttachRequestScopesToGroup(t *testing.T) {
 func TestDialIsChainedHop(t *testing.T) {
 	website := &smartDialMeta{
 		host:        "www.example.com",
-		smartTarget: normaliseDialTarget("www.example.com", ""),
+		smartTarget: smart.GetEffectiveTarget("www.example.com", ""),
 		resolvedIPs: []netip.Addr{netip.MustParseAddr("93.184.216.34")},
 	}
 	cases := []struct {
@@ -727,8 +767,11 @@ func TestRegionStatePersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	store := smart.GetOrInitStore(db)
 	s := newTestLoadBalance(t, context.Background(), option.SmartLoadBalanceOutboundOptions{}, "HK01", "JP01")
+	store, err := smart.NewStore(db, s.engine)
+	if err != nil {
+		t.Fatal(err)
+	}
 	s.store = store
 	if _, err = s.SetRegionLock("JP"); err != nil {
 		t.Fatal(err)
@@ -737,9 +780,6 @@ func TestRegionStatePersistence(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.balance.persistExitGeo("JP01", "JP", "203.0.113.1", time.Now())
-	if err = store.StoreFlushNow(); err != nil {
-		t.Fatal(err)
-	}
 
 	restored := newTestLoadBalance(t, context.Background(), option.SmartLoadBalanceOutboundOptions{}, "HK01", "JP01")
 	restored.store = store
@@ -757,11 +797,7 @@ func TestRegionStatePersistence(t *testing.T) {
 	if _, _, err = restored.SetBalance("default", "default"); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.StoreFlushNow(); err != nil {
-		t.Fatal(err)
-	}
-	rows, _ := store.GetSubBytesByPath(smart.FormatDBKey(smart.KeyTypeRegionState, smartConfigName, "LB"))
-	if len(rows) != 0 {
+	if rows := store.Records("LB", smartRecordRegion); len(rows) != 0 {
 		t.Fatalf("region state not deleted: %v", rows)
 	}
 
@@ -769,16 +805,14 @@ func TestRegionStatePersistence(t *testing.T) {
 	if _, err = restored.SetRegionLock("HK"); err != nil {
 		t.Fatal(err)
 	}
-	stats, err := restored.FlushStore()
-	if err != nil {
+	if _, err = restored.FlushStore(); err != nil {
 		t.Fatal(err)
 	}
-	// The new lock may still sit in the write queue.
-	if stats.ExitGeo != 1 || stats.RegionState+stats.Queue < 1 {
-		t.Fatalf("flush stats %+v", stats)
-	}
-	if rows, _ := store.GetSubBytesByPath(smart.FormatDBKey(smart.KeyTypeRegionState, smartConfigName, "LB")); len(rows) != 0 {
+	if rows := store.Records("LB", smartRecordRegion); len(rows) != 0 {
 		t.Fatalf("region state survived the flush: %v", rows)
+	}
+	if rows := store.Records("LB", smartRecordExitGeo); len(rows) != 0 {
+		t.Fatalf("exit results survived the flush: %v", rows)
 	}
 	if restored.RegionLock() != "" {
 		t.Fatal("flush kept the region lock")
@@ -798,9 +832,6 @@ func TestBalanceServesWithStaleProbes(t *testing.T) {
 		history.StoreURLTestHistory(tag, &adapter.URLTestHistory{Time: time.Now().Add(-time.Hour), Delay: 80})
 	}
 	s.history = history
-	if s.isAlive("HK01") {
-		t.Fatal("precondition: stale history reads as not alive")
-	}
 	if candidates, source := s.balance.selectCandidates(&smartDialMeta{smartTarget: "t"}, false, false); len(candidates) == 0 {
 		t.Fatalf("stale probes stopped the group: %s", source)
 	}
@@ -816,8 +847,8 @@ func TestBalanceServesWithStaleProbes(t *testing.T) {
 // instead of failing outright; one success brings it back.
 func TestBalanceLastResortWhenNothingHealthy(t *testing.T) {
 	s := newTestLoadBalance(t, context.Background(), option.SmartLoadBalanceOutboundOptions{}, "HK01", "JP01")
-	s.knownDead.Store("HK01", time.Now())
-	s.knownDead.Store("JP01", time.Now())
+	testMarkDead(s, "HK01")
+	testMarkDead(s, "JP01")
 	candidates, source := s.balance.selectCandidates(&smartDialMeta{smartTarget: "t"}, false, false)
 	if len(candidates) != 2 {
 		t.Fatalf("last resort: %v (%s)", outboundNames(candidates), source)
@@ -829,7 +860,7 @@ func TestBalanceLastResortWhenNothingHealthy(t *testing.T) {
 		t.Fatalf("region view last resort: %v", outboundNames(candidates))
 	}
 	// With healthy nodes elsewhere, fallback none still refuses to leave.
-	s.knownDead.Delete("HK01")
+	testMarkAlive(s, "HK01")
 	s.balance.healthTCP.Store(nil)
 	if _, err := s.SetRegionLock("JP"); err != nil {
 		t.Fatal(err)
@@ -847,13 +878,13 @@ func TestBalancePriorityAppliedOnce(t *testing.T) {
 	options := option.SmartLoadBalanceOutboundOptions{}
 	options.PolicyPriority = "A:2"
 	s := newTestLoadBalance(t, context.Background(), options, "A", "B")
-	s.publishRankingSnapshot([]smart.NodeRank{{Name: "A", Weight: 1.0}})
+	testPublishRanking(s, []smart.NodeRank{{Name: "A", Quality: 1.0}})
 	setDelays(s, map[string]uint16{"B": 300})
 	sc := s.balance.newScorer(&smartDialMeta{smartTarget: "t"}, false)
-	if q, _ := sc.quality("A"); math.Abs(q-0.9) > 1e-9 {
-		t.Fatalf("learned quality re-weighted: %v", q)
+	if q, _ := sc.quality("A"); math.Abs(q-1.8) > 1e-9 {
+		t.Fatalf("learned quality not weighted: %v", q)
 	}
-	s.parsePolicyPriority("B:2")
+	s.priority, _ = smart.ParsePriority("A:2;B:2")
 	if q, _ := sc.quality("B"); math.Abs(q-1.2) > 1e-9 {
 		t.Fatalf("delay quality not weighted: %v", q)
 	}
@@ -863,8 +894,8 @@ func TestBalancePriorityAppliedOnce(t *testing.T) {
 // still tried, and min_nodes that no region meets does not fail the dial.
 func TestBalanceRelaxesBeforeFailing(t *testing.T) {
 	s := newTestLoadBalance(t, context.Background(), option.SmartLoadBalanceOutboundOptions{}, "HK01", "HK02")
-	s.markDeadForTarget("t", "HK01")
-	s.markDeadForTarget("t", "HK02")
+	testBlockTarget(s, "t", "HK01")
+	testBlockTarget(s, "t", "HK02")
 	if candidates, source := s.balance.selectCandidates(&smartDialMeta{smartTarget: "t"}, false, false); len(candidates) != 2 {
 		t.Fatalf("debargoed region: %v (%s)", outboundNames(candidates), source)
 	}

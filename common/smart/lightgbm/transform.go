@@ -5,19 +5,49 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 )
 
-// LegacyFeatureSize is the original 27-dim feature vector (mihomo parity).
-// Models trained with 27 features still work — PredictWeight auto-truncates.
-const LegacyFeatureSize = 27
+// parseTransformsContent parses the [transforms] section: [order] maps index=feature_name,
+// [definitions] holds scalers keyed "id_param" (std_type, std_features, std_mean, ...);
+// the top level carries untransformed_features and transform. Indices and parameter
+// arrays must match the feature order and count.
 
-// MaxFeatureSize is the extended 35-dim feature vector with jitter, TCP,
-// and temporal signals. New models should be trained against 35 features.
-const MaxFeatureSize = 35
-
-// parseTransformsContent parses the [transforms] section from the model file.
-// Format documented in mihomo's transform.go — preserved byte-identical for model compatibility.
+// defaultFeatureOrder is the slot order the shipped models are trained with; every caller
+// only reads it, a new slot must be appended at the end.
+var defaultFeatureOrder = map[int]string{
+	0:  "success",
+	1:  "failure",
+	2:  "connect_time",
+	3:  "latency",
+	4:  "upload_mb",
+	5:  "history_upload_mb",
+	6:  "maxuploadrate_kb",
+	7:  "history_maxuploadrate_kb",
+	8:  "download_mb",
+	9:  "history_download_mb",
+	10: "maxdownloadrate_kb",
+	11: "history_maxdownloadrate_kb",
+	12: "duration_minutes",
+	13: "history_duration_minutes",
+	14: "last_used_seconds",
+	15: "is_udp",
+	16: "is_tcp",
+	17: "loss_rate",
+	18: "cumul_loss_rate",
+	19: "asn_feature",
+	20: "country_feature",
+	21: "address_feature",
+	22: "port_feature",
+	23: "traffic_ratio",
+	24: "traffic_density",
+	25: "connection_type_feature",
+	26: "asn_hash",
+	27: "host_hash",
+	28: "ip_hash",
+	29: "geoip_hash",
+	30: "exit_region",
+	31: "exit_asn_hash",
+}
 
 type TransformType string
 
@@ -39,14 +69,6 @@ type FeatureTransforms struct {
 	UntransformedFeatures []string          `json:"untransformed_features"`
 }
 
-var transformPool = sync.Pool{
-	New: func() interface{} {
-		return make([]float64, MaxFeatureSize)
-	},
-}
-
-// LoadTransformsFromModel reads the last 16KB of the model file and extracts
-// the [transforms] block.
 func LoadTransformsFromModel(modelPath string) (*FeatureTransforms, error) {
 	file, err := os.Open(modelPath)
 	if err != nil {
@@ -64,16 +86,19 @@ func LoadTransformsFromModel(modelPath string) (*FeatureTransforms, error) {
 		readSize = stat.Size()
 	}
 
-	if _, err = file.Seek(-readSize, 2); err != nil {
+	_, err = file.Seek(-readSize, 2)
+	if err != nil {
 		return nil, fmt.Errorf("failed to seek file position: %v", err)
 	}
 
 	buffer := make([]byte, readSize)
-	if _, err = file.Read(buffer); err != nil {
+	_, err = file.Read(buffer)
+	if err != nil {
 		return nil, fmt.Errorf("failed to read file content: %v", err)
 	}
 
 	content := string(buffer)
+
 	startMarker := "[transforms]"
 	endMarker := "[/transforms]"
 
@@ -81,7 +106,7 @@ func LoadTransformsFromModel(modelPath string) (*FeatureTransforms, error) {
 	if startIdx == -1 {
 		return &FeatureTransforms{
 			TransformsEnabled: false,
-			FeatureOrder:      map[int]string{},
+			FeatureOrder:      defaultFeatureOrder,
 			Transforms:        []TransformParams{},
 		}, nil
 	}
@@ -91,116 +116,177 @@ func LoadTransformsFromModel(modelPath string) (*FeatureTransforms, error) {
 		return nil, fmt.Errorf("found transforms start marker but no end marker")
 	}
 
-	return parseTransformsContent(content[startIdx+len(startMarker) : endIdx])
+	transformsContent := content[startIdx+len(startMarker) : endIdx]
+
+	featureTransforms, err := parseTransformsContent(transformsContent)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse transforms parameters: %v", err)
+	}
+
+	return featureTransforms, nil
 }
 
 func parseTransformsContent(content string) (*FeatureTransforms, error) {
-	ft := &FeatureTransforms{
+	featureTransforms := &FeatureTransforms{
 		FeatureOrder: make(map[int]string),
 		Transforms:   []TransformParams{},
 	}
 
 	lines := strings.Split(content, "\n")
 	currentSection := ""
-	transformDefs := make(map[string]map[string]string)
 
-	for _, raw := range lines {
-		line := strings.TrimSpace(raw)
+	transformDefs := make(map[string]map[string]string)
+	errors := []string{}
+
+	for lineNum, line := range lines {
+		line = strings.TrimSpace(line)
+
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section := strings.Trim(line, "[]")
-			if strings.HasPrefix(section, "/") {
+			sectionName := strings.Trim(line, "[]")
+
+			if strings.HasPrefix(sectionName, "/") {
 				currentSection = ""
+				continue
 			} else {
-				currentSection = section
+				currentSection = sectionName
+				continue
 			}
-			continue
 		}
+
 		if !strings.Contains(line, "=") {
 			continue
 		}
+
 		parts := strings.SplitN(line, "=", 2)
 		if len(parts) != 2 {
 			continue
 		}
+
 		key := strings.TrimSpace(parts[0])
 		value := strings.TrimSpace(parts[1])
 
 		switch currentSection {
 		case "order":
 			idx, err := strconv.Atoi(key)
-			if err != nil || idx < 0 {
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("invalid feature index '%s' at line %d", key, lineNum+1))
 				continue
 			}
-			ft.FeatureOrder[idx] = value
+			if idx < 0 || idx >= MaxFeatureSize {
+				errors = append(errors, fmt.Sprintf("feature index %d out of range [0, %d) at line %d", idx, MaxFeatureSize, lineNum+1))
+				continue
+			}
+			featureTransforms.FeatureOrder[idx] = value
+
 		case "definitions":
 			if strings.Contains(key, "_") {
-				kp := strings.SplitN(key, "_", 2)
-				if len(kp) == 2 {
-					transformID, paramName := kp[0], kp[1]
+				parts := strings.SplitN(key, "_", 2)
+				if len(parts) == 2 {
+					transformID := parts[0]
+					paramName := parts[1]
+
 					if transformDefs[transformID] == nil {
 						transformDefs[transformID] = make(map[string]string)
 					}
 					transformDefs[transformID][paramName] = value
 				}
 			}
+
 		default:
 			switch key {
 			case "transform":
-				ft.TransformsEnabled = value == "true"
+				featureTransforms.TransformsEnabled = value == "true"
 			case "untransformed_features":
-				ft.UntransformedFeatures = parseStringArray(value)
+				featureTransforms.UntransformedFeatures = parseStringArray(value)
 			}
 		}
 	}
 
-	for _, params := range transformDefs {
+	validTransformCount := 0
+	for transformID, params := range transformDefs {
 		transform, err := buildTransformParams(params)
-		if err != nil || len(transform.FeatureIndices) == 0 {
+		if err != nil {
+			errors = append(errors, fmt.Sprintf("failed to build transform %s: %v", transformID, err))
 			continue
 		}
-		// Indices are checked against the model's feature count by
-		// ValidateTransforms once the model is loaded.
-		ft.Transforms = append(ft.Transforms, *transform)
+
+		if len(transform.FeatureIndices) == 0 {
+			errors = append(errors, fmt.Sprintf("transform %s has no feature indices", transformID))
+			continue
+		}
+
+		validIndices := true
+		for _, idx := range transform.FeatureIndices {
+			if idx < 0 || idx >= MaxFeatureSize {
+				errors = append(errors, fmt.Sprintf("transform %s contains invalid feature index %d", transformID, idx))
+				validIndices = false
+				break
+			}
+		}
+
+		if !validIndices {
+			continue
+		}
+
+		featureTransforms.Transforms = append(featureTransforms.Transforms, *transform)
+		validTransformCount++
 	}
 
-	// FeatureOrder holds only what the [order] block lists; the model
-	// loader fills the rest from the model's own feature_names.
-	return ft, nil
+	if len(featureTransforms.FeatureOrder) == 0 {
+		featureTransforms.FeatureOrder = defaultFeatureOrder
+	} else {
+		expectedCount := MaxFeatureSize
+		if len(featureTransforms.FeatureOrder) != expectedCount {
+			for idx, name := range defaultFeatureOrder {
+				if _, exists := featureTransforms.FeatureOrder[idx]; !exists {
+					featureTransforms.FeatureOrder[idx] = name
+				}
+			}
+		}
+	}
+
+	if len(errors) > 0 {
+		errorf("Transform parsing errors: %s", strings.Join(errors, "; "))
+	}
+
+	return featureTransforms, nil
 }
 
 func buildTransformParams(params map[string]string) (*TransformParams, error) {
 	transform := &TransformParams{
 		Parameters: make(map[string][]float64),
 	}
-	typeStr, ok := params["type"]
-	if !ok {
+
+	if typeStr, exists := params["type"]; exists {
+		transform.Type = TransformType(typeStr)
+	} else {
 		return nil, fmt.Errorf("missing transform type")
 	}
-	transform.Type = TransformType(typeStr)
 
-	featuresStr, ok := params["features"]
-	if !ok {
+	if featuresStr, exists := params["features"]; exists {
+		indices, err := parseIntArray(featuresStr)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse feature indices: %v", err)
+		}
+		transform.FeatureIndices = indices
+	} else {
 		return nil, fmt.Errorf("missing feature indices")
 	}
-	indices, err := parseIntArray(featuresStr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse feature indices: %v", err)
-	}
-	transform.FeatureIndices = indices
 
 	for paramName, paramValue := range params {
-		if paramName == "type" || paramName == "features" {
-			continue
+		if paramName != "type" && paramName != "features" {
+			values, err := parseFloatArray(paramValue)
+			if err != nil {
+				return nil, fmt.Errorf("failed to parse parameter %s: %v", paramName, err)
+			}
+			transform.Parameters[paramName] = values
 		}
-		values, err := parseFloatArray(paramValue)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse parameter %s: %v", paramName, err)
-		}
-		transform.Parameters[paramName] = values
 	}
+
 	return transform, nil
 }
 
@@ -208,15 +294,18 @@ func parseFloatArray(value string) ([]float64, error) {
 	if value == "" {
 		return []float64{}, nil
 	}
+
 	parts := strings.Split(value, ",")
 	result := make([]float64, len(parts))
+
 	for i, part := range parts {
-		v, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
+		val, err := strconv.ParseFloat(strings.TrimSpace(part), 64)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse float '%s': %v", part, err)
 		}
-		result[i] = v
+		result[i] = val
 	}
+
 	return result, nil
 }
 
@@ -224,15 +313,18 @@ func parseIntArray(value string) ([]int, error) {
 	if value == "" {
 		return []int{}, nil
 	}
+
 	parts := strings.Split(value, ",")
 	result := make([]int, len(parts))
+
 	for i, part := range parts {
-		v, err := strconv.Atoi(strings.TrimSpace(part))
+		val, err := strconv.Atoi(strings.TrimSpace(part))
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse integer '%s': %v", part, err)
 		}
-		result[i] = v
+		result[i] = val
 	}
+
 	return result, nil
 }
 
@@ -240,86 +332,46 @@ func parseStringArray(value string) []string {
 	if value == "" {
 		return []string{}
 	}
+
 	parts := strings.Split(value, ",")
 	result := make([]string, len(parts))
+
 	for i, part := range parts {
 		result[i] = strings.TrimSpace(part)
 	}
+
 	return result
 }
 
-func getDefaultFeatureOrder() map[int]string {
-	return map[int]string{
-		0:  "success",
-		1:  "failure",
-		2:  "connect_time",
-		3:  "latency",
-		4:  "upload_mb",
-		5:  "history_upload_mb",
-		6:  "maxuploadrate_kb",
-		7:  "history_maxuploadrate_kb",
-		8:  "download_mb",
-		9:  "history_download_mb",
-		10: "maxdownloadrate_kb",
-		11: "history_maxdownloadrate_kb",
-		12: "duration_minutes",
-		13: "last_used_seconds",
-		14: "is_udp",
-		15: "is_tcp",
-		16: "asn_feature",
-		17: "country_feature",
-		18: "address_feature",
-		19: "port_feature",
-		20: "traffic_ratio",
-		21: "traffic_density",
-		22: "connection_type_feature",
-		23: "asn_hash",
-		24: "host_hash",
-		25: "ip_hash",
-		26: "geoip_hash",
-		27: "latency_stddev",
-		28: "connect_time_stddev",
-		29: "short_long_rtt_delta",
-		30: "short_success_rate",
-		31: "active_conns",
-		32: "tls_handshake_time",
-		33: "hour_bucket",
-		34: "tcp_retransmissions",
-	}
-}
-
-// ApplyTransforms applies enabled scalers to the feature vector.
 func (ft *FeatureTransforms) ApplyTransforms(features []float64) []float64 {
 	if ft == nil || !ft.TransformsEnabled || len(ft.Transforms) == 0 {
 		return features
 	}
 
-	var result []float64
-	poolObj := transformPool.Get()
-	if arr, ok := poolObj.([]float64); ok && len(arr) >= len(features) {
-		result = arr[:len(features)]
-	} else {
-		result = make([]float64, len(features))
-	}
+	result := make([]float64, len(features))
 	copy(result, features)
 
-	for _, transform := range ft.Transforms {
-		valid := true
+	var errors []string
+	for i, transform := range ft.Transforms {
+		validTransform := true
 		for _, idx := range transform.FeatureIndices {
 			if idx < 0 || idx >= len(result) {
-				valid = false
+				errors = append(errors, fmt.Sprintf("transform %d feature index %d out of range", i, idx))
+				validTransform = false
 				break
 			}
 		}
-		if valid {
+
+		if validTransform {
 			ft.applyTransformInPlace(result, transform)
 		}
 	}
 
-	out := make([]float64, len(result))
-	copy(out, result)
-	transformPool.Put(result)
-	return out
+	if len(errors) > 0 {
+		errorf("Apply transforms errors: %s", strings.Join(errors, "; "))
+	}
+
+	return result
 }
 
 func (ft *FeatureTransforms) applyTransformInPlace(features []float64, transform TransformParams) {
@@ -328,117 +380,130 @@ func (ft *FeatureTransforms) applyTransformInPlace(features []float64, transform
 		ft.applyStandardScaler(features, transform)
 	case RobustScalerTransform:
 		ft.applyRobustScaler(features, transform)
+	default:
+		errorf("Unknown transform type: %s", transform.Type)
 	}
 }
 
 func (ft *FeatureTransforms) applyStandardScaler(features []float64, transform TransformParams) {
 	mean := transform.Parameters["mean"]
 	scale := transform.Parameters["scale"]
+
 	if len(mean) == 0 || len(scale) == 0 {
 		return
 	}
-	expected := len(transform.FeatureIndices)
-	if len(mean) != expected || len(scale) != expected {
+
+	expectedCount := len(transform.FeatureIndices)
+	if len(mean) != expectedCount || len(scale) != expectedCount {
+		errorf("StandardScaler parameter count mismatch, expected %d, got mean=%d scale=%d",
+			expectedCount, len(mean), len(scale))
 		return
 	}
+
+	errors := []string{}
 	for i, featureIdx := range transform.FeatureIndices {
-		if featureIdx < len(features) && i < len(mean) && i < len(scale) && scale[i] != 0 {
-			features[featureIdx] = (features[featureIdx] - mean[i]) / scale[i]
+		if featureIdx < len(features) && i < len(mean) && i < len(scale) {
+			if scale[i] != 0 {
+				features[featureIdx] = (features[featureIdx] - mean[i]) / scale[i]
+			} else {
+				errors = append(errors, fmt.Sprintf("scale[%d] is zero for feature %d", i, featureIdx))
+			}
 		}
+	}
+
+	if len(errors) > 0 {
+		errorf("StandardScaler errors: %s", strings.Join(errors, "; "))
 	}
 }
 
 func (ft *FeatureTransforms) applyRobustScaler(features []float64, transform TransformParams) {
 	center := transform.Parameters["center"]
 	scale := transform.Parameters["scale"]
+
 	if len(center) == 0 || len(scale) == 0 {
 		return
 	}
+
 	for i, featureIdx := range transform.FeatureIndices {
-		if featureIdx < len(features) && i < len(center) && i < len(scale) && scale[i] != 0 {
-			features[featureIdx] = (features[featureIdx] - center[i]) / scale[i]
+		if featureIdx < len(features) && i < len(center) && i < len(scale) {
+			if scale[i] != 0 {
+				features[featureIdx] = (features[featureIdx] - center[i]) / scale[i]
+			}
 		}
 	}
 }
 
-// alignFeatureOrder checks the [order] block against the model inputs it
-// describes and fills the indices it omits. With real feature names the
-// block must agree with them; without, it must name the catalog slot each
-// positional input reads.
-func (ft *FeatureTransforms) alignFeatureOrder(names []string, layout []int) error {
-	if ft.FeatureOrder == nil {
-		ft.FeatureOrder = make(map[int]string, len(layout))
+// IsCompatible reports whether a parsed transform file still matches the feature slots
+// of the model; a mismatch means the model was trained with another slot order.
+func (ft *FeatureTransforms) IsCompatible() bool {
+	if ft == nil || !ft.TransformsEnabled {
+		return true
 	}
-	expected := names
-	if !hasFeatureNames(names) {
-		order := getDefaultFeatureOrder()
-		expected = make([]string, len(layout))
-		for i, slot := range layout {
-			expected[i] = order[slot]
+	if len(ft.FeatureOrder) != len(defaultFeatureOrder) {
+		return false
+	}
+	for idx, name := range defaultFeatureOrder {
+		if ft.FeatureOrder[idx] != name {
+			return false
 		}
 	}
-	for idx, name := range ft.FeatureOrder {
-		if idx >= len(expected) {
-			return fmt.Errorf("transforms [order] lists index %d, model has %d features", idx, len(expected))
-		}
-		if name != expected[idx] {
-			return fmt.Errorf("transforms [order] names feature %d %q, model feature is %q", idx, name, expected[idx])
-		}
-	}
-	for i, name := range expected {
-		ft.FeatureOrder[i] = name
-	}
-	return nil
+	return true
 }
 
-// ValidateTransforms checks that all transforms reference valid feature indices
-// and have matching parameter arrays.
-func (ft *FeatureTransforms) ValidateTransforms(expectedCount int) error {
+func (ft *FeatureTransforms) ValidateTransforms(expectedFeatureCount int) error {
 	if ft == nil {
 		return fmt.Errorf("FeatureTransforms is nil")
 	}
+
 	if !ft.TransformsEnabled {
 		return nil
 	}
+
 	if len(ft.FeatureOrder) == 0 {
 		return fmt.Errorf("feature order mapping is empty")
 	}
-	for i := 0; i < expectedCount; i++ {
-		if _, ok := ft.FeatureOrder[i]; !ok {
+
+	for i := 0; i < expectedFeatureCount; i++ {
+		if _, exists := ft.FeatureOrder[i]; !exists {
 			return fmt.Errorf("feature index %d missing in feature order mapping", i)
 		}
 	}
+
 	for i, transform := range ft.Transforms {
 		switch transform.Type {
 		case StandardScalerTransform, RobustScalerTransform:
 		default:
-			return fmt.Errorf("transform %d: unsupported type %s", i, transform.Type)
+			return fmt.Errorf("transform %d: unsupported transform type %s", i, transform.Type)
 		}
+
 		if len(transform.FeatureIndices) == 0 {
 			return fmt.Errorf("transform %d: feature indices list is empty", i)
 		}
+
 		for _, idx := range transform.FeatureIndices {
-			if idx < 0 || idx >= expectedCount {
-				return fmt.Errorf("transform %d: feature index %d out of range", i, idx)
+			if idx < 0 || idx >= expectedFeatureCount {
+				return fmt.Errorf("transform %d: feature index %d out of range [0, %d)",
+					i, idx, expectedFeatureCount)
 			}
 		}
+
 		if err := ft.validateTransformParams(transform); err != nil {
 			return fmt.Errorf("transform %d parameter validation failed: %v", i, err)
 		}
 	}
+
 	return nil
 }
 
 func (ft *FeatureTransforms) validateTransformParams(transform TransformParams) error {
-	expected := len(transform.FeatureIndices)
 	switch transform.Type {
 	case StandardScalerTransform:
 		mean := transform.Parameters["mean"]
 		scale := transform.Parameters["scale"]
-		if len(mean) != expected {
+		if len(mean) != len(transform.FeatureIndices) {
 			return fmt.Errorf("StandardScaler mean parameter count mismatch")
 		}
-		if len(scale) != expected {
+		if len(scale) != len(transform.FeatureIndices) {
 			return fmt.Errorf("StandardScaler scale parameter count mismatch")
 		}
 		for i, s := range scale {
@@ -446,13 +511,14 @@ func (ft *FeatureTransforms) validateTransformParams(transform TransformParams) 
 				return fmt.Errorf("StandardScaler scale[%d] is zero", i)
 			}
 		}
+
 	case RobustScalerTransform:
 		center := transform.Parameters["center"]
 		scale := transform.Parameters["scale"]
-		if len(center) != expected {
+		if len(center) != len(transform.FeatureIndices) {
 			return fmt.Errorf("RobustScaler center parameter count mismatch")
 		}
-		if len(scale) != expected {
+		if len(scale) != len(transform.FeatureIndices) {
 			return fmt.Errorf("RobustScaler scale parameter count mismatch")
 		}
 		for i, s := range scale {
@@ -461,5 +527,22 @@ func (ft *FeatureTransforms) validateTransformParams(transform TransformParams) 
 			}
 		}
 	}
+
 	return nil
+}
+
+func (ft *FeatureTransforms) DebugTransforms() {
+	if ft == nil {
+		debugf("FeatureTransforms is nil")
+		return
+	}
+
+	transformSummary := make([]string, len(ft.Transforms))
+	for i, transform := range ft.Transforms {
+		transformSummary[i] = fmt.Sprintf("%s[%d features]", transform.Type, len(transform.FeatureIndices))
+	}
+
+	debugf("FeatureTransforms: enabled=%v, features=%d, transforms=%d [%s], untransformed=%v",
+		ft.TransformsEnabled, len(ft.FeatureOrder), len(ft.Transforms),
+		strings.Join(transformSummary, ", "), ft.UntransformedFeatures)
 }

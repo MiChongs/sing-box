@@ -17,7 +17,7 @@ import (
 
 	"github.com/sagernet/sing-anytls"
 	"github.com/sagernet/sing-box/adapter"
-	"github.com/sagernet/sing-box/common/smart/tcpinfo"
+	"github.com/sagernet/sing-box/common/tcpinfo"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-mux"
 	"github.com/sagernet/sing-snell"
