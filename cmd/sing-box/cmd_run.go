@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	runtimeDebug "runtime/debug"
 	"sort"
 	"strings"
@@ -23,6 +25,7 @@ import (
 	"github.com/sagernet/sing/service"
 
 	"github.com/spf13/cobra"
+	"sigs.k8s.io/yaml"
 )
 
 var commandRun = &cobra.Command{
@@ -59,14 +62,14 @@ func readConfigAt(path string) (*OptionsEntry, error) {
 	if err != nil {
 		return nil, E.Cause(err, "read config at ", path)
 	}
-	// 防御：sing/common/json/internal/contextjson 的 comment 解析器在遇到
-	// malformed JSON（典型：未闭合字符串如 `"server": "dns_hosts<EOL>`）时，
-	// skipJSONString 一路扫到 EOF → parseObject/parseArray 解析器 desync →
-	// p.nodes append 死循环，最终 3GB+ OOM 杀掉进程，没有清晰错误。
-	// 先用一个 cheap 的状态机做语法粗校验：注释剥离 + 引号/括号配平，
-	// 不合法直接报告精确位置；通过后再交给 sing 的完整解析器，避免触发 OOM。
-	if err := preValidateJSONSyntax(configContent); err != nil {
-		return nil, E.Cause(err, "config syntax check at ", path)
+	configContent, err = normalizeConfigContent(path, configContent)
+	if err != nil {
+		return nil, err
+	}
+
+	configContent, err = applyConfigFilter(configContent)
+	if err != nil {
+		return nil, E.Cause(err, "filter config at ", path)
 	}
 	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, configContent)
 	if err != nil {
@@ -216,7 +219,8 @@ func readConfig() ([]*OptionsEntry, error) {
 			return nil, E.Cause(err, "read config directory at ", directory)
 		}
 		for _, entry := range entries {
-			if !strings.HasSuffix(entry.Name(), ".json") || entry.IsDir() {
+			ext := filepath.Ext(entry.Name())
+			if (ext != ".json" && ext != ".jsonc" && ext != ".yaml" && ext != ".yml") || entry.IsDir() {
 				continue
 			}
 			optionsEntry, err := readConfigAt(filepath.Join(directory, entry.Name()))
@@ -382,4 +386,215 @@ func closeMonitor(ctx context.Context) {
 	default:
 	}
 	log.Fatal("sing-box did not close!")
+}
+
+// normalizeConfigContent 统一把配置转换为 JSON：.yaml / .yml 或不以 { 开头的内容按 YAML 解析；
+// 其余按 JSON（允许注释）处理，语法不合法时再尝试 YAML，两者都失败时报告 JSON 的精确错误位置。
+func normalizeConfigContent(path string, content []byte) ([]byte, error) {
+	ext := strings.ToLower(filepath.Ext(path))
+	if ext != ".yaml" && ext != ".yml" && startsAsJSONObject(content) {
+		// 防御：sing/common/json/internal/contextjson 的 comment 解析器在遇到
+		// malformed JSON（典型：未闭合字符串如 `"server": "dns_hosts<EOL>`）时，
+		// skipJSONString 一路扫到 EOF → parseObject/parseArray 解析器 desync →
+		// p.nodes append 死循环，最终 3GB+ OOM 杀掉进程，没有清晰错误。
+		// 先用一个 cheap 的状态机做语法粗校验：注释剥离 + 引号/括号配平，
+		// 不合法直接报告精确位置；通过后再交给 sing 的完整解析器，避免触发 OOM。
+		jsonErr := preValidateJSONSyntax(content)
+		if jsonErr == nil {
+			return content, nil
+		}
+		jsonContent, yamlErr := yamlToConfigJSON(content)
+		if yamlErr != nil {
+			return nil, E.Cause(jsonErr, "config syntax check at ", path)
+		}
+		return jsonContent, nil
+	}
+	jsonContent, err := yamlToConfigJSON(content)
+	if err != nil {
+		return nil, E.Cause(err, "parse YAML config at ", path)
+	}
+	return jsonContent, nil
+}
+
+// startsAsJSONObject 跳过 BOM、空白与 // 、/* */ 注释后判断内容是否以 { 开头。
+func startsAsJSONObject(content []byte) bool {
+	content = bytes.TrimPrefix(content, []byte("\xef\xbb\xbf"))
+	for {
+		content = bytes.TrimLeft(content, " \t\r\n")
+		switch {
+		case bytes.HasPrefix(content, []byte("//")):
+			index := bytes.IndexByte(content, '\n')
+			if index < 0 {
+				return false
+			}
+			content = content[index+1:]
+		case bytes.HasPrefix(content, []byte("/*")):
+			index := bytes.Index(content[2:], []byte("*/"))
+			if index < 0 {
+				return false
+			}
+			content = content[index+4:]
+		default:
+			return len(content) > 0 && content[0] == '{'
+		}
+	}
+}
+
+// yamlToConfigJSON 把 YAML 转为 JSON，并丢弃顶层以 "."、"_"、"x-" 开头的键
+// （常用来存放 YAML 锚点等辅助内容）。
+func yamlToConfigJSON(content []byte) ([]byte, error) {
+	jsonContent, err := yaml.YAMLToJSON(content)
+	if err != nil {
+		return nil, err
+	}
+	var root map[string]json.RawMessage
+	if json.Unmarshal(jsonContent, &root) != nil {
+		return jsonContent, nil
+	}
+	var cleaned bool
+	for key := range root {
+		if strings.HasPrefix(key, ".") || strings.HasPrefix(key, "_") || strings.HasPrefix(key, "x-") || strings.HasPrefix(key, "X-") {
+			delete(root, key)
+			cleaned = true
+		}
+	}
+	if !cleaned {
+		return jsonContent, nil
+	}
+	return json.Marshal(root)
+}
+
+// applyConfigFilter 在解析前按 filter_regex / filter_reverse 处理带 filter_mark 的条目，
+// 并按命中的 filter_option 展开参数；配置中没有任何过滤字段时原样返回。
+func applyConfigFilter(content []byte) ([]byte, error) {
+	if !bytes.Contains(content, []byte("filter_")) {
+		return content, nil
+	}
+	decoder := json.NewDecoder(json.NewCommentFilter(bytes.NewReader(content)))
+	decoder.UseNumber()
+
+	var root any
+	if err := decoder.Decode(&root); err != nil {
+		return content, nil
+	}
+
+	rootMap, ok := root.(map[string]any)
+	if !ok {
+		return content, nil
+	}
+
+	var changed bool
+	filterRegex := regexp.MustCompile(`a\A`)
+	if rawRegex, exists := rootMap["filter_regex"]; exists {
+		changed = true
+		delete(rootMap, "filter_regex")
+		if regexStr, isStr := rawRegex.(string); isStr && regexStr != "" {
+			compiled, err := regexp.Compile(regexStr)
+			if err != nil {
+				return nil, E.Cause(err, "invalid filter_regex pattern: ", regexStr)
+			}
+			filterRegex = compiled
+		}
+	}
+
+	filterReverse := false
+	if rawReverse, exists := rootMap["filter_reverse"]; exists {
+		changed = true
+		delete(rootMap, "filter_reverse")
+		if revBool, isBool := rawReverse.(bool); isBool {
+			filterReverse = revBool
+		}
+	}
+
+	var prune func(v any) (any, bool)
+	prune = func(v any) (any, bool) {
+		switch node := v.(type) {
+		case map[string]any:
+			if rawMark, hasMark := node["filter_mark"]; hasMark {
+				changed = true
+				delete(node, "filter_mark")
+
+				matched := false
+				if markStr, isStr := rawMark.(string); isStr {
+					matched = filterRegex.MatchString(markStr)
+				} else if markArr, isArr := rawMark.([]any); isArr && len(markArr) > 0 {
+					matched = true
+					for _, item := range markArr {
+						if markStr, isStr := item.(string); isStr {
+							if !filterRegex.MatchString(markStr) {
+								matched = false
+								break
+							}
+						} else {
+							matched = false
+							break
+						}
+					}
+				}
+
+				shouldDestroy := (matched == filterReverse)
+				if shouldDestroy {
+					return nil, true
+				}
+			}
+
+			if rawOption, hasOption := node["filter_option"]; hasOption {
+				changed = true
+				delete(node, "filter_option")
+
+				if !filterReverse {
+					if optMap, isMap := rawOption.(map[string]any); isMap {
+						keys := make([]string, 0, len(optMap))
+						for k := range optMap {
+							keys = append(keys, k)
+						}
+						sort.Strings(keys)
+
+						for _, mark := range keys {
+							if filterRegex.MatchString(mark) {
+								if subMap, ok := optMap[mark].(map[string]any); ok {
+									for subKey, subVal := range subMap {
+										if subVal == nil {
+											delete(node, subKey)
+										} else {
+											node[subKey] = subVal
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+
+			for key, val := range node {
+				newChild, shouldDelete := prune(val)
+				if shouldDelete {
+					delete(node, key)
+				} else {
+					node[key] = newChild
+				}
+			}
+			return node, false
+
+		case []any:
+			newSlice := make([]any, 0, len(node))
+			for _, item := range node {
+				newItem, shouldDelete := prune(item)
+				if !shouldDelete {
+					newSlice = append(newSlice, newItem)
+				}
+			}
+			return newSlice, false
+
+		default:
+			return node, false
+		}
+	}
+
+	prune(rootMap)
+	if !changed {
+		return content, nil
+	}
+	return json.Marshal(rootMap)
 }
