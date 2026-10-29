@@ -28,6 +28,10 @@ const (
 
 var _ Searcher = (*linuxSearcher)(nil)
 
+// androidZygotePath prefixes the executables of zygote-forked processes, which
+// carry no per-application path.
+const androidZygotePath = "/system/bin/app_process"
+
 type linuxSearcher struct {
 	logger           log.ContextLogger
 	packageManager   tun.PackageManager
@@ -97,7 +101,7 @@ func (s *linuxSearcher) FindProcessInfoMode(ctx context.Context, network string,
 		s.logger.DebugContext(ctx, "find process path: ", err)
 	} else if C.IsAndroid {
 		processInfo.ProcessPaths = common.Filter(processPaths, func(processPath string) bool {
-			return !strings.HasPrefix(processPath, "/system/bin/app_process")
+			return !strings.HasPrefix(processPath, androidZygotePath)
 		})
 	} else {
 		processInfo.ProcessPaths = processPaths

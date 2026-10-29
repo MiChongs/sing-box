@@ -32,6 +32,17 @@ func BenchmarkBuildProcessPathsCurrentUser(b *testing.B) {
 	}
 }
 
+// BenchmarkBuildProcessPathsUnmatchedUser measures the walk of a scope that
+// owns no process, the cost every other user's process adds to a scoped scan.
+func BenchmarkBuildProcessPathsUnmatchedUser(b *testing.B) {
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := buildProcessPaths(context.Background(), processPathsAllUsers-1); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 func BenchmarkSocketDiagQuery(b *testing.B) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

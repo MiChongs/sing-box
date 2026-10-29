@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"unsafe"
 
+	C "github.com/sagernet/sing-box/constant"
+
 	"golang.org/x/sys/unix"
 )
 
@@ -24,6 +26,8 @@ const (
 var (
 	procExeName = [...]byte{'e', 'x', 'e', 0}
 	procFDName  = [...]byte{'f', 'd', 0}
+
+	androidZygotePrefix = []byte(androidZygotePath)
 
 	errInvalidDirent = errors.New("invalid directory entry")
 
@@ -115,7 +119,7 @@ func (s *procScanner) build(ctx context.Context, uid uint32) (processPathIndex, 
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		return s.scanProcess(procFD, nameZ, uid)
+		return s.scanProcess(procFD, name, nameZ, uid)
 	})
 	if err != nil {
 		s.builder = processPathIndexBuilder{}
@@ -137,18 +141,12 @@ func (s *procScanner) pathList(exe []byte) []string {
 	return paths
 }
 
-func (s *procScanner) scanProcess(procFD int, pid *byte, uid uint32) error {
-	processFD, err := openatDirectory(procFD, pid)
-	if err != nil {
-		if isIgnorableProcError(err) {
-			return nil
-		}
-		return err
-	}
-	defer unix.Close(processFD)
+func (s *procScanner) scanProcess(procFD int, pid []byte, pidZ *byte, uid uint32) error {
+	// A scoped walk filters on the entry's owner before opening it, so the
+	// processes of other users cost one syscall instead of three.
 	if uid != processPathsAllUsers {
 		var stat unix.Stat_t
-		if err = unix.Fstat(processFD, &stat); err != nil {
+		if err := fstatatName(procFD, pid, pidZ, &stat); err != nil {
 			if isIgnorableProcError(err) {
 				return nil
 			}
@@ -158,12 +156,26 @@ func (s *procScanner) scanProcess(procFD int, pid *byte, uid uint32) error {
 			return nil
 		}
 	}
+	processFD, err := openatDirectory(procFD, pidZ)
+	if err != nil {
+		if isIgnorableProcError(err) {
+			return nil
+		}
+		return err
+	}
+	defer unix.Close(processFD)
 	exeLength, err := readlinkat(processFD, &procExeName[0], s.exe)
 	if err != nil {
 		if isIgnorableProcError(err) {
 			return nil
 		}
 		return err
+	}
+	// Owner lookups drop zygote paths on Android, so the all-users fallback
+	// skips the descriptors of application processes and system_server,
+	// which hold most sockets on the device.
+	if uid == processPathsAllUsers && C.IsAndroid && isAndroidZygoteProcess(s.exe[:exeLength]) {
+		return nil
 	}
 	fdFD, err := openatDirectory(processFD, &procFDName[0])
 	if err != nil {
@@ -260,6 +272,10 @@ func readlinkat(dirFD int, name *byte, buffer []byte) (int, error) {
 		return 0, errno
 	}
 	return int(n), nil
+}
+
+func isAndroidZygoteProcess(exe []byte) bool {
+	return bytes.HasPrefix(exe, androidZygotePrefix)
 }
 
 func isPid(name []byte) bool {
