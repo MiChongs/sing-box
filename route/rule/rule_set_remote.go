@@ -29,8 +29,8 @@ import (
 )
 
 const (
-	ruleSetFetchTimeout      = 60 * time.Second
-	ruleSetMaxResponseBytes  = 50 * 1024 * 1024
+	ruleSetFetchTimeout     = 60 * time.Second
+	ruleSetMaxResponseBytes = 50 * 1024 * 1024
 )
 
 var _ adapter.RuleSet = (*RemoteRuleSet)(nil)
@@ -130,6 +130,9 @@ func (s *RemoteRuleSet) StartContext(ctx context.Context, startContext *adapter.
 	if !loadedFromCache && !loadedFromInitialPath {
 		err = s.fetch(ctx, true)
 		if err != nil {
+			if option.RemoteFetchPolicyFromContext(s.ctx).ForceFetch {
+				return E.Cause(err, "initial rule-set: ", s.tag)
+			}
 			s.logger.Warn(E.Cause(err, "initial rule-set fetch failed, starting empty: ", s.tag))
 		}
 	}
@@ -274,11 +277,16 @@ func (s *RemoteRuleSet) loadCacheFile() (bool, error) {
 	var lastEtag string
 	var savedSet *adapter.SavedBinary
 	var staleRecord bool
+	var urlChanged bool
 	if s.cacheFile != nil {
 		if savedSet = s.cacheFile.LoadRuleSet(s.tag); savedSet != nil {
 			if len(savedSet.URLHash) > 0 && !bytes.Equal(savedSet.URLHash, s.urlHash[:]) {
-				s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
-				return false, nil
+				if option.RemoteFetchPolicyFromContext(s.ctx).Verify || s.path == "" {
+					s.logger.Info("cached rule-set was downloaded from another URL, will refetch")
+					return false, nil
+				}
+				// remote_verify disabled: keep the local file and record the new URL.
+				urlChanged = true
 			}
 			s.hash = savedSet.Hash
 		}
@@ -309,7 +317,7 @@ func (s *RemoteRuleSet) loadCacheFile() (bool, error) {
 			return false, closeErr
 		}
 		fileHash := hash.MakeHash(content)
-		if savedSet != nil && s.hash.Equal(fileHash) {
+		if savedSet != nil && s.hash.Equal(fileHash) && !urlChanged {
 			lastUpdated = savedSet.LastUpdated
 			lastEtag = savedSet.LastEtag
 		} else {

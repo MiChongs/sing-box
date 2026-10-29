@@ -29,6 +29,8 @@ type _Options struct {
 	Route                *RouteOptions         `json:"route,omitempty"`
 	Services             []Service             `json:"services,omitempty"`
 	Experimental         *ExperimentalOptions  `json:"experimental,omitempty"`
+	RemoteVerify         *bool                 `json:"remote_verify,omitempty"`
+	RemoteForceFetch     *bool                 `json:"remote_force_fetch,omitempty"`
 }
 
 type Options _Options

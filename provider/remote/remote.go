@@ -194,6 +194,9 @@ func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter
 	if !loadedFromCache && !loadedFromInitialPath {
 		err = s.fetch(ctx, true)
 		if err != nil {
+			if option.RemoteFetchPolicyFromContext(s.ctx).ForceFetch {
+				return E.Cause(err, "initial outbound provider: ", s.Tag())
+			}
 			s.logger.Warn(E.Cause(err, "initial outbound provider fetch failed, starting empty: ", s.Tag()))
 		}
 	} else if s.optionsChanged {
@@ -392,14 +395,18 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 	var lastEtag string
 	var saveSub *adapter.SavedBinary
 	var staleRecord bool
+	var urlChanged bool
 	if s.cacheFile != nil {
 		if saveSub = s.cacheFile.LoadSubscription(s.Tag()); saveSub != nil {
 			if len(saveSub.URLHash) > 0 {
 				if !bytes.HasPrefix(saveSub.URLHash, s.urlHash[:]) {
-					s.logger.Info("cached outbound provider was downloaded from another URL, will refetch")
-					return false, nil
-				}
-				if !bytes.Equal(saveSub.URLHash, s.cacheKey()) {
+					if option.RemoteFetchPolicyFromContext(s.ctx).Verify || s.path == "" {
+						s.logger.Info("cached outbound provider was downloaded from another URL, will refetch")
+						return false, nil
+					}
+					// remote_verify disabled: keep the local file and record the new URL.
+					urlChanged = true
+				} else if !bytes.Equal(saveSub.URLHash, s.cacheKey()) {
 					// include / exclude / override_* changed since the cache was
 					// written, or it was written by a build without the options hash.
 					s.optionsChanged = true
@@ -434,7 +441,7 @@ func (s *ProviderRemote) loadCacheFile() (bool, error) {
 			return false, closeErr
 		}
 		fileHash := hash.MakeHash(content)
-		if saveSub != nil && s.hash.Equal(fileHash) {
+		if saveSub != nil && s.hash.Equal(fileHash) && !urlChanged {
 			lastUpdated = saveSub.LastUpdated
 			lastEtag = saveSub.LastEtag
 		} else {

@@ -11,6 +11,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/hash"
 	"github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/logger"
 
 	"github.com/stretchr/testify/require"
@@ -103,4 +104,34 @@ func TestRemoteRuleSetRefetchesUnreadableReplacedFile(t *testing.T) {
 	require.Error(t, err)
 	require.False(t, loaded)
 	require.Empty(t, cache.stored)
+}
+
+func TestRemoteRuleSetURLChangeRefetchesByDefault(t *testing.T) {
+	t.Parallel()
+
+	content := []byte(remoteRuleSetFixture)
+	saved := &adapter.SavedBinary{Hash: hash.MakeHash(content), LastUpdated: time.Unix(1760000000, 0)}
+	ruleSet, _, _ := newCachedRemoteRuleSet(t, content, saved)
+	saved.URLHash = []byte("another url")
+	loaded, err := ruleSet.loadCacheFile()
+	require.NoError(t, err)
+	require.False(t, loaded)
+}
+
+func TestRemoteRuleSetKeepsFileWhenVerifyDisabled(t *testing.T) {
+	t.Parallel()
+
+	content := []byte(remoteRuleSetFixture)
+	saved := &adapter.SavedBinary{Hash: hash.MakeHash(content), LastUpdated: time.Unix(1760000000, 0), LastEtag: `"old"`}
+	ruleSet, cache, modTime := newCachedRemoteRuleSet(t, content, saved)
+	saved.URLHash = []byte("another url")
+	ruleSet.ctx = option.ContextWithRemoteFetchPolicy(context.Background(), option.RemoteFetchPolicy{Verify: false})
+	loaded, err := ruleSet.loadCacheFile()
+	require.NoError(t, err)
+	require.True(t, loaded)
+	require.Equal(t, uint64(1), ruleSet.RuleCount())
+	require.Equal(t, modTime, ruleSet.lastUpdated)
+	require.Empty(t, ruleSet.lastEtag)
+	require.Len(t, cache.stored, 1)
+	require.Equal(t, ruleSet.urlHash[:], cache.stored[0].URLHash)
 }
