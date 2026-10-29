@@ -183,7 +183,7 @@ jobs:
           set -xeuo pipefail
           CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
           git init ~/cronet-go
-          git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
+          git -C ~/cronet-go remote add origin https://github.com/MiChongs/cronet-go.git
           git -C ~/cronet-go sparse-checkout set --no-cone '/*' '!/lib'
           git -C ~/cronet-go fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
           git -C ~/cronet-go checkout FETCH_HEAD
@@ -262,7 +262,7 @@ jobs:
           CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
           LIBRARY_PATH="lib/${{ matrix.os }}_${{ matrix.arch }}/libcronet.so"
           git init "$RUNNER_TEMP/cronet-go-lib"
-          git -C "$RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/MiChongs/cronet-go.git
           git -C "$RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
           git -C "$RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
           git -C "$RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
@@ -639,7 +639,7 @@ jobs:
           $CRONET_GO_VERSION = Get-Content .github/CRONET_GO_VERSION
           $LIBRARY_PATH = "lib/windows_${{ matrix.arch }}/libcronet.dll"
           git init "$env:RUNNER_TEMP/cronet-go-lib"
-          git -C "$env:RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/sagernet/cronet-go.git
+          git -C "$env:RUNNER_TEMP/cronet-go-lib" remote add origin https://github.com/MiChongs/cronet-go.git
           git -C "$env:RUNNER_TEMP/cronet-go-lib" sparse-checkout set --no-cone "/$LIBRARY_PATH"
           git -C "$env:RUNNER_TEMP/cronet-go-lib" fetch --depth=1 --filter=blob:none origin "$CRONET_GO_VERSION"
           git -C "$env:RUNNER_TEMP/cronet-go-lib" checkout FETCH_HEAD
@@ -1151,7 +1151,7 @@ jobs:
           set -xeuo pipefail
           CRONET_GO_VERSION=$(cat .github/CRONET_GO_VERSION)
           git init ~/cronet-go
-          git -C ~/cronet-go remote add origin https://github.com/sagernet/cronet-go.git
+          git -C ~/cronet-go remote add origin https://github.com/MiChongs/cronet-go.git
           git -C ~/cronet-go fetch --depth=1 origin "$CRONET_GO_VERSION"
           git -C ~/cronet-go checkout FETCH_HEAD
           git -C ~/cronet-go submodule update --init --recursive --depth=1
