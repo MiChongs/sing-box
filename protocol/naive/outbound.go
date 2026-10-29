@@ -4,6 +4,7 @@ package naive
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/pem"
 	"net"
 	"strings"
@@ -88,6 +89,21 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 	}
 	if options.TLS.Reality != nil && options.TLS.Reality.Enabled {
 		return nil, E.New("reality is not supported on naive outbound")
+	}
+	var (
+		ptlsEnabled bool
+		ptlsPSK     string
+	)
+	if options.TLS.PTLS != nil && options.TLS.PTLS.Enabled {
+		if options.QUIC {
+			return nil, E.New("ptls is not supported when quic is enabled on naive outbound")
+		}
+		pskBytes, err := options.TLS.PTLS.ParsePSK()
+		if err != nil {
+			return nil, E.Cause(err, "parse ptls psk")
+		}
+		ptlsEnabled = true
+		ptlsPSK = hex.EncodeToString(pskBytes[:])
 	}
 
 	serverAddress := options.ServerOptions.Build()
@@ -199,6 +215,8 @@ func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextL
 		QUIC:                     options.QUIC,
 		QUICCongestionControl:    quicCongestionControl,
 		QUICSessionReceiveWindow: options.QUICSessionReceiveWindow.Value(),
+		PTLS:                     ptlsEnabled,
+		PTLSPSK:                  ptlsPSK,
 	})
 	if err != nil {
 		return nil, err

@@ -90,15 +90,10 @@ require (
 	howett.net/plist v1.0.1
 )
 
-require (
-	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
-)
-
 replace (
 	github.com/easytier/easytier/easytier-go => github.com/MiChongs/easytier-go v0.0.0-20261028041007-78dad22f2199
 	github.com/metacubex/wazero => github.com/MiChongs/wazero v0.0.0-20261028034105-3ae26daa8d18
-	github.com/sagernet/quic-go => github.com/MiChongs/quic-go v0.0.0-20261025190959-1f4c68673e6c
+	github.com/sagernet/quic-go => github.com/MiChongs/quic-go v0.0.0-20261029121315-f35e38a0ba62
 	github.com/sagernet/sing => github.com/reF1nd/sing v0.9.7-0.20261025115535-d4dda9140332
 	github.com/sagernet/sing-anytls => github.com/reF1nd/sing-anytls v0.0.0-20260924145214-2a81df5d3e9f
 	github.com/sagernet/sing-quic => github.com/MiChongs/sing-quic v0.0.0-20261025191239-19d3492f0dc5
@@ -110,9 +105,7 @@ replace (
 require (
 	filippo.io/edwards25519 v1.2.0 // indirect
 	filippo.io/hpke v0.4.0 // indirect
-	github.com/RussellLuo/timingwheel v0.0.0-20220218152713-54845bda3108
 	github.com/RyuaNerin/go-krypto v1.3.0 // indirect
-	github.com/VividCortex/ewma v1.2.0
 	github.com/ajg/form v1.5.1 // indirect
 	github.com/akutz/memconn v0.1.0 // indirect
 	github.com/alexbrainman/sspi v0.0.0-20231016080023-1a75b4708caa // indirect
@@ -120,7 +113,6 @@ require (
 	github.com/andybalholm/brotli v1.1.0 // indirect
 	github.com/anmitsu/go-shlex v0.0.0-20200514113438-38f4b401e2be // indirect
 	github.com/axiomhq/hyperloglog v0.0.0-20240319100328-84253e514e02 // indirect
-	github.com/benbjohnson/clock v1.3.5
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/cilium/ebpf v0.22.1-0.20260910105759-60e81073fdc6 // indirect
@@ -128,7 +120,6 @@ require (
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6 // indirect
 	github.com/coreos/go-oidc/v3 v3.17.0 // indirect
 	github.com/database64128/netx-go v0.1.1 // indirect
-	github.com/dgraph-io/ristretto/v2 v2.4.0
 	github.com/dgrijalva/jwt-go/v4 v4.0.0-preview1 // indirect
 	github.com/dgryski/go-camellia v0.0.0-20191119043421-69a8a13fb23d // indirect
 	github.com/dgryski/go-metro v0.0.0-20180109044635-280f6062b5bc // indirect
@@ -142,7 +133,6 @@ require (
 	github.com/go4org/hashtriemap v0.0.0-20251130024219-545ba229f689 // indirect
 	github.com/gobwas/httphead v0.1.0 // indirect
 	github.com/gobwas/pool v0.2.1 // indirect
-	github.com/goccy/go-json v0.10.6
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/certificate-transparency-go v1.3.2 // indirect
@@ -156,7 +146,6 @@ require (
 	github.com/huin/goupnp v1.3.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jackpal/go-nat-pmp v1.0.2 // indirect
-	github.com/josharian/intern v1.0.0
 	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/koron/go-ssdp v0.0.4 // indirect
@@ -216,7 +205,6 @@ require (
 	github.com/tidwall/sjson v1.2.5 // indirect
 	github.com/tjfoc/gmsm v1.4.1 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
-	github.com/vmihailenco/msgpack/v5 v5.4.1
 	github.com/x448/float16 v0.8.4 // indirect
 	github.com/youmark/pkcs8 v0.0.0-20240726163527-a2c0da244d78 // indirect
 	github.com/zeebo/blake3 v0.2.4 // indirect

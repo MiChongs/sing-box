@@ -75,6 +75,14 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			return nil, E.New("TLS is required for QUIC server")
 		}
 	}
+	if options.TLS != nil && options.TLS.PTLS != nil && options.TLS.PTLS.Enabled {
+		if !options.TLS.Enabled {
+			return nil, C.ErrTLSRequired
+		}
+		if common.Contains(inbound.network, N.NetworkUDP) {
+			return nil, E.New("ptls is not supported on naive quic / http3 inbound")
+		}
+	}
 	if len(options.Users) == 0 {
 		return nil, E.New("missing users")
 	}

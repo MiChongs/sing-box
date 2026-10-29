@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/sagernet/sing-box/common/badtls"
+	"github.com/sagernet/sing-box/common/ptls"
 	"github.com/sagernet/sing-box/common/tlsspoof"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
@@ -82,6 +83,9 @@ type ClientOptions struct {
 func NewClientWithOptions(options ClientOptions) (Config, error) {
 	if !options.Options.Enabled {
 		return nil, nil
+	}
+	if options.Options.PTLS != nil && options.Options.PTLS.Enabled {
+		return ptls.NewClient(options.Context, options.ServerAddress, options.Options)
 	}
 	if !options.KTLSCompatible {
 		if options.Options.KernelTx {

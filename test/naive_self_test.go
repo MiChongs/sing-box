@@ -3,10 +3,13 @@
 package main
 
 import (
+	"fmt"
+	"net"
 	"net/netip"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/common/tls"
 	C "github.com/sagernet/sing-box/constant"
@@ -319,21 +322,16 @@ func TestNaiveSelfInsecureConcurrency(t *testing.T) {
 	require.True(t, naiveOutbound.Client().Engine().StartNetLogToFile(netLogPath, true))
 	defer naiveOutbound.Client().Engine().StopNetLog()
 
-	// Send multiple sequential connections to trigger round-robin
-	// With insecure_concurrency=3, connections will be distributed to 3 pools
 	for i := 0; i < 6; i++ {
 		testTCP(t, clientPort, testPort)
 	}
 
 	naiveOutbound.Client().Engine().StopNetLog()
 
-	// Verify NetLog contains multiple independent HTTP/2 sessions
 	logContent, err := os.ReadFile(netLogPath)
 	require.NoError(t, err)
 	logStr := string(logContent)
 
-	// Count HTTP2_SESSION_INITIALIZED events to verify connection pool isolation
-	// NetLog stores event types as numeric IDs, HTTP2_SESSION_INITIALIZED = 249
 	sessionCount := strings.Count(logStr, `"type":249`)
 	require.GreaterOrEqual(t, sessionCount, 3,
 		"Expected at least 3 HTTP/2 sessions with insecure_concurrency=3. NetLog: %s", netLogPath)
@@ -529,5 +527,235 @@ func TestNaiveSelfQUICCongestionControl(t *testing.T) {
 			})
 			testTCP(t, clientPort, testPort)
 		})
+	}
+}
+
+func TestNaiveSelfPTLS(t *testing.T) {
+	caPem, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
+	caPemContent, err := os.ReadFile(caPem)
+	require.NoError(t, err)
+	startInstance(t, option.Options{
+		Inbounds: []option.Inbound{
+			{
+				Type: C.TypeMixed,
+				Tag:  "mixed-in",
+				Options: &option.HTTPMixedInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
+						ListenPort: clientPort,
+					},
+				},
+			},
+			{
+				Type: C.TypeNaive,
+				Tag:  "naive-in",
+				Options: &option.NaiveInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
+						ListenPort: serverPort,
+					},
+					Users: []auth.User{
+						{
+							Username: "sekai",
+							Password: "password",
+						},
+					},
+					Network: network.NetworkTCP,
+					InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
+						TLS: &option.InboundTLSOptions{
+							Enabled:         true,
+							ServerName:      "example.org",
+							CertificatePath: certPem,
+							KeyPath:         keyPem,
+							PTLS: &option.InboundPTLSOptions{
+								Enabled: true,
+								PSK:     badoption.Listable[string]{"ptls-test-secret-password"},
+							},
+						},
+					},
+				},
+			},
+		},
+		Outbounds: []option.Outbound{
+			{
+				Type: C.TypeDirect,
+			},
+			{
+				Type: C.TypeNaive,
+				Tag:  "naive-out",
+				Options: &option.NaiveOutboundOptions{
+					ServerOptions: option.ServerOptions{
+						Server:     "127.0.0.1",
+						ServerPort: serverPort,
+					},
+					Username: "sekai",
+					Password: "password",
+					OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
+						TLS: &option.OutboundTLSOptions{
+							Enabled:     true,
+							ServerName:  "example.org",
+							Certificate: []string{string(caPemContent)},
+							PTLS: &option.OutboundPTLSOptions{
+								Enabled: true,
+								PSK:     "ptls-test-secret-password",
+							},
+						},
+					},
+				},
+			},
+		},
+		Route: &option.RouteOptions{
+			Rules: []option.Rule{
+				{
+					Type: C.RuleTypeDefault,
+					DefaultOptions: option.DefaultRule{
+						RawDefaultRule: option.RawDefaultRule{
+							Inbound: []string{"mixed-in"},
+						},
+						RuleAction: option.RuleAction{
+							Action: C.RuleActionTypeRoute,
+							RouteOptions: option.RouteActionOptions{
+								Outbound: "naive-out",
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+	testTCP(t, clientPort, testPort)
+}
+
+func TestNaiveSelfPTLSFallback(t *testing.T) {
+	caPem, certPem, keyPem := createSelfSignedCertificate(t, "example.org")
+	caPemContent, err := os.ReadFile(caPem)
+	require.NoError(t, err)
+
+	fallbackL, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer fallbackL.Close()
+	fallbackPort := uint16(fallbackL.Addr().(*net.TCPAddr).Port)
+
+	fallbackReceived := make(chan []byte, 1)
+	go func() {
+		conn, acceptErr := fallbackL.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		buf := make([]byte, 512)
+		n, _ := conn.Read(buf)
+		if n > 0 {
+			fallbackReceived <- buf[:n]
+		}
+	}()
+
+	startInstance(t, option.Options{
+		Inbounds: []option.Inbound{
+			{
+				Type: C.TypeMixed,
+				Tag:  "mixed-in",
+				Options: &option.HTTPMixedInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
+						ListenPort: clientPort,
+					},
+				},
+			},
+			{
+				Type: C.TypeNaive,
+				Tag:  "naive-in",
+				Options: &option.NaiveInboundOptions{
+					ListenOptions: option.ListenOptions{
+						Listen:     common.Ptr(badoption.Addr(netip.IPv4Unspecified())),
+						ListenPort: serverPort,
+					},
+					Users: []auth.User{
+						{
+							Username: "sekai",
+							Password: "password",
+						},
+					},
+					Network: network.NetworkTCP,
+					InboundTLSOptionsContainer: option.InboundTLSOptionsContainer{
+						TLS: &option.InboundTLSOptions{
+							Enabled:         true,
+							ServerName:      "example.org",
+							CertificatePath: certPem,
+							KeyPath:         keyPem,
+							PTLS: &option.InboundPTLSOptions{
+								Enabled: true,
+								PSK:     badoption.Listable[string]{"correct-password"},
+								Fallback: &option.InboundPTLSFallbackOptions{
+									Enabled:    common.Ptr(true),
+									Server:     "127.0.0.1",
+									ServerPort: fallbackPort,
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Outbounds: []option.Outbound{
+			{
+				Type: C.TypeDirect,
+			},
+			{
+				Type: C.TypeNaive,
+				Tag:  "naive-out",
+				Options: &option.NaiveOutboundOptions{
+					ServerOptions: option.ServerOptions{
+						Server:     "127.0.0.1",
+						ServerPort: serverPort,
+					},
+					Username: "sekai",
+					Password: "password",
+					OutboundTLSOptionsContainer: option.OutboundTLSOptionsContainer{
+						TLS: &option.OutboundTLSOptions{
+							Enabled:     true,
+							ServerName:  "example.org",
+							Certificate: []string{string(caPemContent)},
+							PTLS: &option.OutboundPTLSOptions{
+								Enabled: true,
+								PSK:     "wrong-password",
+							},
+						},
+					},
+				},
+			},
+		},
+		Route: &option.RouteOptions{
+			Rules: []option.Rule{
+				{
+					Type: C.RuleTypeDefault,
+					DefaultOptions: option.DefaultRule{
+						RawDefaultRule: option.RawDefaultRule{
+							Inbound: []string{"mixed-in"},
+						},
+						RuleAction: option.RuleAction{
+							Action: C.RuleActionTypeRoute,
+							RouteOptions: option.RouteActionOptions{
+								Outbound: "naive-out",
+							},
+						},
+					},
+				},
+			},
+		},
+	})
+
+	conn, _ := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", fmt.Sprint(clientPort)), time.Second)
+	if conn != nil {
+		_, _ = conn.Write([]byte("CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n"))
+		defer conn.Close()
+	}
+
+	select {
+	case data := <-fallbackReceived:
+		require.True(t, len(data) >= 5)
+		require.Equal(t, byte(0x16), data[0], "fallback server must receive TLS ClientHello")
+	case <-time.After(3 * time.Second):
+		t.Fatal("fallback server did not receive forwarded connection")
 	}
 }

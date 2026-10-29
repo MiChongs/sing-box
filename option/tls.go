@@ -39,6 +39,7 @@ type InboundTLSOptions struct {
 
 	ECH     *InboundECHOptions     `json:"ech,omitempty"`
 	Reality *InboundRealityOptions `json:"reality,omitempty"`
+	PTLS    *InboundPTLSOptions    `json:"phantom,omitempty"`
 
 	RejectUnknownSNI bool `json:"reject_unknown_sni,omitempty"`
 }
@@ -140,6 +141,7 @@ type OutboundTLSOptions struct {
 	ECH                        *OutboundECHOptions             `json:"ech,omitempty"`
 	UTLS                       *OutboundUTLSOptions            `json:"utls,omitempty"`
 	Reality                    *OutboundRealityOptions         `json:"reality,omitempty"`
+	PTLS                       *OutboundPTLSOptions            `json:"phantom,omitempty"`
 }
 
 type OutboundTLSOptionsContainer struct {

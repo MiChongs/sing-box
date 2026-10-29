@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/sagernet/sing-box/common/badtls"
+	"github.com/sagernet/sing-box/common/ptls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -30,6 +31,9 @@ func NewServer(ctx context.Context, logger log.ContextLogger, options option.Inb
 func NewServerWithOptions(options ServerOptions) (ServerConfig, error) {
 	if !options.Options.Enabled {
 		return nil, nil
+	}
+	if options.Options.PTLS != nil && options.Options.PTLS.Enabled {
+		return ptls.NewServer(options.Context, options.Logger, options.Options)
 	}
 	if !options.KTLSCompatible {
 		if options.Options.KernelTx {
