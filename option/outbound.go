@@ -199,11 +199,33 @@ type ServerOptions struct {
 	ServerPort uint16 `json:"server_port,omitempty"`
 }
 
+// IsUnixSocket reports whether server is a unix domain socket path.
+func (o ServerOptions) IsUnixSocket() bool {
+	return IsSocketPath(o.Server)
+}
+
+// SocketPath returns the unix domain socket path of server, or "".
+func (o ServerOptions) SocketPath() string {
+	if o.IsUnixSocket() {
+		path, _ := ParseSocketPath(o.Server)
+		return path
+	}
+	return ""
+}
+
 func (o ServerOptions) Build() M.Socksaddr {
+	if o.IsUnixSocket() {
+		return M.Socksaddr{
+			Fqdn: o.SocketPath(),
+		}
+	}
 	return M.ParseSocksaddrHostPort(o.Server, o.ServerPort)
 }
 
 func (o ServerOptions) ServerIsDomain() bool {
+	if o.IsUnixSocket() {
+		return false
+	}
 	return o.Build().IsDomain()
 }
 

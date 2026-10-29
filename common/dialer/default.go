@@ -285,6 +285,27 @@ func setMarkWrapper(networkManager adapter.NetworkManager, mark uint32, isDefaul
 }
 
 func (d *DefaultDialer) DialContext(ctx context.Context, network string, address M.Socksaddr) (net.Conn, error) {
+	if network == "unix" || option.IsSocketPath(address.Fqdn) {
+		if N.NetworkName(network) == N.NetworkUDP {
+			return nil, E.New("UDP is not supported for unix domain socket dialer")
+		}
+		socketPath := address.Fqdn
+		if socketPath == "" {
+			socketPath = address.AddrString()
+		}
+		socketPath, _ = option.ParseSocketPath(socketPath)
+		if socketPath == "" {
+			return nil, E.New("empty socket path")
+		}
+		var dialer net.Dialer
+		if d.dialer4.Dialer.Timeout != 0 {
+			dialer.Timeout = d.dialer4.Dialer.Timeout
+		}
+		conn, err := listener.ListenNetworkNamespace[net.Conn](ctx, d.netns, func() (net.Conn, error) {
+			return dialer.DialContext(ctx, "unix", socketPath)
+		})
+		return d.trackConn(ctx, address, conn, err)
+	}
 	if !address.IsValid() {
 		return nil, E.New("invalid address")
 	} else if address.IsDomain() {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"os"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -89,6 +90,10 @@ func New(
 }
 
 func (l *Listener) Start() error {
+	isSocket := l.listenOptions.IsPath()
+	if isSocket && !common.Contains(l.network, N.NetworkTCP) {
+		return E.New("UDP is not supported for unix domain socket listener")
+	}
 	if common.Contains(l.network, N.NetworkTCP) {
 		_, err := l.ListenTCP()
 		if err != nil {
@@ -96,7 +101,7 @@ func (l *Listener) Start() error {
 		}
 		go l.loopTCPIn()
 	}
-	if common.Contains(l.network, N.NetworkUDP) {
+	if !isSocket && common.Contains(l.network, N.NetworkUDP) {
 		_, err := l.ListenUDP()
 		if err != nil {
 			return E.Errors(err, l.Close())
@@ -109,6 +114,9 @@ func (l *Listener) Start() error {
 		}
 	}
 	if l.setSystemProxy {
+		if isSocket {
+			return E.New("system proxy is not supported for unix domain socket listener")
+		}
 		listenPort := M.SocksaddrFromNet(l.tcpListener.Addr()).Port
 		var listenAddrString string
 		listenAddr := l.listenOptions.Listen.Build(netip.IPv4Unspecified())
@@ -139,10 +147,14 @@ func (l *Listener) Close() error {
 		}
 		err = E.Errors(err, l.systemProxy.Close())
 	}
-	return E.Errors(err, common.Close(
+	closeErr := common.Close(
 		l.tcpListener,
 		common.PtrOrNil(l.udpConn),
-	))
+	)
+	if l.listenOptions.IsPath() {
+		_ = os.Remove(l.listenOptions.ListenPath)
+	}
+	return E.Errors(err, closeErr)
 }
 
 func (l *Listener) TCPListener() net.Listener {

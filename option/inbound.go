@@ -2,6 +2,10 @@ package option
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	C "github.com/sagernet/sing-box/constant"
@@ -27,7 +31,25 @@ type _Inbound struct {
 type Inbound _Inbound
 
 func (h *Inbound) MarshalJSONContext(ctx context.Context) ([]byte, error) {
-	return badjson.MarshallObjectsContext(ctx, (*_Inbound)(h), h.Options)
+	content, err := badjson.MarshallObjectsContext(ctx, (*_Inbound)(h), h.Options)
+	if err != nil {
+		return nil, err
+	}
+	if listenWrapper, isListen := h.Options.(ListenOptionsWrapper); isListen {
+		listenOptions := listenWrapper.TakeListenOptions()
+		if listenOptions.IsPath() {
+			var rawMap map[string]any
+			if err := json.Unmarshal(content, &rawMap); err == nil {
+				if listenOptions.ListenPathMode != 0 && listenOptions.ListenPathMode != 0660 {
+					rawMap["listen"] = fmt.Sprintf("%s,%04o", listenOptions.ListenPath, listenOptions.ListenPathMode)
+				} else {
+					rawMap["listen"] = listenOptions.ListenPath
+				}
+				return json.Marshal(rawMap)
+			}
+		}
+	}
+	return content, nil
 }
 
 func (h *Inbound) UnmarshalJSONContext(ctx context.Context, content []byte) error {
@@ -43,11 +65,35 @@ func (h *Inbound) UnmarshalJSONContext(ctx context.Context, content []byte) erro
 	if !loaded {
 		return E.New("unknown inbound type: ", h.Type)
 	}
-	err = badjson.UnmarshallExcludedContext(ctx, content, (*_Inbound)(h), options)
+
+	contentToUnmarshal := content
+	var socketPath string
+	var socketMode os.FileMode
+	var rawListen struct {
+		Listen *string `json:"listen"`
+	}
+	if json.Unmarshal(content, &rawListen) == nil && rawListen.Listen != nil && IsSocketPath(*rawListen.Listen) {
+		socketPath, socketMode = ParseSocketPath(*rawListen.Listen)
+		var rawMap map[string]any
+		if err := json.Unmarshal(content, &rawMap); err == nil {
+			delete(rawMap, "listen")
+			if newContent, err := json.Marshal(rawMap); err == nil {
+				contentToUnmarshal = newContent
+			}
+		}
+	}
+
+	err = badjson.UnmarshallExcludedContext(ctx, contentToUnmarshal, (*_Inbound)(h), options)
 	if err != nil {
 		return err
 	}
 	if listenWrapper, isListen := options.(ListenOptionsWrapper); isListen {
+		if socketPath != "" {
+			listenOptions := listenWrapper.TakeListenOptions()
+			listenOptions.ListenPath = socketPath
+			listenOptions.ListenPathMode = socketMode
+			listenWrapper.ReplaceListenOptions(listenOptions)
+		}
 		//nolint:staticcheck
 		if listenWrapper.TakeListenOptions().InboundOptions != (InboundOptions{}) {
 			return E.New("legacy inbound fields are deprecated in sing-box 1.11.0 and removed in sing-box 1.13.0, checkout migration: https://sing-box.sagernet.org/migration/#migrate-legacy-inbound-fields-to-rule-actions")
@@ -76,8 +122,48 @@ type InboundOptions struct {
 	UDPDisableDomainUnmapping bool               `json:"udp_disable_domain_unmapping,omitempty" schema:"omit"`
 }
 
+func IsSocketPath(path string) bool {
+	if idx := strings.LastIndex(path, ","); idx != -1 {
+		if _, err := strconv.ParseUint(path[idx+1:], 8, 32); err == nil {
+			path = path[:idx]
+		}
+	}
+	return strings.HasPrefix(path, "/") ||
+		strings.HasPrefix(path, "./") ||
+		strings.HasPrefix(path, "../") ||
+		strings.HasPrefix(path, "unix:") ||
+		strings.HasPrefix(path, "unix//") ||
+		strings.HasSuffix(path, ".sock")
+}
+
+func ParseSocketPath(raw string) (string, os.FileMode) {
+	mode := os.FileMode(0660)
+	if idx := strings.LastIndex(raw, ","); idx != -1 {
+		permStr := raw[idx+1:]
+		if val, err := strconv.ParseUint(permStr, 8, 32); err == nil {
+			mode = os.FileMode(val)
+			raw = raw[:idx]
+		}
+	}
+	switch {
+	case strings.HasPrefix(raw, "unix://"):
+		raw = strings.TrimPrefix(raw, "unix:")
+		raw = "/" + strings.TrimLeft(raw, "/")
+	case strings.HasPrefix(raw, "unix//"):
+		raw = strings.TrimPrefix(raw, "unix")
+		raw = "/" + strings.TrimLeft(raw, "/")
+	case strings.HasPrefix(raw, "unix:"):
+		raw = strings.TrimPrefix(raw, "unix:")
+	case strings.HasPrefix(raw, "//"):
+		raw = "/" + strings.TrimLeft(raw, "/")
+	}
+	return raw, mode
+}
+
 type ListenOptions struct {
 	Listen               *badoption.Addr    `json:"listen,omitempty"`
+	ListenPath           string             `json:"-"`
+	ListenPathMode       os.FileMode        `json:"-"`
 	ListenPort           uint16             `json:"listen_port,omitempty"`
 	BindInterface        string             `json:"bind_interface,omitempty"`
 	RoutingMark          FwMark             `json:"routing_mark,omitempty"`
@@ -100,6 +186,10 @@ type ListenOptions struct {
 	// Legacy inbound fields are rejected since sing-box 1.13.0.
 	//nolint:staticcheck
 	InboundOptions `schema:"omit"`
+}
+
+func (o *ListenOptions) IsPath() bool {
+	return o != nil && o.ListenPath != ""
 }
 
 type UDPNATBehavior uint8

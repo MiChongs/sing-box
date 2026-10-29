@@ -3,6 +3,7 @@ package listener
 import (
 	"net"
 	"net/netip"
+	"os"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +23,9 @@ import (
 )
 
 func (l *Listener) ListenTCP() (net.Listener, error) {
+	if l.listenOptions.IsPath() {
+		return l.listenUnix()
+	}
 	var err error
 	bindAddr := M.SocksaddrFrom(l.listenOptions.Listen.Build(netip.AddrFrom4([4]byte{127, 0, 0, 1})), l.listenOptions.ListenPort)
 	var listenConfig net.ListenConfig
@@ -87,6 +91,32 @@ func (l *Listener) ListenTCP() (net.Listener, error) {
 	return tcpListener, err
 }
 
+func (l *Listener) listenUnix() (net.Listener, error) {
+	socketPath := l.listenOptions.ListenPath
+	_ = os.Remove(socketPath)
+	var listenConfig net.ListenConfig
+	listenConfig.Control = control.Append(listenConfig.Control, l.socketControl)
+	unixListener, err := ListenNetworkNamespace[net.Listener](l.ctx, l.listenOptions.NetNs, func() (net.Listener, error) {
+		return listenConfig.Listen(l.ctx, "unix", socketPath)
+	})
+	if err != nil {
+		return nil, err
+	}
+	mode := l.listenOptions.ListenPathMode
+	if mode == 0 {
+		mode = 0660
+	}
+	_ = os.Chmod(socketPath, mode)
+	if l.listenOptions.ProxyProtocol {
+		unixListener = &proxyproto.Listener{Listener: unixListener, AcceptNoHeader: l.listenOptions.ProxyProtocolAcceptNoHeader}
+	}
+	if !l.disableLog {
+		l.logger.Info("unix socket server started at ", socketPath)
+	}
+	l.tcpListener = unixListener
+	return unixListener, nil
+}
+
 func (l *Listener) loopTCPIn() {
 	tcpListener := l.tcpListener
 	var (
@@ -117,8 +147,22 @@ func (l *Listener) loopTCPIn() {
 		acceptDelay = 0
 		//nolint:staticcheck
 		metadata.InboundDetour = l.listenOptions.Detour
-		metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr()).Unwrap()
-		metadata.OriginDestination = M.SocksaddrFromNet(conn.LocalAddr()).Unwrap()
+
+		remoteAddr := conn.RemoteAddr()
+		if remoteAddr != nil && remoteAddr.Network() == "unix" {
+			metadata.Source = M.SocksaddrFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), 0)
+		} else if remoteAddr != nil {
+			metadata.Source = M.SocksaddrFromNet(remoteAddr).Unwrap()
+		}
+
+		localAddr := conn.LocalAddr()
+		if localAddr != nil && localAddr.Network() == "unix" {
+			metadata.OriginDestination = M.SocksaddrFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), l.listenOptions.ListenPort)
+		} else if localAddr != nil {
+			metadata.OriginDestination = M.SocksaddrFromNet(localAddr).Unwrap()
+		}
+		metadata.Destination = metadata.OriginDestination
+
 		ctx := log.ContextWithNewID(l.ctx)
 		if !l.disableLog {
 			l.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
