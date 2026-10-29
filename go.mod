@@ -223,4 +223,4 @@ require (
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
 
-replace github.com/metacubex/utls => github.com/MiChongs/utls v0.0.0-20261029124831-70ad1909c522
+replace github.com/metacubex/utls => github.com/MiChongs/utls v0.0.0-20261029130743-8151191f6798

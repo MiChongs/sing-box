@@ -225,6 +225,28 @@ type InboundRealityOptions struct {
 	MaxTimeDifference badoption.Duration             `json:"max_time_difference,omitempty"`
 	MLDSA65Seed       string                         `json:"mldsa65_seed,omitempty"`
 	KeyShare          string                         `json:"key_share,omitempty" enum:"hybrid,classical"`
+	Fallback          *InboundRealityFallbackOptions `json:"fallback,omitempty"`
+}
+
+type InboundRealityFallbackOptions struct {
+	Enabled        *bool              `json:"enabled,omitempty"`
+	Server         string             `json:"server,omitempty"`
+	ServerPort     uint16             `json:"server_port,omitempty"`
+	Timeout        badoption.Duration `json:"timeout,omitempty"`
+	QOS            string             `json:"qos,omitempty"`
+	MaxConnections string             `json:"max_conn,omitempty"`
+}
+
+type RealityFallbackOptions = InboundRealityFallbackOptions
+
+func (o *InboundRealityFallbackOptions) IsEnabled() bool {
+	if o == nil {
+		return false
+	}
+	if o.Enabled == nil {
+		return true
+	}
+	return *o.Enabled
 }
 
 type InboundRealityHandshakeOptions struct {

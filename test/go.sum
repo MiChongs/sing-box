@@ -12,8 +12,8 @@ github.com/MiChongs/sing-ebpf v0.1.0-alpha.26 h1:SQPIrYphVMP/DFy3mL1F6SfoyXA6C+i
 github.com/MiChongs/sing-ebpf v0.1.0-alpha.26/go.mod h1:08HZT0mFSS7+0q/fegHpJna8FuUTrujnMRMfEM9vHQ4=
 github.com/MiChongs/sing-quic v0.0.0-20261025191239-19d3492f0dc5 h1:8sB+K4BAY6ePN7n7FjoUb8UQsxxjPGBaqY46wPqL19A=
 github.com/MiChongs/sing-quic v0.0.0-20261025191239-19d3492f0dc5/go.mod h1:uD2/JolCYtQLpyDzvmmpH3ay54JSJ1U6UM8yoOYSScY=
-github.com/MiChongs/utls v0.0.0-20261029124831-70ad1909c522 h1:lr8fxL4ucVOIPJZx8t4zPpVu9r4WYAoLltGJucZFGlg=
-github.com/MiChongs/utls v0.0.0-20261029124831-70ad1909c522/go.mod h1:xEJGL9scaZpSQlFZCiwy6zJPp2QxJy7k96xi5gVId0s=
+github.com/MiChongs/utls v0.0.0-20261029130743-8151191f6798 h1:7BMoIonm3+z4762wevNawmYZvUo4S38G/CL/5nZ7N5Y=
+github.com/MiChongs/utls v0.0.0-20261029130743-8151191f6798/go.mod h1:xEJGL9scaZpSQlFZCiwy6zJPp2QxJy7k96xi5gVId0s=
 github.com/Microsoft/go-winio v0.6.1 h1:9/kr64B9VUZrLm5YYwbGtUJnMgqWVOdUAXu6Migciow=
 github.com/Microsoft/go-winio v0.6.1/go.mod h1:LRdKpFKfdobln8UmuiYcKPot9D2v6svN5+sAH+4kjUM=
 github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=

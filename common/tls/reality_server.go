@@ -7,12 +7,15 @@ import (
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/common/dialer"
+	"github.com/sagernet/sing-box/common/ptls"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -31,6 +34,7 @@ type RealityServerConfig struct {
 	config           *utls.RealityConfig
 	handshakeTimeout time.Duration
 	rejectUnknownSNI bool
+	logger           log.ContextLogger
 }
 
 func NewRealityServer(ctx context.Context, logger log.ContextLogger, options option.InboundTLSOptions) (ServerConfig, error) {
@@ -161,6 +165,14 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 		return handshakeDialer.DialContext(ctx, network, M.ParseSocksaddr(addr))
 	}
 
+	if options.Reality.Fallback != nil && options.Reality.Fallback.IsEnabled() {
+		fallbackOptions, err := newRealityFallbackOptions(options.Reality.Fallback)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.Fallback = fallbackOptions
+	}
+
 	if options.ECH != nil && options.ECH.Enabled {
 		return nil, E.New("Reality is conflict with ECH")
 	}
@@ -174,6 +186,7 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 		config:           &tlsConfig,
 		handshakeTimeout: handshakeTimeout,
 		rejectUnknownSNI: options.RejectUnknownSNI,
+		logger:           logger,
 	}
 	if options.KernelTx || options.KernelRx {
 		if !C.IsLinux {
@@ -237,6 +250,12 @@ func (c *RealityServerConfig) Server(conn net.Conn) (Conn, error) {
 func (c *RealityServerConfig) ServerHandshake(ctx context.Context, conn net.Conn) (Conn, error) {
 	tlsConn, err := utls.RealityServer(ctx, conn, c.config)
 	if err != nil {
+		if errors.Is(err, utls.ErrFallbackHandled) {
+			if c.logger != nil {
+				c.logger.DebugContext(ctx, "reality fallback completed")
+			}
+			return nil, net.ErrClosed
+		}
 		return nil, err
 	}
 	if c.rejectUnknownSNI {
@@ -259,6 +278,7 @@ func (c *RealityServerConfig) Clone() Config {
 		config:           c.config.Clone(),
 		handshakeTimeout: c.handshakeTimeout,
 		rejectUnknownSNI: c.rejectUnknownSNI,
+		logger:           c.logger,
 	}
 }
 
@@ -338,4 +358,66 @@ func parseRealityMldsa65Seed(seed string) (*mldsa65.PrivateKey, error) {
 	default:
 		return nil, E.New("invalid mldsa65_seed length: expected ", mldsa65.SeedSize, " (seed) or ", mldsa65.PrivateKeySize, " bytes, got ", len(rawKey))
 	}
+}
+
+// newRealityFallbackOptions 解析 reality.fallback：server 为空时复用伪装目标，可为 UDS 路径；
+// qos 为每个方向的带宽上限（默认 20kb/s）；max_conn 为每秒允许回落的新连接数（默认 10，
+// 支持 "10"、"10/s"、"600/m"、"3600/h"）；timeout 为回落链路的空闲超时（默认 30s）。
+func newRealityFallbackOptions(options *option.InboundRealityFallbackOptions) (*utls.RealityFallbackOptions, error) {
+	isUnixSocket := strings.HasPrefix(options.Server, "/") || strings.HasPrefix(options.Server, "unix:")
+	if options.Server != "" && !isUnixSocket && options.ServerPort == 0 {
+		return nil, E.New("reality fallback: server_port is required when server is specified")
+	}
+	idleTimeout := options.Timeout.Build()
+	if idleTimeout <= 0 {
+		idleTimeout = 30 * time.Second
+	}
+	qos := options.QOS
+	if qos == "" {
+		qos = "20kb/s"
+	}
+	bytesPerSec, err := ptls.ParseBandwidth(qos)
+	if err != nil {
+		return nil, E.Cause(err, "reality fallback: parse qos")
+	}
+	maxConnections := options.MaxConnections
+	if maxConnections == "" {
+		maxConnections = "10"
+	}
+	connectionsPerSec, err := parseRealityFallbackRate(maxConnections)
+	if err != nil {
+		return nil, E.Cause(err, "reality fallback: parse max_conn")
+	}
+	return &utls.RealityFallbackOptions{
+		Server:            options.Server,
+		ServerPort:        options.ServerPort,
+		IdleTimeout:       idleTimeout,
+		BytesPerSec:       uint64(bytesPerSec),
+		ConnectionsPerSec: connectionsPerSec,
+	}, nil
+}
+
+func parseRealityFallbackRate(rate string) (float64, error) {
+	rate = strings.TrimSpace(strings.ToLower(rate))
+	interval := 1.0
+	if count, unit, found := strings.Cut(rate, "/"); found {
+		rate = strings.TrimSpace(count)
+		switch strings.TrimSpace(unit) {
+		case "s", "sec", "second":
+		case "m", "min", "minute":
+			interval = 60
+		case "h", "hour":
+			interval = 3600
+		default:
+			return 0, E.New("unknown rate unit: ", unit)
+		}
+	}
+	count, err := strconv.ParseFloat(rate, 64)
+	if err != nil {
+		return 0, err
+	}
+	if count < 0 {
+		return 0, E.New("negative rate: ", rate)
+	}
+	return count / interval, nil
 }
