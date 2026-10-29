@@ -206,7 +206,7 @@ func (m *Manager) ConnectionsLen() int {
 }
 
 func (m *Manager) Connections() []*TrackerMetadata {
-	var connections []*TrackerMetadata
+	connections := make([]*TrackerMetadata, 0, m.connections.Len())
 	m.connections.Range(func(_ uuid.UUID, tracker Tracker) bool {
 		connections = append(connections, tracker.Metadata())
 		return true

@@ -5,10 +5,10 @@ import (
 	"context"
 	"net"
 	"net/http"
-	"runtime"
 	"runtime/debug"
 	"time"
 
+	"github.com/sagernet/sing-box/common/memstat"
 	"github.com/sagernet/sing/common/json"
 	"github.com/sagernet/ws"
 	"github.com/sagernet/ws/wsutil"
@@ -36,12 +36,6 @@ func (s *Server) setupMetaAPI(r chi.Router) {
 type Memory struct {
 	Inuse   uint64 `json:"inuse"`
 	OSLimit uint64 `json:"oslimit"` // maybe we need it in the future
-}
-
-func inuseMemory() uint64 {
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-	return memStats.StackInuse + memStats.HeapInuse + memStats.HeapIdle - memStats.HeapReleased
 }
 
 func memory(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
@@ -74,7 +68,7 @@ func memory(ctx context.Context) func(w http.ResponseWriter, r *http.Request) {
 			}
 			buf.Reset()
 
-			inuse := inuseMemory()
+			inuse := memstat.Inuse()
 
 			// make chat.js begin with zero
 			// this is shit var,but we need output 0 for first time

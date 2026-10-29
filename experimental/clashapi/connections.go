@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/memstat"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/protocol/group"
@@ -37,25 +38,71 @@ func connectionRouter(ctx context.Context, network adapter.NetworkManager, traff
 	return r
 }
 
-func connectionsSnapshot(trafficManager *trafficcontrol.Manager) render.M {
+// connectionsSnapshotObject and connectionJSON encode through cached struct
+// encoders. The dashboard polls this every second, and map-based encoding
+// sorted and boxed every field of every connection on each tick.
+type connectionsSnapshotObject struct {
+	DownloadTotal int64            `json:"downloadTotal"`
+	UploadTotal   int64            `json:"uploadTotal"`
+	Connections   []connectionJSON `json:"connections"`
+	Memory        uint64           `json:"memory"`
+}
+
+type connectionJSON struct {
+	ID          uuid.UUID              `json:"id"`
+	Metadata    connectionMetadataJSON `json:"metadata"`
+	Upload      int64                  `json:"upload"`
+	Download    int64                  `json:"download"`
+	Start       time.Time              `json:"start"`
+	Chains      []string               `json:"chains"`
+	Rule        string                 `json:"rule"`
+	RulePayload string                 `json:"rulePayload"`
+}
+
+type connectionMetadataJSON struct {
+	Network         string     `json:"network"`
+	Type            string     `json:"type"`
+	SourceIP        netip.Addr `json:"sourceIP"`
+	DestinationIP   netip.Addr `json:"destinationIP"`
+	SourcePort      string     `json:"sourcePort"`
+	DestinationPort string     `json:"destinationPort"`
+	Host            string     `json:"host"`
+	SniffHost       string     `json:"sniffHost"`
+	DNSMode         string     `json:"dnsMode"`
+	ProcessPath     string     `json:"processPath"`
+}
+
+// connectionsSnapshot reuses the connection slice of a previous snapshot of
+// the same stream.
+func connectionsSnapshot(trafficManager *trafficcontrol.Manager, connections []connectionJSON) connectionsSnapshotObject {
 	uplinkTotal, downlinkTotal := trafficManager.Total()
-	connections := common.Filter(trafficManager.Connections(), func(metadata *trafficcontrol.TrackerMetadata) bool {
-		return metadata.OutboundType != C.TypeDNS
-	})
-	return render.M{
-		"downloadTotal": downlinkTotal,
-		"uploadTotal":   uplinkTotal,
-		"connections": common.Map(connections, func(metadata *trafficcontrol.TrackerMetadata) connectionObject {
-			return connectionObject(*metadata)
-		}),
-		"memory": inuseMemory(),
+	clear(connections)
+	connections = connections[:0]
+	for _, metadata := range trafficManager.Connections() {
+		if metadata.OutboundType == C.TypeDNS {
+			continue
+		}
+		connections = append(connections, (*connectionObject)(metadata).toJSON())
+	}
+	if connections == nil {
+		connections = []connectionJSON{}
+	}
+	return connectionsSnapshotObject{
+		DownloadTotal: downlinkTotal,
+		UploadTotal:   uplinkTotal,
+		Connections:   connections,
+		Memory:        memstat.Inuse(),
 	}
 }
 
 type connectionObject trafficcontrol.TrackerMetadata
 
-func (c connectionObject) MarshalJSON() ([]byte, error) {
-	metadata := trafficcontrol.TrackerMetadata(c)
+func (c *connectionObject) MarshalJSON() ([]byte, error) {
+	return json.Marshal(c.toJSON())
+}
+
+func (c *connectionObject) toJSON() connectionJSON {
+	metadata := (*trafficcontrol.TrackerMetadata)(c)
 	var inbound string
 	if c.Metadata.Inbound != "" {
 		inbound = c.Metadata.InboundType + "/" + c.Metadata.Inbound
@@ -96,33 +143,33 @@ func (c connectionObject) MarshalJSON() ([]byte, error) {
 	if c.Rule != nil {
 		rule, rulePayload = R.ClashRule(c.Rule)
 	}
-	return json.Marshal(map[string]any{
-		"id": c.ID,
-		"metadata": map[string]any{
-			"network":         c.Metadata.Network,
-			"type":            inbound,
-			"sourceIP":        c.Metadata.Source.Addr,
-			"destinationIP":   destinationAddr,
-			"sourcePort":      F.ToString(c.Metadata.Source.Port),
-			"destinationPort": F.ToString(c.Metadata.Destination.Port),
-			"host":            domain,
-			"sniffHost":       c.Metadata.SniffHost,
-			"dnsMode":         "normal",
-			"processPath":     processPath,
+	return connectionJSON{
+		ID: c.ID,
+		Metadata: connectionMetadataJSON{
+			Network:         c.Metadata.Network,
+			Type:            inbound,
+			SourceIP:        c.Metadata.Source.Addr,
+			DestinationIP:   destinationAddr,
+			SourcePort:      strconv.FormatUint(uint64(c.Metadata.Source.Port), 10),
+			DestinationPort: strconv.FormatUint(uint64(c.Metadata.Destination.Port), 10),
+			Host:            domain,
+			SniffHost:       c.Metadata.SniffHost,
+			DNSMode:         "normal",
+			ProcessPath:     processPath,
 		},
-		"upload":      c.Upload.Load(),
-		"download":    c.Download.Load(),
-		"start":       c.CreatedAt,
-		"chains":      metadata.ResolvedChain(),
-		"rule":        rule,
-		"rulePayload": rulePayload,
-	})
+		Upload:      c.Upload.Load(),
+		Download:    c.Download.Load(),
+		Start:       c.CreatedAt,
+		Chains:      metadata.ResolvedChain(),
+		Rule:        rule,
+		RulePayload: rulePayload,
+	}
 }
 
 func getConnections(ctx context.Context, trafficManager *trafficcontrol.Manager) func(w http.ResponseWriter, r *http.Request) {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Upgrade") != "websocket" {
-			render.JSON(w, r, connectionsSnapshot(trafficManager))
+			render.JSON(w, r, connectionsSnapshot(trafficManager, nil))
 			return
 		}
 
@@ -146,9 +193,12 @@ func getConnections(ctx context.Context, trafficManager *trafficcontrol.Manager)
 		}
 
 		buf := &bytes.Buffer{}
+		var connections []connectionJSON
 		sendSnapshot := func() error {
 			buf.Reset()
-			encodeErr := json.NewEncoder(buf).Encode(connectionsSnapshot(trafficManager))
+			snapshot := connectionsSnapshot(trafficManager, connections)
+			connections = snapshot.Connections
+			encodeErr := json.NewEncoder(buf).Encode(snapshot)
 			if encodeErr != nil {
 				return encodeErr
 			}

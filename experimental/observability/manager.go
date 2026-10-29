@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/memstat"
 	"github.com/sagernet/sing-box/common/trafficcontrol"
 	"github.com/sagernet/sing-box/common/urltest"
 	C "github.com/sagernet/sing-box/constant"
@@ -300,7 +301,7 @@ func (m *Manager) status() Status {
 	return Status{
 		Version:               C.Version,
 		UptimeSeconds:         time.Since(m.startedAt).Seconds(),
-		MemoryBytes:           inuseMemory(),
+		MemoryBytes:           memstat.Inuse(),
 		Goroutines:            runtime.NumGoroutine(),
 		ActiveConnections:     m.traffic.ConnectionsLen(),
 		RecentConnections:     m.recentConnectionCount(m.recentTTL),
@@ -508,10 +509,4 @@ func dimensionValue(metadata trafficcontrol.TrackerMetadata, name string) string
 		return metadata.Metadata.User
 	}
 	return ""
-}
-
-func inuseMemory() uint64 {
-	var memory runtime.MemStats
-	runtime.ReadMemStats(&memory)
-	return memory.StackInuse + memory.HeapInuse + memory.HeapIdle - memory.HeapReleased
 }
