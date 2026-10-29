@@ -57,7 +57,7 @@ func TestOverrideAnyTLSOptions(t *testing.T) {
 					ClientMetadata: testCase.clientMetadata,
 					DisableReuse:   testCase.disableReuse,
 				},
-			}}, nil, nil, testCase.override, nil, "")
+			}}, nil, nil, testCase.override, nil, nil, "")
 			options := outbounds[0].Options.(*option.AnyTLSOutboundOptions)
 			require.Equal(t, testCase.expectedClientMetadata, options.ClientMetadata)
 			require.Equal(t, testCase.expectedDisableReuse, options.DisableReuse)
@@ -74,7 +74,7 @@ func TestOverrideDialerKeepsDomainResolver(t *testing.T) {
 		Options: &option.SOCKSOutboundOptions{
 			DialerOptions: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{DomainResolver: resolver}},
 		},
-	}}, &option.OverrideDialerOptions{Detour: &detour}, nil, nil, []string{"node"}, "provider")
+	}}, &option.OverrideDialerOptions{Detour: &detour}, nil, nil, nil, []string{"node"}, "provider")
 	options := outbounds[0].Options.(*option.SOCKSOutboundOptions)
 	require.Equal(t, "front", options.Detour)
 	require.Equal(t, resolver, options.DomainResolver, "override without domain_resolver must keep the node's own")
@@ -85,6 +85,6 @@ func TestOverrideDialerKeepsDomainResolver(t *testing.T) {
 		Options: &option.SOCKSOutboundOptions{
 			DialerOptions: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{DomainResolver: resolver}},
 		},
-	}}, &option.OverrideDialerOptions{DomainResolver: override}, nil, nil, nil, "")
+	}}, &option.OverrideDialerOptions{DomainResolver: override}, nil, nil, nil, nil, "")
 	require.Equal(t, override, outbounds[0].Options.(*option.SOCKSOutboundOptions).DomainResolver)
 }

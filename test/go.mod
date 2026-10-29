@@ -55,6 +55,7 @@ require (
 	github.com/caddyserver/zerossl v0.1.5 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cilium/ebpf v0.22.1-0.20260910105759-60e81073fdc6 // indirect
+	github.com/cloudflare/circl v1.6.1 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/coreos/go-iptables v0.7.1-0.20240112124308-65c67c9f46e6 // indirect
 	github.com/coreos/go-oidc/v3 v3.17.0 // indirect
@@ -231,3 +232,5 @@ require (
 	lukechampine.com/blake3 v1.3.0 // indirect
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
+
+replace github.com/metacubex/utls => github.com/MiChongs/utls v0.0.0-20261029124831-70ad1909c522

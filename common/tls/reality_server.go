@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/sagernet/sing-box/common/dialer"
@@ -20,6 +21,7 @@ import (
 	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/sing/common/ntp"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	utls "github.com/metacubex/utls"
 )
 
@@ -113,20 +115,39 @@ func NewRealityServer(ctx context.Context, logger log.ContextLogger, options opt
 		return nil, E.New("invalid private key")
 	}
 	tlsConfig.PrivateKey = privateKey
-	tlsConfig.MaxTimeDiff = time.Duration(options.Reality.MaxTimeDifference)
+
+	switch options.Reality.KeyShare {
+	case C.RealityKeyShareDefault, C.RealityKeyShareHybrid:
+	case C.RealityKeyShareClassical:
+		tlsConfig.ClassicalKeyShare = true
+	default:
+		return nil, E.New("unknown reality key_share: ", options.Reality.KeyShare, " (expected \"hybrid\" or \"classical\")")
+	}
+
+	if options.Reality.MaxTimeDifference > 0 {
+		tlsConfig.MaxTimeDiff = options.Reality.MaxTimeDifference.Build()
+	}
+
+	if options.Reality.MLDSA65Seed != "" {
+		mldsa65Key, err := parseRealityMldsa65Seed(options.Reality.MLDSA65Seed)
+		if err != nil {
+			return nil, err
+		}
+		tlsConfig.Mldsa65Key = mldsa65Key
+	}
 
 	tlsConfig.ShortIds = make(map[[8]byte]bool)
 	if len(options.Reality.ShortID) == 0 {
 		tlsConfig.ShortIds[[8]byte{0}] = true
 	} else {
 		for i, shortIDString := range options.Reality.ShortID {
+			if len(shortIDString) > 16 || len(shortIDString)%2 != 0 {
+				return nil, E.New("invalid short_id[", i, "]: ", shortIDString)
+			}
 			var shortID [8]byte
-			decodedLen, err := hex.Decode(shortID[:], []byte(shortIDString))
+			_, err := hex.Decode(shortID[:], []byte(shortIDString))
 			if err != nil {
 				return nil, E.Cause(err, "decode short_id[", i, "]: ", shortIDString)
-			}
-			if decodedLen > 8 {
-				return nil, E.New("invalid short_id[", i, "]: ", shortIDString)
 			}
 			tlsConfig.ShortIds[shortID] = true
 		}
@@ -201,6 +222,7 @@ func (c *RealityServerConfig) Client(conn net.Conn) (Conn, error) {
 }
 
 func (c *RealityServerConfig) Start() error {
+	utls.DetectPostHandshakeRecordsLens(c.config)
 	return nil
 }
 
@@ -281,4 +303,39 @@ func (c *realityConnWrapper) ReaderReplaceable() bool {
 
 func (c *realityConnWrapper) WriterReplaceable() bool {
 	return false
+}
+
+// parseRealityMldsa65Seed 解析 mldsa65_seed：32 字节种子（与 xray mldsa65 输出一致）或
+// 4032 字节完整私钥，接受 base64（标准 / URL）与 hex。
+func parseRealityMldsa65Seed(seed string) (*mldsa65.PrivateKey, error) {
+	keyStr := strings.TrimSpace(seed)
+	var rawKey []byte
+	if len(keyStr) == 2*mldsa65.SeedSize || len(keyStr) == 2*mldsa65.PrivateKeySize {
+		rawKey, _ = hex.DecodeString(keyStr)
+	}
+	if len(rawKey) != mldsa65.SeedSize && len(rawKey) != mldsa65.PrivateKeySize {
+		unpadded := strings.TrimRight(keyStr, "=")
+		var err error
+		rawKey, err = base64.RawURLEncoding.DecodeString(unpadded)
+		if err != nil {
+			rawKey, err = base64.RawStdEncoding.DecodeString(unpadded)
+			if err != nil {
+				return nil, E.Cause(err, "decode mldsa65_seed")
+			}
+		}
+	}
+	switch len(rawKey) {
+	case mldsa65.SeedSize:
+		_, privateKey := mldsa65.NewKeyFromSeed((*[mldsa65.SeedSize]byte)(rawKey))
+		return privateKey, nil
+	case mldsa65.PrivateKeySize:
+		privateKey := new(mldsa65.PrivateKey)
+		err := privateKey.UnmarshalBinary(rawKey)
+		if err != nil {
+			return nil, E.Cause(err, "parse mldsa65_seed")
+		}
+		return privateKey, nil
+	default:
+		return nil, E.New("invalid mldsa65_seed length: expected ", mldsa65.SeedSize, " (seed) or ", mldsa65.PrivateKeySize, " bytes, got ", len(rawKey))
+	}
 }

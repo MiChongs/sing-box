@@ -8,6 +8,7 @@ require (
 	github.com/anthropics/anthropic-sdk-go v1.26.0
 	github.com/caddyserver/certmagic v0.25.3-0.20260421143802-60d9d8b415d6
 	github.com/caddyserver/zerossl v0.1.5
+	github.com/cloudflare/circl v1.6.1
 	github.com/coder/websocket v1.8.14
 	github.com/creack/pty v1.1.24
 	github.com/cretz/bine v0.2.0
@@ -221,3 +222,5 @@ require (
 	lukechampine.com/blake3 v1.3.0
 	zombiezen.com/go/capnproto2 v2.18.2+incompatible // indirect
 )
+
+replace github.com/metacubex/utls => github.com/MiChongs/utls v0.0.0-20261029124831-70ad1909c522

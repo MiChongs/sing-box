@@ -72,9 +72,10 @@ type ProviderRemote struct {
 	exclude           *regexp.Regexp
 	include           *regexp.Regexp
 
-	overrideDialer *option.OverrideDialerOptions
-	overrideTLS    *option.OverrideTLSOptions
-	overrideAnyTLS *option.OverrideAnyTLSOptions
+	overrideDialer    *option.OverrideDialerOptions
+	overrideTLS       *option.OverrideTLSOptions
+	overrideAnyTLS    *option.OverrideAnyTLSOptions
+	overrideTransport *option.OverrideTransportOptions
 }
 
 func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, options option.ProviderRemoteOptions) (adapter.Provider, error) {
@@ -148,7 +149,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		httpClientOptions: options.HTTPClient,
 		url:               url,
 		urlHash:           sha256.Sum256([]byte(url)),
-		optionsHash:       processOptionsHash(include, exclude, options.OverrideDialer, options.OverrideTLS, options.OverrideAnyTLS),
+		optionsHash:       processOptionsHash(include, exclude, options.OverrideDialer, options.OverrideTLS, options.OverrideAnyTLS, options.OverrideTransport),
 		path:              path,
 		initialPath:       initialPath,
 		userAgent:         userAgent,
@@ -156,9 +157,10 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		exclude:           exclude,
 		include:           include,
 
-		overrideDialer: options.OverrideDialer,
-		overrideTLS:    options.OverrideTLS,
-		overrideAnyTLS: options.OverrideAnyTLS,
+		overrideDialer:    options.OverrideDialer,
+		overrideTLS:       options.OverrideTLS,
+		overrideAnyTLS:    options.OverrideAnyTLS,
+		overrideTransport: options.OverrideTransport,
 
 		//nolint:staticcheck
 		downloadDetour: options.DownloadDetour,
@@ -585,7 +587,7 @@ func (s *ProviderRemote) saveCacheFile(hasInfo bool, info adapter.SubscriptionIn
 }
 
 func (s *ProviderRemote) updateProviderFromContent(content string) error {
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(parser.ContextWithWarnHandler(s.ctx, s.logger.Warn), content, s.overrideDialer, s.overrideTLS, s.overrideAnyTLS, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(parser.ContextWithWarnHandler(s.ctx, s.logger.Warn), content, s.overrideDialer, s.overrideTLS, s.overrideAnyTLS, s.overrideTransport, s.Tag())
 	if err != nil {
 		return err
 	}
@@ -620,7 +622,7 @@ func (s *ProviderRemote) cacheKey() []byte {
 	return append(key, s.optionsHash[:]...)
 }
 
-func processOptionsHash(include, exclude *regexp.Regexp, overrideDialer *option.OverrideDialerOptions, overrideTLS *option.OverrideTLSOptions, overrideAnyTLS *option.OverrideAnyTLSOptions) [32]byte {
+func processOptionsHash(include, exclude *regexp.Regexp, overrideDialer *option.OverrideDialerOptions, overrideTLS *option.OverrideTLSOptions, overrideAnyTLS *option.OverrideAnyTLSOptions, overrideTransport *option.OverrideTransportOptions) [32]byte {
 	regexString := func(it *regexp.Regexp) string {
 		if it == nil {
 			return ""
@@ -628,14 +630,15 @@ func processOptionsHash(include, exclude *regexp.Regexp, overrideDialer *option.
 		return it.String()
 	}
 	content, err := json.Marshal(struct {
-		Include        string                        `json:"include"`
-		Exclude        string                        `json:"exclude"`
-		OverrideDialer *option.OverrideDialerOptions `json:"override_dialer"`
-		OverrideTLS    *option.OverrideTLSOptions    `json:"override_tls"`
-		OverrideAnyTLS *option.OverrideAnyTLSOptions `json:"override_anytls"`
-	}{regexString(include), regexString(exclude), overrideDialer, overrideTLS, overrideAnyTLS})
+		Include           string                           `json:"include"`
+		Exclude           string                           `json:"exclude"`
+		OverrideDialer    *option.OverrideDialerOptions    `json:"override_dialer"`
+		OverrideTLS       *option.OverrideTLSOptions       `json:"override_tls"`
+		OverrideAnyTLS    *option.OverrideAnyTLSOptions    `json:"override_anytls"`
+		OverrideTransport *option.OverrideTransportOptions `json:"override_transport,omitempty"`
+	}{regexString(include), regexString(exclude), overrideDialer, overrideTLS, overrideAnyTLS, overrideTransport})
 	if err != nil {
-		content = []byte(fmt.Sprintf("%s\x00%s\x00%+v\x00%+v\x00%+v", regexString(include), regexString(exclude), overrideDialer, overrideTLS, overrideAnyTLS))
+		content = []byte(fmt.Sprintf("%s\x00%s\x00%+v\x00%+v\x00%+v\x00%+v", regexString(include), regexString(exclude), overrideDialer, overrideTLS, overrideAnyTLS, overrideTransport))
 	}
 	return sha256.Sum256(content)
 }

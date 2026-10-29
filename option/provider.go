@@ -63,9 +63,10 @@ type ProviderLocalOptions struct {
 	Path        string                     `json:"path"`
 	HealthCheck ProviderHealthCheckOptions `json:"health_check,omitempty"`
 
-	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
-	OverrideTLS    *OverrideTLSOptions    `json:"override_tls,omitempty"`
-	OverrideAnyTLS *OverrideAnyTLSOptions `json:"override_anytls,omitempty"`
+	OverrideDialer    *OverrideDialerOptions    `json:"override_dialer,omitempty"`
+	OverrideTLS       *OverrideTLSOptions       `json:"override_tls,omitempty"`
+	OverrideAnyTLS    *OverrideAnyTLSOptions    `json:"override_anytls,omitempty"`
+	OverrideTransport *OverrideTransportOptions `json:"override_transport,omitempty"`
 }
 
 type ProviderRemoteOptions struct {
@@ -80,9 +81,10 @@ type ProviderRemoteOptions struct {
 	Include     *badoption.Regexp          `json:"include,omitempty"`
 	HealthCheck ProviderHealthCheckOptions `json:"health_check,omitempty"`
 
-	OverrideDialer *OverrideDialerOptions `json:"override_dialer,omitempty"`
-	OverrideTLS    *OverrideTLSOptions    `json:"override_tls,omitempty"`
-	OverrideAnyTLS *OverrideAnyTLSOptions `json:"override_anytls,omitempty"`
+	OverrideDialer    *OverrideDialerOptions    `json:"override_dialer,omitempty"`
+	OverrideTLS       *OverrideTLSOptions       `json:"override_tls,omitempty"`
+	OverrideAnyTLS    *OverrideAnyTLSOptions    `json:"override_anytls,omitempty"`
+	OverrideTransport *OverrideTransportOptions `json:"override_transport,omitempty"`
 
 	// Deprecated: use http_client instead
 	DownloadDetour string `json:"download_detour,omitempty" reference:"outbound" schema:"omit"`
@@ -251,4 +253,11 @@ type OverrideRealityOptions struct {
 	Enabled   *bool   `json:"enabled,omitempty"`
 	PublicKey *string `json:"public_key,omitempty"`
 	ShortID   *string `json:"short_id,omitempty"`
+	KeyShare  *string `json:"key_share,omitempty"`
+	Version   *string `json:"version,omitempty"`
+}
+
+type OverrideTransportOptions struct {
+	XHTTPDownloadEnabled *bool   `json:"xhttp_download_enabled,omitempty"`
+	XHTTPDownloadDetour  *string `json:"xhttp_download_detour,omitempty" reference:"outbound"`
 }

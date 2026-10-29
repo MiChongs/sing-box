@@ -12,6 +12,8 @@ github.com/MiChongs/sing-ebpf v0.1.0-alpha.26 h1:SQPIrYphVMP/DFy3mL1F6SfoyXA6C+i
 github.com/MiChongs/sing-ebpf v0.1.0-alpha.26/go.mod h1:08HZT0mFSS7+0q/fegHpJna8FuUTrujnMRMfEM9vHQ4=
 github.com/MiChongs/sing-quic v0.0.0-20261025191239-19d3492f0dc5 h1:8sB+K4BAY6ePN7n7FjoUb8UQsxxjPGBaqY46wPqL19A=
 github.com/MiChongs/sing-quic v0.0.0-20261025191239-19d3492f0dc5/go.mod h1:uD2/JolCYtQLpyDzvmmpH3ay54JSJ1U6UM8yoOYSScY=
+github.com/MiChongs/utls v0.0.0-20261029124831-70ad1909c522 h1:lr8fxL4ucVOIPJZx8t4zPpVu9r4WYAoLltGJucZFGlg=
+github.com/MiChongs/utls v0.0.0-20261029124831-70ad1909c522/go.mod h1:xEJGL9scaZpSQlFZCiwy6zJPp2QxJy7k96xi5gVId0s=
 github.com/Microsoft/go-winio v0.6.1 h1:9/kr64B9VUZrLm5YYwbGtUJnMgqWVOdUAXu6Migciow=
 github.com/Microsoft/go-winio v0.6.1/go.mod h1:LRdKpFKfdobln8UmuiYcKPot9D2v6svN5+sAH+4kjUM=
 github.com/RyuaNerin/go-krypto v1.3.0 h1:smavTzSMAx8iuVlGb4pEwl9MD2qicqMzuXR2QWp2/Pg=
@@ -46,6 +48,8 @@ github.com/cespare/xxhash/v2 v2.3.0/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XL
 github.com/cilium/ebpf v0.22.1-0.20260910105759-60e81073fdc6 h1:BdLBpmxO6ShIDtGwvPrTeEBF1YUXbtADExQa+J7jKnE=
 github.com/cilium/ebpf v0.22.1-0.20260910105759-60e81073fdc6/go.mod h1:aEqGNOYbSL1ezCvpK7qm/O9C8RTzU/aNYHycwduDkrU=
 github.com/client9/misspell v0.3.4/go.mod h1:qj6jICC3Q7zFZvVWo7KLAzC3yx5G7kyvSDkc90ppPyw=
+github.com/cloudflare/circl v1.6.1 h1:zqIqSPIndyBh1bjLVVDHMPpVKqp8Su/V+6MeDzzQBQ0=
+github.com/cloudflare/circl v1.6.1/go.mod h1:uddAzsPgqdMAYatqJ0lsjX1oECcQLIlRpzZh3pJrofs=
 github.com/cncf/udpa/go v0.0.0-20191209042840-269d4d468f6f/go.mod h1:M8M6+tZqaGXZJjfX53e64911xZQV5JYwmTeXPW+k8Sc=
 github.com/coder/websocket v1.8.14 h1:9L0p0iKiNOibykf283eHkKUHHrpG7f65OE3BhhO7v9g=
 github.com/coder/websocket v1.8.14/go.mod h1:NX3SzP+inril6yawo5CQXx8+fk145lPDC6pumgx0mVg=
@@ -221,8 +225,6 @@ github.com/mdlayher/socket v0.6.0 h1:ScZPaAGyO1icQnbFrhPM8mnXyMu9qukC1K4ZoM2IQKU
 github.com/mdlayher/socket v0.6.0/go.mod h1:q7vozUAnxSqnjHc12Fik5yUKIzfZ8ITCfMkhOtE9z18=
 github.com/mdlayher/wifi v0.9.0 h1:d5mmqw9S2U4f95dcW5wnnUagpI6GJh328/AchVSP4ko=
 github.com/mdlayher/wifi v0.9.0/go.mod h1:Bfkrz+VncrVPaOLcFG/bR9tSY2PbmYNQicWvAZlUZlI=
-github.com/metacubex/utls v1.8.7 h1:Cp+yWkNTFkSihETgGWq34hlVFds5HpYWVOR1xovUVTs=
-github.com/metacubex/utls v1.8.7/go.mod h1:kncGGVhFaoGn5M3pFe3SXhZCzsbCJayNOH4UEqTKTko=
 github.com/metacubex/wazero v0.0.0-20260628025728-9ae6bdcf2a7d h1:UMFI+kdp0jA8s9tC7oul0pWeTW6s8lnm0dD5PT+RY14=
 github.com/metacubex/wazero v0.0.0-20260628025728-9ae6bdcf2a7d/go.mod h1:p48xp436h1oGfoXuEnVONeDhTW+E2UpY94GAVxA62oI=
 github.com/mholt/acmez/v3 v3.1.6 h1:eGVQNObP0pBN4sxqrXeg7MYqTOWyoiYpQqITVWlrevk=

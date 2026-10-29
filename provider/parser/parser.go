@@ -17,13 +17,13 @@ var subscriptionParsers = []func(ctx context.Context, content string) ([]option.
 	ParseRawSubscription,
 }
 
-func ParseSubscription(ctx context.Context, content string, overrideDialerOptions *option.OverrideDialerOptions, overrideTLSOptions *option.OverrideTLSOptions, overrideAnyTLSOptions *option.OverrideAnyTLSOptions, providerTag string) ([]option.Outbound, []option.Endpoint, error) {
+func ParseSubscription(ctx context.Context, content string, overrideDialerOptions *option.OverrideDialerOptions, overrideTLSOptions *option.OverrideTLSOptions, overrideAnyTLSOptions *option.OverrideAnyTLSOptions, overrideTransportOptions *option.OverrideTransportOptions, providerTag string) ([]option.Outbound, []option.Endpoint, error) {
 	var pErr error
 	for _, parser := range subscriptionParsers {
 		outbounds, endpoints, err := parser(ctx, content)
 		if len(outbounds) > 0 || len(endpoints) > 0 {
 			tags := providerTags(outbounds, endpoints)
-			return overrideOutbounds(outbounds, overrideDialerOptions, overrideTLSOptions, overrideAnyTLSOptions, tags, providerTag),
+			return overrideOutbounds(outbounds, overrideDialerOptions, overrideTLSOptions, overrideAnyTLSOptions, overrideTransportOptions, tags, providerTag),
 				overrideEndpoints(endpoints, overrideDialerOptions, tags, providerTag),
 				nil
 		}
@@ -43,7 +43,7 @@ func providerTags(outbounds []option.Outbound, endpoints []option.Endpoint) []st
 	return tags
 }
 
-func overrideOutbounds(outbounds []option.Outbound, overrideDialerOptions *option.OverrideDialerOptions, overrideTLSOptions *option.OverrideTLSOptions, overrideAnyTLSOptions *option.OverrideAnyTLSOptions, tags []string, providerTag string) []option.Outbound {
+func overrideOutbounds(outbounds []option.Outbound, overrideDialerOptions *option.OverrideDialerOptions, overrideTLSOptions *option.OverrideTLSOptions, overrideAnyTLSOptions *option.OverrideAnyTLSOptions, overrideTransportOptions *option.OverrideTransportOptions, tags []string, providerTag string) []option.Outbound {
 	var parsedOutbounds []option.Outbound
 	for _, outbound := range outbounds {
 		switch outbound.Type {
@@ -65,16 +65,19 @@ func overrideOutbounds(outbounds []option.Outbound, overrideDialerOptions *optio
 			options := outbound.Options.(*option.VMessOutboundOptions)
 			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
 			options.OutboundTLSOptionsContainer.TLS = overrideTLSOption(options.OutboundTLSOptionsContainer.TLS, overrideTLSOptions)
+			options.Transport = overrideTransportOption(options.Transport, overrideTLSOptions, overrideTransportOptions)
 			outbound.Options = options
 		case C.TypeVLESS:
 			options := outbound.Options.(*option.VLESSOutboundOptions)
 			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
 			options.OutboundTLSOptionsContainer.TLS = overrideTLSOption(options.OutboundTLSOptionsContainer.TLS, overrideTLSOptions)
+			options.Transport = overrideTransportOption(options.Transport, overrideTLSOptions, overrideTransportOptions)
 			outbound.Options = options
 		case C.TypeTrojan:
 			options := outbound.Options.(*option.TrojanOutboundOptions)
 			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
 			options.OutboundTLSOptionsContainer.TLS = overrideTLSOption(options.OutboundTLSOptionsContainer.TLS, overrideTLSOptions)
+			options.Transport = overrideTransportOption(options.Transport, overrideTLSOptions, overrideTransportOptions)
 			outbound.Options = options
 		case C.TypeHysteria:
 			options := outbound.Options.(*option.HysteriaOutboundOptions)
@@ -270,6 +273,18 @@ func overrideDialerOption(options option.DialerOptions, overrideDialerOptions *o
 	return options
 }
 
+func overrideRealityOption(reality *option.OutboundRealityOptions, overrideReality *option.OverrideRealityOptions) {
+	if reality == nil || overrideReality == nil {
+		return
+	}
+	if overrideReality.KeyShare != nil {
+		reality.KeyShare = *overrideReality.KeyShare
+	}
+	if overrideReality.Version != nil {
+		reality.Version = *overrideReality.Version
+	}
+}
+
 func overrideTLSOption(options *option.OutboundTLSOptions, overrideTLSOptions *option.OverrideTLSOptions) *option.OutboundTLSOptions {
 	if options == nil {
 		return options
@@ -304,6 +319,36 @@ func overrideTLSOption(options *option.OutboundTLSOptions, overrideTLSOptions *o
 	}
 	if overrideTLSOptions.ECH != nil {
 		options.ECH = overrideECHOption(options.ECH, overrideTLSOptions.ECH)
+	}
+	if overrideTLSOptions.Reality != nil && options.Reality != nil {
+		overrideRealityOption(options.Reality, overrideTLSOptions.Reality)
+	}
+	return options
+}
+
+func overrideTransportOption(options *option.V2RayTransportOptions, overrideTLSOptions *option.OverrideTLSOptions, overrideTransportOptions *option.OverrideTransportOptions) *option.V2RayTransportOptions {
+	if options == nil || options.Type != C.V2RayTransportTypeXHTTP {
+		return options
+	}
+	xhttpOptions, ok := options.Extra.(*option.V2RayXHTTPOptions)
+	if !ok || xhttpOptions == nil {
+		return options
+	}
+	if overrideTLSOptions != nil && overrideTLSOptions.Reality != nil && xhttpOptions.DownloadSettings != nil && xhttpOptions.DownloadSettings.TLS != nil && xhttpOptions.DownloadSettings.TLS.Reality != nil {
+		overrideRealityOption(xhttpOptions.DownloadSettings.TLS.Reality, overrideTLSOptions.Reality)
+	}
+	if overrideTransportOptions == nil {
+		return options
+	}
+	if overrideTransportOptions.XHTTPDownloadEnabled != nil {
+		if xhttpOptions.DownloadSettings != nil {
+			xhttpOptions.DownloadSettings.Enabled = overrideTransportOptions.XHTTPDownloadEnabled
+		}
+	}
+	if overrideTransportOptions.XHTTPDownloadDetour != nil {
+		if xhttpOptions.DownloadSettings != nil {
+			xhttpOptions.DownloadSettings.Detour = *overrideTransportOptions.XHTTPDownloadDetour
+		}
 	}
 	return options
 }

@@ -25,7 +25,7 @@ type InboundPTLSOptions struct {
 	CACertificatePath   string                     `json:"ca_certificate_path,omitempty"`
 	CAKey               badoption.Listable[string] `json:"ca_key,omitempty"`
 	CAKeyPath           string                     `json:"ca_key_path,omitempty"`
-	CertificateDomains  badoption.Listable[string] `json:"certificate_domains,omitempty"` // 动态证书签发专属域名列表 (支持泛域名，解耦外层 server_name)
+	CertificateDomains  badoption.Listable[string] `json:"certificate_domains,omitempty"`  // 动态证书签发专属域名列表 (支持泛域名，解耦外层 server_name)
 	CertificateValidity badoption.Duration         `json:"certificate_validity,omitempty"` // 证书有效期 (默认 90 天)
 	LeafType            string                     `json:"leaf_type,omitempty"`            // 目标叶子证书算法类型 ("ecdsa" / "rsa"，默认 "ecdsa")
 	LeafDERSize         int                        `json:"leaf_der_size,omitempty"`        // 目标叶子证书物理 DER 字节尺寸

@@ -133,7 +133,7 @@ func TestParseClashShadowTLSWithProviderDetour(t *testing.T) {
 	outbounds, _, err := ParseSubscription(context.Background(), `
 proxies:
   - {name: ss, type: ss, server: 1.2.3.4, port: 443, cipher: aes-128-gcm, password: x, plugin: shadow-tls, plugin-opts: {host: a.com, password: p}}
-`, &option.OverrideDialerOptions{Detour: &detour}, nil, nil, "sub")
+`, &option.OverrideDialerOptions{Detour: &detour}, nil, nil, nil, "sub")
 	require.NoError(t, err)
 	require.Equal(t, "sub/ss (shadow-tls)", outbounds[0].Options.(*option.ShadowsocksOutboundOptions).Detour)
 	require.Equal(t, "front", outbounds[1].Options.(*option.ShadowTLSOutboundOptions).Detour,

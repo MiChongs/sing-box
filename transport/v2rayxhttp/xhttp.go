@@ -61,7 +61,7 @@ func NewClient(
 		ctx:    ctx,
 		upload: upload,
 	}
-	if options != nil && options.DownloadSettings != nil {
+	if options != nil && options.DownloadSettings.IsEnabled() {
 		client.download, err = newDownloadEndpoint(ctx, cfg, options.DownloadSettings, dialer, serverAddr)
 		if err != nil {
 			return nil, E.Cause(err, "xhttp: download_settings")

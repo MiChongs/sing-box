@@ -43,9 +43,10 @@ type ProviderLocal struct {
 	lastUpdated time.Time
 	watcher     *fswatch.Watcher
 
-	overrideDialer *option.OverrideDialerOptions
-	overrideTLS    *option.OverrideTLSOptions
-	overrideAnyTLS *option.OverrideAnyTLSOptions
+	overrideDialer    *option.OverrideDialerOptions
+	overrideTLS       *option.OverrideTLSOptions
+	overrideAnyTLS    *option.OverrideAnyTLSOptions
+	overrideTransport *option.OverrideTransportOptions
 }
 
 func NewProviderInline(ctx context.Context, router adapter.Router, logFactory log.Factory, tag string, options option.ProviderInlineOptions) (adapter.Provider, error) {
@@ -83,9 +84,10 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 		logger:   logger,
 		provider: service.FromContext[adapter.ProviderManager](ctx),
 
-		overrideDialer: options.OverrideDialer,
-		overrideTLS:    options.OverrideTLS,
-		overrideAnyTLS: options.OverrideAnyTLS,
+		overrideDialer:    options.OverrideDialer,
+		overrideTLS:       options.OverrideTLS,
+		overrideAnyTLS:    options.OverrideAnyTLS,
+		overrideTransport: options.OverrideTransport,
 	}
 	filePath := filemanager.BasePath(ctx, options.Path)
 	provider.path, _ = filepath.Abs(filePath)
@@ -154,7 +156,7 @@ func (s *ProviderLocal) reloadFile(path string) error {
 		return closeErr
 	}
 	s.lastUpdated = fileInfo.ModTime()
-	outboundOpts, endpointOpts, err := parser.ParseSubscription(parser.ContextWithWarnHandler(s.ctx, s.logger.Warn), string(content), s.overrideDialer, s.overrideTLS, s.overrideAnyTLS, s.Tag())
+	outboundOpts, endpointOpts, err := parser.ParseSubscription(parser.ContextWithWarnHandler(s.ctx, s.logger.Warn), string(content), s.overrideDialer, s.overrideTLS, s.overrideAnyTLS, s.overrideTransport, s.Tag())
 	if err != nil {
 		return err
 	}

@@ -8,3 +8,9 @@ const (
 	TLSEngineApple   = "apple"
 	TLSEngineWindows = "windows"
 )
+
+const (
+	RealityKeyShareDefault   = ""
+	RealityKeyShareHybrid    = "hybrid"
+	RealityKeyShareClassical = "classical"
+)

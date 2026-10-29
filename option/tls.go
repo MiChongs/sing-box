@@ -223,6 +223,8 @@ type InboundRealityOptions struct {
 	PrivateKey        string                         `json:"private_key,omitempty"`
 	ShortID           badoption.Listable[string]     `json:"short_id,omitempty"`
 	MaxTimeDifference badoption.Duration             `json:"max_time_difference,omitempty"`
+	MLDSA65Seed       string                         `json:"mldsa65_seed,omitempty"`
+	KeyShare          string                         `json:"key_share,omitempty" enum:"hybrid,classical"`
 }
 
 type InboundRealityHandshakeOptions struct {
@@ -259,7 +261,10 @@ type OutboundUTLSOptions struct {
 }
 
 type OutboundRealityOptions struct {
-	Enabled   bool   `json:"enabled,omitempty"`
-	PublicKey string `json:"public_key,omitempty"`
-	ShortID   string `json:"short_id,omitempty"`
+	Enabled       bool   `json:"enabled,omitempty"`
+	PublicKey     string `json:"public_key,omitempty"`
+	ShortID       string `json:"short_id,omitempty"`
+	KeyShare      string `json:"key_share,omitempty" enum:"hybrid,classical"`
+	MLDSA65Verify string `json:"mldsa65_verify,omitempty"`
+	Version       string `json:"version,omitempty"`
 }

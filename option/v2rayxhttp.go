@@ -114,6 +114,7 @@ type V2RayXHTTPXmuxOptions struct {
 // 不从上行配置继承，需要单独写；server / server_port 为空时沿用上行地址。
 // dialer 字段 (detour / bind_interface ...) 全部为空时复用上行 dialer。
 type V2RayXHTTPDownloadOptions struct {
+	Enabled *bool `json:"enabled,omitempty"`
 	ServerOptions
 	OutboundTLSOptionsContainer
 	DialerOptions
@@ -188,4 +189,8 @@ func ParseXHTTPRange(value string) (XHTTPRange, error) {
 		from, to = to, from
 	}
 	return XHTTPRange{From: int32(from), To: int32(to)}, nil
+}
+
+func (o *V2RayXHTTPDownloadOptions) IsEnabled() bool {
+	return o != nil && (o.Enabled == nil || *o.Enabled)
 }
