@@ -1,0 +1,103 @@
+---
+title: 服务键
+description: Smart 用“服务键”决定哪些连接算同一个服务：命中的路由规则、通配主机，或开启 prefer_asn 后的 ASN。本页说明服务键怎样得出、prefer_asn 如何归并大合集规则、ASN 认领与网站键，以及同一服务收敛到一个出口的机制。
+---
+
+import Callout from '../../../components/Callout.astro';
+
+Smart 不是按单个域名学习，而是按**服务**学习：同一服务的连接共享评分记录、共享在任节点，节点出问题时一起避开，换节点时一起收敛。这套“服务键”的设计来自 [vernesong/mihomo](https://github.com/vernesong/mihomo) 的 Smart 组。
+
+## 三个层次的键
+
+| 键 | 例子 | 说明 |
+|---|---|---|
+| 精确目标 | `api.openai.com:443` | 域名（没有域名时为 IP）加端口 |
+| 通配主机 | `*.openai.com` | 把子域名归并到可注册域名，随机生成的子域名也会被合并 |
+| 服务键 | `RuleSet [geosite-openai]` | 命中的路由规则；没有规则时等于通配主机 |
+
+通配主机的归并规则：
+
+| 域名 | 通配主机 |
+|---|---|
+| `www.example.com`、`cdn-12.example.com` | `*.example.com` |
+| `example.com` | `*.example.com` |
+| `img.static.example.com` | `*.static.example.com` |
+| `rr3---sn-abc.googlevideo.com` | `*.googlevideo.com` |
+| `www.example.co.uk` | `*.example.co.uk` |
+| IP 目标 `203.0.113.7` | `203.0.113.7` |
+
+子域名只保留最靠近主域名的一段，而且这一段含 `-`、是 8 位以上的十六进制串、或字母数字混杂得像随机串时，也直接用 `*`。
+
+## 规则就是服务
+
+连接命中的路由规则会以 mihomo 的格式写成服务键：
+
+| 路由规则 | 服务键 |
+|---|---|
+| `{"rule_set": "geosite-netflix", "outbound": "auto"}` | `RuleSet [geosite-netflix]` |
+| `{"domain_suffix": "openai.com", "outbound": "auto"}` | `DomainSuffix [openai.com]` |
+| `{"ip_cidr": "91.108.4.0/22", "outbound": "auto"}` | `IPCIDR [91.108.4.0/22]` |
+| 多个条件或多个取值的规则 | `AND [...]`、`OR [...]` 形式的组合键 |
+| `route.final`，或端口、进程等其他类型的规则 | 不产生服务键，使用通配主机 |
+
+可以产生服务键的规则类型是 Domain、DomainSuffix、DomainKeyword、DomainRegex、AdGuardDomain、GeoIP、IPCIDR、RuleSet 以及 AND / OR / NOT 组合。GeoIP 国家规则（两个字母）代表一个地区而不是服务，不产生服务键。只有当规则的出站最终落到会在拨号时选择成员的组（Smart 组本身，或当前选中 Smart 组的 `selector`）时才会计算服务键。
+
+所以，**给需要“同一个出口”的服务单独写一条规则**，例如 `geosite-openai`、`geosite-netflix`，Smart 就会让这个服务的所有域名共享学习结果，并收敛到同一个节点；而通过 `route.final` 进入 Smart 的流量按网站分别处理。
+
+## prefer_asn
+
+大合集规则（如 `geosite-geolocation-!cn`、`geosite-cn`、`geoip-us`）覆盖成千上万个毫不相干的网站，把它们当成同一个服务并不合理。开启 `prefer_asn` 后，这类规则和没有规则的流量改按**目标 IP 所属的网络（ASN）**归并：同一家公司的网站通常在同一个 ASN 上，它们共享学习结果，新网站也能直接沿用经验。
+
+哪些规则算“大合集”：
+
+| 规则 | 处理 |
+|---|---|
+| 没有规则（`route.final` 等） | 按 ASN |
+| `geoip-<国家>`、`geoip-private`、`geoip-cloudflare` 等 | 按 ASN |
+| `geosite-cn`、`geosite-gfw`、`geosite-private`、`geosite-category-*`、`geosite-geolocation-*`、`geosite-tld-*` 等 | 按 ASN |
+| 其他规则集（如 `geosite-netflix`、自己写的规则集） | 保持规则；规则集超过 10000 条，或它的目标出现在 6 个以上不同 ASN 上时，改按 ASN |
+| 域名、IP 段等具体规则，以及组合规则 | 始终保持规则 |
+
+规则集名称中 `@` 之后的部分与开头的 `!` 不影响判断。
+
+### 共用网络与网站键
+
+Cloudflare、Akamai、Fastly、Amazon CloudFront、Google Cloud、OVH、DigitalOcean、Hetzner、Vultr、阿里云、腾讯云，以及中国电信、中国联通骨干网等网络上住着大量互不相干的网站，Smart 内置了约 50 个这样的 **共用 ASN**，不用它们作为服务键。目标在共用网络上、或查不到 ASN 时，改用**通配主机**作为服务键（称为网站键）。
+
+一个网站第一次被识别为网站键时，它此前按 ASN 归并、仍在进行的连接会被关闭，让它尽快收敛到自己的在任节点上。
+
+<Callout type="note" title="需要知道目标 IP">
+  ASN 按目标的第一个公网 IP 查询。目标只有域名、路由时也没有解析出 IP（例如使用 FakeIP，或没有 `resolve` 规则）时查不到 ASN，Smart 会按网站区分，等同于没有开启 `prefer_asn`。
+</Callout>
+
+### ASN 认领
+
+一个服务规则（例如 `RuleSet [geosite-netflix]`）的连接成功地落在某个 ASN 上，就是这个 ASN 属于该服务的证据。每 2 分钟，Smart 根据这些证据计算**认领**：
+
+- 规则的目标分布在 2 个以上网络时，它出现过的每个网络都归它；
+- 只出现在 1 个网络上时，需要在该网络上成功 4 次以上；
+- 同一个 ASN 被两个不同的规则认领时，标记为有争议，谁也不归。
+
+之后，按 ASN 归并的连接如果落在被认领的 ASN 上，服务键就直接用认领它的规则。例如 Netflix 的某个新域名还没被规则集收录、通过 `route.final` 进来，它会因为 IP 在 Netflix 的网络上而与 `RuleSet [geosite-netflix]` 共享节点。共用网络永远不会被认领。
+
+ASN 数据来自 GeoX：`experimental.geox.url.asn` 中配置的文件，没有配置时自动下载 GeoLite2-ASN，见 [配置字段](../config/#experimentalgeox)。数据库下载完成前，相当于查不到 ASN。
+
+## 收敛
+
+同一服务分散在多个出口上，会让登录态、风控与出口 IP 绑定的网站出问题。Smart 在这些时候主动收敛：
+
+| 时机 | 做法 |
+|---|---|
+| 主选节点拨号失败、由后面的成员接通 | 接通的成员成为这个服务的在任节点；这个服务经**其他节点**的 TCP 连接被关闭 |
+| 节点对这个服务被封锁（`manual`、`lowWeight`，或其他代码真正生效时） | 这个服务的 TCP 连接全部关闭，在任节点被清除，下一条连接重新选择 |
+| 响应探测发现网站拒绝了节点 | 同上 |
+| 网站第一次被识别为网站键 | 关闭它按 ASN 归并的连接 |
+| 出口嫌疑成立 | 清除这个网站的在任节点 |
+
+被 Smart 关闭的连接不计成功也不计失败，客户端通常会立即重连。日志中的 `converged N connections of [<服务键>] on <节点>` 就是第一种情况。这些关闭与 `interrupt_exist_connections` 无关。
+
+在任节点按（组, 服务键, TCP/UDP, IPv4/IPv6）记住，最多 4096 条，只保存在内存中，重启后由评分重新选出。
+
+## 封锁的范围
+
+节点被封锁时，记录写在**通配主机**上；封锁一旦生效，也会同时写在**服务键**上，同一服务的其他域名随之避开这个节点。还没达到 `max_failed_times` 的错误计数只记在通配主机上。过滤成员时，两处的记录合并生效。详见 [封锁与探测](../blocks-and-probes/)。

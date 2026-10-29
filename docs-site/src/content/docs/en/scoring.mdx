@@ -1,0 +1,174 @@
+---
+title: Score and selection
+description: How Smart scores and chooses nodes. Layered evidence, decayed reliability with confidence bounds, eligibility, the comprehensive score, the incumbent and the bar for switching, the serving pool, the exploration budget, policy_priority, and where the dashboard ranking comes from.
+---
+
+import Callout from '../../../components/Callout.astro';
+
+Smart's scoring and selection follow the Score policy of [honk](https://github.com/daeuniverse/honk) (daeuniverse/honk). Its core idea: **reliability is the payoff, performance only breaks ties**. However fast a node is, if it clearly fails more often than others it is not chosen; only among equally reliable nodes do speed, goodput and connection quality decide. The connection quality and the node ranking come from the Smart group of vernesong/mihomo.
+
+## Where the evidence comes from
+
+Every connection's outcome is recorded in four layers (evidence cells) of the same node:
+
+| Layer | Scope | Stored |
+|---|---|---|
+| Global | All of the node's connections in this group (TCP and UDP separate) | Cache file |
+| Family | Connections to IPv4 / IPv6 destinations | Cache file |
+| Service | Connections of one service key (see [Service keys](../service-keys/)) | Cache file |
+| Exact target | Connections to one `host:port` | Memory only |
+
+At selection the layers merge from coarse to fine: the more data a specific layer holds, the more it overrides its parents. A layer's weight is its useful completions ÷ 8 (at most 1), so after 8 useful connections of a service, the node's standing for that service is decided by the service layer alone; until then its global record fills in, and a new site benefits from the node's overall reputation right away.
+
+The records are bounded (8192 service cells, 16384 exact cells, 4096 global and family cells together); when full, the least recently used are evicted.
+
+## Reliability
+
+In every layer each node has two decaying counts, useful successes and failures, with a **30-minute half-life**. A "useful success" is a successful connection with data in both directions; a dial failure counts extra (as 3 failures), because it says more about the node than an error after connecting. From these:
+
+- **Observed success rate**: successes ÷ (successes + failures), 0.5 without data;
+- **Reliability lower / upper bound**: the bounds of Beta(successes + 1, failures + 1) at 1.64 standard deviations. With few samples the interval is wide and only narrows with more data, so a new node with 3 successes out of 3 is not taken as more reliable than an old one with 300 successes and 1 failure.
+
+### Failure state
+
+A "hard failure" puts the node in a failure state: its failure streak grows by 1, it is not tried again during a backoff of 5 minutes, 10, 20 … (doubling, up to 6 hours), and its earned "proven" status is voided. A dial failure is hard in every layer; a failure after connecting (read/write errors, no answer) is hard only in the service and exact layers, so the node's standing on other sites is untouched.
+
+When **4 different connections** in turn prove that the node receives data again (each within 60 s of the previous), the failure state clears. A single connection receiving data normally already ends the backoff early.
+
+## Eligibility
+
+Only "eligible" members can win an ordinary selection:
+
+1. While other members are healthy (failure streak below 3), members with a streak of 3 or more are not eligible;
+2. A member that just recovered (see above) with no new failure is eligible;
+3. When some member is "proven" (4 useful completions, or normal traffic within the last 60 s), only proven members are eligible, and their upper reliability bound + 0.05 must reach the best lower bound, and their observed success rate + 0.05 the best observed rate;
+4. When no member is proven, a lower bound + 0.05 reaching the best lower bound is enough.
+
+If no member is eligible, the one with the highest lower bound is taken.
+
+## The comprehensive score
+
+Eligible members compete on the comprehensive score:
+
+```text
+score = observed success rate
+      + 0.03 × latency term
+      + 0.02 × max(upload term, download term)
+      + 0.02 × quality term
+      − 0.02 × loss penalty
+      (then multiplied by the policy_priority factor)
+```
+
+- **The latency, upload, download and quality terms** are relative: each is compared to the best value among eligible members and lands in 0–1. Lower latency is better; higher goodput and quality are better. If only one member has data for a term, there is nothing to compare and the term is 0 for everyone.
+- **The latency term** mostly reflects the first-response time (data for this service preferred); without enough response data it uses the probe delay, and without that the connect time.
+- **The quality term** is mihomo's connection quality (the scene formula, or the model prediction with `use_lightgbm`); see [Connection quality](#connection-quality).
+- **Loss penalty** = 1 − e^(−50 × retransmission rate), using the rate's exponential average over 30 minutes: 1% gives about 0.39, 5% about 0.92.
+
+All performance terms together move the score by at most 0.07, while every 1% of success rate is worth 0.01. Performance therefore only matters when reliability is close.
+
+### Freshness
+
+Latency and goodput describe the road right now, so they age fast: each is averaged over at most the last 4 samples, confidence falls linearly once the newest sample is 60 s old, and the value is void after 120 s. Probe delays likewise count only for 2 minutes after each health check. "Mature" means 4 samples with the newest under 60 s old. Connection quality is the opposite, a long-term measure: it decays slowly with a 30-minute half-life and is kept in the cache file.
+
+## The incumbent and switching
+
+Every service key (TCP, UDP, IPv4 and IPv6 apart) remembers the result of its last ordinary selection, the **incumbent**. When a new connection arrives:
+
+- The incumbent is **no longer eligible** (its reliability fell clearly behind, say): switch at once to the best-scoring member;
+- The incumbent has an **unresolved failure** on this service: switch at once;
+- The incumbent has hardly any data (under 0.5 completions): choose by score;
+- Otherwise a challenger must prove a gain on data that is **mature on both sides**. Gain = the difference in observed success rate (when both are proven) + 0.03 × the relative improvement in response time + 0.02 × the relative improvement in goodput (counted only when one direction improves by at least 10% and neither the other direction nor the response time gets more than 10% worse). The bar is 0.005 × min(incumbent completions ÷ 8, 1).
+
+The bar is low, but it demands mature data from both sides, so a passing fluctuation does not cause a switch while a real difference shows quickly.
+
+### Selection reasons
+
+`selection[].reasons` of the diagnostic endpoint `GET /smart/groups/{name}/diag` counts why each choice was made:
+
+| Reason | Meaning |
+|---|---|
+| `singleton` | Only one candidate |
+| `coldExplore` | A member without data tried from the cold allowance |
+| `periodicExplore` | A member lacking data tried from credit earned by traffic |
+| `recoveryExplore` | Recovery trial of a failed member after its backoff |
+| `incumbentIneligible` | The incumbent lost eligibility and was replaced |
+| `freshFailureBypass` | The incumbent just failed and was replaced |
+| `insufficientEvidenceHeld` | No comparable data on both sides; incumbent kept |
+| `directionalTradeoffHeld` | The challenger is faster one way and slower the other; incumbent kept |
+| `incumbentHeld` | Compared, and the challenger's gain fell short; incumbent kept |
+| `reliabilityWinner` | Only one member (or none) was eligible; chosen by reliability |
+| `performanceWinner` | Several members were eligible and the best score won, or a challenger replaced the incumbent |
+
+`ordinarySwitch` counts incumbent replacements, and `switchFlap` counts switches back to the previous winner within 8 ordinary selections; if the latter keeps growing, a few nodes are too close to tell apart.
+
+## The serving pool
+
+With many nodes, comparing all of them wastes traffic and never reaches a conclusion. Smart therefore makes ordinary choices, trials and switches inside a small **serving pool**:
+
+- The pool grows with traffic: the more new connections per second recently, the larger it is; at least 3, at most √n rounded up plus 1 (never above 25). Groups of 3 members or fewer have everyone in the pool.
+- Every 5 minutes the pool is re-ranked by each node's overall score (not per service); nodes without data are ordered by probe delay. A member is replaced only after falling 2 places below the cut, so members do not flap in and out.
+- A full pool keeps one **rotation slot**: every 10 minutes another outside member takes it to get compared; once chosen it becomes a regular member.
+- A member failing 3 times in a row is replaced early when a healthy outsider exists.
+
+Members outside the pool only serve as fallbacks when the pool members cannot connect.
+
+## Exploration
+
+Without data there is nothing to compare, so Smart occasionally hands a connection to a member that lacks data: a **trial**. Trials are budgeted per (group, network, address family):
+
+- **Cold allowance**: the member count up to 4 members, otherwise √n rounded up plus 1;
+- **Earned credit**: every new connection earns 1/16 trial; with heavy traffic (over 2 connections per second) and mostly successful trials (80% or more), 1/8. At most 8 are banked;
+- **Recovery trials**: when a failed member's backoff ends it gets a free trial;
+- A member has at most one unanswered trial at a time (no result within 60 s ends it);
+- When the primary works fine but trials keep failing (under 20% success), trials pause;
+- Only members with fewer completions than the current choice are tried; members with enough data compete on score.
+
+When the incumbent is replaced for losing eligibility or a fresh failure, no trial is scheduled on top. If a trial connection fails, the next member is dialed right away, so the user waits at most one extra dial round.
+
+## Node preferences
+
+`policy_priority` assigns factors by node name, in the same syntax as vernesong/mihomo:
+
+```json
+"policy_priority": "(?i)iplc|iepl:1.3;Hong Kong|HK:1.1;(?i)x[2-9]:0.6"
+```
+
+- Rules are separated by `;`, each `pattern:factor`, split at the last `:`; write `:` inside a pattern as `\:`.
+- A pattern that compiles as a regex (RE2) matches anywhere in the name, otherwise it is a substring; matching is case-sensitive.
+- **The first matching rule wins.** In the example, a Hong Kong node named `IPLC` gets 1.3, not 1.3 × 1.1.
+- Factors must be above 0; a node no rule matches gets 1. Bad syntax fails startup.
+
+What the factor does:
+
+- **It multiplies the comprehensive score.** Scores sit around 1, so a factor of 1.1 is like a 10% success-rate advantage: a strong effect;
+- But **eligibility ignores the factor**: a node clearly behind on reliability cannot win, whatever its factor;
+- When the incumbent and a challenger have different factors, the difference of their scores counts directly toward the switching gain;
+- Fallback members outside the serving pool are ordered by factor, highest first;
+- A node whose connection quality × factor falls below 0.4 is blocked (`lowWeight`), so nodes below 1 get blocked for low quality more easily;
+- The quality shown in the dashboard ranking is multiplied by the factor too. Learned quality itself is stored without it, so changing `policy_priority` takes effect at once.
+
+<Callout type="note" title="Example">
+  Two nodes, both proven on the same service: A has an observed success rate of 0.97 and answers faster (latency term 1), B has 0.99 and a latency term of 0.4, all else equal. A scores about 0.97 + 0.03 = 1.00 and B about 0.99 + 0.012 = 1.002, so B wins narrowly: reliability first. Give A a factor of 1.1 and it scores 1.10 and wins. But if A's observed rate drops to 0.80, more than 0.05 behind B, A loses eligibility and no factor can make it win.
+</Callout>
+
+## Connection quality
+
+When a connection ends, Smart computes a quality value for it (roughly 0–1.5) with vernesong/mihomo's `CalculateWeight`:
+
+- The connection's duration, volume and rates first identify a scene: **web**, **interactive** (games, voice; sustained traffic both ways), **streaming** (download-heavy bulk) or **transfer** (large files);
+- The base score combines success rate, connect time and first-response time with scene-specific weights;
+- Volume, duration, a bonus for high quality (low latency, large transfers) and a loss penalty adjust it, and it decays with the time since the previous use;
+- It is not computed while the node has fewer than 2 completions on the service.
+
+With `use_lightgbm` and a usable model, the model prediction is used instead; see [LightGBM model](../lightgbm/). The quality feeds the score's quality term, blocks the node when it falls below 0.4 (after the factor), and drives the dashboard ranking.
+
+## The dashboard ranking
+
+The ranking from `GET /group/{name}/weights` follows mihomo's rules:
+
+1. Take the group's 64 most recently used services, and within each, sort the nodes by connection quality (times their factor);
+2. Nodes with quality 0.4 or higher score 1, 1/2, 1/3 … by position, summed over the services;
+3. `Weight` is the score as a percentage of the highest (0–100);
+4. Among alive members with a positive score, the top 20% (at least 1) are `MostUsed`, the next 50% `OccasionalUsed`, and everyone else (including unavailable members) `RarelyUsed`.
+
+Until any service has learned a quality, members are ranked by the comprehensive score. The ranking is cached for 30 s; `?refresh=true` recomputes it. It is used for display and for `smart-loadbalance` quality estimates only; it does not affect selection in a `smart` group. Fields are described in [Clash API](../clash-api/#get-groupnameweights).

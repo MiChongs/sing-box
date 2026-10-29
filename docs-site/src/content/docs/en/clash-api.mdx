@@ -1,19 +1,19 @@
 ---
 title: Clash API
-description: Use the Clash API to inspect Smart groups and their node rankings, pin or block nodes, switch algorithms, clear learned data, and control the regions and balancing of smart-loadbalance groups. Every endpoint comes with its purpose, a request and a sample response.
+description: Use the Clash API to inspect a Smart group's state, ranking and diagnostics, pin or block nodes, flush learned data, and control the regions and balancing of smart-loadbalance. Every endpoint comes with its purpose, request and response.
 ---
 
 import Callout from '../../../components/Callout.astro';
 
-Smart groups (and `smart-loadbalance` groups) expose their state and controls through sing-box's built-in Clash API. Whatever a dashboard (metacubexd, zashboard, Yacd, …) shows about a Smart group, and every node you click in it, goes through these endpoints; you can also call them from scripts to read weights, block nodes or clear data.
+Smart groups (and `smart-loadbalance` groups) expose state and controls through sing-box's built-in Clash API. Paths and response shapes follow the Smart group of [vernesong/mihomo](https://github.com/vernesong/mihomo) as closely as possible, so dashboards such as metacubexd and zashboard work out of the box. Scripts can call the same endpoints to read the ranking, block nodes or flush data.
 
-This page first explains how to call the API, then groups the endpoints by task: [Checking status](#checking-status), [Manual control](#manual-control), [Clearing data](#clearing-data) and [Smart load balancing](#smart-load-balancing). Terms such as "destination", "weight" and "circuit breaker" are explained in the [Glossary](../glossary/).
+This page first explains how to call it, then groups endpoints by purpose: [Inspecting state](#inspecting-state), [Manual control](#manual-control), [Flushing data](#flushing-data) and [Smart load balancing](#smart-load-balancing). Terms are in the [Glossary](../glossary/).
 
 ## Before you start
 
-### Enabling the Clash API
+### Enable the Clash API
 
-Set a listen address in the configuration. With a `secret`, every request has to carry it:
+Set a listen address in the config. With a `secret`, every request must carry it:
 
 ```json
 {
@@ -28,44 +28,45 @@ Set a listen address in the configuration. With a `secret`, every request has to
 
 ### Calling it
 
-The examples on this page assume `127.0.0.1:9090`. With a `secret`, send the header `Authorization: Bearer <secret>`; WebSocket connections opened by a browser cannot set headers and may pass `?token=<secret>` instead.
+The examples assume `127.0.0.1:9090`. With a `secret`, add the header `Authorization: Bearer <secret>`:
 
 ```bash
 curl -H 'Authorization: Bearer change-me' http://127.0.0.1:9090/smart/groups
 ```
 
-A missing or wrong secret returns 401 `{"message": "Unauthorized"}`. Other errors share the `{"message": "..."}` shape; the common ones are 404 `Resource not found` (no such group or node) and 400 `Body invalid` (a malformed body or parameter). The few endpoints that answer differently say so below.
+A missing or wrong secret returns 401. Errors are usually `{"message": "..."}`; endpoints with a different error shape say so below.
 
 ### Group names in URLs
 
-Percent-encode group names containing non-ASCII characters, emoji or spaces as UTF-8, for example `HK auto` → `HK%20auto` and `香港` → `%E9%A6%99%E6%B8%AF`. With curl you encode them yourself; dashboards do it for you.
+Percent-encode group names with non-ASCII characters, emoji or spaces as UTF-8; `Hong Kong auto` becomes `Hong%20Kong%20auto`. With curl you encode it yourself; dashboards do it for you.
 
 <Callout type="warn" title="Group names containing /">
-  `/smart/*` and `/cache/smart/flush/{name}` do not decode `%2F` in the path, so they return 404 for group names containing `/`. The `/proxies/{name}` and `/group/{name}` endpoints are not affected.
+  `/smart/*` and `/cache/smart/flush/{name}` do not decode `%2F` in the path, so they cannot find a group whose name contains `/`: `/smart/*` returns 404, and `/cache/smart/flush/{name}` **flushes every Smart group**. The `/proxies/{name}` and `/group/{name}` endpoints are not affected.
 </Callout>
 
 ### Endpoints at a glance
 
-| Task | Endpoint |
+| Purpose | Endpoint |
 |---|---|
-| Current state of a group (what dashboards read) | `GET /proxies/{name}`, `GET /group/{name}` |
-| Node ranking and weights | `GET /proxies/{name}/weights`, `GET /smart/weights` |
+| A group's current state (what dashboards read) | `GET /proxies/{name}`, `GET /group/{name}` |
+| Node ranking | `GET /group/{name}/weights`, `GET /proxies/{name}/weights`, `GET /group/weights`, `GET /smart/weights` |
 | List every Smart group | `GET /smart/groups` |
 | Internal diagnostics | `GET /smart/groups/{name}/diag` |
 | Delay tests | `GET /proxies/{name}/delay`, `GET /group/{name}/delay` |
-| Node each connection actually uses | `GET /connections` |
-| Pin and unpin a node | `PUT /proxies/{name}`, `DELETE /proxies/{name}`, `POST /smart/groups/{name}/clear-selection` |
-| Switch the selection algorithm | `PUT /smart/groups/{name}/algorithm` |
-| Block a node | `POST /smart/groups/{name}/block/{node}`, `DELETE /connections/smart/{id}` |
+| The node each connection really uses | `GET /connections` |
+| Pin and unpin | `PUT /proxies/{name}`, `DELETE /proxies/{name}`, `POST /smart/groups/{name}/clear-selection` |
+| Block nodes | `POST`, `DELETE /smart/groups/{name}/block/{node}`, `DELETE /connections/smart/{id}` |
 | Recompute the ranking now | `POST /smart/groups/{name}/recompute` |
-| Clear learned data | `DELETE /proxies/{name}/weights`, `POST /cache/smart/flush`, `POST /cache/smart/flush/{name}` |
+| Flush learned data | `DELETE /proxies/{name}/weights`, `POST`/`DELETE /cache/smart/flush`, `POST`/`DELETE /cache/smart/flush/{name}` |
 | Regions and balancing of smart-loadbalance | `/smart/groups/{name}/regions`, `/smart/groups/{name}/balance` |
 
-## Checking status
+The old `PUT /smart/groups/{name}/algorithm` has been removed and now returns 404 or 405.
+
+## Inspecting state
 
 ### `GET /proxies/{name}`
 
-Shows what a group is doing right now: its current node, members, whether a node is pinned and which algorithm runs. Dashboards display Smart groups from this response. A Smart group has `type: "Smart"` and, besides the standard Clash fields, carries Smart's own:
+A group's current state. Smart groups have `type: "Smart"` and, besides the standard Clash fields, carry the same fields as mihomo Smart:
 
 ```json
 {
@@ -74,278 +75,279 @@ Shows what a group is doing right now: its current node, members, whether a node
   "udp": true,
   "now": "HK-01",
   "all": ["HK-01", "HK-02", "JP-01"],
-  "history": [{ "time": "2026-10-07T08:00:00Z", "delay": 123 }],
+  "history": [{ "time": "2026-10-29T08:00:00Z", "delay": 123 }],
   "alive": true,
   "delay": 123,
   "hidden": false,
   "icon": "",
   "testUrl": "https://www.gstatic.com/generate_204",
-  "useASN": false,
-  "useLightGBM": true,
-  "collectData": false,
+  "expectedStatus": "*",
   "fixed": "",
   "fixedSuspended": false,
   "fixedActive": "",
-  "algorithm": "strict-best",
-  "hysteresis": "0s",
-  "policyPriority": null,
-  "pinEndorsements": null,
+  "policy-priority": "Hong Kong|HK:1.20;Japan|JP:1.10",
+  "useLightGBM": true,
+  "collectData": false,
+  "sampleRate": 1,
+  "preferASN": false,
+  "tolerance": 0,
   "lgbmModelAge": "2h3m0s"
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `udp` | Whether the group handles UDP, i.e. `!disable_udp` |
-| `now` | The "current node" dashboards show. Smart picks a node per connection, so this is only a representative: the pinned node if there is one, otherwise the node of the last successful dial. See [Current node](../how-it-works/#current-node) |
-| `history`, `delay`, `alive` | Probe data of the `now` node. `alive` only means its last probe is less than 10 minutes old, which is not how Smart itself decides whether a node is usable |
-| `fixed` | The pinned node, or an empty string |
-| `fixedSuspended` | `true` while the pinned node fails to dial and Smart temporarily uses another one |
-| `fixedActive` | The node actually carrying traffic: `now` during a suspension, otherwise the same as `fixed` |
-| `algorithm`, `hysteresis` | The algorithm and anti-flap window in effect, updated at once after a runtime switch |
-| `policyPriority` | Parsed `policy_priority` rules, or `null`; format under [`GET /smart/groups`](#get-smartgroups) |
-| `pinEndorsements` | Pin-learning records, or `null`; same format reference |
-| `lgbmModelAge` | Time since the LightGBM model was loaded; present only while a model is loaded |
+| `udp` | Whether the group carries UDP, i.e. `disable_udp` is not set |
+| `now` | The dashboard's "current node": the pinned node, else the member that carried the latest connection, else the member a new connection would most likely get. Smart chooses per connection, so this is only a representative |
+| `history`, `delay`, `alive` | The probe record of the `now` node. `alive` only means the latest probe is less than 10 minutes old |
+| `fixed`, `fixedActive` | The pinned node (for `smart-loadbalance` without a pin, the locked region), or an empty string |
+| `fixedSuspended` | Always `false`: a pinned node is never temporarily replaced |
+| `policy-priority` | The parsed `policy_priority` rules, factors with two decimals; empty without a config |
+| `useLightGBM`, `collectData`, `sampleRate`, `preferASN`, `tolerance`, `expectedStatus` | The configured values |
+| `lgbmModelAge` | Time since the LightGBM model was loaded; present only while it is loaded |
+| `loadBalance` | Only on `smart-loadbalance` groups; see [Smart load balancing](#smart-load-balancing) |
 
-`GET /group/{name}` returns the same object (404 for something that is not a group), and `GET /group` returns every group as `{"proxies": [...]}`.
+`GET /group/{name}` returns the same shape (404 when the object is not a group); `GET /group` returns all groups: `{"proxies": [...]}`.
 
-### `GET /proxies/{name}/weights`
+### `GET /group/{name}/weights`
 
-Shows how the group scores each node: which nodes it relies on and whether it has learned enough. Parameters:
+The group's node ranking, as in mihomo's endpoint of the same name; `GET /proxies/{name}/weights` is the same endpoint. Parameters:
 
-- `refresh=true`: recompute the ranking from the existing prefetch results instead of returning the cached one. It does not prefetch again; to redo the prefetch as well, use [`POST /smart/groups/{name}/recompute`](#post-smartgroupsnamerecompute).
-- `full=1` (or `full=true`): add `per_target`, the per-(destination, node) detail. It is exactly the data selection reads, so it answers "why did this site use that node". With a lot of data the rows are a random sample of at most `MaxTargets / 2`.
-
-```bash
-curl 'http://127.0.0.1:9090/proxies/auto/weights?full=1'
-```
+- `refresh=true`: recompute now instead of returning the cached ranking (up to 30 s old);
+- `full=1` (or `full=true`): add a `diagnostic` object, the same as [`GET /smart/groups/{name}/diag`](#get-smartgroupsnamediag).
 
 ```json
 {
   "weights": [
-    { "name": "HK-01", "rank": "MostUsed", "weight": 1.4231, "score": 100,
-      "targetCount": 37, "sampleCount": 412, "lastUpdated": 1759800000 }
-  ],
-  "per_target": [
-    { "target": "*.example.com", "node": "HK-01", "weight_tcp": 1.42,
-      "weights_by_type": { "tcp": 1.42 },
-      "success": 12, "failure": 1, "connect_time_ms": 85, "latency_ms": 140,
-      "last_used": 1759800000, "upload_mb": 0.53, "download_mb": 12.8 }
+    {
+      "Name": "HK-01", "Rank": "MostUsed", "Weight": 100,
+      "Alive": true, "Pool": true,
+      "Utility": 1.0123, "Reliability": 0.9412, "Observed": 0.9831, "Quality": 0.8734,
+      "Completed": 37.42, "Qualified": true, "FailStreak": 0, "BackedOff": false,
+      "ProbeMs": 182, "ResponseMs": 240.5, "SetupMs": 95.2,
+      "UploadBps": 81234, "DownloadBps": 2345678, "Loss": 0.0021,
+      "Success": 412, "Failure": 7, "Targets": 23
+    }
   ]
 }
 ```
 
 | Field | Meaning |
 |---|---|
-| `rank` | Usable nodes sorted by weight: the top 20% are `MostUsed`, the next 50% `OccasionalUsed`, the rest `RarelyUsed`. Unusable nodes are always `RarelyUsed` |
-| `weight` | The node's average weight over its active destinations, on the same scale selection uses |
-| `score` | `weight` as a percentage of the highest one, handy for progress bars |
-| `targetCount` | How many destinations the average covers; more means more trustworthy |
-| `sampleCount` | Total dials across those destinations |
-| `per_target[].weight_tcp`, `weight_udp`, `weights_by_type` | TCP weight, UDP weight, and every weight including the ASN-scoped ones, for that (destination, node) |
+| `Name`, `Rank`, `Weight` | mihomo's three fields: the node; `MostUsed` / `OccasionalUsed` / `RarelyUsed`; a relative score 0–100. See [The dashboard ranking](../scoring/#the-dashboard-ranking) |
+| `Alive` | Health checks pass and no group-wide block |
+| `Pool` | In the TCP serving pool |
+| `Utility` | The node's overall comprehensive score (not per service, `policy_priority` factor included) |
+| `Reliability`, `Observed` | Reliability lower bound and observed success rate (decayed) |
+| `Quality` | Overall connection quality (without the factor), 0 when none |
+| `Completed`, `Qualified` | Decayed completion count; whether the node is proven |
+| `FailStreak`, `BackedOff` | Consecutive hard failures; whether a backoff is running |
+| `ProbeMs`, `ResponseMs`, `SetupMs` | Probe delay, first-response time and connect time (present only with fresh data from the last 2 minutes) |
+| `UploadBps`, `DownloadBps` | Recent upload and download goodput in bytes per second, omitted when unknown |
+| `Loss` | Average TCP retransmission rate over the last 30 minutes, omitted when unknown |
+| `Success`, `Failure` | Lifetime successes and failures |
+| `Targets` | Number of services the node has records for |
 
-With no data at all, the list is empty and `"message": "no weight data available for this group"` is added. Without stats (for example when the cache file is off) the ranking is derived from probe delays, with `targetCount` 1 and `sampleCount` 0. For an outbound that is not a Smart group the answer is 400 `{"weights": [], "error": "not a Smart group"}`.
+Rows are sorted by `Alive`, `Weight`, then `Name`. Without any data the list is empty, with `"message": "No weight data available for the specified group"`. A non-Smart object returns 400 `{"weights": [], "error": "not a Smart group"}`. Called on a `smart-region` outbound, it returns the part of its group's ranking that belongs to the region, plus `group` and `region`.
 
-### `GET /smart/weights`
+### `GET /group/weights`
 
-Every Smart group's ranking in one call (at most 5 groups computed at a time), with `refresh=true` supported — useful for an overview page.
+The ranking of every Smart group in one call (up to 5 groups computed in parallel), as in mihomo; `GET /smart/weights` is the same endpoint. Accepts `refresh=true`.
 
 ```json
 {
-  "weights": { "auto": [ { "name": "HK-01", "rank": "MostUsed", "weight": 1.42, "score": 100, "targetCount": 37, "sampleCount": 412, "lastUpdated": 1759800000 } ] },
+  "weights": { "auto": [ { "Name": "HK-01", "Rank": "MostUsed", "Weight": 100 } ] },
   "errors": {}
 }
 ```
 
-A group that fails to compute shows up under its name in `errors`; the others are returned as usual. With no Smart groups the answer is `{"weights": {}, "message": "no Smart groups configured"}`.
+A group that fails is listed under its name in `errors`. Without Smart groups: `{"weights": {}, "message": "No Smart groups or no weight data available"}`.
 
 ### `GET /smart/groups`
 
-Lists every Smart group with its main settings, so you can confirm the configuration took effect as intended:
+Every Smart group with its main settings, to confirm the config took effect:
 
 ```json
 {
   "groups": [
     {
-      "name": "auto", "type": "smart", "testUrl": "https://www.gstatic.com/generate_204",
-      "useASN": false, "useLightGBM": true, "collectData": false,
+      "name": "auto", "type": "smart",
+      "testUrl": "https://www.gstatic.com/generate_204", "expectedStatus": "*",
+      "preferASN": false, "useLightGBM": true, "collectData": false, "sampleRate": 1, "tolerance": 0,
       "fixed": "", "now": "HK-01", "members": 42,
-      "algorithm": "strict-best", "pinSuspended": false, "http3FallbackNodes": 0,
-      "lgbmModelAge": "2h3m0s",
-      "policyPriority": [ { "raw": "HK", "pattern": "HK", "kind": "substring", "negate": false, "factor": 1.3 } ],
-      "pinEndorsements": [ { "node": "HK-01", "boost": 1.12, "count": 18, "success": 17, "failure": 1,
-                             "first_pinned": 1759000000, "last_pinned": 1759800000,
-                             "top_targets": { "*.example.com": 9 }, "age_seconds": 3600 } ]
+      "policyPriority": [ { "pattern": "Hong Kong|HK", "factor": 1.2 } ],
+      "lgbmModelAge": "2h3m0s"
     }
   ]
 }
 ```
 
-- `type` is `smart` or `smart-loadbalance`; the latter also carries the same [`loadBalance` block](#get-proxiesname-1) as `/proxies`.
-- `members` is always the number of member nodes. `fixed` is the pinned node; on a `smart-loadbalance` group with no pin but a locked region, it is that region.
-- `policyPriority` shows how each rule was parsed: `raw` is the rule text without its factor (prefixes `=`, `~`, `!` included), `pattern` what is actually matched, `kind` one of `substring`, `exact`, `regex`, `glob`, `negate` whether it is negated, and `factor` its factor. Use it to confirm your rules mean what you intended.
-- `pinEndorsements` are pin-learning records, highest boost first: `boost` is the multiplier, `count` / `success` / `failure` the dials made while pinned, `top_targets` the destinations visited most, `age_seconds` the time since the last pin.
-- `http3FallbackNodes` is currently always 0.
-- `lgbmModelAge`, `policyPriority`, `pinEndorsements`, `hysteresis` and `loadBalance` are omitted when empty.
+- `type` is `smart` or `smart-loadbalance`; the latter also carries the same `loadBalance` block as `/proxies`.
+- `members` is the number of member nodes. `fixed` is the pinned node, or the locked region of `smart-loadbalance`.
+- `policyPriority`, `lgbmModelAge` and `loadBalance` are omitted when empty.
 
 ### `GET /smart/groups/{name}/diag`
 
-A group's internal state, for questions like "the ranking looks wrong" or "why is the target count 0". Read-only and safe to call often:
+A group's internal state: why it chose what it chose, which nodes are blocked, who is in the serving pool. Read-only and cheap to poll:
 
 ```json
 {
-  "name": "auto", "algorithm": "strict-best", "hysteresis": "0s",
-  "policy_priority": null, "members": 42, "now": "HK-01", "fixed": "",
-  "test_url": "https://www.gstatic.com/generate_204",
-  "snapshot_entries": 42, "snapshot_age": "42s",
-  "live_coverage": { "HK-01": { "target_count": 37, "sample_count": 412 } }
+  "name": "auto", "type": "smart", "now": "HK-01", "fixed": "",
+  "testUrl": "https://www.gstatic.com/generate_204",
+  "members": [
+    { "name": "HK-01", "alive": true, "delay": 182, "stabilityGrade": 1, "load": 3, "priority": 1.2,
+      "exitRegion": "HK", "exitAsn": "9304" },
+    { "name": "US-03", "alive": true, "delay": 420, "stabilityGrade": 2, "load": 0, "priority": 1,
+      "blocked": "unstable", "blockedUntil": 1761730000 }
+  ],
+  "selection": [
+    { "network": "tcp",
+      "reasons": { "incumbentHeld": 812, "performanceWinner": 37, "coldExplore": 6, "periodicExplore": 21 },
+      "ordinarySwitch": 15, "switchFlap": 2, "pool": ["HK-01", "JP-01", "SG-02", "HK-04"],
+      "budgets": [ { "family": "ipv4", "coldAllowance": 8, "coldAvailable": 2, "earnedAvailable": 3,
+                     "earningPeriod": 16, "paused": false, "inFlight": 0, "trialYield": 0.83,
+                     "businessStarts": 1203, "trialStarts": 33, "coldTrialStarts": 6, "periodicTrialStarts": 21,
+                     "recoveryStarts": 6, "budgetBlocked": 140, "inFlightBlocked": 4, "refunded": 1,
+                     "trialSuccess": 25, "trialFailure": 5 } ] },
+    { "network": "udp", "reasons": {}, "ordinarySwitch": 0, "switchFlap": 0, "pool": null, "budgets": null }
+  ],
+  "filtered": 96,
+  "cache": { "aggregate": 168, "aggregateEvicted": 0, "site": 1320, "siteEvicted": 0, "exact": 4210, "exactEvicted": 0 },
+  "hosts": [ { "key": "*.example.com", "nodes": { "HK-02": "answer" } } ],
+  "hostFailLimit": 14,
+  "floodSuppressed": false,
+  "asnClaims": 0,
+  "connections": 57,
+  "preferAsn": false, "useLightGBM": true, "lightgbmLoaded": true, "collectData": false,
+  "ranking": [ { "Name": "HK-01", "Rank": "MostUsed", "Weight": 100 } ]
 }
 ```
 
-- `snapshot_entries`, `snapshot_age`: size and age of the in-memory ranking snapshot; `snapshot_age` is `(none)` when there is none.
-- `live_coverage`: read straight from the stats table, bypassing every cache — how many destinations and samples each node really has. Present only when the cache file is available.
-- `members` is the length of the group's `all` list. For a `smart-loadbalance` group that lists region outbounds, that is the number of entries, not of nodes.
-- `fixed` shows only a pinned node, never a region lock.
+| Field | Meaning |
+|---|---|
+| `members[]` | Per member: `alive` health checks pass, `delay` the latest check's delay, `stabilityGrade` the stability grade (1–4), `blocked` / `blockedUntil` reason and deadline (Unix seconds) of a group-wide block, `load` live connections through this group, `priority` factor, `exitRegion` / `exitAsn` the real exit |
+| `selection[]` | One entry each for TCP and UDP: `reasons` counts selection reasons (see [Selection reasons](../scoring/#selection-reasons)), `ordinarySwitch` incumbent replacements, `switchFlap` switches back, `pool` serving-pool members, `budgets` the exploration budget per address family |
+| `filtered` | Candidates removed by filtering, in total |
+| `cache` | Current size and total evictions of the three evidence tables (shared by all groups) |
+| `hosts[]` | Sites or service keys with block records: `nodes` maps node → block code, `hostBlocked` means the site itself is judged broken, `udp` marks UDP records |
+| `hostFailLimit` | The broken-site threshold (more blocked nodes than this) |
+| `floodSuppressed` | Whether a failure flood is in progress |
+| `asnClaims` | Current number of ASN claims |
+| `connections` | Live connections of the group |
+| `lightgbmLoaded`, `collectedSamples` | Whether the model is loaded; training samples written this run (present while collecting) |
+| `ranking` | The same ranking as the weights endpoint |
 
-A missing group returns 404, one that is not a Smart group 400 `not a Smart group`.
+An unknown group returns 404 `group not found: <name>`, a non-Smart one 404 `not a Smart group: <name>`.
 
 ### `GET /proxies/{name}/delay`
 
-Measures the delay to the probe URL through this group. Parameters: `timeout` (required, milliseconds) and `url` (optional). The test goes through Smart's own selection and does not release a pin.
-
-- Up to 3 samples, median returned; a first sample under 50 ms is returned straight away.
-- A `url` starting with `http://` is ignored and the default probe URL used.
-- Success returns `{"delay": 120}`. When every sample fails, a timeout returns 504 `{"message": "Timeout"}` and any other failure 503 `{"message": "An error occurred in the delay test"}`; a missing `timeout` returns 400.
-- The result is stored under the `now` node, which is not necessarily the node that was measured.
+Tests the group as one proxy, through the node it would currently choose. Parameters: `timeout` (required, milliseconds) and `url` (optional; `http://` URLs are ignored). Success returns `{"delay": 120}`; a timeout returns 504 and other failures 503. It does **not** release the pin.
 
 ### `GET /group/{name}/delay`
 
-Tests every member of the group, 4 at a time, with the same parameters as above. Only successful results are returned, such as `{"HK-01": 120, "JP-01": 85}`, and the shared delay history is updated. For a member that is itself a group, its currently selected node is tested.
+Tests every member of the group (up to 4 at a time) with the same parameters and returns `{"HK-01": 120, "JP-01": 85}`, successful members only. The results also count toward each member's health and the probe delay in the score.
+
+<Callout type="warn" title="A group delay test releases the pin">
+  As in mihomo, calling this on a Smart group first releases the pinned node. The "test" button of dashboards usually calls this endpoint.
+</Callout>
 
 ### `GET /connections`
 
-Shows the node each connection really uses. For connections through Smart, `chains` is extended to the node that was actually dialed, in mihomo's order, final node first:
+The node each connection really uses. For connections through Smart, `chains` is completed down to the node that actually connected, in mihomo's order with the final node first:
 
 ```json
 { "chains": ["HK-01", "auto", "proxy"] }
 ```
 
-When Smart's members are groups such as `urltest` or `selector`, the chain unfolds level by level down to the real node. The connection lists of the SFA / SFW / SFL GUI clients show this node as well.
-
 ## Manual control
 
 ### `PUT /proxies/{name}`
 
-Pins a node: from now on new connections use it. Clicking a node in a dashboard calls this endpoint. `PATCH` does the same.
+Pins a node: new connections use only this node. Clicking a node in a dashboard calls this. `PATCH` is equivalent.
 
 ```bash
 curl -X PUT http://127.0.0.1:9090/proxies/auto -d '{"name":"HK-01"}'
 ```
 
-- Success returns 204; a body that is not valid JSON returns 400 `Body invalid`; a node outside the group returns 400 `Smart update error: not found`.
-- `{"name": ""}` unpins.
-- The pin is saved in the cache file and survives restarts. It also clears the group's unwrap cache (the short-term "destination → node" memory).
-- Existing connections are left alone unless `interrupt_exist_connections` is on.
-- If the pinned node fails, Smart temporarily uses others and returns to the pin once it recovers; see [Pinning a node](../priority-and-pinning/#pinning-a-node).
+- Returns 204 on success; an invalid JSON body returns 400; a node that is not a member returns 400 `Smart update error: not found`.
+- `{"name": ""}` releases the pin.
+- The pin is saved in the cache file and restored after a restart. With `interrupt_exist_connections`, existing connections are closed.
+- While pinned there is no filtering, scoring, fallback or blocking from connection outcomes; see [Manual pin](../how-it-works/#manual-pin).
 
 ### `DELETE /proxies/{name}`
 
-Unpins and lets Smart choose on its own again, then recomputes prefetch and ranking in the background. The "release fixed" buttons of dashboards call this.
+Releases the pin and returns to automatic selection. Dashboard buttons such as "unpin" call this.
 
 ```json
-{ "group": "auto", "previous_pin": "HK-01", "now": "JP-01", "interrupted_mux": true, "unwrap_cleared": true }
+{ "group": "auto", "previous_pin": "HK-01", "now": "JP-01", "interrupted": false }
 ```
 
-- `previous_pin` is the node that was pinned (omitted when none was); `now` is the current node afterwards.
-- `interrupted_mux` only means an interrupt was issued: the group's existing connections are actually closed only when `interrupt_exist_connections` is on.
-- `urltest` groups support this too and answer `{"group", "previous_pin", "now"}`; other group types return 400.
+- `previous_pin` is the node that was pinned, omitted when none was; `now` is the current node afterwards.
+- `interrupted` reports whether `interrupt_exist_connections` is on (if `true`, the group's existing connections were closed).
+- `urltest` and `smart-region` support this too, returning `{"group", "previous_pin", "now"}`; other group types return 400.
 
 ### `POST /smart/groups/{name}/clear-selection`
 
-Same effect as `DELETE /proxies/{name}`; answers `{"group": "auto", "cleared": true}`. A missing group or one that is not a Smart group returns 404.
-
-### `PUT /smart/groups/{name}/algorithm`
-
-Switches the selection algorithm without a restart — handy for trying algorithms out. The body must be a JSON object:
-
-```bash
-curl -X PUT http://127.0.0.1:9090/smart/groups/auto/algorithm -d '{"algorithm":"p2c"}'
-```
-
-```json
-{ "group": "auto", "requested": "p2c", "applied": "p2c", "previous": "strict-best" }
-```
-
-- Values and aliases are listed in [Algorithms](../algorithms/). An unrecognised value is not an error but becomes `strict-best`, so trust `applied`.
-- The switch lasts for the current run only; it is not written back, and the configured value returns after a restart.
-- A malformed body returns 400 `invalid JSON body: ...`; a missing group 404; a group that is not a Smart group 400 `not a Smart group`; a `smart-loadbalance` group 400 — use [`PUT /smart/groups/{name}/balance`](#put-smartgroupsnamebalance) there.
+Same effect and response as `DELETE /proxies/{name}`.
 
 ### `POST /smart/groups/{name}/block/{node}`
 
-Keeps the group off a node for a while, for example when you know its route is bad tonight. The `duration` parameter (Go duration, such as `15m` or `2h`) sets how long, 30 minutes by default; an invalid value falls back to the default.
+Takes a node out of the whole group for a while, for example when you know its line is bad tonight. Parameter `duration` (Go duration such as `15m`, `2h`), 30 minutes by default; an invalid value falls back to the default.
 
 ```bash
 curl -X POST 'http://127.0.0.1:9090/smart/groups/auto/block/HK-01?duration=2h'
 ```
 
 ```json
-{ "group": "auto", "node": "HK-01", "blocked_until": "2026-10-07T09:30:00+08:00" }
+{ "group": "auto", "node": "HK-01", "blocked_until": "2026-10-29T18:30:00+08:00" }
 ```
 
-- While blocked, the node is recorded as "failed 100 times, degraded factor 0.1"; after expiry the recovery check restores it gradually.
-- There is no unblock endpoint: wait for expiry or use one of the [Clearing data](#clearing-data) endpoints. The block list is cached for 5 minutes, so expiry or clearing can take up to 5 more minutes to show.
-- Blocking does not affect a pin: a pinned node is used even while blocked. The last-resort fallback, used when no candidate is available, ignores blocks too.
-- A missing group returns 404; a node outside the group 404 `node not a member of this group`; without a cache file 500 `smart: store unavailable`.
+- While blocked, the node is excluded at the first filtering level (it may still serve as a last resort when nothing else is available) and shows `Alive: false` in the ranking; the block is saved in the cache file.
+- A pinned node is not affected.
+- A node that is not a member returns 404 `node not a member of this group: <node>`.
+
+### `DELETE /smart/groups/{name}/block/{node}`
+
+Lifts a group-wide block early (including an `unstable` block from the stability check); returns 204.
 
 ### `DELETE /connections/smart/{id}`
 
-Closes a connection and blocks the Smart member it **actually used** for 30 minutes — a one-click fix when a connection in the list is crawling. `id` is the connection ID from `GET /connections`.
+Closes a connection and blocks the Smart member it **actually used** for the connection's site (code `manual`), as in mihomo. Handy when the connection list shows a site crawling through one node. `id` is the connection ID from `GET /connections`.
 
-- Success returns `{"group": "auto", "node": "HK-01"}`. When the connection did not go through a Smart group, or blocking failed, the answer is `{}` — the connection is still closed.
+```json
+{ "group": "auto", "node": "HK-01" }
+```
+
+- The block is recorded on the connection's wildcard host (such as `*.example.com`) and on its service key (the matched rule such as `RuleSet [geosite-netflix]`; with `prefer_asn` possibly the ASN or the service that claimed it), so the service's other domains avoid the node too. It is **permanent** and only [flushing](#flushing-data) removes it.
+- Related connections are closed and the incumbent is cleared.
+- A connection that did not go through a Smart group returns `{}` and is still closed; one without routing metadata returns 204.
 - An `id` that is not a valid UUID returns 400; an unknown connection 404.
 
 ### `POST /smart/groups/{name}/recompute`
 
-Recomputes prefetch and ranking in the background right away instead of waiting for the next cycle, and immediately returns a fresh ranking `{"group": "auto", "ranking": [...]}`. Because the prefetch runs asynchronously, that ranking can lag the final result by one cycle. A missing group or one that is not a Smart group returns 404.
+Recomputes the ranking now and returns it: `{"group": "auto", "ranking": [...]}`.
 
-## Clearing data
+## Flushing data
 
-Clearing deletes everything Smart has learned for a group in the cache file, so it starts learning from scratch. Do it after a large change of nodes, or when you suspect the data was skewed by an unusual event. A recompute starts in the background afterwards.
+Flushing removes everything the group learned, as if starting over: evidence, incumbents, the serving pool and exploration budget, every block record (including `manual`), group-wide blocks, the manual pin, exit info and all of its records in the cache file; health state is reset as well. A `smart-loadbalance` group returns to its configured lock and settings and re-detects regions.
 
 ### `DELETE /proxies/{name}/weights`
 
-Clears all of one group's data: stats, node state, ranking, prefetch, destination failure counts, queued writes not yet on disk, the pin, unavailable markers, circuit breakers, pin-learning records, and — for `smart-loadbalance` — the region lock, runtime settings and exit-probe results. The in-memory state is reset too: the pin is released, breakers are closed, and so on.
+Flushes one group and returns how many entries were removed:
 
 ```json
-{
-  "group": "auto",
-  "deleted": { "stats": 1203, "nodes": 42, "ranking": 1, "prefetch": 380, "failures": 12,
-               "queue": 3, "manual_pin": 1, "known_dead": 2, "breakers": 1, "pin_endorsement": 1,
-               "region_state": 0, "exit_geo": 0 },
-  "total": 1646,
-  "recomputed": true
-}
+{ "group": "auto", "deleted": { "aggregate": 168, "site": 1320, "exact": 4210, "blocks": 12 } }
 ```
 
-`deleted` counts the entries removed per kind; `queue` is the number of pending writes dropped. On a `smart-loadbalance` group the region lock is released in memory as well, mode, strategy and affinity return to the configuration, exit results, region memories, affinity bindings and region-probe results are dropped, and regions are re-detected and exits re-probed.
+`aggregate`, `site` and `exact` count the evidence cells of the three layers, `blocks` the block records. If writing the cache file fails, it returns 500 with an extra `error`. A non-Smart object returns 400 `{"error": "not a Smart group"}`.
 
 ### `POST /cache/smart/flush`
 
-Clears every Smart group in the current configuration (as above) and empties Smart's in-process caches. `DELETE` does the same.
-
-```json
-{
-  "flushed_groups": 2, "errors": 0,
-  "total": { "stats": 2406, "nodes": 84, "ranking": 2, "prefetch": 760, "failures": 24, "queue": 0 },
-  "groups": [ { "group": "auto", "deleted": { "stats": 1203 }, "recomputed": true } ]
-}
-```
-
-`total` adds up only six kinds — stats, node state, ranking, prefetch, failure counts and queue; pins, unavailable markers, breakers and the rest appear only in each group's `deleted`. The response is 500 only when every group failed.
+Flushes every Smart group of the current config and returns **204** with no body, as in mihomo. `DELETE` is equivalent. If a group fails, it returns 500 `{"message": "<group>: <error>"}`.
 
 ### `POST /cache/smart/flush/{name}`
 
-Clears a single group, the same as `DELETE /proxies/{name}/weights`; `DELETE` does the same. Returns `{"group", "deleted", "total", "recomputed": true}`. A missing group returns 404, one that is not a Smart group 400 `not a Smart group`.
+Flushes the Smart group named `name` and returns 204. `DELETE` is equivalent. mihomo keys this path by configuration name, so when `name` is not a Smart group, every Smart group is flushed.
 
 ## Smart load balancing
 
@@ -359,7 +361,7 @@ A `smart-loadbalance` group carries an extra `loadBalance` block summarising how
 {
   "type": "Smart",
   "name": "balance",
-  "now": "🇭🇰 Hong Kong LB",
+  "now": "🇭🇰 Hong Kong 03",
   "all": ["🇭🇰 Hong Kong LB", "🇯🇵 Japan LB", "🇺🇸 United States LB", "unknown-node-1"],
   "fixed": "",
   "loadBalance": {
@@ -372,7 +374,8 @@ A `smart-loadbalance` group carries an extra `loadBalance` block summarising how
 }
 ```
 
-- With `region.outbounds.members` set to `regions` (the default) and region outbounds generated, `all` lists the region outbounds, then declared region outbounds that have no members yet, then the members of regions without an outbound; `now` is the locked region's outbound, otherwise the outbound of the region that carried the last connection. With `members: "nodes"`, `all` and `now` behave as in a plain Smart group.
+- With `region.outbounds.members` set to `regions` (the default) and region outbounds generated, `all` lists the region outbounds, then declared region outbounds that have no members yet, then the members of regions without an outbound. With `members: "nodes"`, `all` is the same as in a plain Smart group.
+- `now` is a node: the pinned node, else the node that carried the latest connection. The `now` returned by `GET /smart/groups`, `DELETE /proxies/{name}` and the region endpoints shows the region instead: the locked region's outbound, else the outbound of the region that carried the last connection.
 - `fixed` is the pinned node; with no pin but a locked region, it is that region's outbound (the region code when region outbounds are not listed).
 - `regions[].name` is the Chinese display name (or a name set in `region.rules`) and `nameEn` the English one; `healthy` counts usable nodes for TCP; `icon` and `outbound` appear only when present.
 

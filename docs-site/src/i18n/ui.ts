@@ -6,7 +6,7 @@ export const ui = {
   zh: {
     htmlLang: 'zh-CN',
     siteName: 'sing-box Smart',
-    siteDesc: 'sing-box xiaobaf14g 分支 Smart 出站组文档：按网站学习节点表现，为每条连接自动选出当下最合适的节点，也能按地区分摊连接。',
+    siteDesc: 'sing-box xiaobaf14g 分支 Smart 出站组文档：结合 honk 的综合评分与 mihomo Smart 的服务识别，按服务学习节点表现，为每条连接选出最可靠的节点，也能按地区分摊连接。',
     footerNote: 'xiaobaf14g 分支 · 基于 reF1nd/sing-box',
     nav: { docs: '文档', config: '配置', api: 'Clash API', examples: '示例' },
     menu: '目录',
@@ -26,7 +26,7 @@ export const ui = {
   en: {
     htmlLang: 'en',
     siteName: 'sing-box Smart',
-    siteDesc: 'Docs for the Smart outbound groups of the sing-box xiaobaf14g fork: they learn how each node performs for each site, pick the best node for every connection, and can spread connections by region.',
+    siteDesc: 'Docs for the Smart outbound groups of the sing-box xiaobaf14g fork: honk\'s comprehensive score plus mihomo Smart\'s service keys learn how every node serves every service, pick the most reliable node for each connection, and can spread connections by region.',
     footerNote: 'xiaobaf14g fork · built on reF1nd/sing-box',
     nav: { docs: 'Docs', config: 'Config', api: 'Clash API', examples: 'Examples' },
     menu: 'Menu',

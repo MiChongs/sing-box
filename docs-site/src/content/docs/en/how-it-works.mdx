@@ -1,226 +1,144 @@
 ---
 title: How it works
-description: What happens to a connection in a Smart group — identifying the destination, gathering candidates in tiers, filtering, ordering, racing dials — and how stats and weights are updated afterwards and what the background tasks do.
+description: The full path of a connection through a Smart group, from target and service key, manual pin, member filtering, the comprehensive score, dial rounds, and observation and verdict at close, plus background tasks, the current node and what groups share.
 ---
 
 import Flow from '../../../components/Flow.astro';
 import Callout from '../../../components/Callout.astro';
 
-This page follows one connection through a Smart group from start to finish. Read it when you want to know why Smart picked or switched a node, or before you tune anything. To just get it running, see [Quick start](../quick-start/); unfamiliar terms are in the [Glossary](../glossary/).
+Smart picks a node for **every single connection**. This page follows one connection in order; each step's details live in the matching guide. By design, scoring and selection follow the Score policy of [honk](https://github.com/daeuniverse/honk), while service keys, blocks, probes and convergence follow the Smart group of [vernesong/mihomo](https://github.com/vernesong/mihomo).
 
 ## Overview
 
-Smart does not tie all connections to one node: **it chooses again on every dial**, based on its record of "this website through this node". There are six steps. The first five happen at dial time; the last runs in the background after the connection closes.
-
 <Flow
   items={[
-    { title: 'Identify the destination', body: 'Fold the requested domain into a destination key such as `www.example.com` (randomized subdomains merge into `*.example.com`), or use the IP when there is no domain. Everything Smart records is kept per destination.' },
-    { title: 'Gather candidates in tiers', body: 'Try, in order: the pin, an in-memory cache, prefetched results, the weight ranking, probe latency — and use the first that returns something.' },
-    { title: 'Filter and top up', body: 'Drop nodes that are unavailable, blocked, soft-blocked for this destination or weighted too low; top up to 10 from the ranking.' },
-    { title: 'Order', body: 'Apply `policy_priority`, the algorithm, `hysteresis`, request-scene reordering and suspect-node demotion. Only the order changes.' },
-    { title: 'Race the dials', body: 'Up to 4 rounds, dialing in parallel within a round; the first to connect wins. A suspect first choice gets a hedged second dial after 250 ms.' },
-    { title: 'Record and learn', body: 'After the connection closes, update the stats and weight of that (destination, node) pair in the background, and hand anomalies to the watchdog and circuit breaker.' },
+    { title: 'Target and service', body: 'The domain, IPs and port of the connection give three keys: the exact target `host:port`, the wildcard host `*.example.com`, and the service key (the matched routing rule, or the wildcard host or ASN). See [Service keys](/en/service-keys/).' },
+    { title: 'Manual pin', body: 'When a node is pinned in the dashboard, only that node is used and every later step is skipped.' },
+    { title: 'Filter members', body: 'Drops members whose health checks fail, that are blocked for the whole group, blocked for this site or service, or deferred by an exit suspicion; if nothing is left, the conditions loosen step by step.' },
+    { title: 'Score and select', body: 'Inside the serving pool, the reliability-first comprehensive score picks the primary; when the service already has an incumbent, a challenger must prove itself to replace it. Now and then the exploration budget tries another node. See [Score and selection](/en/scoring/).' },
+    { title: 'Dial in rounds', body: 'Primary, the rest of the pool, then members outside it, at most 10; the first three rounds dial one member each, later rounds race 5 at once.' },
+    { title: 'Convergence', body: 'When the primary fails and a fallback connects, the fallback becomes the service\'s incumbent and the service\'s connections through other nodes are closed.' },
+    { title: 'Observe and judge', body: 'Records connect time, first response, goodput windows and TCP retransmissions; at close the connection is judged a success, a failure, or inconclusive, which updates the score and block records and may trigger a response probe. See [Blocks and probes](/en/blocks-and-probes/).' },
   ]}
 />
 
-A `smart-loadbalance` group keeps steps 1 and 6 and the dial machinery, but replaces steps 2–4 with "choose a region, then spread within it" — see [Smart load balancing](../smart-loadbalance/).
+## Target and service
 
-## Destination
+From the routing metadata Smart takes the destination domain (the domain in the destination address first, then the sniffed one), every known IP and the port, and derives keys at three levels:
 
-Every statistic Smart keeps is per destination: how a node does for one website is recorded and scored separately from how it does for another. The destination key comes from the first of these that is set: the connection's destination domain, the sniffed domain, the domain recorded during routing, the original domain before routing rewrote it — and the destination IP when there is no domain.
+| Key | Example | Used for |
+|---|---|---|
+| Exact target | `www.example.com:443` | The finest score record (memory only) |
+| Wildcard host | `*.example.com` | Block records, response probes and exit suspicions |
+| Service key | `RuleSet [geosite-netflix]`, `*.example.com`, `13414` | Score, incumbent, convergence and persistence |
 
-So that subdomains of one site share what was learned, Smart finds the registrable domain (eTLD+1, such as `example.com` or `example.co.uk`) using the public-suffix list, then folds:
+The wildcard host folds randomly generated subdomains together: `rr3---sn-abc.googlevideo.com` and `rr5---sn-xyz.googlevideo.com` both become `*.googlevideo.com`, and multi-label suffixes such as `example.co.uk` are handled correctly. The service key is the matched routing rule by default, else the wildcard host; with `prefer_asn`, broad rules and rule-less targets are grouped by ASN. The full rules are in [Service keys](../service-keys/).
 
-- the registrable domain itself becomes `*.example.com`;
-- a subdomain keeps only the label right next to the registrable domain, and deeper levels fold into `*.`;
-- labels that look randomly generated (containing `-`, long hex strings, mostly digits) become `*`.
+## Filtering members
 
-| Requested domain | Destination key |
+Before selection, Smart tries four increasingly loose conditions and uses the first that leaves any member:
+
+1. Health checks pass, not blocked for the whole group, not blocked for this site or service, not deferred by an exit suspicion (and, for UDP, the member supports UDP);
+2. Ignore health and group-wide blocks;
+3. Ignore site and group-wide blocks, but require passing health checks;
+4. Exclude only manual blocks and exit suspicions (UDP support is no longer required either).
+
+At level 1, **one** member deferred by an exit suspicion is added back to take an 8-second "half-open" lease and test whether the suspicion still holds (see [Exit watch](../blocks-and-probes/#exit-watch)).
+
+When more than a third of the members (at least 2) are blocked for a site with `error`, `lowWeight` or `loss`, Smart concludes the **site itself** is broken: it ignores those blocks (but not `manual`) and stops blocking more nodes over that site's failures.
+
+## Selection
+
+After filtering, Smart scores each member of the **serving pool** (the few members worth comparing): reliability is the payoff, latency, goodput, connection quality and loss only fine-tune it, and the result is multiplied by the `policy_priority` factor. The service's **incumbent** (the node chosen for it before) is kept unless a challenger proves a large enough gain on mature data from both sides, or the incumbent stops being reliable or has just failed. A single candidate is used directly.
+
+The exploration budget now and then swaps the primary for a member that lacks data (cold trials, periodic trials earned by traffic, recovery trials when a failed member's backoff ends), so new and recovered nodes get compared at all. Details in [Score and selection](../scoring/).
+
+## Dialing
+
+The dial order is: the primary, the rest of the serving pool (by eligibility and score), then members outside the pool (not exit-suspected first, then by `policy_priority` factor and probe delay, with delays within `tolerance` keeping their configured order), at most 10 in total. Then rounds:
+
+| Round | Members | How |
+|---|---|---|
+| 1–3 | 1st, 2nd, 3rd | One per round |
+| 4 | 4th–8th | 5 race at once, the first to connect wins |
+| 5 | 9th–10th | Same |
+
+- Each round's timeout is the longest adaptive timeout of its members: the member's average connect time × 5 (at least 1 s), capped by `timeout` (5 s by default). A failure caused only by such an adaptive timeout is not held against the node.
+- When the destination does not resolve (NXDOMAIN), dialing stops at once; another node would not help.
+- Connections that lose a race are closed and count as neither success nor failure.
+- UDP dials one member at a time; a lone member is tried 3 times.
+
+When everything fails the error is `all members failed for <target>`; when filtering leaves nothing it is `no available member for <target>`.
+
+## Convergence
+
+When the primary fails and a later member connects, that member becomes the service's **incumbent**, and the service's TCP connections through other nodes are closed so clients reconnect to the same exit (mihomo's service convergence). Sites that tie logins to the exit IP therefore do not stay spread over several exits. When a node gets blocked for a service, the service's connections are closed and its incumbent is cleared too. See [Convergence](../service-keys/#convergence).
+
+## During and after a connection
+
+While a connection runs, Smart observes:
+
+- **Connect time**: how long the successful dial took;
+- **First response**: from the start of the dial to the first byte received;
+- **Progress**: data received after sending, recorded at most once per second, proving the node still works;
+- **Goodput windows**: when one direction carries 64 KiB or more within 1–10 s, an upload or download rate is recorded;
+- **TCP retransmissions**: at close, the send and retransmission counters of the TCP connection to the node's server are read and judged in windows of at least 64 segments or 64 KiB (Linux, Android, macOS, FreeBSD, Windows).
+
+The verdict at close:
+
+| Situation | Verdict |
 |---|---|
-| `example.com` | `*.example.com` |
-| `www.example.com` | `www.example.com` |
-| `a.b.example.com` | `*.b.example.com` |
-| `r1---sn-abc.googlevideo.com` | `*.googlevideo.com` |
-| `abc123def456.example.com` | `*.example.com` |
-| IP only, `203.0.113.7` | `203.0.113.7` |
+| Closed by Smart itself for convergence | Not counted |
+| Not a single byte either way | Not counted |
+| Read or write error from the node | Failure (for this site only) |
+| Sent data, no answer for 4 s or more, on port 443 or an IP target | Failure (site level), plus a 2-minute block (`stalled`) |
+| Sent data and ended before any answer (the client gave up) | Not counted |
+| Anything else | Success |
+| Dial failure | Failure (node level, for every site) |
 
-The key does not include the port or protocol. TCP and UDP have separate caches and weights; with `use_asn` on, weights are also kept per ASN of the destination IP, see [ASN and GeoX](../asn-geox/).
+A failure "for this site only" puts the node in a failure state for this site (its service and exact target) without touching its score elsewhere; a dial failure means the node itself is in trouble. Besides success or failure, Smart computes a **connection quality** with mihomo's scene formula (or the LightGBM model) and uses it to decide whether to block and whether to run a response probe; see [Blocks and probes](../blocks-and-probes/).
 
-When Smart is a member of another group, or the `detour` (front) of a landing node, and has no information about the original connection's destination, it builds the key from the address of the dial itself.
+Connections to the health-check URL's host and connections of `block` and `dns` members are not learned.
 
-## Candidate tiers
+## Manual pin
 
-The candidates are the nodes this dial is going to try. Smart tries the sources below from top to bottom and uses the first that returns something; the result then goes through filtering and ordering.
+Clicking a node in the dashboard (`PUT /proxies/{group}`) pins it:
 
-| Tier | Source | When it is used |
-|---|---|---|
-| Pin | The node you pinned in a dashboard or through the Clash API | A pin is set and its circuit breaker is not open |
-| Unwrap cache | The previous candidate list for this destination, in memory | The destination was dialed before and the entry is still cached |
-| Prefetch | Node lists computed every 2 minutes for recently used destinations | The destination is within the prefetch set |
-| Weight | Weights of this destination's nodes from the stats store, time-decayed | Weight data exists |
-| Delay | URL probe latency, lowest first | None of the above returned anything |
-| Fallback | Any available node | Everything above was empty |
+- New connections use **only** that node, with no filtering, scoring or fallback; if it cannot connect, the connection fails. A UDP connection is selected automatically when the pinned node has no UDP.
+- While pinned, connection outcomes do not block nodes, so a node you chose is not blacklisted behind your back.
+- The pin is saved in the cache file and restored after a restart; it is released when the node leaves the group.
+- Release it with `DELETE /proxies/{group}`, a `PUT` with an empty name, or `POST /smart/groups/{group}/clear-selection`. **A group delay test (`GET /group/{group}/delay`) also releases the pin**, as in mihomo.
+- With `interrupt_exist_connections`, a pin change closes existing connections.
 
-Without a cache file (no stats store), or when no destination can be identified, selection starts at the Delay tier.
+## The current node
 
-The unwrap cache lives only in memory and has no expiry time. Entries are removed when a node fails, a connection is judged degraded, the pin changes or the cache is cleared; when the memory budget runs short, the least recently used entries go first. In practice, then, the Prefetch and Weight tiers are used mainly for a destination's first visit or after the cache was cleared. Prefetch covers the most recently used destinations, up to half the number of destinations the memory budget allows.
+Smart picks a node per connection, so the dashboard's "current node" (`now`) is only a representative, taken in this order:
 
-## Filtering and top-up
-
-The nodes a tier returns are filtered first. A node is dropped if any of these holds:
-
-- it is no longer a member of the group;
-- it is blocked — too many accumulated failures, or blocked through the API;
-- it is unavailable: its circuit breaker is open; a dial or probe through it failed within the last 3 minutes; its last probe failed; or its probe record is older than 3 × `interval`. A node never probed counts as available, so there is something to choose right after start;
-- the connection is UDP and the node does not support UDP;
-- it is soft-blocked for this destination for 10 minutes, see [Health and failures](../health/#escalation);
-- its weight is below 0.4 (the unwrap-cache tier skips this check).
-
-Except for the unwrap-cache tier, at most 10 candidates are kept; with fewer, the list is topped up from, in order: `policy_priority` factors when configured, otherwise the background ranking, probe latency and a random sample. If nothing survives filtering, any available node is used, and failing that the first 10 members — a connection always has something to try.
-
-## Ordering layers
-
-With the candidate list fixed, these layers adjust it in turn. They **only reorder**; the first node is dialed first.
-
-1. **`policy_priority`**: a stable sort by "priority factor × pin-endorsement boost". Nodes with a factor above 1 go ahead of every node at 1, regardless of weight. See [Priority and pinning](../priority-and-pinning/).
-2. **The algorithm** moves one candidate to the front; `p2c`, for example, draws two of the top 5 and compares them. See [Algorithms](../algorithms/).
-3. **`hysteresis`**: if the node this destination last used successfully within the window is still a candidate, it goes back to the front, which cuts down on switching back and forth.
-4. **Request-scene reordering**: only for ranking-style algorithms (`strict-best`, `least-loaded`, `fastest-recent`, `latency-banded`), and only within the top 5. Downloads and streaming sort by the node's peak download rate; SSH, remote desktop, games and voice sort by recent RTT. The scene is guessed from the port and domain keywords — ports 22 and 3389 count as interactive, 3478 and 27000–28000 as real-time.
-5. **Suspect-node demotion**: nodes whose TLS probe to this destination failed in the last 15 minutes, or whose recent success rate is below 40%, move to the end. They are not removed, so something remains when every node is suspect.
-
-The `sticky-session` algorithm has a fast path: when the node that last served this destination is still available and not suspect, Smart uses it directly and skips all of the above.
-
-## Dialing and retries
-
-A TCP dial runs at most 4 rounds. Each round dials the candidates below; the first to connect wins and the rest are cancelled:
-
-| Round | Candidates dialed | Notes |
-|---|---|---|
-| 0 | the 1st, or the 1st and 2nd | Selection-style algorithms dial 1, ranking-style ones 2; a ranking-style first choice with a recent success rate ≥ 95% also gets just 1 |
-| 1 | the 3rd–5th | In parallel |
-| 2 | the 6th–8th | Same |
-| 3 | the 9th–10th | Same |
-
-- **Hedged dial**: when round 0 dials a single node and that node is suspect (recent dial failures, marked unavailable within 3 minutes, or never dialed or probed successfully during this run), the 2nd candidate is dialed as well after 250 ms, and whichever connects first wins. A healthy node usually connects within 250 ms, so the hedge rarely fires.
-- **Round timeout**: twice the historical connect time of the round's nodes; 10 seconds when there is no history or it exceeds 10 seconds. After a round that ended by timing out, Smart waits about 20–200 ms before the next; a round that failed quickly (connection refused, say) gets no wait.
-- **Re-selection**: when a round finds no candidates left to dial (which happens with fewer than 9 candidates) and nothing has connected, Smart selects once more — the nodes that just failed are now marked unavailable, so different ones come up — and starts again from round 0. A dial re-selects at most once. A failing pinned node goes through this too; see [Pinning](../priority-and-pinning/#pinning-a-node).
-- **What a failure costs**: every dial failure not caused by cancellation marks the node unavailable for 3 minutes, counts toward its circuit breaker, and records a failure in the stats.
-
-UDP does not dial in parallel: it tries the first 3 candidates one by one, each with a timeout of twice the historical connect time or 10 seconds. A UDP failure also marks the node unavailable for 3 minutes, but does not count toward the circuit breaker.
-
-After a successful dial, Smart remembers the node it used (for `now`, `sticky-session` and `hysteresis`) and writes the actual node into the connection's outbound chain. In the Clash API's `/connections`, a connection through Smart therefore shows as `["node-a", "auto", ...]`, with the actual node first.
-
-## Recording and learning
-
-When a connection closes, Smart hands its outcome to a background queue. If the queue is full, the sample is dropped rather than slowing the close down.
-
-### Statistics records
-
-There is one record per (group, destination, node). It holds the success and failure counts, connect time and first-byte latency (smoothed averages), upload and download bytes and peak rates, connection duration, time of last use, and the weights in separate slots: `tcp` and `udp`, plus `tcp_asn:<ASN>` and `udp_asn:<ASN>` with ASN on.
-
-Each record also keeps four sample-count-based exponential moving averages in memory, to catch "recently got better or worse". They are not written to disk and reset on restart:
-
-| Metric | Window (samples) | Used by |
-|---|---|---|
-| Short-term RTT | 30 | `fastest-recent`, `p2c`, `latency-banded`, scene reordering |
-| Short-term success rate | 20 (reads 0 for the first 11 samples) | Suspect detection, deciding whether round 0 dials just 1 node |
-| Long-term RTT | 900 | Recent-degradation penalty, training data |
-| Long-term success rate | 600 | Training data |
-
-### Weight formula
-
-The weight is the score Smart gives a (destination, node) pair: the higher, the more preferred, and nodes below 0.4 are not candidates. Without LightGBM, or before the model has loaded, the weight comes from the classic formula below; it is not computed until the pair has 2 samples.
-
-1. **Classify the connection's scene**: by traffic shape into interactive, streaming, transfer, web, realtime, voip and api, each with its own coefficients and limits.
-2. **Success rate**: the Wilson lower bound (z = 1.645) of the time-decayed success and failure counts. Few samples make it cautious: 1 success scores only 0.27, 10 out of 10 scores 0.79.
-3. **Latency scores**: connect time and first-byte latency each map through `exp(−ms / 1500)`; jitter costs up to 40%.
-4. **Base score**: `1.6 × success^a × connect^b × latency^c`, with scene-dependent exponents; UDP weighs latency and success more.
-5. **Adjustments**: traffic, duration, quality and efficiency factors; up to +20% for peak bandwidth in streaming and transfer scenes; up to −30% when recent RTT clearly worsened or the recent success rate is low; and, with few samples, a confidence factor of at least 0.7.
-6. **Priority**: multiplied by the `policy_priority` factor and the pin-endorsement boost, and by a further 1.15 while the node is pinned.
-7. **Scene limits**: above the latency or connect time a scene tolerates (150 ms / 300 ms for realtime, for example), the weight is capped at 0.38, below the 0.4 threshold; a success rate under the scene's minimum is discounted by the shortfall.
-
-| Scene | Latency limit | Connect limit | Minimum success rate |
-|---|---|---|---|
-| realtime | 150 ms | 300 ms | 80% |
-| voip | 200 ms | 400 ms | 75% |
-| interactive | 300 ms | 500 ms | 70% |
-| streaming | 600 ms | 800 ms | 75% |
-| api | 600 ms | 600 ms | 70% |
-| web | 800 ms | 1000 ms | 60% |
-| transfer | none | none | 70% |
-
-A new weight is blended with the old one: `new = max((4 × old + 2 × computed) / 6, 0.1)` — each new sample counts for a third, so a single odd connection cannot swing the weight wildly.
-
-With LightGBM enabled and the model loaded, the model's output **replaces** the formula's result and is then multiplied by the priority factor; see [LightGBM model](../lightgbm/).
-
-### Time decay
-
-Old data is not deleted; it is discounted when read: the weight is multiplied by `2^(−hours / half-life)`, with whole hours. A node's good results from long ago therefore do not outweigh how it does now.
-
-- The base half-life is 168 hours (7 days), adjustable with the `SMART_DECAY_HALF_LIFE_HOURS` environment variable.
-- Fewer samples mean a longer half-life: 1× at about 20 samples, 3× below 5, 0.5× above 40.
-- Failure records get a further 2× half-life (`SMART_FAILURE_STICKY`), so failures are remembered longer than successes.
-- For selection, the decay factor never drops below 0.4, so a good node left unused for long is not forgotten entirely.
-- `SMART_LEGACY=1` switches back to the old piecewise decay curve.
-
-### Degradation and recovery
-
-Besides the per-destination stats, Smart keeps a per-node failure count F within the group. Each connection that ends in failure adds 1 to F, and the node's degradation factor `max(0.1, 1 − 0.01 × F)` pulls its weight down. When F reaches 30 (factor 0.7), the node is blocked for `30 + 2F + ⌊F/10⌋` minutes (93 minutes at F = 30). A connection on port 443 that ends without transferring any data, or a weight that drops by more than 30% at once, also marks the node degraded and clears this destination's unwrap cache.
-
-Every 5 minutes a background check lifts expired blocks; nodes not blocked gain 0.01 on their degradation factor while F is multiplied by 0.95, and a factor back above 0.99 counts as recovered.
-
-Once the same destination has been degraded `max_host_failed_times` times in the group (10 by default), Smart concludes the website itself is the problem, and that destination's failures stop counting against nodes.
-
-The faster responses — unavailable for 3 minutes, circuit breaking, per-destination soft blocks — are covered in [Health and failures](../health/).
+1. The pinned node;
+2. (`smart-loadbalance`) the representative of the current region;
+3. The member that carried the latest connection;
+4. The member a new TCP connection would most likely get;
+5. The first member.
 
 ## Background tasks
 
-Every Smart group runs the periodic tasks below. Tasks marked "skip when idle" do not run while the group is idle — it has never dialed successfully, or not within the last 2 minutes — so a phone in a pocket spends no battery on them.
+| Task | First run | Period | Notes |
+|---|---|---|---|
+| Health check | 10 s | `interval` | Only while the group is in use (a connection within `idle_timeout`) |
+| Stability check | 5 min | 10 min | Finds jittery or slowing members from their last 10 delays; see [Health checks](../health/#stability) |
+| Broken-site threshold | 1 min | 15 min | How many blocked nodes mean the site itself is broken: a third of the members, at least 2 |
+| ASN claims | 1 min | 2 min | Only meaningful with `prefer_asn`; see [ASN claims](../service-keys/#asn-claims) |
+| Save to the cache file | 5 min | 5 min | Also on shutdown |
+| Recheck refusing sites | 15 min | 30 min | Re-probes `answer` blocks, only while in use; each round has a one-in-two chance of being skipped |
+| Clean block records | 2 h | 2 h | Drops records without a failure for a week |
 
-| Task | First run | Period | Skip when idle | Purpose |
-|---|---|---|---|---|
-| Health check | 10 s | `interval` | Yes | Probing, see [Health checks](../health/#active-probing) |
-| Ranking | 45 s | 1 min | Yes | Compute the node ranking snapshot |
-| Prefetch | 30 s | 2 min | Yes | Precompute candidate lists for recently used destinations |
-| Recovery check | 5 min | 5 min | Yes | Lift expired blocks, recover degraded nodes |
-| Destination liveness probe | 2 min | 15 min | Yes | TLS handshake probes for popular destinations |
-| Watchdog scan | 10 s | 2.5 s | No | Check for stalled connections |
-| Flush | 5 s | 5 min | No | Write queued stats to the cache file |
-| Cache budget adjustment | 5 s | 5 min | No | Resize in-memory caches to the budget |
-| Memory table cleanup | 3 min | 5 min | No | Remove expired in-memory entries |
-| Old record cleanup | 10 min | 2 h | No | Trim records when there are too many |
-| Departed node cleanup | 10 min | 10 min | No | Delete data of nodes no longer in the group |
-| Departed group cleanup | 15 min | 2 h | No | Delete data of groups that no longer exist |
+While the device or network is paused (a sleeping phone, for example), every task is skipped.
 
-A `smart-loadbalance` group runs three more: region probes (first after about 90 s, every `region.probe.interval`, skipped when idle), exit re-probing (hourly, for members whose result expired) and load-balancing memory cleanup (first after 3 minutes, then every 5).
+## Network changes
 
-- Same-named tasks of different Smart groups have their first run staggered by the golden ratio (by up to 30 seconds, or a quarter of the period when that is shorter) plus a random offset of up to 10% of the period, so they do not all start at once.
-- After the device sleeps or the clock jumps, tasks continue from the current time instead of catching up on missed periods; a trigger that finds the previous run still going is skipped.
-- The minimum ranking interval grows with the number of nodes: 1 minute up to 100, 3 minutes up to 250, 5 minutes up to 500, 10 minutes beyond. An extra ranking runs 2 seconds after the first successful dial.
+When sing-box detects a network change (switching between Wi-Fi and mobile data, for example), Smart treats every member as available again, clears the failure-flood state and, while the group is in use, runs a health check right away. Learned scores are kept.
 
-How the ranking is computed: for each node, the average of its weights in the top 10 of every active destination's prefetch result, scaled to 0–100; the top 20% are `MostUsed`, the next 50% `OccasionalUsed`, the rest `RarelyUsed`.
+## What Smart groups share
 
-## Current node
-
-`now` in dashboards and `GET /proxies/{name}` is decided in this order:
-
-1. the pinned node, unless the pin is suspended;
-2. the node of the most recent successful dial;
-3. the first node in the ranking with a weight above 0;
-4. the node with the lowest probe latency;
-5. the first member.
-
-Since Smart picks per destination, `now` only means "the node used most recently", not that every connection uses it. For the node each connection actually uses, look at `chains` in `/connections`. In a `smart-loadbalance` group that lists region outbounds, `now` shows a region outbound; see [Smart load balancing](../smart-loadbalance/).
-
-## What multiple Smart groups share
-
-- One probe queue and probe worker pool, with 2 × the CPU core count workers, clamped to 8–32. Probes of the same node with the same probe URL are merged, and a result is reused for 1 second;
-- one stats queue (4 workers, 2048 slots; samples are dropped when it is full);
-- the same cache file and in-memory cache budget;
-- the LightGBM model, the training-data file, and the ASN and country database readers.
-
-Stats are kept per group: the same node has independent weights in two Smart groups. Putting the same nodes in several Smart groups means each group learns them from scratch.
-
-<Callout type="note" title="Nested groups">
-  Members of a Smart group can be other groups such as `urltest` or `selector`. Smart treats them as ordinary nodes: stats and probes are recorded under the group's tag and measure whichever node it had selected at the time. Members of type `direct`, `block` or `dns` take no part in stats or probing.
-</Callout>
+- **Per group**: score records, incumbents, serving pool, exploration budget, block records, exit watch and the manual pin. One node in two groups has two independent records.
+- **Shared**: the health-check prober (results are reused within half an `interval`); the global response-probe limits (120 per minute, at most 4 at once); the LightGBM model and the training-data file; the ASN and country databases.

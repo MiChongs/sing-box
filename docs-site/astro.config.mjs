@@ -38,8 +38,14 @@ export default defineConfig({
   },
   // Pages renamed in the 2026-10 restructure; keep old links alive.
   redirects: {
-    '/zh/watchdog': '/sing-box/zh/health/',
-    '/en/watchdog': '/sing-box/en/health/',
+    '/zh/watchdog': '/sing-box/zh/blocks-and-probes/',
+    '/en/watchdog': '/sing-box/en/blocks-and-probes/',
+    '/zh/algorithms': '/sing-box/zh/scoring/',
+    '/en/algorithms': '/sing-box/en/scoring/',
+    '/zh/priority-and-pinning': '/sing-box/zh/scoring/',
+    '/en/priority-and-pinning': '/sing-box/en/scoring/',
+    '/zh/asn-geox': '/sing-box/zh/service-keys/',
+    '/en/asn-geox': '/sing-box/en/service-keys/',
   },
   markdown: {
     shikiConfig: {

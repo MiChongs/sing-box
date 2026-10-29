@@ -1,11 +1,33 @@
 ---
 title: Changelog
-description: Changes in Smart group behavior since the docs site launched in April 2026, and the corrections made in this documentation rewrite.
+description: Changes in Smart group behavior since the docs site launched in April 2026, including the complete rewrite of Smart at the end of October.
 ---
 
 Only changes that affect usage are listed, newest first. For the full commit history, see [GitHub](https://github.com/MiChongs/sing-box/commits/xiaobaf14g-testing).
 
 ## 2026-10
+
+**Smart rewritten: honk's comprehensive score + mihomo Smart (breaking)** (Oct 29)
+
+The Smart group was deleted and rewritten from scratch: scoring and selection now follow the Score policy of [honk](https://github.com/daeuniverse/honk), while service keys, blocks, probes and convergence follow the Smart group of [vernesong/mihomo](https://github.com/vernesong/mihomo). Old configs need changes, and old learned data is not migrated.
+
+- **Removed fields** (writing them fails with `json: unknown field`): `algorithm`, `hysteresis`, `use_asn`, `asn_database`, `max_host_failed_times`; the old `SMART_*` environment variables are no longer read. Mapping in [Removed fields](../config/#removed-fields).
+- **New fields**: `idle_timeout` (30 minutes by default), `timeout` (5 s), `tolerance`, `max_failed_times` (5), `prefer_asn`. The default `interval` changed from 3 to 5 minutes; `policy_priority` uses mihomo's syntax: `pattern:factor`, the first matching rule wins, patterns are regexes or substrings, factors must be positive, and mistakes are config errors.
+- **Selection**: a reliability-first comprehensive score (decayed Beta confidence bounds, with latency, goodput, connection quality and loss only fine-tuning it); an incumbent per service key, replaced only when a challenger proves better; a serving pool and an exploration budget. See [Score and selection](../scoring/).
+- **Service keys**: the matched routing rule is the service (`RuleSet [geosite-netflix]` and so on); `prefer_asn` groups broad rules by ASN, with shared networks, site keys and ASN claims; when a fallback connects for a failed primary, the service's connections converge on the new node. See [Service keys](../service-keys/).
+- **Blocks and probes**: per-site block codes `manual`, `answer`, `error`, `lowWeight`, `loss`, `stalled`; response probes (`robots.txt`) after short connections; exit watch and exit suspicions; learning paused during failure floods; the MAD stability check. They replace the old watchdog, circuit breaker, degradation factor and target suspicion. See [Blocks and probes](../blocks-and-probes/).
+- **Manual pin**: only the pinned node is used; it is no longer replaced temporarily when it fails (`fixedSuspended` is always `false`), and pin endorsements are gone; a group delay test (`GET /group/{name}/delay`) releases the pin.
+- **LightGBM**: features follow mihomo's current 32-slot layout (adding `exit_region` and `exit_asn_hash`) and are read by position; the default model is `Model.bin`, saved as `Model.bin`; the training CSV has 42 columns, and files in an older format are renamed as backups. See [LightGBM model](../lightgbm/).
+- **Storage**: the cache-file bucket changed from `smart_stats` to `smart_score`; the old bucket is deleted when the cache file opens. Without a cache file Smart still learns, but nothing survives a restart. See [Storage and performance](../storage-performance/).
+- **Clash API**:
+  - `PUT /smart/groups/{name}/algorithm` is removed;
+  - New `GET /group/weights` and `GET /group/{name}/weights` (as in mihomo);
+  - Ranking keys are mihomo's `Name`, `Rank` and `Weight` (0–100), plus comprehensive-score fields such as `Alive`, `Pool`, `Utility` and `Reliability`;
+  - `POST`/`DELETE /cache/smart/flush` and `/cache/smart/flush/{name}` return 204 on success instead of statistics; `DELETE /proxies/{name}/weights` returns `{"group", "deleted": {"aggregate", "site", "exact", "blocks"}}`;
+  - `DELETE /connections/smart/{id}` blocks the node for the connection's site permanently (`manual`) until a flush, instead of a 30-minute group-wide block;
+  - The Smart fields of `/proxies` are now mihomo's `testUrl`, `expectedStatus`, `policy-priority`, `preferASN`, `tolerance` and so on; `useASN`, `algorithm`, `hysteresis` and `pinEndorsements` are gone;
+  - New `DELETE /smart/groups/{name}/block/{node}` lifts a group-wide block early; `DELETE /proxies/{name}` now returns `{"group", "previous_pin", "now", "interrupted"}`; the content of `/smart/groups/{name}/diag` is entirely new. See [Clash API](../clash-api/).
+- **smart-loadbalance**: configuration and region endpoints are unchanged. Node quality now comes from the engine's learned connection quality (`policy_priority` now applies to every quality), candidates are dialed in the same rounds as `smart` (3 one at a time, then batches of 5), and `now` in `/proxies` still shows the region outbound.
 
 **New smart-loadbalance: region-aware smart load balancing** (Oct 7)
 

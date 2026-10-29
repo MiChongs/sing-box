@@ -1,6 +1,6 @@
 ---
 title: 示例配置
-description: 八份可直接使用的 Smart 配置：最小配置、调整探测与选路、LightGBM、ASN、按流量类型分组、嵌套策略组、Smart 负载均衡与嵌套代理前置。每份都说明适合谁、做了什么、用之前要改哪里。
+description: 八份可直接使用的 Smart 配置：最小配置、调整检查与选择、LightGBM、prefer_asn 与 GeoX、按服务分流、嵌套策略组、Smart 负载均衡与嵌套代理前置。每份都说明适合谁、做了什么、用之前要改哪里。
 ---
 
 import CodeBlock from '../../../components/CodeBlock.astro';
@@ -9,7 +9,7 @@ import ex1 from '../../../examples/01-minimal.json?raw';
 import ex2 from '../../../examples/02-tuned.json?raw';
 import ex3 from '../../../examples/03-lightgbm.json?raw';
 import ex4 from '../../../examples/04-asn-geox.json?raw';
-import ex5 from '../../../examples/05-algorithms.json?raw';
+import ex5 from '../../../examples/05-service-keys.json?raw';
 import ex6 from '../../../examples/06-nested.json?raw';
 import ex7 from '../../../examples/07-smart-loadbalance.json?raw';
 import ex8 from '../../../examples/08-chain.json?raw';
@@ -28,69 +28,65 @@ import ex8 from '../../../examples/08-chain.json?raw';
 
 **适合**：第一次使用 Smart。
 
-- 引用一个订阅的全部节点，其余字段都用默认值。Smart 会自动探测节点，并为每个网站学习最好的节点。
-- `cache_file` 不能省略：Smart 学到的数据保存在缓存文件里，没有它就不会学习。
-- `clash_api` 用来在面板中查看权重、手动指定节点，不需要时可以删除。
+- 引用一个订阅的全部节点，其余字段都用默认值。Smart 在组使用中时每 5 分钟检查一次成员，并为每个服务学习最可靠的节点。
+- `cache_file` 让学到的数据跨重启保留；不开启时每次重启都从零开始。
+- `clash_api` 用来在面板中查看排名、手动指定节点，不需要时可以删除。
 
 **使用前修改**：订阅的 `url`；按需修改 `update_interval`（订阅的更新周期）。
 
-## 调整探测与选路
+## 调整检查与选择
 
 <CodeBlock code={ex2} filename="02-tuned.json" locale="zh" />
 
-**适合**：已经跑起来，想减少误判、在手机上省电，或者偏好某些地区的节点。
+**适合**：已经跑起来，想减少误判、偏好某些地区的节点，或者希望切换节点时立即生效。
 
 - `exclude` 去掉订阅里的流量、到期提示等非节点条目，`(?i)` 表示忽略大小写。
-- `expected_status: "204"` 要求探测地址必须返回 204。留空时任何 HTTP 响应都算成功，在有登录页（强制门户）的网络里容易把不通的节点误判为可用。
-- `interval: "5m"` 减少探测次数，适合手机。
-- `hysteresis: "30s"` 让同一网站在持续有流量时停留在同一节点，减少来回切换。
-- `policy_priority` 提高名称含 `HK`、`JP` 的节点的优先级，并用正则把名称带 2–9 倍率标记（如 `2x`、`3×`）的高倍率节点降为 0.8。注意系数大于 1 的节点会排在所有其他节点之前，见 [节点偏好](../priority-and-pinning/#生效位置)。
+- `expected_status: "204"` 要求检查地址必须返回 204，避免强制门户（酒店、机场 Wi-Fi 登录页）把不通的节点误判为可用。
+- `interval`、`idle_timeout`、`timeout` 写的是默认值，方便你按需调整；`interval` 不能大于 `idle_timeout`。
+- `tolerance: 50`：服务池之外的备用成员，健康检查延迟相差 50 ms 以内的按配置顺序排列。
+- `max_failed_times: 5`：同一网站连续 5 次错误就把节点对它封锁 24 小时。
+- `policy_priority` 让名称含“香港”或 `HK` 的节点系数为 1.2、“日本”或 `JP` 的为 1.1，并用正则把带 `x2`–`x9` 倍率标记的节点降为 0.7。按顺序取第一条命中的规则，见 [节点偏好](../scoring/#节点偏好)。
+- `interrupt_exist_connections: true`：在面板中切换手动指定时，已有连接立即断开重连。
 
-**使用前修改**：`exclude` 里的关键词换成你订阅中提示条目的写法；`policy_priority` 里的 `HK`、`JP` 换成你订阅节点名称的实际写法。
+**使用前修改**：`exclude` 里的关键词换成你订阅中提示条目的写法；`policy_priority` 里的名称换成你订阅节点名称的实际写法。
 
 ## 启用 LightGBM
 
 <CodeBlock code={ex3} filename="03-lightgbm.json" locale="zh" />
 
-**适合**：想用预训练模型代替传统公式给节点评分，或想采集自己的数据训练模型。
+**适合**：想用 vernesong/mihomo 发布的模型代替场景公式计算连接质量，或想采集自己的数据训练模型。
 
-- 首次启动时在后台下载默认模型，下载完成前使用传统公式，不影响使用。`auto_update` 每 72 小时检查一次新模型。
-- `download_detour: "direct"` 直连下载模型，避免经过还没准备好的 Smart 组。也可以改用更新的 `http_client` 字段，见 [配置字段](../config/#lightgbm-http_client)。
+- 首次启动时在后台下载 `Model.bin`，下载完成前使用场景公式，不影响使用。`auto_update` 每 72 小时检查一次新模型。
+- `download_detour: "direct"` 直连下载模型，避免经过还没学好的 Smart 组。也可以改用 `http_client`，见 [配置字段](../config/#lightgbm-http_client)。
 - `collect_data` 与 `sample_rate: 0.3` 以约 30% 的比例采集训练数据，文件达到 100 MB 后停止写入。
 
 **使用前修改**：不打算训练模型时，删掉 `collect_data`、`sample_rate` 和 `collector`；直连无法访问 GitHub 时，把 `download_detour` 换成能访问的出站，或把模型 `url` 换成可访问的镜像。
 
-## 按 ASN 学习
+## prefer_asn 与 GeoX
 
 <CodeBlock code={ex4} filename="04-asn-geox.json" locale="zh" />
 
-**适合**：常访问同一运营者（如 Google）的大量不同网站，希望新网站也能沿用已有经验。
+**适合**：大量流量经 `route.final` 进入 Smart，希望同一网络上的网站共享学习结果。
 
-- GeoX 下载 ASN 与国家数据库，每周更新一次；ASN 数据库供 `use_asn` 使用，国家数据库供 LightGBM 使用。
-- 全新安装时首次下载需要一点时间，下载完成后 ASN 自动生效，无需重启，见 [ASN 与 GeoX](../asn-geox/#experimentalgeox)。
+- `prefer_asn` 让没有规则、或大合集规则下的网站按 ASN 归并为同一个服务，Cloudflare 等共用网络仍按网站区分，见 [服务键](../service-keys/#prefer_asn)。
+- GeoX 每周更新 ASN 与国家数据库；ASN 数据库供 `prefer_asn` 与 LightGBM 使用，国家数据库供 LightGBM 使用。
+- 首次下载需要一点时间，下载完成后自动生效，无需重启。
 
-**使用前修改**：只想用本地文件时，删掉 `geox`，在组内写 `"asn_database": "/path/to/GeoLite2-ASN.mmdb"`；不需要 LightGBM 时删掉 `use_lightgbm`。
+**使用前修改**：不需要 LightGBM 时删掉 `use_lightgbm`；只用默认数据库时可以删掉整个 `geox` 块，Smart 会自动下载 GeoLite2。
 
-## 按流量类型分组
+## 按服务分流
 
-<CodeBlock code={ex5} filename="05-algorithms.json" locale="zh" />
+<CodeBlock code={ex5} filename="05-service-keys.json" locale="zh" />
 
-**适合**：不同类型的流量需要不同的选路方式，例如 SSH 要稳定低延迟、下载要分散。
+**适合**：希望某些服务（流媒体、AI 服务、代码托管）各自收敛到一个稳定的出口，其余海外网站也能共享经验。
 
-四个 Smart 组引用同一个订阅，用路由规则按流量类型分配：
+- 每条指向 `auto` 的规则都是一个服务：`RuleSet [geosite-netflix]`、`RuleSet [geosite-openai]`、`DomainSuffix [github.com]` 各自独立学习、各自有在任节点，一个服务内的所有域名共用同一个出口。
+- `geosite-geolocation-!cn` 是大合集规则，开启 `prefer_asn` 后它覆盖的网站按 ASN 归并，而不是全部算成一个服务。
+- ASN 认领会把落在 Netflix、OpenAI 网络上、但规则集还没收录的新域名归到对应服务，见 [ASN 认领](../service-keys/#asn-认领)。
+- `policy_priority` 优先专线节点，其次香港节点，并回避高倍率节点。
+- `sniff` 让只有 IP 的连接也能拿到域名；`final` 为 `direct`，其余流量直连。
 
-| 组 | 算法 | 用途 |
-|---|---|---|
-| `smart-interactive` | `latency-banded` + 1 分钟 `hysteresis` | SSH、远程桌面，优先低延迟且尽量不换节点 |
-| `smart-bulk` | `least-loaded`，仅 TCP | 下载，分散到连接最少的节点 |
-| `smart-sticky` | `sticky-session` | 登录状态与出口 IP 绑定的服务 |
-| `smart-default` | `p2c` | 其余流量 |
-
-**使用前修改**：路由规则中的端口和域名换成你自己需要区分的流量。
-
-<Callout type="note" title="多组的代价">
-  统计按组分别保存，四个组意味着同一批节点要分别学习四次，内存与磁盘占用也相应增加。只在不同流量确实需要不同算法时才拆分。
-</Callout>
+**使用前修改**：按需要增删规则集；规则集经 `direct` 下载，网络不通时换成能访问的出站。
 
 ## 嵌套策略组
 
@@ -99,8 +95,8 @@ import ex8 from '../../../examples/08-chain.json?raw';
 **适合**：节点很多，但只关心用哪个地区。
 
 - 三个 `urltest` 组各自从订阅中挑出一个地区的最快节点，Smart 在三个地区之间学习选择。
-- Smart 把成员组当作普通节点：统计记在 `HK`、`JP`、`US` 名下，反映的是该组当时选中的节点。
-- `policy_priority: "=HK:1.2"` 用 `=` 精确匹配，只作用于名为 `HK` 的成员。
+- Smart 把成员组当作普通节点：评分记在 `HK`、`JP`、`US` 名下，反映的是该组当时选中的节点。
+- `policy_priority: "^HK$:1.2"` 用锚定的正则只匹配名为 `HK` 的成员；不锚定时，`HK` 会匹配任何名称中含 `HK` 的成员。
 - 最外层的 `selector` 默认使用 `auto`，需要时可以在面板中切到固定地区。
 - 这种结构候选少、学习快；代价是 Smart 看不到地区内具体节点的差异。想让 Smart 直接管理所有节点并按地区分摊连接，用下面的 [Smart 负载均衡](#smart-负载均衡)。
 

@@ -12,12 +12,12 @@ How it compares with the other two group types:
 
 | | `loadbalance` | `smart` | `smart-loadbalance` |
 |---|---|---|---|
-| Node per connection | Round-robin / hash / sticky | The learned best node (fine-tuned among the top few) | Spread over every good node of the chosen region by quality and load |
-| Knows good from bad nodes | Only whether probes pass | Learned per destination | Learned per destination |
+| Node per connection | Round-robin / hash / sticky | The comprehensive score per service, reliability first | Spread over every good node of the chosen region by quality and load |
+| Knows good from bad nodes | Only whether probes pass | Learned per service | Learned per service |
 | Regions | None | None | Sorted automatically, region chosen per destination |
 | As the front of chained proxies | Possible, but region-blind and keeps using bad nodes | One front node | Front spread within a region; region lockable or matched to the landing server's country |
 
-Everything `smart` does — learning, circuit breakers, the watchdog, persistence, LightGBM, ASN — works the same here, and every `smart` field except `algorithm` and `hysteresis` keeps its meaning. Terms such as "destination", "weight" and "circuit breaker" are explained in the [Glossary](../glossary/).
+Every `smart` field keeps its meaning here, and connection outcomes are learned by the same Smart engine (reliability, failure state, connection quality) and saved to the cache file. What differs is the choice: nodes are picked by region and balance strategy, without the comprehensive-score selection, serving pool, incumbents or convergence; finished connections are not judged for blocks, response probes or the exit watch either, though nodes with blocks or unresolved failures for the service are avoided. Terms are explained in the [Glossary](../glossary/).
 
 ## Three-minute setup
 
@@ -38,7 +38,7 @@ With nothing else set, the group:
 - spreads connections inside a region by node quality and current connection count;
 - does not bind connections to a fixed node.
 
-As with `smart`, **`experimental.cache_file` must be enabled** for the group to learn; without it, it can only judge nodes by probe latency.
+Learned quality, the region lock and exit-probe results are saved in `experimental.cache_file`; enabling it is recommended, otherwise every restart starts learning from scratch.
 
 ### 2. The three settings people change most
 
@@ -68,7 +68,7 @@ With `region.outbounds` on, the `balance` group lists its region outbounds in da
 The startup log shows how many nodes each region has:
 
 ```
-smart-loadbalance[balance] regions: HK(12) JP(8) SG(5) US(4) OTHER(1); mode=auto strategy=smart affinity=site fallback=auto
+INFO outbound/smart-loadbalance[balance]: regions: HK(12) JP(8) SG(5) US(4) OTHER(1)
 ```
 
 `OTHER` holds nodes whose region could not be detected. To see which nodes they are and how each node was placed:
@@ -77,11 +77,7 @@ smart-loadbalance[balance] regions: HK(12) JP(8) SG(5) US(4) OTHER(1); mode=auto
 curl http://127.0.0.1:9090/smart/groups/balance/regions
 ```
 
-With `log.level` set to `debug`, every connection logs the region it chose, how it picked the node, and how many nodes were in the pool:
-
-```
-smart[balance] select via auto region=HK pick=smart pool=8: target=*.openai.com asn=[none] candidates=[HK-03,HK-01,HK-02,...]
-```
+The node a connection finally used shows in the `chains` of `GET /connections`.
 
 See [Examples](../examples/#smart-load-balancing) for complete configurations and [Configuration](../config/#smart-loadbalance) for every field.
 
@@ -93,7 +89,7 @@ See [Examples](../examples/#smart-load-balancing) for complete configurations an
     { title: 'Choose regions', body: 'The lock, a region outbound or the region mode decides the primary region; `fallback` orders the fallback regions.' },
     { title: 'Build the pool', body: 'Take the healthy nodes of the primary region, minus those that do badly for this destination, are below the quality floor, or are full.' },
     { title: 'Pick a node', body: 'If affinity has a node bound for this connection, use it; otherwise the strategy picks one.' },
-    { title: 'Dial and fail over', body: 'Only the picked node is dialed; if it looks suspect, the next one is hedged after 250 ms. On failure the rest of the pool, then the fallback regions, are tried in order.' },
+    { title: 'Dial and fail over', body: 'Candidates are dialed in order, the first 3 one at a time, then racing batches of 5, at most 10: the picked node, the rest of the pool, then nodes of the fallback regions. A node pinned by a region outbound is the only one dialed.' },
     { title: 'Learn', body: 'The outcome is recorded as usual; a successful node refreshes the affinity binding, and the region the destination remembers follows the region actually used.' },
   ]}
 />
@@ -186,8 +182,8 @@ Probes run after start and after subscription updates, and every hour the group 
 
 Two scores come up below:
 
-- **Node quality** is, in order: the weight the node has learned for this destination; the node's overall weight across all destinations × 0.9; a value derived from its probe latency (0.4 + 0.4 × 300 ÷ (300 + latency in ms), so 100 ms gives 0.70); or 0.55 when there is nothing else. It is then multiplied by the node's `policy_priority` factor.
-- **Region score** is the mean quality of the region's 3 best healthy nodes, times a pool-size bonus (+5% per doubling, at most +20%), the region's factor in `region.weights`, and the region-probe result. Nodes whose learned weight for this destination is below 0.4 count half.
+- **Node quality** is, in order: the connection quality the node has learned for this service; its overall quality in the ranking × 0.9; a value derived from its probe latency (0.4 + 0.4 × 300 ÷ (300 + latency in ms), so 100 ms gives 0.70); or 0.55 when there is nothing. It is then multiplied by the `policy_priority` factor.
+- **Region score** is the mean quality of the region's 3 best healthy nodes, times a pool-size bonus (+5% per doubling, at most +20%), the region's factor in `region.weights`, and the region-probe result. Nodes whose learned quality for this service is below 0.4 count half in the region score.
 
 ### auto (default)
 
@@ -235,13 +231,13 @@ Pick a region outbound in a dashboard, or set `lock` with `PUT /smart/groups/{na
 
 ### When nothing is healthy
 
-Health data — probes, circuit breakers — can be stale or wrong. So when no healthy node can be chosen, the group does not give up at once: like a `smart` group, it dials the members in scope anyway, best quality first, and one success brings it back to normal:
+Health data, probes and failure counts alike, can be stale or wrong. So when no healthy node can be chosen, the group does not give up at once: like a `smart` group, it dials the members in scope anyway, best quality first, and one success brings it back to normal:
 
-- the chosen region's healthy nodes are all soft-blocked for this destination: it retries within that region;
+- the chosen region's healthy nodes all have blocks or failures for this service: it retries within that region;
 - a region outbound (without `fallback`), or a region locked with `fallback: none`, has no healthy node: it retries within that region only and never leaves it;
 - otherwise, when no allowed region has a healthy node: it retries across all allowed members.
 
-A connection only fails, with `no node can serve ...`, when other regions do have healthy nodes but `region.fallback` keeps the connection away from them (`none`, or `priority` with no listed region healthy). In the debug log, the source of such a last-resort dial ends with `(last resort: no healthy node)`.
+A connection only fails, with `no available member for ...`, when other regions do have healthy nodes but `region.fallback` keeps the connection away from them (`none`, or `priority` with no listed region healthy).
 
 ## Region probes
 
@@ -253,15 +249,15 @@ Results stay valid for 3 intervals and scale the region scores:
 - a region whose probe failed is multiplied by 0.25;
 - a region without a result while other regions have one for the same site is multiplied by 0.85.
 
-Only domains reached over TCP 443 are probed. The first round runs about 90 s after start; rounds are skipped while the group is idle (no dial for 2 minutes), the network is down, a region is locked, or the mode is `priority` or `off`. Probes go through Smart's shared probe queue and its concurrency limit. Set `probe.disabled: true` to turn them off.
+Only domains reached over TCP 443 are probed. The first round runs about 90 s after start; rounds are skipped while the group is idle (no new connection for 2 minutes), during a failure flood, while a region is locked, or in the `priority` and `off` modes. Region probes of all groups share at most 4 concurrent probes. Set `probe.disabled: true` if you do not need them.
 
 ## The node pool
 
 Once a region is chosen, the group builds a pool from the region's members:
 
-1. Healthy nodes only: circuit breaker closed, not marked unavailable in the last 3 minutes, last probe not failed, not blocked; UDP connections also need UDP support. An old probe result does not count as a failure: health checks pause while the group is idle (no dial for 2 minutes), so results naturally go stale.
-2. Nodes soft-blocked for this destination are dropped; nodes that failed often for it recently have their quality ×0.3.
-3. Nodes whose learned weight for this destination is below 0.4 are dropped as long as other nodes remain.
+1. Healthy nodes only: not blocked group-wide, passing health checks, last probe not failed, global failure streak below 3 (or its backoff over); UDP connections also need UDP support.
+2. Nodes with blocks or unresolved failures for this service are dropped.
+3. Nodes whose learned quality for this service is below 0.4 are dropped as long as other nodes remain.
 4. Nodes below the best node of the pool × `min_quality` (0.5 by default) are dropped.
 5. With `max_nodes`, only the best ones are kept.
 6. With `max_connections_per_node`, nodes at the cap are skipped, unless all of them are.
@@ -280,7 +276,7 @@ Once a region is chosen, the group builds a pool from the region's members:
 | `random` | | Uniform random |
 | `consistent-hashing` | `chash`, `hash`, `rendezvous` | Weighted rendezvous hashing: the same key (the affinity key, or the destination without affinity) keeps landing on the same node; when a node leaves, only its own keys move |
 
-Values are case-insensitive, and `_` and spaces count as `-`. Unlike the `algorithm` of `smart`, a misspelled value **is a config error**.
+Values are case-insensitive, and `_` and spaces count as `-`; a misspelled value is a config error.
 
 ## Affinity
 
@@ -294,7 +290,7 @@ Values are case-insensitive, and `_` and spaces count as `-`. Unlike the `algori
 | `source` | Same client IP | Per-device placement on a LAN |
 | `source-site` | Same client, same site | Similar to `sticky-sessions` of `loadbalance` |
 
-Bindings are kept per region for `affinity_ttl` (10 minutes by default, refreshed on every use). A binding whose node is no longer in the pool (unhealthy, soft-blocked, at its connection cap) is placed again and updated. `PUT /smart/groups/{name}/balance` switches affinity at runtime; changing it drops the existing bindings.
+Bindings are kept per region for `affinity_ttl` (10 minutes by default, refreshed on every use). A binding whose node is no longer in the pool (unhealthy, blocked or failing for the service, at its connection cap) is placed again and updated. `PUT /smart/groups/{name}/balance` switches affinity at runtime; changing it drops the existing bindings.
 
 <Callout type="note" title="Affinity versus spreading">
   The wider the affinity, the more connections share one node. Do not set `target` or `site` on the front group of chained proxies: every connection to the same landing server would land on one front node, which defeats the spreading.
@@ -302,7 +298,7 @@ Bindings are kept per region for `affinity_ttl` (10 minutes by default, refreshe
 
 ## Dialing and failover
 
-Unlike `smart`, round 0 dials only the picked node, without racing the runner-up, so the distribution holds. When the picked node looks suspect (recent dial failures, marked unavailable, or no successful dial or probe yet), the next node of the pool is hedged after 250 ms and whichever connects first wins. Then up to 3 more rounds dial 3 candidates each: first the rest of the pool, then the fallback regions. The candidate list holds at most 10 nodes, exactly what these 4 rounds reach. If everything fails, the group selects once more with the updated circuit-breaker state.
+The candidate list holds at most 10 nodes: the picked node, the rest of the pool (at most 7 from the main region), and the best nodes of fallback regions (at most 3 from 2 regions). Dial rounds are those of `smart`: the first 3 candidates one at a time, then racing batches of 5, and the candidate order keeps the distribution; each node's timeout is its average connect time × 5 (at least 1 s, at most `timeout`). Dial failures count toward the node's failure state as usual, but do not build up `error` blocks as in `smart`.
 
 ## Region outbounds
 
@@ -318,7 +314,7 @@ With `region.outbounds.enabled`, the group generates `smart-region` outbounds fo
 }
 ```
 
-This creates `🇭🇰 Hong Kong LB`, `🇯🇵 Japan LB` and `🇺🇸 United States LB` (the default template `{group}-{region}` gives tags like `balance-HK`). Connections through a region outbound still run the group's full pipeline — learning, circuit breakers and spreading are shared with the group — with the region fixed.
+This creates `🇭🇰 Hong Kong LB`, `🇯🇵 Japan LB` and `🇺🇸 United States LB` (the default template `{group}-{region}` gives tags like `balance-HK`). Connections through a region outbound still run the group's full pipeline (learning, failure state and spreading are shared with the group) with the region fixed.
 
 - Outbounds listed in **`regions`** are created at startup and can be referenced by route rules, `detour` and `selector`.
 - **`auto`** (implied when `regions` is empty) creates outbounds for regions that appear at runtime and removes them when the region disappears. Outbounds created at runtime cannot be referenced from the configuration.
@@ -371,7 +367,7 @@ A landing node (your own VPS, a static residential IP and so on) can connect thr
 | Re-detect regions, re-probe exits | `POST /smart/groups/{name}/regions/detect` |
 | Pick a region outbound or a node in a dashboard | `PUT /proxies/{name}`: a region locks, a node pins |
 
-The lock and any mode, strategy or affinity switched at runtime are saved in the cache file and restored after a restart; `default` or an empty value restores the configured value. See [Clash API](../clash-api/#smart-load-balancing). Pinning a node works as in `smart`; see [Priority and pinning](../priority-and-pinning/).
+The lock and any mode, strategy or affinity switched at runtime are saved in the cache file and restored after a restart; `default` or an empty value restores the configured value. See [Clash API](../clash-api/#smart-load-balancing). Pinning a node works as in `smart`; see [Manual pin](../how-it-works/#manual-pin).
 
 ## Choosing settings
 

@@ -1,0 +1,48 @@
+{
+  "outbounds": [
+    {
+      "type": "smart",
+      "tag": "auto",
+      "providers": ["my-subscription"],
+      "prefer_asn": true,
+      "policy_priority": "(?i)iplc|iepl:1.3;香港|HK:1.1;(?i)x[2-9]:0.6"
+    },
+    { "type": "direct", "tag": "direct" }
+  ],
+  "route": {
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite-netflix",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-netflix.srs",
+        "download_detour": "direct"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-openai",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-openai.srs",
+        "download_detour": "direct"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-geolocation-!cn",
+        "format": "binary",
+        "url": "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-geolocation-!cn.srs",
+        "download_detour": "direct"
+      }
+    ],
+    "rules": [
+      { "action": "sniff" },
+      { "rule_set": "geosite-netflix", "outbound": "auto" },
+      { "rule_set": "geosite-openai", "outbound": "auto" },
+      { "domain_suffix": "github.com", "outbound": "auto" },
+      { "rule_set": "geosite-geolocation-!cn", "outbound": "auto" }
+    ],
+    "final": "direct"
+  },
+  "experimental": {
+    "cache_file": { "enabled": true }
+  }
+}

@@ -1,0 +1,103 @@
+---
+title: Service keys
+description: Smart uses a "service key" to decide which connections belong to one service, the matched routing rule, the wildcard host, or with prefer_asn the ASN. How keys are derived, how prefer_asn regroups broad rules, ASN claims and site keys, and how a service converges on one exit.
+---
+
+import Callout from '../../../components/Callout.astro';
+
+Smart learns per **service**, not per domain: connections of one service share their score record and their incumbent, avoid a failing node together, and converge together when the node changes. This "service key" design comes from the Smart group of [vernesong/mihomo](https://github.com/vernesong/mihomo).
+
+## Three levels of keys
+
+| Key | Example | What it is |
+|---|---|---|
+| Exact target | `api.openai.com:443` | Domain (or IP without one) plus port |
+| Wildcard host | `*.openai.com` | Subdomains folded into the registrable domain, random ones included |
+| Service key | `RuleSet [geosite-openai]` | The matched routing rule; the wildcard host without one |
+
+How the wildcard host folds names:
+
+| Domain | Wildcard host |
+|---|---|
+| `www.example.com`, `cdn-12.example.com` | `*.example.com` |
+| `example.com` | `*.example.com` |
+| `img.static.example.com` | `*.static.example.com` |
+| `rr3---sn-abc.googlevideo.com` | `*.googlevideo.com` |
+| `www.example.co.uk` | `*.example.co.uk` |
+| IP target `203.0.113.7` | `203.0.113.7` |
+
+Only the label next to the registrable domain is kept, and it becomes `*` too when it contains `-`, is a hex string of 8 or more characters, or mixes letters and digits like a random token.
+
+## A rule is a service
+
+The routing rule a connection matched becomes its service key, in mihomo's format:
+
+| Routing rule | Service key |
+|---|---|
+| `{"rule_set": "geosite-netflix", "outbound": "auto"}` | `RuleSet [geosite-netflix]` |
+| `{"domain_suffix": "openai.com", "outbound": "auto"}` | `DomainSuffix [openai.com]` |
+| `{"ip_cidr": "91.108.4.0/22", "outbound": "auto"}` | `IPCIDR [91.108.4.0/22]` |
+| Rules with several conditions or values | A combined key such as `AND [...]` or `OR [...]` |
+| `route.final`, or rules on ports, processes and other types | No service key; the wildcard host is used |
+
+The rule types that yield a service key are Domain, DomainSuffix, DomainKeyword, DomainRegex, AdGuardDomain, GeoIP, IPCIDR, RuleSet and AND / OR / NOT combinations. A GeoIP country rule (two letters) names a region, not a service, and yields none. The key is only computed when the rule's outbound ends at a group that picks its member while dialing (a Smart group, or a `selector` currently on a Smart group).
+
+So **give services that need one exit a rule of their own**, such as `geosite-openai` or `geosite-netflix`: Smart makes all of that service's domains share what they learned and converge on one node, while traffic that reaches Smart through `route.final` is handled per site.
+
+## prefer_asn
+
+Broad rules such as `geosite-geolocation-!cn`, `geosite-cn` or `geoip-us` cover thousands of unrelated sites; treating them as one service makes no sense. With `prefer_asn`, such rules and rule-less traffic are grouped by **the network (ASN) of the destination IP** instead: one company's sites usually live on one ASN, so they share what was learned and a new site benefits right away.
+
+Which rules count as broad:
+
+| Rule | Keyed by |
+|---|---|
+| No rule (`route.final` and the like) | ASN |
+| `geoip-<country>`, `geoip-private`, `geoip-cloudflare` and similar | ASN |
+| `geosite-cn`, `geosite-gfw`, `geosite-private`, `geosite-category-*`, `geosite-geolocation-*`, `geosite-tld-*` and similar | ASN |
+| Other rule sets (`geosite-netflix`, your own sets) | The rule; ASN once the set has more than 10000 entries or its destinations show up on 6 or more different ASNs |
+| Concrete rules (domains, IP ranges) and combinations | Always the rule |
+
+An `@` suffix and a leading `!` in a rule-set name do not change the verdict.
+
+### Shared networks and site keys
+
+Cloudflare, Akamai, Fastly, Amazon CloudFront, Google Cloud, OVH, DigitalOcean, Hetzner, Vultr, Alibaba Cloud, Tencent Cloud, the China Telecom and China Unicom backbones and similar networks host masses of unrelated sites. Smart knows about 50 of these **shared ASNs** and never uses them as a service key. When the destination is on a shared network, or its ASN is unknown, the **wildcard host** becomes the service key (a site key).
+
+The first time a site gets a site key, its connections still keyed by ASN are closed, so the site converges on its own incumbent quickly.
+
+<Callout type="note" title="The destination IP must be known">
+  The ASN is looked up for the destination's first public IP. When a destination is only a domain and routing did not resolve it (with FakeIP, or without a `resolve` rule), there is no ASN, and Smart handles it per site, just as without `prefer_asn`.
+</Callout>
+
+### ASN claims
+
+When connections of a service rule (say `RuleSet [geosite-netflix]`) succeed on an ASN, that is evidence the ASN belongs to the service. Every 2 minutes Smart turns this evidence into **claims**:
+
+- When the rule's destinations span 2 or more networks, every network they appeared on is claimed;
+- When they appear on a single network, it needs 4 or more successes there;
+- An ASN claimed by two different rules is marked ambiguous and belongs to neither.
+
+From then on, a connection keyed by ASN that lands on a claimed ASN uses the claiming rule as its service key. For example, a new Netflix domain that the rule set does not list yet arrives through `route.final`, but shares its node with `RuleSet [geosite-netflix]` because its IP is on Netflix's network. Shared networks are never claimed.
+
+ASN data comes from GeoX: the files configured in `experimental.geox.url.asn`, or GeoLite2-ASN, downloaded automatically when none is configured; see [Configuration](../config/#experimentalgeox). Until the database has downloaded, no ASN is known.
+
+## Convergence
+
+A service spread over several exits breaks sites that tie logins and fraud checks to the exit IP. Smart actively converges at these moments:
+
+| When | What happens |
+|---|---|
+| The primary fails to dial and a later member connects | That member becomes the service's incumbent; the service's TCP connections through **other nodes** are closed |
+| A node gets blocked for the service (`manual`, `lowWeight`, or another code once it takes effect) | All of the service's TCP connections are closed and its incumbent is cleared; the next connection chooses afresh |
+| A response probe finds the site refusing the node | Same |
+| A site gets a site key for the first time | Its connections keyed by ASN are closed |
+| An exit suspicion is raised | The site's incumbent is cleared |
+
+Connections closed by Smart count as neither success nor failure, and clients usually reconnect right away. `converged N connections of [<service key>] on <node>` in the log is the first case. None of this depends on `interrupt_exist_connections`.
+
+Incumbents are remembered per (group, service key, TCP/UDP, IPv4/IPv6), up to 4096, in memory only; after a restart the score chooses them again.
+
+## Scope of blocks
+
+A node's block record is written on the **wildcard host**; once a block takes effect it is written on the **service key** as well, so the service's other domains avoid the node too. Error counts still below `max_failed_times` stay on the wildcard host. When members are filtered, both records apply. See [Blocks and probes](../blocks-and-probes/).

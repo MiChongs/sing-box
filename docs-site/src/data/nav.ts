@@ -15,9 +15,9 @@ export const sidebar: NavSection[] = [
   {
     zh: '指南',
     en: 'Guides',
-    slugs: ['algorithms', 'smart-loadbalance', 'priority-and-pinning', 'health', 'lightgbm', 'asn-geox', 'storage-performance', 'examples'],
+    slugs: ['scoring', 'service-keys', 'blocks-and-probes', 'health', 'lightgbm', 'smart-loadbalance', 'storage-performance', 'examples'],
   },
-  { zh: '参考', en: 'Reference', slugs: ['config', 'glossary', 'clash-api', 'troubleshooting', 'changelog'] },
+  { zh: '参考', en: 'Reference', slugs: ['config', 'clash-api', 'glossary', 'troubleshooting', 'changelog'] },
 ];
 
 export const orderedSlugs = sidebar.flatMap((s) => s.slugs);

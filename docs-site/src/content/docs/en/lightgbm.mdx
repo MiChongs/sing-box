@@ -1,128 +1,98 @@
 ---
 title: LightGBM model
-description: "Score nodes with a pretrained LightGBM model instead of the hand-written formula: what it is, when it is worth turning on, how to confirm it is in use, the model format and features, collecting training data, and training your own model step by step."
+description: Compute connection quality with the LightGBM model published by vernesong/mihomo instead of the scene formula. What it affects, when it is worth enabling, how to confirm it works, the model format and its 32 features, collecting training data, and training and deploying your own model.
 ---
 
 import Callout from '../../../components/Callout.astro';
 import CodeBlock from '../../../components/CodeBlock.astro';
 import FeatureTable from '../../../components/FeatureTable.astro';
-import { csvColumns, defaultModelInputs } from '../../../data/lightgbm';
+import { csvColumns } from '../../../data/lightgbm';
 import example from '../../../examples/03-lightgbm.json?raw';
 
-This page covers an optional Smart feature: scoring nodes with a machine-learning model. Smart learns and selects nodes perfectly well without it, so you can skip this page at first. Come back when you want scores that match mihomo Smart's model, or want to train a model on your own data.
+This page covers an optional Smart feature: computing connection quality with a machine-learning model. Without it Smart learns and chooses just the same, so you can skip this page at first.
 
-## What it is
+## What it affects
 
-Every time a connection closes, Smart computes a **weight** for that (destination, node) pair: a score for how well the node serves that destination. Nodes with higher weights are preferred, and nodes below 0.4 are not selected (see [How it works](../how-it-works/) and the [Glossary](../glossary/)).
+When a connection ends, Smart computes its **connection quality** (roughly 0–1.5); see [Connection quality](../scoring/#connection-quality). By default this is vernesong/mihomo's scene formula; with `use_lightgbm` a **LightGBM** model predicts it instead. The model is an ensemble of decision trees trained on real connection data, and can capture combinations a hand-written formula cannot.
 
-By default the weight comes from a hand-written formula that combines success rate, connect time, first-byte latency, traffic, connection duration and so on by fixed rules. **LightGBM** is a machine-learning model made of many decision trees. When enabled, it replaces that formula: Smart hands the same statistics (called *features*) to the model, and the model returns the weight directly. Because the model is trained on large amounts of real connection data, it can pick up combinations that are hard to write by hand, such as "high latency but steady throughput is fine for downloads".
+Connection quality serves four purposes in Smart:
 
-The default model is `Model-large.bin` (about 27 MB) published by vernesong/mihomo, the same model mihomo's Smart core uses.
+- The quality term of the comprehensive score (weight 0.02; it only matters when reliability is close);
+- Blocking a node when quality × the `policy_priority` factor falls below 0.4 (`lowWeight`);
+- The node ranking in dashboards;
+- Node quality in `smart-loadbalance`.
 
-### When it is worth turning on
+So the model mostly decides which nodes are considered poor enough to block, and the ranking; its effect on the reliability-first choice is limited.
 
-- **Usually not needed**: the traditional formula works well, and Smart's breakers, watchdog and per-destination learning do not depend on the model.
-- **To match mihomo Smart's scoring**: turn on `use_lightgbm` with the default model.
-- **To train on your own data**: turn on `collect_data` for a while, then follow [Training your own model](#training-your-own-model).
+### When it is worth enabling
 
-The cost is small: the model runs in the background after a connection closes, and its result for a pair is cached for 30 seconds. If no group turns it on, the model is neither downloaded nor loaded.
+- **Usually not needed**: the scene formula is good enough, and Smart's reliability score, blocks and probes do not depend on the model.
+- **To match mihomo Smart**: enable `use_lightgbm` with the default model.
+- **To train on your own data**: enable `collect_data` for a while first, then follow [Training your own model](#training-your-own-model).
 
 ## Enabling
 
-Set `use_lightgbm: true` on each Smart group that should use it (`smart` and `smart-loadbalance` groups both work). All groups share one model. Its settings live in `experimental.smart.lightgbm`, and all of them are optional.
+Set `use_lightgbm: true` on the groups that should use it (`smart` and `smart-loadbalance` both work). The model is shared by all groups; its settings live in `experimental.smart.lightgbm`, and all of them can be omitted.
 
 <CodeBlock code={example} filename="03-lightgbm.json" locale="en" />
 
-What happens next:
+Once enabled:
 
-- **First download**: if the model file does not exist, Smart downloads the default model in the background and saves it as `smart_lgbm_model.bin` in the data directory. A missing model is downloaded even when `auto_update` is `false`. A failed download is retried after 30 seconds, doubling each time up to 30 minutes, until it succeeds.
-- **While downloading**: weights keep coming from the traditional formula. Once the download finishes, the model takes effect at once, with no restart.
-- **An existing file**: with `auto_update: false`, a model file that already exists is never downloaded again, even if it cannot be used. To download it again, delete the file and restart.
-- **Auto-update**: with `auto_update: true`, Smart checks for a new version every `update_interval` (default 72 hours) using ETag / Last-Modified, and hot-loads a successful download with no restart.
-- **Which route the download takes**: all `http_client` settings apply (the outbound and other dial options, TLS, headers, HTTP version). Without `http_client`, `download_detour` is used; without either, the default HTTP client (`route.default_http_client`). Send the download through `direct` or a stable node, not through the Smart group that is still learning.
-- **Model path**: `model_path` defaults to `smart_lgbm_model.bin`; relative paths are resolved against the data directory.
+- **First download**: when the model file is missing, `Model.bin` published by vernesong/mihomo is downloaded in the background and saved as `Model.bin` in the data directory (`model_path`). A missing file is downloaded even with `auto_update` off; an existing file is never downloaded again.
+- **While downloading**: the scene formula keeps working; the model takes over as soon as it arrives, with no restart.
+- **Auto-update**: with `auto_update: true` the model is checked every `update_interval` (72 hours by default) and a new one is hot-loaded.
+- **Download path**: `http_client`, else `download_detour`, else the default HTTP client. Do not download the model through the Smart group that still has to learn.
+- **Databases**: groups with `use_lightgbm` open the ASN and country databases (GeoX downloads GeoLite2 when none is configured) for the model's ASN and country features.
 
-## Checking that the model is in use
+## Confirming it works
 
-**Startup log**: each group's summary line has an `ml=` field:
+- **Log**: loading the model logs INFO `lightgbm model loaded from <path> (<N> features)`, a reload after a download logs `lightgbm model reloaded from <path>`, and an unusable file logs WARN `lightgbm: cannot use model <path>: <reason>`.
+- **Clash API**: once the model is loaded, `GET /proxies/{name}` and `GET /smart/groups` show `lgbmModelAge` (how long ago it was loaded), and `lightgbmLoaded` is `true` in `GET /smart/groups/{name}/diag`.
+- **Training data**: with `collect_data`, the CSV column `weight_source` is `LightGBM` when the model computed a connection's quality and `Traditional` when the scene formula did.
 
-| Value | Meaning |
-|---|---|
-| `ml=loaded` | The model is loaded and in use |
-| `ml=pending` | The model is still downloading (or not loaded yet); the traditional formula is used meanwhile |
-| `ml=unusable` | The model file exists but cannot be used; the reason is in the `lightgbm: cannot use model ...` WARN logged with it. See [Model format](#model-format) |
-| `ml=off` | The group does not set `use_lightgbm` |
+## How the model is used
 
-The summary line is only printed at startup. When a download finishes later, `assetdl[lightgbm]: downloaded <bytes> bytes → <path>` and `lightgbm: model reloaded from <path>` tell you the model is now in use.
+When a connection closes, Smart assembles its 32 features and hands them to the model; the prediction becomes the connection quality as is (no factor; the factor applies where the quality is used). The scene formula is used instead when:
 
-**Clash API**: once the model is loaded, `GET /proxies/{name}` and `GET /smart/groups` include `lgbmModelAge`, how long ago the model was loaded.
+- The model is not loaded (still downloading, broken file);
+- The model has a `[transforms]` section whose `[order]` differs from Smart's feature order;
+- Prediction fails, or yields NaN or a value of 0 or less.
 
-**Per connection**: with `log.level: debug`, each connection's close log names the source of its weight: `[closedlightgbm]` means the model computed it, `[closedtraditional]` the traditional formula (failed dials start with `failed` instead). No weight is computed while a pair has fewer than 2 samples, so the first connection or two of each pair always show `traditional`.
+Neither is computed while the node has fewer than 2 completions on the service.
 
 ## Model format
 
-Smart loads LightGBM models in the text format written by `save_model`, format versions v2 to v4, including LightGBM 4.x linear trees (`linear_tree`).
+LightGBM models in text format (the output of `save_model`) are supported. Inputs are **positional**: input i is feature i of the table below, whatever names the model file carries.
 
-Each model input is matched by the `feature_names` in the file against the names in the [feature table](#features), regardless of order. The default model `Model-large.bin` uses 30 of them, in this order:
+- A model with fewer than 32 inputs uses only the leading features, so models trained on the earlier 30-feature layout still work;
+- A model with more than 32 inputs gets zeros for the extra ones, with a warning.
 
-<ol class="not-prose my-6 grid gap-x-6 gap-y-1 rounded-card bg-surface px-4 py-3 shadow-ring sm:grid-cols-2">
-  {defaultModelInputs.map((name, i) => (
-    <li class="flex gap-2 text-[0.85rem]">
-      <span class="w-5 shrink-0 text-right font-mono text-[0.8rem] text-subtle">{i}</span>
-      <code class="break-all font-mono text-[0.82rem] text-accent">{name}</code>
-    </li>
-  ))}
-</ol>
-
-A model trained without feature names (named `Column_0`, `Column_1`, …) is read position by position in the order of the 35 features. If the `[transforms]` block at the end of the file names the inputs in `[order]`, those names are matched instead.
-
-These models are rejected:
-
-- Models that use a feature name not in the feature table.
-- Models without feature names that have more than 35 inputs.
-- Models whose `[transforms]` `[order]` disagrees with `feature_names`, or that scale an input index beyond the model's input count.
-
-A rejected model logs a WARN `lightgbm: cannot use model <path>: <reason>`, the startup log shows `ml=unusable`, and weights come from the traditional formula. When a new model downloaded by auto-update is rejected, the model already loaded stays in use.
-
-## How the model affects node selection
-
-The model is not blended with the traditional formula. It **replaces** it:
-
-1. When a connection closes, Smart builds the input for that (destination, node) pair from the model's feature names and asks the model for a prediction.
-2. The prediction is multiplied by the priority factor to give this connection's weight. The factor includes `policy_priority`, the learned pin bonus, and 1.15 when the dial went through a pinned node.
-3. The new weight is smoothed into the old one and saved. From there everything works as with the traditional formula: nodes below 0.4 are not selected, and `smart-loadbalance` uses these weights as node quality.
-
-Smart falls back to the traditional formula when the model is not loaded, prediction fails, or the result is NaN or not greater than 0. While a pair has fewer than 2 samples, neither method computes a weight.
-
-Predictions are cached for 30 seconds, keyed by `node|destination` (plus `|u` for UDP), so under heavy load the same pair is not inferred twice. The cache holds the value before the factor is applied, so a change to `policy_priority` takes effect immediately.
-
-The model also produces a "confidence": 1 ÷ (1 + |prediction of all trees − prediction of the first half of the trees|), between 0 and 1. The closer to 1, the less the later trees corrected the result. Confidence is only written to the training data and does not affect node selection.
+The end of the model file (within the last 16 KB) may carry a mihomo-style `[transforms] … [/transforms]` section: `[order]` lists `index=feature name`, and `[definitions]` defines StandardScaler or RobustScaler scaling applied before inference. When the scaling parameters fail validation, the section is ignored and nothing is scaled; when `[order]` differs from the table order, the model's predictions are not used.
 
 ## Features
 
-**Features** are the numbers handed to the model, such as the success count or the smoothed connect time. Smart can compute the 38 features below, and a model picks the ones it uses by name. The index is the position among the 35 features and also the column number in the training-data CSV: features 0–26 are mihomo's 27 features, and features 27–34 are new in this fork. The 3 features marked `+` are not among the 35 and can only be used by name. log1p(x) in the table means ln(1 + x), which compresses values that span a wide range.
+The table gives the order of the 32 features, which is also the order of the first 32 CSV columns. log1p(x) means ln(1 + x), which compresses values spanning many magnitudes. The last two (30, 31) are the exit features appended after the earlier layout, as in mihomo.
 
 <FeatureTable lang="en" />
 
-Some notes:
+Notes:
 
-- Features 16 and 23 need `use_asn` and are 0 without it. Features 17 and 26 need the country database (`experimental.geox.url.mmdb`, or the automatically downloaded `country.mmdb`); see [ASN and GeoX](../asn-geox/).
-- Features 29 and 30 come from in-memory moving averages and must build up again after a restart.
-- Features 32 and 34 come from the most recent health-check probe. TCP retransmission counts can only be read on Linux and Android.
-- `loss_rate` and `cumul_loss_rate` are read from the send and retransmission counters of the underlying TCP connection when it closes. Linux, Android, macOS and iOS count segments; FreeBSD and Windows count bytes. Nodes carried over UDP, such as QUIC, have no such counters, and both values are 0.
-- The meaning of `duration_minutes` depends on the model. When the model also uses `history_duration_minutes` (as the default model does), it is the duration of this connection, and `history_duration_minutes` holds the average. Otherwise it is the average duration.
+- "Service" means the connection's service key (see [Service keys](../service-keys/)); counts and totals come from the node's record for that service, or its group-wide record when there is none.
+- Slots 19 and 26 need the ASN database, slots 20 and 29 the country database; they are 0 when the lookup fails.
+- Slots 17 and 18 come from the retransmission counters of the TCP connection to the node's server, judged in windows of at least 64 segments or 64 KiB; nodes over QUIC or other UDP transports have none.
+- Slots 30 and 31 come from the [exit watch](../blocks-and-probes/#exit-watch): the exit as seen by the site when known, else the node's own exit.
 
 ## Collecting training data
 
-Set `collect_data: true` on a Smart group, and each time a connection ends (or a dial fails) a row with the features and the computed weight is appended to a CSV file. Leave it off unless you plan to train a model.
+With `collect_data: true` on a group, every connection that ends with a verdict (success or failure) appends a row to the CSV; inconclusive connections and dial failures are not recorded. Leave it off unless you plan to train a model.
 
-- **File**: `experimental.smart.collector.path`, by default `smart_weight_data.csv` in the data directory. When several groups collect, they share the file; the `group_name` column tells them apart.
-- **Sampling**: `sample_rate` is in (0, 1]; `0.3` records 30% of connections. `0`, negative values and values above 1 all become `1.0`.
-- **Writes**: flushed to disk every 100 rows or every 30 seconds. Samples may be dropped while the stats queue is busy.
-- **Limit**: `size_limit_mb` (default 100 MB). Once the limit is reached, writing stops and one WARN is logged; the file is not rotated. Writing resumes within 30 seconds after you delete or truncate the file.
-- **Header**: the first line holds the 63 column names. If an existing file's header does not match the current format (including the 37-column and 60-column headers of earlier versions), the file is renamed to `<path>.bak.<timestamp>` and a new one is created. An empty file gets a header.
+- **File**: `experimental.smart.collector.path`, by default `smart_weight_data.csv` in the data directory. Several groups write to the same file; the `group_name` column tells them apart.
+- **Sampling**: `sample_rate` in (0, 1]; `0.3` records 30% of connections.
+- **Writes**: flushed to disk every 100 rows and on shutdown.
+- **Cap**: `size_limit_mb` (100 MB by default); at the cap writing stops with one log line, with no rotation. Delete the file and a new one is created within 5 s.
+- **Header**: the first row holds 42 column names. When an existing file's header lacks `cumul_loss_rate` or `exit_region` (an older format), it is renamed to `<path>.bak.<timestamp>` and a new file is created.
 
-Each row has 63 columns:
+Each row has 42 columns:
 
 <div class="not-prose my-6 overflow-hidden rounded-card bg-surface shadow-ring">
   {csvColumns.map((c) => (
@@ -136,50 +106,34 @@ Each row has 63 columns:
   ))}
 </div>
 
-<Callout type="note" title="Backups from older versions">
-  Old files renamed to `.bak.<timestamp>` come in two kinds. Files whose header has 60 names (format version `4`) can be read by column name; they only lack columns 59–61. Files whose header has only 37 names (versions before 2026-10-07) are misaligned with the data from column 28 on; when reading them, skip the first line and read values by the indexes of columns 0–58 in the table above.
-</Callout>
-
 ## Training your own model
 
-The repository does not ship a training script. The steps below use the Python packages pandas and lightgbm.
+The repository ships no training script. The steps below use Python with pandas and lightgbm.
 
-**Step 1: collect data.** Turn on `collect_data` on the Smart groups you use and run as usual for a few days, until you have at least tens of thousands of rows. The more varied the connections, the more reliable the model.
+**Step 1: collect data.** Enable `collect_data` on the groups you use most and use them normally for a few days, until you have at least tens of thousands of rows. The more varied the connections, the better.
 
-**Step 2: prepare labels.** The label is the value you want the model to output. The CSV's `weight` column is the weight computed *at the time*; training on it only teaches the model to imitate the existing formula (or model). To get a better model, build your own label, for example from whether the connection succeeded, its throughput and its duration. Keep the label in the range of traditional weights (mostly 0.1–2): the prediction is used directly as the weight, and nodes below 0.4 are not selected.
+**Step 2: prepare labels.** The `weight` column is the quality computed **at the time** (already cut down for connections that degraded a node or triggered a block). Training on it directly only teaches the model to imitate the current formula; to do better, build your own labels, for example from whether connections succeeded, their goodput and duration. Keep labels in the range of existing qualities (mostly 0.1–1.5), because predictions are used as quality directly and values below 0.4 block nodes.
 
-**Step 3: train.** A minimal example:
+**Step 3: train.**
 
 ```python
 import pandas as pd
 import lightgbm as lgb
 
 df = pd.read_csv("smart_weight_data.csv")
-X = df.iloc[:, 0:35].astype(float)   # columns 0–34: the 35 features, named by feature
-y = df["weight"].astype(float)       # the label; replace with your own
+X = df.iloc[:, 0:32].astype(float)   # the first 32 columns: features, order must not change
+y = df["weight"].astype(float)       # labels; replace with your own
 
 booster = lgb.train(
     {"objective": "regression", "learning_rate": 0.05, "num_leaves": 31, "verbose": -1},
     lgb.Dataset(X, y),
     num_boost_round=300,
 )
-booster.save_model("smart_lgbm_model.bin")   # LightGBM text format
+booster.save_model("Model.bin")   # LightGBM text format
 ```
 
-The DataFrame's column names become the model's `feature_names`, and Smart fetches values by those names, so you can pick and reorder feature columns freely as long as every name is in the [feature table](#features). For example, to add columns 59–61 and train with the default model's layout, first rename the two duration columns so that `duration_minutes` means the duration of this connection:
+Features are read by position, so you cannot select or reorder columns; to ignore a feature, set its column to a constant before training.
 
-```python
-df = df.rename(columns={"duration_minutes": "history_duration_minutes",
-                        "current_duration_minutes": "duration_minutes"})
-X = df[["success", "failure", "connect_time", "latency", "duration_minutes",
-        "history_duration_minutes", "loss_rate", "cumul_loss_rate"]].astype(float)
-```
+**Step 4: deploy.** Put the file at `model_path` (`Model.bin` in the data directory by default) and set `auto_update` to `false`, otherwise auto-update overwrites it with the default model; or point `url` at a file you publish yourself. Then restart sing-box: a file replaced by hand is not picked up on its own.
 
-**Step 4: deploy.** Put the file at `model_path` (by default `smart_lgbm_model.bin` in the data directory) and set `auto_update` to `false`, otherwise auto-update overwrites it with the default model. Then restart sing-box or reload the config: a file replaced by hand is not picked up automatically.
-
-**Step 5: verify.** Follow [Checking that the model is in use](#checking-that-the-model-is-in-use): the startup log should show `ml=loaded`. If it shows `ml=unusable`, fix the model according to the reason in the WARN and [Model format](#model-format).
-
-Also keep in mind:
-
-- The model file can end with a mihomo-format `[transforms]` block (StandardScaler or RobustScaler) that scales the features before inference. It must sit within the last 16 KB of the file, and its indexes refer to model input positions, in the order of `feature_names`. A model whose block fails validation is rejected.
-- A model can only use the 38 feature names in the feature table. Using another feature requires adding its computation to the source code (`common/smart/lightgbm/layout.go`) and recompiling.
+**Step 5: confirm.** The log should show `lightgbm model loaded from …`, and the CSV column `weight_source` then shows `LightGBM`.

@@ -1,252 +1,62 @@
 ---
-title: Health and failures
-description: How Smart notices a node going bad, how fast it reacts and how it recovers — availability checks, active probing, the connection watchdog, graded responses (soft blocks, unavailable marks, circuit breaker, blocks), failure storms, network changes, and how to confirm what happened from logs and the API.
+title: Health checks
+description: When Smart checks members, how a member is judged unavailable, group delay tests and dashboard delays, finding unstable nodes with the median absolute deviation, node-level failures and recovery, manual group-wide blocks, idle power saving and network changes.
 ---
 
 import Callout from '../../../components/Callout.astro';
-import PatternGroups from '../../../components/PatternGroups.astro';
-import { resetMarkers, transferFamilies } from '../../../data/errors';
 
-This page answers one question: when a node misbehaves, how does Smart notice, how quickly does it route around it, and when does it use it again? Read it when you are working out why a node is never picked or why connections get closed, or before you tune `interval`.
+Health checks answer a coarse question: does this member work right now, and is it steady? They do not decide which node is better (that is the job of the [comprehensive score](../scoring/)), but members that fail or wobble are excluded during [filtering](../how-it-works/#filtering-members).
 
-Smart judges nodes from two kinds of signals:
+## Periodic checks
 
-- **Active probing**: it periodically fetches a test URL through each node and measures the latency (a "probe").
-- **Passive observation**: it watches every real connection for resets, stalls, and connections abandoned right after they open.
+- **When**: first 10 s after start, then every `interval` (5 minutes by default), only while the group is **in use**: a new connection within `idle_timeout` (30 minutes by default). An idle phone spends no battery on them.
+- **How**: an HTTP HEAD request to `url` (`https://www.gstatic.com/generate_204` by default) through every member, up to 15 s, at most 10 at once; `expected_status` decides which status codes pass. Members of type `block` or `dns` and the built-in `Compatible` are not checked.
+- **Reuse**: groups share one prober. A member result younger than half an `interval` is reused instead of requested again.
+- **Where results go**: into the delay history dashboards show; into the score as the "probe delay" (valid for 2 minutes after each check, see [Freshness](../scoring/#freshness)); and into the last-10 history of the stability check.
 
-Responses are graded by severity: a minor problem only keeps a node away from one destination for a while (a soft block), a serious one takes the whole node out (unavailable mark, circuit breaker), and nodes that keep failing are blocked for longer. Terms are explained in the [Glossary](../glossary/).
+### Judging a member unavailable
 
-## An example first
+- A working member is judged unavailable after **2 failed checks in a row**; one failure may just be the check URL. A member already unavailable stays so after one more failure.
+- One success makes it available again.
+- A member never checked counts as available.
 
-Say node `JP-01` starts acting up and connections to `*.example.com` keep getting reset. Smart reacts roughly like this:
+Unavailable members are excluded at the first filtering level; if every member is unavailable, filtering loosens to ignore health, so a false negative never leaves a connection with nowhere to go.
 
-| Time | What happens | What Smart does |
-|---|---|---|
-| 0 s | A connection to `*.example.com` is reset mid-transfer (RST) | `JP-01` is **soft-blocked for that destination for 10 minutes**; it still serves other sites |
-| 20 s | The same destination is reset again through `JP-01` (2nd time within 60 s) | `JP-01` is **unavailable for 3 minutes**, the circuit breaker counts 1 failure, the ranking is recomputed; new connections use other nodes |
-| Next health check | The probe of `JP-01` fails | The 3 unavailable minutes restart from now, its probe record is deleted, and its next probe is postponed by 3 minutes (then 6, 12 … up to 1 hour on further failures) |
-| Unavailable mark expires | With no probe record, `JP-01` counts as "untested" and is selectable again | If a dial fails again: another 3 minutes unavailable; once the breaker has 2 failures within 30 s it **opens for about 15 s**, and even a pin is bypassed meanwhile |
-| After the line recovers | One successful dial or probe | Unavailable mark cleared, breaker reset, error counts cleared; the soft block for `*.example.com` still runs out its 10 minutes |
+### Group delay tests
 
-All the while, user requests move to other nodes on their own. The sections below explain each rule and number.
+Running a delay test on a Smart group in the dashboard (`GET /group/{name}/delay`) tests every member, and the results count toward health and the score as well. **Note: a group delay test releases the pinned node**, as in mihomo. Testing the group as a single proxy (`GET /proxies/{name}/delay`) does not release the pin; it measures through the current choice.
 
-## When a node counts as available
+## Stability
 
-A node is unavailable in the group, and never becomes a candidate, while any of these holds:
+A node that works but wobbles is worse than one that is plainly down: delays jump around, the odd request times out, and users notice the stutter. Smart reuses mihomo's **MAD (median absolute deviation)** check. Every 10 minutes (first 5 minutes after start) it looks at each member's last 10 health checks:
 
-| Condition | Lasts |
-|---|---|
-| Its circuit breaker is open | From about 15 s (with random jitter); see [Circuit breaker](#circuit-breaker) |
-| Its latest dial or probe failed (unavailable mark) | 3 minutes, or until the next success |
-| Its probe record shows a failure (delay 0, usually written by a `urltest` group in the same config) | Until the next successful probe |
-| Its latest probe record is older than 3 × `interval` | Until it is probed again |
+- **Anomaly**: the latest check failed, or the latest two delays are both above the threshold. Threshold = median + k × 1.4826 × MAD, with k = 3.5 below 10 samples and 2.5 otherwise (when the MAD is 0, mean + 2 standard deviations);
+- **Unstable**: more than half of the last 3 checks failed, or 1.4826 × MAD ÷ median (the robust coefficient of variation) is 0.6 or more;
+- **Worse**: thresholds are graded (up to 500 ms grade 1, up to 1000 ms grade 2, up to 2000 ms grade 3, beyond that grade 4), and the grade rose since the last check, or moved from grade 2 or better to grade 3 or worse.
 
-A node with no probe record counts as available, so selection works right after startup. When one of Smart's own probes fails, the record is deleted, so once the 3-minute unavailable mark expires the node is tried again as an "untested" node; if it still fails, it is marked for another 3 minutes.
+Any of these blocks the node **group-wide for 12 minutes** (reason `unstable`): the first filtering level excludes it and the ranking shows `Alive: false`. With fewer than 3 valid samples, only failures count. No stability check runs during a failure flood.
 
-Two further exclusions are narrower or longer:
+## Node-level failures
 
-- **Soft block for one destination**: the node just does not serve that destination; see [Escalation](#escalation).
-- **Block**: after 30 connections ending in failure, the node is blocked for 93 minutes or more; see [Degradation and recovery](../how-it-works/#degradation-and-recovery). Nodes blocked by hand through the Clash API fall in this category too.
+Besides health checks, real connections tell Smart when a node is in trouble. A dial failure is a **node-level** failure: the node's failure streak grows on every site, and it enters a backoff starting at 5 minutes, doubling up to 6 hours. With a streak of 3, the node is not eligible as long as some other member is healthy.
 
-## Active probing
+Recovery comes from real traffic, not health checks: once 4 different connections in turn prove it receives data again, the failure state clears. Details in [Score and selection](../scoring/#failure-state). `FailStreak` and `BackedOff` in the ranking show both states.
 
-### When probes run
+## Manual group-wide blocks
 
-- **Idle** groups do not probe: a group is idle if it has never dialed successfully or has not dialed successfully in the last 2 minutes. So after Smart starts, no background probing happens until the first connection succeeds, and a phone in your pocket does not burn battery on probes. Pinning a node in a dashboard also ends the idle state.
-- The first probe round is scheduled about 10 seconds after startup (staggered across groups), then every `interval` (3 minutes by default); rounds that fall into an idle period are skipped.
-- A network change triggers an immediate round that ignores idleness; see [Network changes](#network-changes).
-- Nodes that dialed successfully or passed a probe within `max(interval, 5 minutes)` are skipped for the round. Members of type `direct`, `block` or `dns` are never probed.
+If you know a node's line is bad tonight, take it out of the group for a while:
 
-<Callout type="warn" title="Keep interval at 100 seconds or more">
-  A node only counts as available while its probe record is at most 3 × `interval` old, yet probing skips nodes tested within the last 5 minutes. Below 100 seconds, 3 × `interval` is shorter than 5 minutes, so nodes are judged unavailable during that gap without being probed again.
-</Callout>
+```bash
+curl -X POST 'http://127.0.0.1:9090/smart/groups/auto/block/HK-01?duration=2h'
+curl -X DELETE 'http://127.0.0.1:9090/smart/groups/auto/block/HK-01'   # lift early
+```
 
-### Which nodes each round probes
+Without `duration` it lasts 30 minutes. Like stability blocks, a group-wide block excludes the node at the first filtering level, is saved in the cache file and lifts on its own when it expires. A pinned node ignores blocks.
 
-With many nodes, a round does not probe them all, to keep phones cool and data usage low:
+## Idle power saving
 
-- The top 16 ranked nodes are probed every round (they are the ones most often selected);
-- the rest get at most `max(24, ⌈N / 10⌉)` probes per round (N = member count), taken in batches by a rotating cursor so every node is covered after a few rounds;
-- a node whose probe fails has its next probe postponed: 3 minutes, 6, 12 … doubling up to 1 hour; one successful probe clears it.
-
-With 500 nodes, a round probes about 66 of them rather than 500.
-
-### The probe itself
-
-- **Request**: an HTTP **HEAD** to `url`, without following redirects. Outbounds with multiplexing enabled get one warm-up request before the timed one.
-- **Timeout**: 5 seconds, counted from when the probe actually starts, so time spent queued does not count.
-- **What counts as success**:
-  - with `expected_status` set, the status code must be in its range, such as `204` or `200-299`;
-  - without it (or with `*`), any HTTP response counts as success, including 3xx redirects and 4xx/5xx. Behind a captive portal (a hotel or airport Wi-Fi login page) that can mark a broken node as available, so set `expected_status: "204"` for `generate_204`-style URLs.
-- **Expiry**: a probe that has not started by the next round is dropped without a verdict.
-- **Outcome**: on success the latency is recorded and the node becomes available; on failure its probe record is deleted, it is marked unavailable for 3 minutes, and its next probe is postponed.
-
-All Smart groups share one probe queue (1024 slots) and `clamp(2 × CPU cores, 8, 32)` probe workers. Probes from different groups for the same node, URL and expected status are merged into one, and a node's probe result is reused by other groups for 1 second. When the queue is full, new probes are skipped rather than counted as failures.
-
-## Connection watchdog
-
-A probe only shows that a node can reach the test URL; the watchdog watches every real connection. Each TCP connection through Smart is wrapped to record read and write times and inspect errors. UDP connections have no watchdog.
-
-### First-byte timeout
-
-Many broken nodes finish the handshake but never return any data. So timing starts at the client's **first successful write**, and the server's first byte must arrive before the timeout:
-
-- The timeout is `min(5 s, max(1.5 s, 4 × the node's probe latency))`. A node probed at 200 ms gets 0.8 s, raised to 1.5 s; a node at 600 ms gets 2.4 s; without a probe record it is 5 s.
-- The first read returning, successfully or not, stops the timer;
-- connections where the client never writes (protocols where the server speaks first) are not timed.
-
-The timer is mostly enforced by the connection's read deadline, with a backstop scan every 2.5 seconds for outbounds that ignore read deadlines.
-
-### Stall detection
-
-After the first byte, the watchdog scans every 2.5 seconds and closes connections that meet all of these as stalled:
-
-- the last write is newer than the last read, i.e. something written has not been answered;
-- the last write is more than **60 seconds** old.
-
-Idle long-lived connections (keep-alive, WebSocket, push channels) have no unanswered writes and are **never closed** by this.
-
-<Callout type="note" title="Fixed: long connections cut at 30 seconds">
-  Before 2026-10-05, a non-renewing 30-second read timeout was set after the first byte, so long-lived connections through Smart were cut at 30 seconds and healthy nodes were counted as failures. The current version uses the mechanism above.
-</Callout>
-
-### Error detection
-
-Errors are checked on read, write and close, and each connection triggers at most one response.
-
-**Before the first byte**, any read error other than `io.EOF` (the peer closing normally) is fatal, including the first-byte timeout.
-
-**At any time**, these errors count as a reset: the system errors `ECONNRESET`, `EPIPE`, `ECONNABORTED`, or an error message containing one of these substrings (case-insensitive):
-
-<ul class="not-prose my-4 flex flex-wrap gap-2">
-  {resetMarkers.map((m) => <li><code class="rounded bg-surface-2 px-2 py-1 font-mono text-[0.8rem] text-fg-2">{m}</code></li>)}
-</ul>
-
-**After the first byte**, proxy protocol stacks often "translate" an underlying reset into their own errors, so these count as fatal too. An HTTP/2 GOAWAY containing `goaway` but not `no_error` is fatal as well; a graceful GOAWAY is not.
-
-<PatternGroups lang="en" families={transferFamilies} />
-
-After the first byte, `io.EOF` and `io.ErrUnexpectedEOF` are not fatal; they usually just mean the peer finished early.
-
-### Short-lived connections
-
-Connections the user gave up on are also a sign that a node is not working well. A connection counts as short-lived if, when it closes, any of these holds:
-
-- it lived less than 2 seconds and moved less than 4 KB in total;
-- it lived more than 500 ms and never read any data;
-- it lived more than 2 seconds but downloaded less than 1 KB.
-
-Three short-lived connections for the same (destination, node) within 60 seconds mark the node unavailable for 3 minutes. Below that threshold, only the destination's unwrap cache is cleared, so the next request selects afresh.
-
-## Escalation
-
-| Event | Response |
-|---|---|
-| One fatal error, or the watchdog finds a stall | The node is soft-blocked **for that destination** for 10 minutes and the destination's unwrap cache is cleared; the node keeps serving other destinations. A stalled connection is closed |
-| 2 fatal errors for the same (destination, node) within 60 s | The breaker counts 1 failure, the node is unavailable for 3 minutes, soft-blocked for that destination for 10 minutes, and the ranking is recomputed |
-| 3 short-lived connections for the same (destination, node) within 60 s | The node is unavailable for 3 minutes |
-| One failed TCP dial | The node is unavailable for 3 minutes and the breaker counts 1 failure |
-| One failed UDP dial | The node is unavailable for 3 minutes (the breaker does not count it) |
-| The breaker counts 2 failures within 30 s | The breaker opens |
-| One failed probe | The node is unavailable for 3 minutes and its next probe is postponed |
-| 30 connections ending in failure | The node is blocked for 93 minutes or more; see [Degradation and recovery](../how-it-works/#degradation-and-recovery) |
-
-A soft block is never lifted early by a successful dial; it only expires. Fatal-error and short-lived counts each keep at most 4096 (destination, node) pairs; when full, entries outside their window are cleaned first.
-
-### Circuit breaker
-
-The circuit breaker stops Smart from retrying a node that has just failed repeatedly:
-
-| State | When | Behavior |
-|---|---|---|
-| Closed | Normal | Failures are counted; a second failure within 30 s of the first opens it |
-| Open | Before the open time ends | The node is unavailable; even a pin is bypassed |
-| Half-open | After the open time ends | A trial dial is allowed; another failure reopens it at once, a success resets it completely |
-
-The open time is 15 s × 1, 2, 4 or 8 (growing with consecutive trips, capped at 8× = 120 s), times a random jitter of 0.8–1.2 so a batch of nodes does not recover all at once. A successful dial or probe resets the breaker completely, so the next incident starts from 15 s again. Breaker state is saved in the cache file, and breakers still open after a restart are restored.
-
-### Failure storm
-
-When the group has 5 or more dial failures and the latest is within 30 seconds, Smart assumes the network itself is down (no connectivity, or a switch between Wi-Fi and cellular) and pauses health checks, post-network-change warm-ups and destination probes, so it does not mark every node as failed during an outage. Each successful dial halves the count, so the pause lifts quickly once the network is back.
-
-Separately, after 5 consecutive dial failures with no more than 60 seconds between any two, Smart immediately recomputes its prefetch results.
-
-## Destination suspicion
-
-Some nodes work fine overall but cannot reach one particular site (for example, the site blocks that exit IP). Smart therefore judges whether a node is suspect **for a destination**:
-
-- a TLS handshake probe to the destination through the node failed within the last 15 minutes;
-- or the (destination, node) pair's recent success rate is below 40% with at least 3 samples.
-
-Suspect nodes are not removed, only moved to the end of the candidate list, and they never take the `sticky-session` fast path.
-
-TLS handshake probes start 2 minutes after startup and run every 15 minutes (skipped while the group is idle or in a failure storm): for the 10 most visited destinations, each of the first 3 available nodes in member order connects to port 443 of the destination and completes a TLS handshake, within 2 seconds overall.
+When the group has had no new connection for `idle_timeout`, health checks and `answer` rechecks pause; they resume with the next connection. While the device or network is paused (a sleeping phone, for example), every background task is skipped.
 
 ## Network changes
 
-On a network change — the default interface changing, Windows waking from sleep, memory being reclaimed under pressure, or a network reset triggered by the client — sing-box first closes every connection, then notifies each Smart group:
-
-1. Notifications within 500 ms of each other are merged into one;
-2. every node's dial heartbeat and the 1-second probe-result cache are cleared;
-3. dials in flight are cancelled, so callers retry right away instead of waiting for a timeout on the old interface (new dials started in the next 2 seconds are not cancelled again);
-4. after 300 ms, the pinned node and the most recently used node are warmed up with a probe (3 s timeout), then a health check runs immediately. Because the heartbeats were cleared, nodes that were only proven by recent traffic, without a fresh probe record, are probed again.
-
-When several Smart groups are notified together, only the first one runs the warm-up and this health check within 5 seconds, to avoid duplicate probes. During a failure storm both are skipped.
-
-## Recovery
-
-Any successful dial or successful probe:
-
-- clears the 3-minute unavailable mark;
-- resets the circuit breaker;
-- clears the node's fatal-error and short-lived counts;
-- resumes a suspended pin; see [Pinning a node](../priority-and-pinning/#pinning-a-node).
-
-A successful probe also clears the probe backoff, putting the node back on the normal probing schedule. Soft blocks for single destinations are unaffected and only expire; nodes blocked for 93 minutes or more recover gradually as described in [Degradation and recovery](../how-it-works/#degradation-and-recovery).
-
-## On smart-loadbalance groups
-
-[`smart-loadbalance`](../smart-loadbalance/) groups use exactly the same probing, watchdog, breaker and recovery; only selection differs:
-
-- Unavailable nodes, blocked nodes and nodes soft-blocked for the destination are left out of the region's node pool. Nodes suspect for the destination stay in the pool, but their quality is multiplied by 0.3, so they get fewer connections.
-- A region with fewer healthy nodes than `region.min_nodes` is not chosen by the `auto`, `priority` or `destination` modes; a locked region and region outbounds only need one healthy node.
-- Round 0 dials only the picked node; if it failed recently, is marked unavailable, or has had no successful dial or probe yet, the next node of the pool is hedged after 250 ms.
-- A stale probe result does **not** count as a failure. Health checks pause while the group is idle, so after a while every result is old; `smart-loadbalance` only leaves out nodes with an open breaker, an unavailable mark, a failed last probe, or a block.
-- When no healthy node can be chosen at all, the group still dials the nodes in scope, and one success brings it back; see [When nothing is healthy](../smart-loadbalance/#when-nothing-is-healthy).
-
-## Checking what happened
-
-With `log.level` set to `debug` you see per-connection details. Common log lines (`auto` is the group name):
-
-| Log line | Meaning |
-|---|---|
-| `smart[auto] read RST from [JP-01] target=[*.example.com] err=...` | A fatal error (`read`, `write`, `close`; `read-prefirst` before the first byte; `watchdog first-byte-timeout` / `watchdog transfer-stalled` from the watchdog) |
-| `smart[auto] target debargo enacted for [JP-01] on target [*.example.com]` | Soft block for that destination for 10 minutes |
-| `smart[auto] node [JP-01] marked dead after 2 upstream resets on target [...]` | 2nd fatal error within 60 s; node unavailable for 3 minutes |
-| `smart[auto] node [JP-01] marked dead after 3 short-life closes on target [...]` | Short-lived connection threshold reached |
-| `smart[auto] circuit-breaker OPEN for [JP-01] ...` | Breaker opened (debug) |
-| `smart[auto] health-check skipped — network-storm gate active ...` | Health check skipped during a failure storm (debug) |
-| `smart[auto] network changed — cancelled 3 in-flight dial(s) on the old interface` | Network change; dials on the old interface cancelled |
-
-From the API: `alive` and `delay` in `GET /proxies/{name}` are the current node's probe state; `GET /smart/groups/{name}/diag` shows the group's internal state; `GET /proxies/{name}/weights?full=1` shows per-destination stats. See [Clash API](../clash-api/).
-
-## Constants
-
-| Constant | Value | Notes |
-|---|---|---|
-| First-byte timeout | 5 s (down to 1.5 s depending on probe latency) | From the client's first write |
-| Stall | 60 s | Written data left unanswered |
-| Watchdog scan | 2.5 s | |
-| Fatal-error threshold | 2 per 60 s | Per (destination, node) |
-| Short-lived threshold | 3 per 60 s | Per (destination, node) |
-| Destination soft block | 10 min | |
-| Unavailable mark | 3 min | |
-| Circuit breaker | 2 failures within 30 s; open 15 s × 1/2/4/8 | Jitter 0.8–1.2 |
-| Probe timeout | 5 s | From when the probe starts |
-| Probe budget | Top 16 + `max(24, ⌈N/10⌉)` | Per round |
-| Probe backoff | From 3 min, doubling, up to 1 h | |
-| Idle | No successful dial for 2 min | |
-| Failure storm | 5 failures, latest within 30 s | |
-| Suspicion | Failed TLS probe (within 15 min), or recent success rate < 40% (at least 3 samples) | |
-| Network change | 500 ms debounce, 300 ms warm-up delay, one warm-up per 5 s across groups | |
-| Dialing | Up to 4 rounds, 10 candidates, 250 ms hedge delay | See [How it works](../how-it-works/#dialing-and-retries) |
+When sing-box detects a network change, Smart treats every member as available again, clears the consecutive check failures and the failure-flood state, and, while the group is in use, runs a check right away. Scores, blocks and learned quality are kept.

@@ -1,6 +1,6 @@
 ---
 title: Examples
-description: Eight ready-to-use Smart configurations — a minimal setup, tuned probing and selection, LightGBM, ASN, groups per traffic type, nested groups, Smart load balancing and the front of chained proxies — each with who it is for, what it does and what to change before using it.
+description: Eight ready-to-use Smart configurations. Minimal, tuned checks and selection, LightGBM, prefer_asn with GeoX, per-service routing, nested groups, Smart load balancing and the front of chained proxies. Each says who it is for, what it does and what to change first.
 ---
 
 import CodeBlock from '../../../components/CodeBlock.astro';
@@ -9,7 +9,7 @@ import ex1 from '../../../examples/01-minimal.json?raw';
 import ex2 from '../../../examples/02-tuned.json?raw';
 import ex3 from '../../../examples/03-lightgbm.json?raw';
 import ex4 from '../../../examples/04-asn-geox.json?raw';
-import ex5 from '../../../examples/05-algorithms.json?raw';
+import ex5 from '../../../examples/05-service-keys.json?raw';
 import ex6 from '../../../examples/06-nested.json?raw';
 import ex7 from '../../../examples/07-smart-loadbalance.json?raw';
 import ex8 from '../../../examples/08-chain.json?raw';
@@ -26,71 +26,67 @@ All examples pass `sing-box check`. Apart from the first, each lists only the Sm
 
 <CodeBlock code={ex1} filename="01-minimal.json" locale="en" />
 
-**For**: your first Smart setup.
+**For**: your first Smart group.
 
-- Uses every node of one subscription, with all other fields at their defaults. Smart probes the nodes on its own and learns the best node for each site.
-- `cache_file` cannot be left out: Smart keeps what it learns in the cache file and does not learn without it.
-- `clash_api` lets you view weights and pin nodes in a dashboard. Remove it if you do not need it.
+- Uses every node of one subscription, with defaults for everything else. While the group is in use, Smart checks its members every 5 minutes and learns the most reliable node for each service.
+- `cache_file` keeps what was learned across restarts; without it every restart starts from zero.
+- `clash_api` lets you view the ranking and pin nodes in a dashboard; remove it if you do not need it.
 
 **Change before use**: the subscription `url`, and `update_interval` (how often the subscription refreshes) if you like.
 
-## Tuning probes and selection
+## Tuning checks and selection
 
 <CodeBlock code={ex2} filename="02-tuned.json" locale="en" />
 
-**For**: a working setup where you want fewer false results, better battery life on phones, or a preference for certain regions.
+**For**: a running setup where you want fewer false verdicts, a preference for some regions, or node switches that take effect immediately.
 
-- `exclude` removes entries that are not nodes, such as traffic and expiry notices. `(?i)` makes the match case-insensitive.
-- `expected_status: "204"` requires the probe address to answer 204. When it is empty, any HTTP response counts as success, so on networks with a login page (a captive portal) dead nodes can look healthy.
-- `interval: "5m"` probes less often, which suits phones.
-- `hysteresis: "30s"` keeps a site on the same node while it has steady traffic, so it does not bounce between nodes.
-- `policy_priority` prefers nodes whose names contain `HK` or `JP`, and uses a regex to drop nodes carrying a 2–9 multiplier tag (such as `2x` or `3×`, the expensive ones) to 0.8. Nodes with a factor above 1 rank ahead of all other nodes; see [Priority and pinning](../priority-and-pinning/#where-the-factor-applies).
+- `exclude` drops non-node entries such as traffic or expiry notices; `(?i)` makes it case-insensitive.
+- `expected_status: "204"` requires the check URL to answer 204, so a captive portal (a hotel or airport Wi-Fi login page) cannot make a dead node look alive.
+- `interval`, `idle_timeout` and `timeout` are written with their defaults so you can adjust them; `interval` must not exceed `idle_timeout`.
+- `tolerance: 50`: fallback members outside the serving pool whose probe delays are within 50 ms keep their configured order.
+- `max_failed_times: 5`: 5 errors in a row on one site block the node for that site for 24 hours.
+- `policy_priority` gives nodes named "香港" or `HK` a factor of 1.2 and "日本" or `JP` 1.1, and uses a regex to lower nodes marked `x2`–`x9` (premium multipliers) to 0.7. The first matching rule wins; see [Node preferences](../scoring/#node-preferences).
+- `interrupt_exist_connections: true`: changing the pin in the dashboard drops existing connections so they reconnect at once.
 
-**Change before use**: the keywords in `exclude` to match the notice entries of your subscription, and `HK` / `JP` in `policy_priority` to match how your nodes are named.
+**Change before use**: the keywords in `exclude` to match the notice entries in your subscription; the names in `policy_priority` to match your node names.
 
 ## Enabling LightGBM
 
 <CodeBlock code={ex3} filename="03-lightgbm.json" locale="en" />
 
-**For**: scoring nodes with a pre-trained model instead of the classic formula, or collecting your own data to train a model.
+**For**: computing connection quality with the model published by vernesong/mihomo instead of the scene formula, or collecting your own data to train a model.
 
-- On first start the default model downloads in the background; until it arrives the classic formula is used, so nothing breaks. `auto_update` checks for a new model every 72 hours.
-- `download_detour: "direct"` downloads the model without a proxy, so the download does not depend on a Smart group that is not ready yet. The newer `http_client` field works too; see [Configuration](../config/#lightgbm-http_client).
-- `collect_data` with `sample_rate: 0.3` records training data for about 30% of connections, and writing stops once the file reaches 100 MB.
+- On first start `Model.bin` downloads in the background; until then the scene formula is used, so nothing breaks. `auto_update` checks for a new model every 72 hours.
+- `download_detour: "direct"` downloads the model directly instead of through a Smart group that is still learning. You can use `http_client` instead; see [Configuration](../config/#lightgbm-http_client).
+- `collect_data` with `sample_rate: 0.3` records about 30% of connections as training data, and stops at 100 MB.
 
-**Change before use**: if you do not plan to train a model, remove `collect_data`, `sample_rate` and `collector`. If GitHub is not reachable directly, set `download_detour` to an outbound that can reach it, or point the model `url` at a mirror you can reach.
+**Change before use**: if you do not plan to train a model, remove `collect_data`, `sample_rate` and `collector`; if GitHub is unreachable directly, point `download_detour` at an outbound that can reach it, or the model `url` at a reachable mirror.
 
-## Learning by ASN
+## prefer_asn and GeoX
 
 <CodeBlock code={ex4} filename="04-asn-geox.json" locale="en" />
 
-**For**: visiting many different sites run by the same operator (Google, say), so new sites can benefit from what was already learned.
+**For**: setups where much traffic reaches Smart through `route.final`, and sites on the same network should share what was learned.
 
-- GeoX downloads the ASN and country databases and updates them once a week. The ASN database serves `use_asn`; the country database serves LightGBM.
-- On a fresh install the first download takes a moment. ASN takes effect on its own once the download finishes, with no restart; see [ASN and GeoX](../asn-geox/#experimentalgeox).
+- `prefer_asn` groups sites without a rule, or under broad rules, into one service per ASN; shared networks such as Cloudflare stay per site. See [Service keys](../service-keys/#prefer_asn).
+- GeoX refreshes the ASN and country databases weekly; the ASN database serves `prefer_asn` and LightGBM, the country database LightGBM.
+- The first download takes a moment; the databases are used as soon as they arrive, with no restart.
 
-**Change before use**: to use only a local file, remove `geox` and write `"asn_database": "/path/to/GeoLite2-ASN.mmdb"` in the group; remove `use_lightgbm` if you do not want the model.
+**Change before use**: remove `use_lightgbm` if you do not need LightGBM; to use the default databases only, drop the whole `geox` block and Smart downloads GeoLite2 itself.
 
-## Groups per traffic type
+## Routing by service
 
-<CodeBlock code={ex5} filename="05-algorithms.json" locale="en" />
+<CodeBlock code={ex5} filename="05-service-keys.json" locale="en" />
 
-**For**: traffic that needs different handling, such as SSH that should stay on one fast node and downloads that should spread out.
+**For**: services (streaming, AI, code hosting) that should each converge on one stable exit, while other foreign sites still share experience.
 
-Four Smart groups use the same subscription, and route rules send each kind of traffic to one of them:
+- Every rule pointing at `auto` is a service: `RuleSet [geosite-netflix]`, `RuleSet [geosite-openai]` and `DomainSuffix [github.com]` each learn on their own and have their own incumbent, and all domains of one service share one exit.
+- `geosite-geolocation-!cn` is a broad rule; with `prefer_asn` its sites are grouped by ASN instead of counting as one giant service.
+- ASN claims attach new domains on Netflix's or OpenAI's networks, not yet listed in the rule sets, to the matching service; see [ASN claims](../service-keys/#asn-claims).
+- `policy_priority` prefers private-line nodes, then Hong Kong nodes, and avoids premium-multiplier nodes.
+- `sniff` gives IP-only connections a domain; `final` is `direct`, so everything else goes out directly.
 
-| Group | Algorithm | Use |
-|---|---|---|
-| `smart-interactive` | `latency-banded` + 1-minute `hysteresis` | SSH and remote desktop; prefers low latency and avoids switching nodes |
-| `smart-bulk` | `least-loaded`, TCP only | Downloads, spread across the nodes with the fewest connections |
-| `smart-sticky` | `sticky-session` | Services that tie the login session to the exit IP |
-| `smart-default` | `p2c` | All other traffic |
-
-**Change before use**: the ports and domains in the route rules, to match the traffic you want to separate.
-
-<Callout type="note" title="The cost of multiple groups">
-  Stats are stored per group, so four groups learn the same nodes four separate times, and memory and disk use grow accordingly. Split groups only when different traffic really needs different algorithms.
-</Callout>
+**Change before use**: add or remove rule sets as you need; they download through `direct`, so switch to an outbound that works if that fails.
 
 ## Nested groups
 
@@ -99,8 +95,8 @@ Four Smart groups use the same subscription, and route rules send each kind of t
 **For**: many nodes, when all you care about is which region to use.
 
 - Three `urltest` groups each pick the fastest node of one region from the subscription, and Smart learns which of the three regions to use.
-- Smart treats member groups like ordinary nodes: stats are recorded under `HK`, `JP` and `US`, and reflect whichever node that group had selected at the time.
-- `policy_priority: "=HK:1.2"` uses `=` for an exact match, so it only applies to the member named `HK`.
+- Smart treats member groups like ordinary nodes: scores are recorded under `HK`, `JP` and `US`, and reflect whichever node that group had selected at the time.
+- `policy_priority: "^HK$:1.2"` uses an anchored regex so it only matches the member named `HK`; unanchored, `HK` would match any member whose name contains it.
 - The outer `selector` uses `auto` by default; switch it to a fixed region in the dashboard when you need to.
 - With few candidates Smart learns fast; the cost is that it cannot see the differences between nodes inside a region. To let Smart manage every node directly and spread connections within regions, use [Smart load balancing](#smart-load-balancing) below.
 
@@ -115,7 +111,7 @@ Four Smart groups use the same subscription, and route rules send each kind of t
 - Every node of the subscription goes into one `smart-loadbalance` group and is sorted into regions by name; nodes whose names contain `IPLC` or `IEPL` go to a custom region named "专线" (private line), and `deny` leaves out mainland-China nodes.
 - `mode: auto` learns the best region per site, `weights` gives Hong Kong a slight edge, and `affinity: site` keeps each site on one node so logins do not break when the exit IP changes.
 - `max_connections_per_node: 64` keeps any one node from taking too many concurrent connections.
-- `region.outbounds` generates outbounds such as `🇭🇰 香港负载` for four regions. The group lists them as its members in dashboards — picking one locks that region — and a `selector` such as `proxy` can reference them directly.
+- `region.outbounds` generates outbounds such as `🇭🇰 香港负载` for four regions. The group lists them as its members in dashboards (picking one locks that region), and a `selector` such as `proxy` can reference them directly.
 - Details in [Smart load balancing](../smart-loadbalance/).
 
 **Change before use**: list in `regions` only the regions your subscription actually has (the region outbounds the `selector` references must match). If a stable exit per site does not matter to you, set `affinity` back to `none` to spread the load better.

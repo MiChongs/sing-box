@@ -1,147 +1,80 @@
 ---
 title: Storage and performance
-description: Where Smart keeps what it learns, what is restored after a restart, when it writes to disk, how the memory budget is split, how old data is cleaned up or cleared by hand, and how to keep overhead down with many nodes or on phones.
+description: Where Smart keeps what it learns, what is stored, when it is written, what survives a restart, how to flush it, and the memory use and per-connection cost.
 ---
 
 import Callout from '../../../components/Callout.astro';
 
-What Smart learns — per-destination statistics and weights for every node — lives in sing-box's cache file, so it survives restarts. This page covers what is stored, how much memory and disk it takes, how to clear it, and how to cut overhead with many nodes or on phones. For everyday use, remember one thing: **the command-line build needs `experimental.cache_file` enabled**.
+Smart keeps what it learns in memory, writes it to sing-box's cache file every 5 minutes, and picks up where it left off after a restart. This page covers what is stored, how much, and how to flush it. For normal use remember one thing: **enable `experimental.cache_file`**, otherwise every restart starts learning from scratch.
 
-## Where data is stored
+## Where data lives
 
-Smart uses the bbolt database set by `experimental.cache_file` (by default `cache.db` in the data directory) and keeps everything in its `smart_stats` bucket, separate from rule sets, FakeIP and other caches. The command-line build needs `cache_file.enabled: true`; the SFA / SFW / SFL GUI clients always enable the cache file.
+Smart uses the bbolt database of `experimental.cache_file` (`cache.db` in the data directory by default) and keeps everything in its `smart_score` bucket. The `smart_stats` bucket of the old Smart is no longer recognized and is deleted automatically when the cache file opens; old data is not migrated. The command-line version needs `cache_file.enabled: true`; the SFA / SFW / SFL GUI clients always have a cache file.
 
-```json
-"experimental": {
-  "cache_file": { "enabled": true }
-}
-```
+Without a cache file, Smart still learns, blocks and chooses, but only in memory: everything is lost on restart, including the manual pin and the region lock of `smart-loadbalance`.
 
-Without a cache file Smart still works, but:
+### What is stored
 
-- it records no statistics, selects by probe delay only, and `/proxies/{name}/weights` and similar endpoints return a delay-based ranking;
-- pins and the region lock of `smart-loadbalance` live only in memory and are lost on restart;
-- `POST /smart/groups/{name}/block/{node}` returns `smart: store unavailable`.
-
-The startup log line `smart: no cache file available, using ephemeral store` means you are in this situation.
-
-### Keys and record types
-
-Each record's key is `smart/<type>/singbox/<group>/...`. `/`, `%` and control characters inside a segment are percent-escaped, so nodes with `/` in their names are stored and read correctly.
-
-| Type | Key | Contents |
-|---|---|---|
-| `stats` | `…/<group>/<destination>/<node>` | Successes and failures, connect time, latency, traffic, peak rates, duration, last use, the weight of each slot |
-| `node` | `…/<group>/<node>` | Failure count, degradation factor, blocked-until time |
-| `prefetch` | `…/<group>/<destination or ASN>` | Candidate list computed by prefetch |
-| `ranking` | `…/<group>` | Node ranking |
-| `failures` | `…/<group>/<destination>` | Degradation count of the destination (for `max_host_failed_times`) |
-| `manual` | `…/<group>` | Pinned node |
-| `dead` | `…/<group>/<node>` | Time the node was marked unavailable |
-| `breaker` | `…/<group>/<node>` | Circuit breaker state |
-| `pinendor` | `…/<group>/<node>` | Pin endorsement record |
-| `region` | `…/<group>` | The region lock of `smart-loadbalance`, plus the region mode, strategy and affinity if switched at runtime |
-| `exitgeo` | `…/<group>/<node>` | Country and exit IP found by a `smart-loadbalance` exit probe |
-
-Stats records are written as msgpack (JSON records from older versions are still read); the other records are JSON.
-
-These live only in memory and build up again after a restart: the unwrap cache (each destination's last candidate list), short- and long-term moving averages, latency standard deviation, the memories of `sticky-session` and `hysteresis`, per-destination SNI probe results; and for `smart-loadbalance`, each destination's remembered region, affinity bindings, region-probe results and the destination-country cache.
-
-### What is restored after a restart
-
-On a cold start, and after a config reload through SIGHUP or the Clash API, Smart restores the following from the cache file:
-
-| Data | Restore rule |
+| Key | Content |
 |---|---|
-| Stats, weights, prefetch, ranking | All kept; time decay applies when they are read |
-| Pin | Restored if the node is still in the group |
-| Unavailable markers | Restored if set within the last 3 minutes; older ones are deleted |
-| Circuit breakers | Restored if still within the open window |
-| Pin endorsements | Restored if within the last 14 days |
-| Region lock and runtime settings | All restored; a locked region with no members for now is handled by `region.fallback` |
-| Exit-probe results | Restored within `detect.exit_ttl` (24 hours by default); expired ones are deleted |
+| `cell/<group>/<layer>/<network>/<family>/<node>[/<service key>]` | Evidence cells of the global, family and service layers: decayed successes and failures, failure streak and backoff, connection quality, retransmission average, total traffic and duration, average connect and response times |
+| `host/<group>/<tcp\|udp>/<key>` | Block records of one site or service key |
+| `gblock/<group>/<node>` | Group-wide blocks (manual, `unstable`) with their deadlines |
+| `rec/<group>/pin/` | The pinned node |
+| `rec/<group>/exit/<node>` | A member's exit country, IP and ASN |
+| `rec/<group>/region/` | The region lock of `smart-loadbalance`, plus any mode, strategy or affinity switched at runtime |
+| `rec/<group>/exitgeo/<node>` | Exit country and IP from `smart-loadbalance` exit detection |
 
-## Writing to disk
+`/` and `%` in key parts are escaped, so groups and nodes with `/` in their names work.
 
-- Writes go into an in-memory queue first, and repeated writes to the same key merge into one. Queued and in-flight data can be read immediately, so you never read an older value right after a write.
-- When the queue reaches the threshold (300 on desktop, 204 on phones), a single writer goroutine commits it. A timed commit also runs every 5 minutes (one task shared by all groups, run at most once per 5 seconds).
-- Each commit is one bbolt transaction, synced to disk afterwards.
-- On exit, Smart waits for the in-flight batch and syncs once more, so a normal shutdown does not lose the last batch.
+These live **in memory only** and rebuild after a restart: exact-target (`host:port`) evidence, fresh performance data such as latency and goodput (which expires after 2 minutes anyway), each service's incumbent, the serving pools, exploration budgets, health-check state, site-specific exits and exit suspicions, response-probe throttles, and the ranking cache; for `smart-loadbalance`, the per-target region memory, affinity bindings and region-probe results.
 
-## Memory budget
+### Writing and restoring
 
-Smart's in-memory caches are measured in **actual bytes**. The total budget comes from the environment variable `SMART_CACHE_BUDGET_MB`: 32 MB by default on desktop, 8 MB on Android and iOS. It is split into 6 equal shares:
+- Evidence cells, block records and group-wide blocks are written every 5 minutes and once more on shutdown; each write replaces the group's previous data as a whole.
+- The manual pin, exit info and the runtime state of `smart-loadbalance` are written as soon as they change.
+- At startup, data of nodes that are still members is restored; decay continues from the stored timestamps, so after a night off the old successes and failures weigh less on their own. Unexpired group-wide blocks and the manual pin (if the node is still a member) are restored too.
 
-| Cache | Contents | Expiry |
+### Members and groups that change
+
+- When a node leaves the group (removed by a subscription update, say), its in-memory data for the group is dropped at once and disappears from the cache file at the next write.
+- Data of a **whole group** removed from the config stays in the cache file and is not cleaned up; delete the cache file if you need to.
+- Renaming a group is the same as removing the old group and adding a new one.
+
+### Flushing
+
+| Endpoint | Scope | Response |
 |---|---|---|
-| Destination cache | Domain to destination-key conversions | None |
-| Unwrap cache | Each destination's last candidate list | None; cleared by events |
-| Record cache | Stats records, counted at 768 bytes each | None |
-| Query cache | Prefix scan results | 300 seconds |
-| Block cache | Each group's set of blocked nodes | 300 seconds |
-| Stats index | Per-group decoded stats, used by prefetch and weight lookups | 1 minute, or rebuilt after 1024 accumulated writes |
+| `DELETE /proxies/{name}/weights` | One group | Counts of removed entries: `{"group", "deleted": {"aggregate", "site", "exact", "blocks"}}` |
+| `POST` / `DELETE /cache/smart/flush/{name}` | One group (all of them when the name is not a Smart group) | 204 |
+| `POST` / `DELETE /cache/smart/flush` | Every Smart group of the current config | 204 |
 
-Limits derived from the budget:
+Flushing removes the group's evidence, incumbents, serving pool and exploration budget, every block record (including `manual`), group-wide blocks, the manual pin, exit info and all of its records in the cache file; health state is reset, and a `smart-loadbalance` group returns to its configured lock and settings and re-detects regions. Use it after a big change of nodes, or when you suspect the data was skewed by something unusual.
 
-| | Desktop (32 MB) | Phone (8 MB) |
-|---|---|---|
-| Each share | about 5.3 MB | about 1.3 MB |
-| Record cache capacity | about 7300 records | about 1800 records |
-| Destination limit `MaxTargets` | 5000 | 3276 |
-| Pairs covered by prefetch | 2500 | 1638 |
-| Write threshold | 300 | 204 |
+## Memory
 
-The budget is re-applied from the current setting every 5 minutes. When a cache is full, its admission policy decides what to evict, so the budget is never exceeded; evicted data is still on disk and is read again when needed.
+Evidence cells live in tables shared by all Smart groups, each split into 64 shards and evicting approximately the least recently used cell when full:
 
-`smart-loadbalance` keeps a few small in-memory tables outside this budget, each capped: remembered regions and affinity bindings at 16384 entries each (expired entries go first; if still full, the table is cleared), region-probe tracking at 1024 destinations, and the destination-country cache at 4096 domains.
-
-## Data cleanup
-
-| Task | Period | What it does |
-|---|---|---|
-| Old-record cleanup | Every 2 hours (first after 10 minutes) | When a record type exceeds 2 × `MaxTargets`, trims it to `MaxTargets`, deleting records without timestamps first, then those with the fewest samples, then the oldest |
-| Departed-node cleanup | Every 10 minutes | Deletes stats, prefetch, ranking and state of nodes no longer in the group |
-| Departed-group cleanup | Every 2 hours (first after 15 minutes) | Deletes all data of groups no longer in the config |
-
-Each group runs the first two for its own data; the departed-group cleanup is shared by all Smart groups and runs once per period. Data is never deleted just for being old: old data loses influence through time decay when it is read; see [How it works](../how-it-works/#time-decay) for the decay rules.
-
-### Clearing data by hand
-
-To make a group learn from scratch (after switching subscriptions, or when node quality has changed across the board), use the Clash API:
-
-| Method | Scope |
+| Table | Capacity |
 |---|---|
-| `DELETE /proxies/{name}/weights` | All data of one group, then a recompute |
-| `POST /cache/smart/flush/{name}` | Same as above |
-| `POST /cache/smart/flush` | Every Smart group in the current config |
-| Stop sing-box, then delete the cache file | All data, **including** other caches such as rule sets, FakeIP and selector state |
+| Global and family | 4096 cells |
+| Service | 8192 cells |
+| Exact target | 16384 cells |
 
-Clearing resets the in-memory state too, not just the records on disk: pins, unavailable markers, circuit breakers and the like are cleared, and a `smart-loadbalance` group also releases its region lock, returns to the configured mode and strategy, and re-detects its regions.
+Up to 4096 incumbents are kept; block records are per site and cleaned up after a week without a failure. `cache` in the diagnostic endpoint shows each table's size and total evictions; if evictions keep climbing fast, you visit far more services than fit, and the less used ones restart learning more often.
 
-## With many nodes
+## Cost per connection
 
-These mechanisms keep background work from growing linearly with the node count:
+The selection path is built for groups with many nodes:
 
-- **Probe budget**: each round probes only the top 16 ranked nodes plus `max(24, ⌈N/10⌉)` nodes in rotation, and nodes that fail probes back off from 3 minutes, doubling up to 1 hour. With 500 nodes that is about 66 probes per round instead of 500.
-- **Ranking throttle**: the minimum gap between ranking recomputes widens with the node count: 1 minute up to 100 nodes, 3 minutes up to 250, 5 minutes up to 500, 10 minutes beyond.
-- **Idle pause**: after 2 minutes without a successful dial, health checks, ranking, prefetch, recovery checks, destination probes and the region probes of `smart-loadbalance` all pause, and resume when traffic returns.
-- **Incremental index**: prefetch and per-destination selection use an incrementally maintained stats index; one per-destination lookup takes about 0.6 µs.
-- **Inference cache**: LightGBM results are cached for 30 seconds.
-- **Bounded queues**: the probe queue holds 1024 and the stats queue 2048, and both drop rather than block when full. The event counter table is capped at 4096 pairs.
+- The serving pool limits each scoring pass to a few members, and members outside it are only sorted when fallbacks are needed;
+- Reading evidence takes no write lock, health is a lock-free snapshot, and connection counters are atomics; scoring is only updated on connect, first response, progress (at most once per second), goodput windows and close;
+- Connection quality, LightGBM inference, block judgement and response probes run in the background after a connection closes, never slowing the connection itself.
 
-Suggestions:
-
-- Use `include` / `exclude` to drop nodes you clearly do not need. Fewer candidates mean faster learning and fewer probes.
-- When several Smart groups reference the same subscription, stats are kept per group, multiplying memory and disk use. Split into several groups only when you really need different algorithms.
-- Keep `interval` at the default 3 minutes or longer; see [Health checks](../health/#when-probes-run).
+In parallel benchmarks on an i7-14650HX, for a group of 100 members: engine selection takes about 2.3 µs with 3 allocations; the whole dial plan, filtering, selection and ordering included, about 6.4 µs with 7 allocations.
 
 ## Phones and low-memory devices
 
-- **Memory**: the default budget is already 8 MB. If memory is very tight, set a smaller `SMART_CACHE_BUDGET_MB`, at the cost of more disk reads.
-- **Battery**: probes wake the radio and are the main battery cost. With many nodes, the probe budget and backoff already hold each round to `16 + max(24, ⌈N/10⌉)` probes; dropping unneeded nodes with `exclude` helps more, and `interval` can be 5 minutes or longer.
-- **smart-loadbalance**: region probes only run while there is traffic; set `region.probe.disabled: true` if you do not need them. Exit-probe results are kept for 24 hours, and by default only members whose names cannot be placed are probed; `detect.exit: prefer` probes every member each day and is not recommended on phones.
-- **Sleep**: after the device sleeps or the clock jumps, periodic tasks continue from the current time instead of catching up on missed runs.
-
-<Callout type="note" title="Setting environment variables in GUI clients">
-  SFA, SFW and SFL have no place to set environment variables, so use the default budget there. For the command-line build, export the variable before starting, or set it with `Environment=` in a systemd unit.
-</Callout>
+- The default `interval: 5m` and `idle_timeout: 30m` already save power: health checks pause when the group is unused, and all background tasks skip while the system sleeps;
+- Leave `use_lightgbm` and `collect_data` off unless you need them: they open the ASN and country databases, and the model itself takes some memory;
+- Leave `prefer_asn` off unless you need ASN grouping, which also spares the ASN database.

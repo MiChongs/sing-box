@@ -1,0 +1,128 @@
+---
+title: Blocks and probes
+description: When a node gets blocked, for how long and for which site; how a site that is itself down is kept from blacklisting every node; how response probes recognize refusals and "not available in your region"; how the exit watch spots a region refused as a whole; and how learning pauses during a failure flood.
+---
+
+import Callout from '../../../components/Callout.astro';
+
+The score answers "which node is better"; blocks answer "this node cannot serve this site right now". Block codes, response probes, the exit watch and failure floods on this page all follow the Smart group of [vernesong/mihomo](https://github.com/vernesong/mihomo).
+
+Blocks are **per site**: a node blocked for `*.example.com` still serves other sites. The record is written on the wildcard host and, once it takes effect, on the service key too (see [Service keys](../service-keys/#scope-of-blocks)). There are also two **group-wide blocks**: manual blocks through the Clash API, and unstable nodes found by the stability check; see [Health checks](../health/).
+
+## Judging a finished connection
+
+When a connection closes, Smart checks the following in order and stops at the first match:
+
+1. The group has a pinned node: no judgement (a node you chose is never blocked behind your back);
+2. The connection was closed with `DELETE /connections/smart/{id}`: block `manual`;
+3. The site itself is judged broken (see below): no judgement;
+4. Connection quality × the `policy_priority` factor lies between 0 and 0.4: block `lowWeight`;
+5. A read or write error: the `error` count grows by 1;
+6. The node is already blocked for this site: no further judgement;
+7. Data was sent and no answer came for 4 s or more (port 443 or an IP target): block `stalled`;
+8. The node is under an exit suspicion, or this was a short connection (port 443, a domain, under about 30 KB downloaded): run a [response probe](#response-probes);
+9. When a TCP retransmission window was judged, record a `loss` strike based on its rate.
+
+TCP dial failures count toward `error` as well. UDP connections only ever produce `error` and `lowWeight`.
+
+## Block codes
+
+| Code | Trigger | Duration |
+|---|---|---|
+| `manual` | Closing a connection with `DELETE /connections/smart/{id}` in the Clash API | Permanent, until the group's data is flushed |
+| `answer` | A response probe found the site refusing this node | 1–30 minutes the first time, by kind of refusal; repeated refusals by the same site give 15 minutes, 1 hour, 4 hours, then 24 hours; the count restarts after 4 hours without a failure |
+| `error` | `max_failed_times` (5 by default) errors in a row for the same site, each within 5 minutes of the previous failure | 24 hours |
+| `lowWeight` | Connection quality × factor below 0.4 | 24 hours |
+| `loss` | A judged window with a retransmission rate of 10% or more, or 5% or more while the node's average rate is also 5% or more; the first strike is only a warning, a second within 5 minutes blocks | 15 minutes, 1 hour, 4 hours, then 24 hours |
+| `stalled` | No answer for 4 s or more after sending; or a short connection needing a recheck while the previous probe of this site and node is still running (over 2 s) or ended without a verdict | 2 minutes |
+
+- Codes are listed from strongest to weakest. A weaker verdict never overwrites a stronger block that is still active.
+- UDP blocks (except `manual`) always last 3 minutes.
+- When a response probe confirms that the site answers normally, the node's records for that site are cleared, except `manual`.
+- While the group has a pinned node, all block judgements pause.
+- Block records are saved in the cache file and restored after a restart; records without a new failure for a week are removed by the cleanup.
+
+Blocked nodes are excluded during [filtering](../how-it-works/#filtering-members); when that would exclude every member, filtering loosens step by step, so blocks never leave a connection with nowhere to go, `manual` excepted.
+
+### When the site itself is broken
+
+If a site fails on many nodes, the site is most likely the problem. When the nodes blocked for a site with `error`, `lowWeight` or `loss` are **more than a third of the members (at least 2)**:
+
+- Filtering ignores that site's blocks (`manual` still applies);
+- Its connection outcomes no longer block further nodes;
+- The diagnostic endpoint shows `hostBlocked: true` for the site.
+
+So one dead website cannot blacklist every node. The threshold is updated every 15 minutes from the current member count.
+
+## Response probes
+
+Many sites refuse certain exits without dropping the connection: they quickly return an error page, a challenge, or "not available in your region", which looks like a successful short connection. To catch this, after a **short connection** (port 443, a domain, under about 30 KB downloaded) Smart requests `https://<site>/robots.txt` through **the same node**:
+
+- HTTP/1.1 with browser-like headers, following up to 3 redirects only within the same host, 8 s timeout, at most 4 KB of body read;
+- At most one probe per (site, node) every 120 s (30 s after a failure within the last 10 minutes); at most 6 per site per minute; globally at most 120 per minute and 4 at a time;
+- No probe while the site is held back for refusing everyone (see below).
+
+How answers are classified:
+
+| Answer | Verdict | First block |
+|---|---|---|
+| Cloudflare / AWS WAF challenge | `challenge` | 10 minutes |
+| 429, a 403 with rate-limit headers, or 200 with a zero quota | `rate limited` / `quota exhausted` | From `Retry-After` / `X-RateLimit-Reset`, 1–30 minutes, 10 by default |
+| Body or redirect target says "not available in your region" | `region unavailable` | 30 minutes |
+| 403 | `forbidden` | 10 minutes |
+| 451 | `unavailable for legal reasons` | 30 minutes |
+| 5xx (Cloudflare error page / other) | `edge error` / `origin error`; `overloaded` with `Retry-After` | 5 minutes (`overloaded`: from `Retry-After`) |
+| TLS certificate for another name, unknown issuer | `certificate hostname mismatch` / `unknown certificate authority` | 10 minutes |
+| Probe timed out | `probe timed out` | 5 minutes |
+| Other connection errors | No verdict, no block | — |
+| Cross-host redirect, 421, 405, 501 | Ignored | — |
+| Other 2xx–4xx | The site answers normally | Clears the node's records for the site |
+
+A refusal blocks the node for the site with `answer`, closes the service's connections and clears its incumbent; the log says `node <node> refused for <site>: <reason>`.
+
+### Sites that refuse everyone
+
+If **3 different nodes** are refused by the same site within an hour with `forbidden`, `region unavailable`, `origin error` or a certificate error, Smart concludes the site itself is refusing (or down), not the nodes: it pauses probes and `answer` blocks for that site for 30 minutes; the first refusal after that pauses it for another 30 minutes, until some node gets a normal answer and the record is cleared.
+
+### Rechecks
+
+`answer` blocks are rechecked every 30 minutes (while the group is in use; each round has a one-in-two chance of being skipped): the blocked node probes again, and the block lifts early once the site answers.
+
+## Exit watch
+
+A node named "Hong Kong" may land somewhere else, and nodes of one region are often refused by a site together. Smart therefore records each member's **real exit**:
+
+- **Member exit**: after a member carries a connection and its exit info is older than 6 hours (15 minutes after a failure), Smart requests `https://www.cloudflare.com/cdn-cgi/trace`, `https://api.ip.sb/geoip` and `https://ipwho.is/` through it in turn, for the exit country and IP (plus the exit ASN with `prefer_asn`). Results are saved in the cache file.
+- **Site exit**: when a response probe gets a region-type refusal or a 2xx answer, Smart also requests `https://<site>/cdn-cgi/trace` through the same node, to see where the site thinks the node is (a CDN may route the same node elsewhere).
+
+### Exit suspicions
+
+When, within 10 minutes, one site refuses **2 or more different exits of the same region (with `prefer_asn`, also of the same ASN)** while nodes of another region reach it fine, Smart suspects the site refuses that region:
+
+- That region's members are **deferred** for the site: excluded by filtering, ordered last among fallbacks, and the site's incumbent is cleared;
+- The suspicion lasts 30 minutes, and fresh refusals extend it;
+- Then it turns "half-open": one member of the region at a time may try, holding an 8-second lease; a normal answer lifts the suspicion.
+
+Only `region unavailable`, `forbidden` and `origin error` refusals count toward a region. Exit info also feeds the LightGBM features `exit_region` and `exit_asn_hash`, and shows as `exitRegion` and `exitAsn` in the diagnostic endpoint.
+
+`smart-loadbalance` groups do not use this exit watch; they sort nodes into regions with their own exit detection.
+
+## Failure floods
+
+When the network drops, every node fails at once, and those failures say nothing about the nodes. After **50 failures in a row, each within 2 s of the previous**, Smart declares a failure flood:
+
+- It logs a WARN: `failures are flooding in, learning paused until a connection succeeds`;
+- Further failures count against no node and produce no blocks; the stability check and `smart-loadbalance` region probes pause;
+- The next successful connection ends it; a network change resets it as well.
+
+`floodSuppressed` in the diagnostic endpoint shows whether a flood is in progress.
+
+## Inspecting blocks
+
+`hosts` in `GET /smart/groups/{name}/diag` lists every site (or service key) with blocks:
+
+```json
+{ "key": "*.example.com", "hostBlocked": false, "nodes": { "HK-02": "answer", "JP-01": "error" } }
+```
+
+`udp: true` marks UDP records. Error counts below the threshold and first loss strikes are not shown. `members[].blocked` shows the reason of a group-wide block (`manual` or `unstable`). Manual blocks can only be lifted by flushing the group (`DELETE /proxies/{name}/weights`).

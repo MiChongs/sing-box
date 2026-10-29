@@ -1,11 +1,33 @@
 ---
 title: 变更记录
-description: 2026 年 4 月文档站上线以来 Smart 出站组的行为变化，以及本次文档重写更正的内容。
+description: 2026 年 4 月文档站上线以来 Smart 出站组的行为变化，包括 10 月底 Smart 的整体重写。
 ---
 
 只列出影响使用的变化，按时间倒序。完整提交历史见 [GitHub](https://github.com/MiChongs/sing-box/commits/xiaobaf14g-testing)。
 
 ## 2026-10
+
+**Smart 重写：honk 综合评分 + mihomo Smart（不兼容的变更）**（10-29）
+
+Smart 组被删除后从头重写：评分与选择改用 [honk](https://github.com/daeuniverse/honk) 的 Score 策略，服务识别、封锁、探测与收敛沿用 [vernesong/mihomo](https://github.com/vernesong/mihomo) 的 Smart 组。旧配置需要修改，旧的学习数据不迁移。
+
+- **删除的字段**（写在配置中会报错 `json: unknown field`）：`algorithm`、`hysteresis`、`use_asn`、`asn_database`、`max_host_failed_times`；旧的 `SMART_*` 环境变量不再读取。对照见 [已删除的字段](../config/#已删除的字段)。
+- **新增的字段**：`idle_timeout`（默认 30 分钟）、`timeout`（默认 5 秒）、`tolerance`、`max_failed_times`（默认 5）、`prefer_asn`。`interval` 默认值由 3 分钟改为 5 分钟；`policy_priority` 改用 mihomo 的写法：`模式:系数`，第一条命中的规则生效，模式是正则或子串，系数必须为正，写错会报错。
+- **选择**：可靠性优先的综合分（衰减的 Beta 置信区间，延迟、吞吐、连接质量与丢包只作微调）；按服务键记住在任节点，挑战者证明更好才换；服务池与探索预算。见 [综合评分与选择](../scoring/)。
+- **服务键**：命中的路由规则就是服务（`RuleSet [geosite-netflix]` 等）；`prefer_asn` 按 ASN 归并大合集规则，支持共用网络、网站键与 ASN 认领；主选失败由备用接通时，同一服务的连接收敛到新节点。见 [服务键](../service-keys/)。
+- **封锁与探测**：按网站的封锁代码 `manual`、`answer`、`error`、`lowWeight`、`loss`、`stalled`；短连接的响应探测（`robots.txt`）；出口识别与出口嫌疑；失败风暴时暂停学习；MAD 稳定性检查。取代了旧的 Watchdog、熔断器、劣化系数与目标可疑度。见 [封锁与探测](../blocks-and-probes/)。
+- **手动指定**：只用指定的节点，不再在故障时临时改用其他节点（`fixedSuspended` 始终为 `false`），也不再有“手动指定认可”加成；组测速（`GET /group/{name}/delay`）会解除指定。
+- **LightGBM**：特征改为 mihomo 当前的 32 维布局（新增 `exit_region`、`exit_asn_hash`），按位置读取；默认模型改为 `Model.bin`，默认路径 `Model.bin`；训练数据 CSV 改为 42 列，旧格式的文件会被改名备份。见 [LightGBM 模型](../lightgbm/)。
+- **存储**：缓存文件中的 bucket 由 `smart_stats` 改为 `smart_score`，旧 bucket 在打开缓存文件时被删除。没有缓存文件时 Smart 也会学习，只是不能跨重启保留。见 [存储与性能](../storage-performance/)。
+- **Clash API**：
+  - 删除 `PUT /smart/groups/{name}/algorithm`；
+  - 新增 `GET /group/weights` 与 `GET /group/{name}/weights`（与 mihomo 相同）；
+  - 排名的键改为 mihomo 的 `Name`、`Rank`、`Weight`（0–100），并附带 `Alive`、`Pool`、`Utility`、`Reliability` 等综合分字段；
+  - `POST`/`DELETE /cache/smart/flush` 与 `/cache/smart/flush/{name}` 成功时返回 204，不再返回统计；`DELETE /proxies/{name}/weights` 返回 `{"group", "deleted": {"aggregate", "site", "exact", "blocks"}}`；
+  - `DELETE /connections/smart/{id}` 把节点对这条连接的网站永久封锁（`manual`），直到清空数据，不再是 30 分钟的整组屏蔽；
+  - `/proxies` 中的 Smart 字段改为 mihomo 的 `testUrl`、`expectedStatus`、`policy-priority`、`preferASN`、`tolerance` 等，删除 `useASN`、`algorithm`、`hysteresis`、`pinEndorsements`；
+  - 新增 `DELETE /smart/groups/{name}/block/{node}` 提前解除整组封锁；`DELETE /proxies/{name}` 的返回改为 `{"group", "previous_pin", "now", "interrupted"}`；`/smart/groups/{name}/diag` 的内容全部更新。见 [Clash API](../clash-api/)。
+- **smart-loadbalance**：配置与地区接口不变。节点质量改为引擎学到的连接质量（`policy_priority` 现在作用于所有质量），拨号轮次与 `smart` 相同（前 3 个逐个，之后每批并发 5 个）；`/proxies` 中的 `now` 仍显示地区出站。
 
 **新增 smart-loadbalance：按地区分池的智能负载均衡**（10-07）
 

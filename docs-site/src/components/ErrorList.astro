@@ -1,0 +1,35 @@
+---
+import type { ErrorFamily } from '../data/errors';
+import type { Lang } from '../data/nav';
+import { inline } from '../lib/inline';
+
+// Error and log messages grouped by where they show up: the message in
+// monospace, what it means below. Messages wrap instead of scrolling.
+
+export interface Props {
+  lang: Lang;
+  families: ErrorFamily[];
+}
+
+const { lang, families } = Astro.props;
+const base = import.meta.env.BASE_URL.replace(/\/$/, '');
+---
+
+<div class="not-prose my-6 space-y-5">
+  {families.map((f) => (
+    <section class="overflow-hidden rounded-card bg-surface shadow-ring">
+      <p class="flex items-baseline justify-between gap-2 border-b border-line-soft bg-surface-2/50 px-4 py-2 text-[0.92rem] font-semibold text-fg">
+        {f[lang]}
+        <span class="font-mono text-[0.75rem] font-normal text-subtle">{f.entries.length}</span>
+      </p>
+      <dl class="divide-y divide-line-soft">
+        {f.entries.map((e) => (
+          <div class="px-4 py-3">
+            <dt><code class="break-words font-mono text-[0.84rem] text-accent">{e.message}</code></dt>
+            <dd class="mt-1 text-[0.92rem] leading-relaxed text-fg-2" set:html={inline(e[lang], base)} />
+          </div>
+        ))}
+      </dl>
+    </section>
+  ))}
+</div>

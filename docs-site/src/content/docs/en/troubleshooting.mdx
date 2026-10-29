@@ -1,183 +1,140 @@
 ---
 title: Troubleshooting
-description: Symptom-by-symptom troubleshooting for Smart and smart-loadbalance groups — config errors, no learning, nodes never chosen or wrongly marked unusable, pins ignored, dropped connections, ASN and model problems, wrong regions — each with likely causes, how to check and how to fix.
+description: Common Smart and smart-loadbalance problems by symptom. Errors after upgrading, data lost on restart, nodes never chosen or never switched, nodes blocked wrongly, sites refusing, pins released, connections dropped, prefer_asn or the model not working, wrong regions, plus every error Smart can produce.
 ---
 
 import Callout from '../../../components/Callout.astro';
+import ErrorList from '../../../components/ErrorList.astro';
+import { errorFamilies } from '../../../data/errors';
 
-This page is organised by symptom. Find the section closest to what you are seeing; each one lists the likely causes, how to confirm them and how to fix them. Terms such as "destination", "circuit breaker" and "soft block" are explained in the [Glossary](../glossary/), and every endpoint is described in [Clash API](../clash-api/).
+This page is organized by symptom. Find the section closest to what you see; each lists likely causes, how to confirm, and how to fix. Terms are in the [Glossary](../glossary/); every endpoint is described in [Clash API](../clash-api/).
 
-## Collect this information first
+## Gather this first
 
-Gather these before digging in — they answer most questions on their own:
+1. **`GET /smart/groups`**: confirms the group type, member count, and switches such as `preferASN` and `useLightGBM`.
+2. **`GET /smart/groups/{name}/diag`**: selection reasons, serving pool, block records, failure flood, ASN claims. Most questions are answered here.
+3. **`GET /group/{name}/weights`**: each member's reliability, failure streak and pool membership.
+4. For per-connection detail, set the log level to `debug`. Smart logs dial failures, convergence, site refusals and blocks with the prefix `outbound/smart[<group>]`, for example:
 
-1. **The summary line in the startup log.** Each Smart group logs one line at startup with its member count, probe settings, the algorithm actually in effect and the model state:
-
-   ```
-   smart[auto] started: 42 outbounds, 10 background tasks, testURL=https://www.gstatic.com/generate_204 interval=3m0s asn=off algorithm=strict-best hysteresis=off ml=off collect=off
-   ```
-
-   A `smart-loadbalance` group adds a line with its regions:
-
-   ```
-   smart-loadbalance[balance] regions: HK(12) JP(8) OTHER(1); mode=auto strategy=smart affinity=none fallback=auto
+   ```text
+   DEBUG outbound/smart[auto]: dial HK-02 for api.example.com failed: i/o timeout
+   DEBUG outbound/smart[auto]: node HK-05 lowWeight for [*.example.com]
    ```
 
-2. The output of `GET /smart/groups` and `GET /smart/groups/{name}/diag`, to confirm the configuration took effect and how much data the stats table really holds.
-3. The output of `GET /proxies/{name}/weights?full=1`, for the per-(destination, node) weights.
-4. For per-connection detail, raise the log level to `debug`:
+5. The node each connection finally used: `chains` in `GET /connections`.
 
-   ```json
-   { "log": { "level": "debug" } }
-   ```
+## Errors and log messages
 
-   Every connection then logs its selection, for example:
+Every error and warning Smart can produce, and what it means:
 
-   ```
-   smart[auto] select via weight: target=*.example.com asn=[none] candidates=[HK-01,HK-02,JP-01]
-   smart[auto] tcp → www.example.com:443 via [HK-01] in 85ms (target=*.example.com asn=[none] source=weight)
-   ```
+<ErrorList lang="en" families={errorFamilies} />
 
-   `source` tells which tier the candidates came from (`manual`, `unwrap`, `prefetch`, `weight`, `delay`, `fallback`); see [How it works](../how-it-works/). Watchdog decisions are logged at Debug level too.
+## Startup fails after upgrading
 
-## Config errors
+`json: unknown field "algorithm"` (or `hysteresis`, `use_asn`, `asn_database`, `max_host_failed_times`): these fields were removed in the rewrite. Delete them; replace `use_asn` with `prefer_asn`, and a custom ASN database with `experimental.geox.url.asn`. The mapping is in [Removed fields](../config/#removed-fields).
 
-| Error or symptom | Cause | Fix |
-|---|---|---|
-| `outbounds[0].tolerance: json: unknown field "tolerance"` (or `"idle_timeout"`) | A `urltest` field that Smart never supported; earlier docs listed it by mistake | Remove the field |
-| `urltest: invalid expected-status: ...` or `urltest: invalid expected-status range: ...` | Malformed `expected_status` | Use `204`, `200-299` or `204/300-399`, with codes between 100 and 599 |
-| `missing outbound and provider tags` | Both `outbounds` and `providers` are empty | Set at least one |
-| `outbound provider <i> not found: <tag>` | `providers` names a provider that does not exist | Check the provider's `tag` |
-| `dependency[<tag>] not found for outbound[<smart>]` | `outbounds` names an outbound that does not exist | Check the outbound's `tag` |
+`policy_priority` fails to parse: the syntax is now `pattern:factor`; the old `=`, `~` and `!` prefixes mean nothing special any more, and factors must be positive.
 
-Two mistakes do **not** cause an error, but the configuration does not do what you meant:
+## Learned data is lost on restart
 
-- **A typo in `algorithm`**: Smart falls back to `strict-best` and only logs a WARN:
+- The command-line version runs without `experimental.cache_file`, so Smart only learns in memory.
+- Data is written every 5 minutes; killing the process loses the last few minutes.
+- The group was renamed: data is keyed by group name, so the new name starts from zero.
+- Upgrading from the old Smart: the old `smart_stats` data is not migrated and is deleted automatically.
 
-  ```
-  smart[auto] algorithm config [fastest_recnet] was not recognised — falling back to strict-best; accepted values: ...
-  ```
+## A node is never chosen
 
-  The `algorithm=` in the startup summary line is what actually runs.
+Find the node in `weights` and `diag` and go through this list:
 
-- **Some `policy_priority` rules have no effect**: invalid rules are skipped with `smart[auto] policy_priority: ignored invalid rule [...]`. Common causes: a factor of 1 (which changes nothing), a case mismatch (matching is case-sensitive), or a regex written without the `~` prefix. The `policyPriority` field of `GET /smart/groups` shows how each rule was parsed.
+| What you see | Cause |
+|---|---|
+| `Alive: false`, `alive: false` in `diag` | Two health checks in a row failed. Check that `url` and `expected_status` suit this node |
+| `blocked: "unstable"` in `diag` | The stability check saw jitter or a slowdown; blocked group-wide for 12 minutes |
+| `blocked: "manual"` in `diag` | Blocked through `POST /smart/groups/{name}/block/{node}`; `DELETE` on the same path lifts it |
+| `FailStreak` 3 or more | Consecutive node-level failures; no trials during the backoff (`BackedOff`); see [Failure state](../scoring/#failure-state) |
+| A block for some site in `hosts` | Unusable for that site only; see [Block codes](../blocks-and-probes/#block-codes) |
+| `Pool: false` with few `Completed` | Not in the serving pool. With many nodes the pool holds only a few, and an outside member rotates in every 10 minutes to be compared; this is normal |
+| `Observed` clearly below others | More than 0.05 behind on reliability, so not eligible |
 
-Config errors of `smart-loadbalance` are covered under [Smart load balancing](#smart-load-balancing) below.
+A node with a lower `policy_priority` factor loses to higher-factor nodes when reliability is close; the factor does not rule it out, but it rarely wins.
 
-## Smart does not seem to be learning
+## It sticks to one node and never switches to a faster one
 
-**Symptom**: `weights` stays empty, or every node shows `targetCount` 1 and `sampleCount` 0 and the ranking simply follows probe delay.
+Usually by design: each service has an incumbent, and a challenger replaces it only by proving a gain on data that is **mature on both sides**. When `incumbentHeld` and `insufficientEvidenceHeld` dominate the reasons in `diag`, this is what is happening.
 
-Check, in order:
+- The challenger has to gather data on the same service, through exploration and rotation, which can take minutes to tens of minutes;
+- Latency is only a small part of the score, so a more reliable node wins even when it is a bit slower;
+- To switch right now, pin a node or flush the group.
 
-- **No cache file**: the log shows `smart: no cache file available, using ephemeral store`. Without a cache file Smart records no stats at all. On the command line set `experimental.cache_file.enabled: true`; the SFA / SFW / SFL GUI clients always use a cache file.
-- **An old version**: versions between 2026-06-08 and 2026-10-07 had a bug that kept stats from working at all (see the [Changelog](../changelog/)). Upgrade.
-- **No traffic yet**: a group runs no health checks and computes no ranking until its first successful dial, and pauses those background tasks again after 2 minutes without dials. Generate some real traffic, then look again.
-- **Too few samples**: a (destination, node) pair needs at least 2 dial outcomes before it gets a weight.
-- **`targetCount` 1 and `sampleCount` 0**: the endpoint is serving a temporary ranking built from probe delays because there are no stats yet — see the causes above.
+## Nodes keep switching back and forth
 
-**To confirm**: `live_coverage` in `GET /smart/groups/{name}/diag` is read straight from the stats table and shows how many destinations and samples each node really has. If it has data while `weights` is empty, call `POST /smart/groups/{name}/recompute` to recompute right away.
+A growing `switchFlap` in `diag` means a few nodes perform almost identically. Give one of them a slightly higher `policy_priority` factor (say 1.05) to break the tie, or put the similar nodes in a `urltest` group and hand that to Smart.
 
-## A node is never selected
+## A working node gets blocked
 
-Rule these out one by one:
+- **`lowWeight`**: connection quality × factor below 0.4. Nodes with a factor below 1 trigger it more easily; with `use_lightgbm`, the model's predictions may also run low.
+- **`error`**: `max_failed_times` errors in a row on one site. If the site itself is flaky, raise the value.
+- **`answer`**: the site refused the node (403, a challenge, region unavailable, …); usually a real refusal, see the next section.
+- **`manual`**: set by `DELETE /connections/smart/{id}`; permanent until the group is flushed.
+- Many nodes blocked at once: when more than a third of the members are blocked, the site itself is judged broken and the blocks are ignored (`hostBlocked: true`); no blocks are made during a failure flood.
 
-1. **It is not in the group**: `include` / `exclude` only filter provider nodes. `all` in `GET /proxies/{name}` lists every member (for a `smart-loadbalance` group that lists region outbounds, use `GET /smart/groups/{name}/regions`).
-2. **It is considered unusable.** Any of these keeps a node out of selection for a while:
-   - its last probe failed;
-   - it was marked unusable within the last 3 minutes (failed probe, repeated resets and so on — see the [next section](#working-nodes-are-marked-unavailable));
-   - its circuit breaker is open: 2 dial failures within 30 s open it for about 15 s, and each further failure doubles that, up to 8×;
-   - in a plain Smart group, its last probe is older than 3 × `interval` (`smart-loadbalance` groups do not use this rule).
+## A site keeps saying "not available in your region" or shows challenges
 
-   Test the node on its own with `GET /proxies/{node}/delay?timeout=5000` to see whether it works right now.
-3. **It is blocked**: after 30 accumulated failures a node is blocked for 93 minutes or more (longer with more failures); a block set through the Clash API lasts 30 minutes by default. Blocked nodes are not chosen until the block expires.
-4. **It is soft-blocked for this destination only**: one reset, first-byte timeout or mid-transfer stall soft-blocks the node for that destination for 10 minutes; other destinations are unaffected.
-5. **Its weight for this destination is below 0.4**: nodes below 0.4 never become candidates. Traffic scenes have latency ceilings — for realtime traffic (games, voice calls) a node above 150 ms is capped at 0.38. Check `weight_tcp` for that destination in `weights?full=1`.
-6. **`policy_priority` pushes it back**: nodes with a factor above 1 always come first, so nodes below 1 rarely get a turn.
-7. **(`smart-loadbalance`) It is in another region, or excluded**: check its region, its `source` and the `excluded` list in `GET /smart/groups/{name}/regions`.
+Response probes recognize this and block refused nodes for the site with `answer`; when several exits of one region are refused, the whole region is deferred for that site (an exit suspicion). To confirm:
 
-To make the group start learning from scratch, clear its data with `DELETE /proxies/{name}/weights` (this also lifts blocks and the pin).
+- `node <node> refused for <site>: <reason>` in the `debug` log;
+- `answer` records for the site in `hosts` of `diag`, and `members[].exitRegion`.
 
-## Working nodes are marked unavailable
+If every node is refused, Smart blames the site and pauses blocking for 30 minutes; only another line or subscription helps then. A rule of its own for the site makes all its domains converge on a node that works.
 
-- **`interval` below 100 seconds**: a probe result counts as stale after 3 × `interval`, but health checks skip nodes probed within the last 5 minutes. Below 100 seconds, 3 × `interval` is shorter than 5 minutes, which leaves a window where the node is considered unusable yet never re-probed. Set `interval` back to the default 3 minutes or more.
-- **The probe URL is flaky through some nodes**: probes go out through each node, and some exits cannot reach the default URL reliably. Switch to a 204 URL every node reaches, such as `https://cp.cloudflare.com/generate_204`.
-- **Repeated "useless" connections to one destination**: when the same destination on the same node sees 3 of these within 60 s, the node is marked unusable for 3 minutes: closed within 2 s with under 4 KB transferred; no response at all for more than 0.5 s; or open for more than 2 s with under 1 KB downloaded. The log says:
+## The pin is released, or the pinned node does not work
 
-  ```
-  smart[auto] node [HK-01] marked dead after 3 short-life closes on target [*.example.com] within 1m0s
-  ```
+- **A group delay test releases the pin** (as in mihomo). Testing a Smart group in the dashboard does that; testing the group as one proxy (`GET /proxies/{name}/delay`) does not.
+- The node left the group (renamed or removed by a subscription update), so the pin was released.
+- When the pinned node cannot connect, the connection fails; there is no fallback.
+- UDP connections are selected automatically when the pinned node has no UDP.
 
-  Apps that mostly upload and barely download can trigger this rule.
-- **Two resets on one destination within 60 s**: the node is marked unusable and its breaker trips, logged as `... marked dead after 2 upstream resets on target [...] within 1m0s ...`. This usually means the route interferes with that site.
-- **The network just changed** (for example Wi-Fi to cellular): dials in progress at that moment are cancelled and the client retries right away. That is expected and says nothing about the node.
+## Connections get dropped
 
-## A node shows as available but does not work
+Smart closes connections itself at these moments:
 
-With `expected_status` empty, any HTTP response counts as a successful probe — including the redirect a captive portal (hotel or airport Wi-Fi login page) returns. Set `"expected_status": "204"` together with the default probe URL to tell "really online" from "stuck at a login page".
+- **Convergence**: after the primary fails and a fallback connects, the service's TCP connections through other nodes are closed (log: `converged N connections of [...]`);
+- **A block takes effect**: when a node is blocked for a service, the service's TCP connections are closed;
+- **The pin changes** with `interrupt_exist_connections` on;
+- A site gets a site key for the first time (`prefer_asn`).
 
-## The dashboard shows a different node from the one in use
+None of these count as success or failure, and clients usually reconnect at once. If one service keeps getting dropped, check its block records in `diag`.
 
-The dashboard's "current node" (`now`) is a representative: the pinned node if there is one, otherwise the node of the last successful dial. Smart picks a node per connection, so different sites can use different nodes at the same moment.
+## prefer_asn has no effect
 
-To see the node a connection really uses, look at `chains` in `GET /connections`; the first entry is the final node. A `smart-loadbalance` group that lists region outbounds shows a region outbound, not a node, as `now`.
+- The ASN database is still downloading: the `debug` log shows `ASN database ... is downloading`; it takes effect once downloaded.
+- No destination IP at routing time: with FakeIP, or domains that were never resolved, there is no ASN and Smart works per site. Add a `resolve` action to your rules.
+- The destination is on a shared network (Cloudflare, Akamai, AWS, …): per site by design.
+- The rule is not broad: specific rules (`geosite-netflix`, `domain_suffix`) always key by the rule; see [prefer_asn](../service-keys/#prefer_asn).
+- `asnClaims` is 0 in `diag`: not enough evidence from service rules yet; claims are recomputed every 2 minutes.
 
-## Traffic still uses other nodes after pinning
+## The LightGBM model has no effect
 
-- **The pinned node is temporarily unusable**: while it fails to dial, Smart uses other nodes, the dashboard shows `fixedSuspended: true`, and `fixedActive` names the node in use. Smart switches back as soon as the pinned node dials or probes successfully again.
-- **Its circuit breaker is open**: the pin is bypassed while the breaker is open and honoured again afterwards.
-- **Existing connections stayed where they were**: a pin only affects new connections. Existing ones keep going until they end; turn on `interrupt_exist_connections` to switch them at once.
-- **(`smart-loadbalance`) You picked a region, not a node**: picking a region outbound in a dashboard locks the region, and connections are still spread over its nodes. To stick to one node, pick the node itself.
-
-## Smart still favors the old node after unpinning
-
-That is pin learning: a node you pinned gets a boost that fades over time, up to about 1.63× and for at most 14 days; see [Pinning a node](../priority-and-pinning/#pinning-a-node). To remove it at once, clear the group's data with `DELETE /proxies/{name}/weights`.
-
-## Connections are dropped
-
-- **First-byte timeout**: if nothing comes back within 5 s after the client sends its first data (less for fast nodes: 4× the node's probe delay, at least 1.5 s), the connection fails and the node is soft-blocked for that destination for 10 minutes.
-- **Stalled transfer**: after data has flowed, if the client writes and gets no response at all for 60 s, the connection is closed. Normally idle long-lived connections (WebSocket, push, keep-alive) have no unanswered writes and are not affected.
-- **Network change**: sing-box closes all connections and clients reconnect.
-- **`interrupt_exist_connections`**: when on, changing the pin (and, on `smart-loadbalance`, the region lock) interrupts the group's existing connections.
-- **Versions before 2026-10-05**: long-lived connections through Smart were cut at 30 s. Upgrade.
-
-## ASN does not take effect
-
-Start with the ASN state in the startup log (details in [ASN and GeoX](../asn-geox/#log-messages)):
-
-- **`asn=on(downloading)`**: the database is still downloading and takes effect by itself when done, with no restart. If it never does, look for `assetdl[...]: download failed, retrying in ...` and check that the `http_client` of `experimental.geox` can reach the download URL.
-- **Wrong database format**: it must be a MaxMind GeoLite2-ASN mmdb.
-- **A relative path that is not found**: paths in `asn_database` are used as written, not joined with the data directory; prefer absolute paths.
-- **Destination IP unknown**: during selection, only connections whose destination IP is already known can use ASN (connections with only a domain, resolved on the node side, have no IP); for stats, a DNS lookup of up to 200 ms is made after the connection closes.
-- **Deliberately ignored ASNs**: CDN and backbone ASNs cover far too much to group by, so they are ignored.
-
-## The model stays at ml=pending
-
-The model has not been downloaded yet. Check that the outbound given by `download_detour` or `http_client` can reach the model URL (GitHub by default). You can also download `Model-large.bin` yourself, put it at `model_path` (by default `smart_lgbm_model.bin` in the data directory) and restart.
-
-## The model shows ml=unusable
-
-The model file exists but cannot be used. This WARN in the log gives the reason:
-
-```
-lightgbm: cannot use model <path>: <reason>; traditional weights until a usable model replaces it
-```
-
-Typical reasons: a damaged file or one not in LightGBM text format; feature names Smart does not know; a `[transforms]` block that does not match the model's feature names. Check self-trained models against [Model format](../lightgbm/#model-format). With the default model, delete the file and restart to download it again; with `auto_update` off an existing file is never replaced automatically. While the model is unusable, Smart uses the classic weight formula and keeps routing normally.
+- No `lightgbm model loaded from …` in the log: the model is still downloading, or the download failed (check `download_detour` / `http_client`).
+- WARN `lightgbm: cannot use model …`: the file is not a LightGBM text model or is damaged; delete it to download again.
+- The model loaded but the CSV still says `Traditional`: its `[transforms]` section has an `[order]` that differs from Smart's feature order, or the node has fewer than 2 completions on that service.
+- Your own model was overwritten: with `auto_update` on, the model at `url` replaces the local file.
 
 ## Training data stops growing
 
-- **Size limit reached**: once the file exceeds `size_limit_mb` (100 MB by default) writing stops, logged as `smart collector: reached size limit 100 MB; dropping further samples ...`. Delete the file or truncate it below the limit and collection resumes within 30 s.
-- **Only part of the connections are sampled**: with `sample_rate` below 1, only that share is collected.
-- **The stats queue is busy**: during bursts of connections, samples that cannot be queued are dropped.
+- The file reached `size_limit_mb` (100 MB by default) and writing stopped; delete it and a new one is created within 5 s.
+- Only groups with `collect_data` write; with `sample_rate` below 1 only some connections are recorded; dial failures and inconclusive connections never are.
+- Rows are flushed every 100; the newest may still be in the buffer.
+
+## The failure-flood warning appears
+
+`failures are flooding in, learning paused until a connection succeeds` means 50 failures in a row within a short time, usually a network outage. Meanwhile failures count against no node, and learning resumes with the first successful connection. If it appears often while the network is fine, check whether every node is dead (an expired subscription).
 
 ## Battery drain or heat on phones
 
-- Set `interval` to 5 minutes or more to probe less;
-- drop nodes you never use with `exclude`;
-- avoid several Smart groups over the same nodes — each probes and learns on its own;
-- turn off region probes on `smart-loadbalance` groups that do not need them (`region.probe.disabled: true`);
-- when memory is tight, lower `SMART_CACHE_BUDGET_MB` (command-line builds only).
+- Keep the default `interval: 5m` and `idle_timeout: 30m`; health checks pause when the group is unused;
+- Turn off `use_lightgbm`, `collect_data` and `prefer_asn` unless you need them;
+- Avoid several Smart groups over the same large subscription: each one checks and learns separately.
 
 ## Smart load balancing
 
@@ -185,63 +142,50 @@ Typical reasons: a damaged file or one not in LightGBM text format; feature name
 
 | Error | Cause and fix |
 |---|---|
-| `unknown balance strategy: ...`, `unknown balance affinity: ...`, `unknown region mode: ...`, `unknown region fallback: ...` | A misspelled value. Unlike `algorithm`, invalid values in `balance` and `region` are errors; valid values are in [Configuration](../config/#smart-loadbalance) |
+| `unknown balance strategy: ...`, `unknown balance affinity: ...`, `unknown region mode: ...`, `unknown region fallback: ...` | A misspelled value; valid values are in [Configuration](../config/#smart-loadbalance) |
 | `region.mode priority requires region.priority` | The `priority` mode needs `region.priority` |
-| `region.outbounds.tag must contain {region}, {name}, {name_en} or {flag}` | The region outbound tag template has no region placeholder, so every generated outbound would get the same tag |
-| `register region outbound <tag>: duplicate outbound tag: <tag>` | A generated region outbound clashes with an existing tag. Change the `region.outbounds.tag` template or the other outbound's tag |
-| `smart-region[<tag>]: <group> is not a smart-loadbalance group` | A hand-declared `smart-region` points at a group that does not exist or is not a `smart-loadbalance` group |
-| `dependency[...] not found` when referencing a region outbound | Only region outbounds listed in `region.outbounds.regions` exist at startup; those created by `auto` at runtime cannot be referenced from the configuration. Add the region to `regions` |
+| `region.outbounds.tag must contain {region}, {name}, {name_en} or {flag}` | The tag template of region outbounds has no region placeholder, so generated tags would collide |
+| `register region outbound <tag>: ...` | A generated region outbound collides with an existing tag. Change the `region.outbounds.tag` template or the existing outbound's tag |
+| `smart-region[<tag>]: <group> is not a smart-loadbalance group` | A hand-written `smart-region` points at a group that is not `smart-loadbalance` |
+| `dependency[...] not found` when referencing a region outbound | Only the region outbounds listed in `region.outbounds.regions` exist at startup; outbounds created at runtime by `auto` cannot be referenced in the config |
 
 ### A node lands in the wrong region
 
-**To confirm**: `GET /smart/groups/{name}/regions` lists each node's region and `source` (`rule`, `name`, `exit`, `unknown`), i.e. what placed it there.
+**Confirm**: `GET /smart/groups/{name}/regions` lists every node's region and `source` (`rule`, `name`, `exit`, `unknown`).
 
-**To fix**: correct name misdetections with `region.rules` (a regex or a list of nodes); to trust the real exit instead, set `detect.exit: prefer` and re-probe with `POST /smart/groups/{name}/regions/detect?force=true`.
+**Fix**: when name detection is wrong, correct it with `region.rules` by regex or node name; to trust the real exit, set `detect.exit: prefer` and call `POST /smart/groups/{name}/regions/detect?force=true` to probe again.
 
-### `no node can serve ...`
+### Error `no available member for ...`
 
-The full error looks like this:
+`smart-loadbalance` found no candidate at all:
 
-```
-smart-loadbalance[balance]: no node can serve www.example.com:443 (priority-unavailable (no healthy node))
-```
+- Other regions have healthy nodes, but `region.fallback` keeps the connection away from them (`none`, or `priority` with no listed region healthy). Set `fallback` to `auto`, or add more regions to `priority`.
+- The confined region (a region outbound without `fallback`, or a region locked with `fallback: none`) has no members at all.
 
-The part in brackets is the region decision, and its ending gives the reason:
+When the allowed scope has no healthy node at all (after a long outage, say), the group does not fail outright: it ignores health and tries members in quality order. A node only counts as unhealthy with a global failure streak of 3 during its backoff, failed health checks, a failed last probe, or a group-wide block.
 
-- **Ends in `(no healthy node)`**: other regions do have healthy nodes, but `region.fallback` keeps this connection away from them. Typical cases: in the `priority` mode none of the listed regions has a healthy node and `fallback` is `none` or `priority`; a region outbound with `fallback` on, or a locked region, has no healthy node while the group's `fallback` is `none`, or `priority` with no listed region healthy either. Set `fallback` to `auto`, or add regions to `priority`.
-- **Ends in `(no node)`**: the allowed scope has no member that can be used at all: every member is blocked, a UDP connection only finds members without UDP, or the restricted region (a region outbound without `fallback`, or a region locked with `fallback: none`) has no members.
-- **`all retries failed`**: candidates were chosen but every dial failed — same as a plain Smart group; troubleshoot as unusable nodes.
+### Connections always land on the same node
 
-When no usable node exists anywhere in the allowed scope (after a long network outage, for example), or every usable node of the chosen region is soft-blocked for this destination, the group does not fail outright: as a last resort it ignores health and tries the unblocked members best quality first, and the debug source ends in `(last resort: no healthy node)`. A region outbound without `fallback`, and a region locked with `fallback: none`, still stay inside their region for this. Regions excluded by `allow` / `deny` are never used.
+- Is `balance.affinity` `target`, `site` or `source`? Those bind sets of connections to one node;
+- Is only one node left in the pool? `min_quality` too high, `max_nodes: 1`, or other nodes of the region unavailable;
+- Is a node pinned in the dashboard?
 
-Also note that `smart-loadbalance` does not treat a node as unusable just because its probe result is old: health checks pause while the group is idle, so stale results are normal. Only an open breaker, a mark within the last 3 minutes, a failed last probe or a block make a node unusable.
+### Exit detection never produces a result
 
-### Connections keep landing on one node
+Exit detection requests `detect.exit_url` through the node; it fails when the node is down or the URL is blocked, and retries after 30 minutes. The `debug` log records `exit probe [<node>] failed: ...`. Try another URL that returns a country, such as a JSON API with a `country_code` field.
 
-Check:
+### No destination country (destination mode)
 
-- whether `balance.affinity` is `target`, `site` or `source` — these bind a set of connections to one node;
-- whether the pool is down to one node: `min_quality` set too high, `max_nodes: 1`, or the region's other nodes unusable;
-- whether a node is pinned in the dashboard.
-
-With the log level at `debug`, each connection logs `region=... pick=... pool=...`: `pool` is how many nodes could take it, and `pick` how it was chosen (`affinity` means an affinity binding decided).
-
-### Exit probes never return a result
-
-An exit probe fetches `detect.exit_url` through the node, so it fails when the node is down or the URL is blocked, and is retried after 30 minutes; the debug log records `exit probe [<node>] failed: ...`. Another URL that reports a country works too, such as a JSON endpoint with a `country_code` field.
-
-### The destination country cannot be determined (destination mode)
-
-First make sure the country database has been downloaded: GeoX fetches it in the background, and until then only domain suffixes can tell the country. With FakeIP, resolved addresses are fake and carry no country; rely on `destination.map` and country-code TLDs, or use the `auto` mode.
+First make sure the country database has downloaded: GeoX downloads it in the background, and until then only domain suffixes help. With FakeIP, resolving yields fake addresses with no country; rely on `destination.map` and country TLDs, or use the `auto` mode.
 
 ## Resetting all Smart data
 
 | Method | Scope |
 |---|---|
-| `DELETE /proxies/{name}/weights` | One group: stats, pin, blocks, breakers, and the region lock and exit results of `smart-loadbalance` |
-| `POST /cache/smart/flush` | Every Smart group in the current configuration |
-| Stop sing-box, then delete the cache file | All data, **including** other caches such as rule sets, FakeIP and selector state |
+| `DELETE /proxies/{name}/weights` | One group: everything learned, blocks, the pin, and the region lock and exit results of `smart-loadbalance` |
+| `POST /cache/smart/flush` | Every Smart group of the current config |
+| Stop sing-box and delete the cache file | Everything, **including** other caches such as rule sets, FakeIP and selector state, and data left by groups removed from the config |
 
-<Callout type="note" title="Reporting an issue">
-  When filing an issue on [GitHub Issues](https://github.com/MiChongs/sing-box/issues), please include the version (`sing-box version`), your configuration with secrets removed, the Smart summary lines from the startup log, and the output of the `diag` endpoint.
+<Callout type="note" title="Reporting a problem">
+  When filing a [GitHub issue](https://github.com/MiChongs/sing-box/issues), include the version (`sing-box version`), your config with secrets removed, the output of the `diag` endpoint, and the relevant `debug` log.
 </Callout>

@@ -22,7 +22,7 @@
       "type": "smart",
       "tag": "auto",
       "outbounds": ["HK", "JP", "US"],
-      "policy_priority": "=HK:1.2"
+      "policy_priority": "^HK$:1.2"
     },
     {
       "type": "selector",
