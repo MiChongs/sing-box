@@ -152,9 +152,13 @@ func (m *ConnectionManager) TrackPacketConn(conn net.PacketConn) net.PacketConn 
 }
 
 func notifyConnectionFailure(ctx context.Context, chain []adapter.Outbound) {
-	for _, outbound := range chain {
+	for i, outbound := range chain {
 		if listener, ok := outbound.(adapter.ConnectionFailureListener); ok {
-			listener.OnConnectionFailure(ctx)
+			var member adapter.Outbound
+			if i+1 < len(chain) {
+				member = chain[i+1]
+			}
+			listener.OnConnectionFailure(ctx, member)
 		}
 	}
 }

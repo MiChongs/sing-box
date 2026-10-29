@@ -322,6 +322,10 @@ func (s *URLTest) Selected(network string) adapter.Outbound {
 	outbound := s.group.selectedOutbound(network)
 	if outbound == nil {
 		outbound, _ = s.group.Select(network)
+		if outbound != nil {
+			// Keep the cold-start pick until a health check decides.
+			s.group.storeInitialSelection(network, outbound)
+		}
 	}
 	return outbound
 }
@@ -402,6 +406,12 @@ func (s *URLTest) SelectOutbound(tag string) bool {
 	detour := s.group.findOutboundByTag(tag)
 	if detour == nil {
 		return false
+	}
+	if current := s.group.manualPin.Load(); current == nil || current.outbound != detour {
+		if err := s.group.probeManualSelection(detour); err != nil {
+			s.logger.Warn("manual selection of ", tag, " rejected: ", err)
+			return false
+		}
 	}
 	prev := s.group.manualPin.Swap(&manualPinData{tag: tag, outbound: detour})
 	// Persist even when prev.outbound == detour — restart resilience
@@ -512,7 +522,11 @@ func (s *URLTest) DialContext(ctx context.Context, network string, destination M
 		return nil, err
 	}
 	s.logger.ErrorContext(ctx, "outbound ", outbound.Tag(), " failed: ", err)
-	for _, detour := range s.group.failoverCandidates(N.NetworkName(network), outbound) {
+	candidates := s.group.failoverCandidates(N.NetworkName(network), outbound)
+	if len(candidates) == 0 {
+		s.group.onUnmeasuredDialFailed(outbound, N.NetworkName(network))
+	}
+	for _, detour := range candidates {
 		failoverConn, failoverErr := detour.DialContext(ctx, network, destination)
 		if failoverErr == nil {
 			s.group.reportFailover(outbound.Tag(), detour.Tag())
@@ -543,7 +557,11 @@ func (s *URLTest) ListenPacket(ctx context.Context, destination M.Socksaddr) (ne
 		return nil, err
 	}
 	s.logger.ErrorContext(ctx, "outbound ", outbound.Tag(), " failed: ", err)
-	for _, detour := range s.group.failoverCandidates(N.NetworkUDP, outbound) {
+	candidates := s.group.failoverCandidates(N.NetworkUDP, outbound)
+	if len(candidates) == 0 {
+		s.group.onUnmeasuredDialFailed(outbound, N.NetworkUDP)
+	}
+	for _, detour := range candidates {
 		failoverConn, failoverErr := detour.ListenPacket(ctx, destination)
 		if failoverErr == nil {
 			s.group.reportFailover(outbound.Tag(), detour.Tag())
@@ -639,6 +657,11 @@ type URLTestGroup struct {
 	// manualPin: user's temporary manual selection. nil = auto.
 	// Set via SelectOutbound, cleared at the next user-triggered URL test.
 	manualPin atomic.Pointer[manualPinData]
+
+	// Recovery after failures, see group_probe_recovery.go.
+	failureProbePending atomic.Bool
+	failureTrustUntil   atomic.Int64
+	emergencyCheckAt    atomic.Int64
 }
 
 func NewURLTestGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, tolerance uint16, idleTimeout time.Duration, fallback URLTestFallback, interruptExternalConnections bool, expectedStatus *urltest.StatusMatcher) (*URLTestGroup, error) {
@@ -688,7 +711,10 @@ func (g *URLTestGroup) PostStart() {
 	}
 	g.started.Store(true)
 	g.markActive()
-	go g.CheckOutbounds(false)
+	go func() {
+		g.CheckOutbounds(false)
+		g.startupCheckWithBackoff()
+	}()
 }
 
 // Touch records activity and resumes the health check loop after an idle
@@ -979,7 +1005,10 @@ func (g *URLTestGroup) selectFullScan(st *groupState, network string) (adapter.O
 	if minOutbound != nil {
 		return minOutbound, true
 	}
-	return anyAvailable, false
+	if anyAvailable == nil {
+		return nil, false
+	}
+	return g.randomUnmeasured(st, network, nil), false
 }
 
 // hasExcessiveDialFailures reports whether tag has exceeded dial-failure threshold.

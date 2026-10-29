@@ -112,7 +112,7 @@ type failureListenerGroup struct {
 	calls int
 }
 
-func (g *failureListenerGroup) OnConnectionFailure(context.Context) { g.calls++ }
+func (g *failureListenerGroup) OnConnectionFailure(context.Context, adapter.Outbound) { g.calls++ }
 
 type failureDialer struct{ N.Dialer }
 

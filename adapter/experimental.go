@@ -286,8 +286,9 @@ type DialingOutboundGroup interface {
 }
 
 // ConnectionFailureListener is notified when dialing a resolved outbound chain fails.
+// member is the outbound the group resolved to (the next one in the chain), or nil.
 type ConnectionFailureListener interface {
-	OnConnectionFailure(ctx context.Context)
+	OnConnectionFailure(ctx context.Context, member Outbound)
 }
 
 type PreMatchOutboundGroup interface {

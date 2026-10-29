@@ -235,8 +235,11 @@ func (s *LoadBalance) CheckOutbounds() {
 	s.group.CheckOutbounds(true)
 }
 
-func (s *LoadBalance) OnConnectionFailure(context.Context) {
-	go s.group.CheckOutbounds(true)
+func (s *LoadBalance) OnConnectionFailure(ctx context.Context, member adapter.Outbound) {
+	if member == nil || ctx.Err() != nil {
+		return
+	}
+	s.group.onOutboundFailed(member)
 }
 
 func (s *LoadBalance) InterfaceUpdated(context.Context) {
@@ -267,10 +270,10 @@ func (s *LoadBalance) DialContext(ctx context.Context, network string, destinati
 	conn, err := outbound.DialContext(ctx, network, destination)
 	if err == nil {
 		adapter.RecordGroupDial(ctx, s.Tag(), outbound)
-		return s.group.interruptGroup.NewConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
+		return s.group.newConn(outbound.Tag(), conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.OnConnectionFailure(ctx)
+	s.OnConnectionFailure(ctx, outbound)
 	return nil, err
 }
 
@@ -284,10 +287,10 @@ func (s *LoadBalance) ListenPacket(ctx context.Context, destination M.Socksaddr)
 	conn, err := outbound.ListenPacket(ctx, destination)
 	if err == nil {
 		adapter.RecordGroupDial(ctx, s.Tag(), outbound)
-		return s.group.interruptGroup.NewPacketConn(conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
+		return s.group.newPacketConn(outbound.Tag(), conn, interrupt.IsExternalConnectionFromContext(ctx), interrupt.IsResourceDownloadFromContext(ctx)), nil
 	}
 	s.logger.ErrorContext(ctx, err)
-	s.OnConnectionFailure(ctx)
+	s.OnConnectionFailure(ctx, outbound)
 	return nil, err
 }
 
@@ -365,6 +368,14 @@ type LoadBalanceGroup struct {
 	closed          bool
 	lastActive      common.TypedValue[time.Time]
 	strategyFn      strategyFn
+
+	memberInterruptAccess sync.Mutex
+	memberInterrupts      map[string]*interrupt.Group
+
+	failureAccess       sync.Mutex
+	failureProbePending map[string]bool
+	failureTrustUntil   map[string]time.Time
+	emergencyCheckAt    atomic.Int64
 }
 
 func NewLoadBalanceGroup(ctx context.Context, outboundManager adapter.OutboundManager, logger log.Logger, outbounds []adapter.Outbound, link string, interval time.Duration, idleTimeout time.Duration, ttl time.Duration, strategy string) (*LoadBalanceGroup, error) {
@@ -419,7 +430,10 @@ func (g *LoadBalanceGroup) PostStart() {
 	defer g.access.Unlock()
 	g.started.Store(true)
 	g.lastActive.Store(time.Now())
-	go g.CheckOutbounds(false)
+	go func() {
+		g.CheckOutbounds(false)
+		g.startupCheckWithBackoff()
+	}()
 }
 
 func (g *LoadBalanceGroup) Touch() {
@@ -659,6 +673,7 @@ func (g *LoadBalanceGroup) storeOutbounds(outbounds []adapter.Outbound) {
 	g.outboundsAccess.Lock()
 	g.outbounds = outbounds
 	g.outboundsAccess.Unlock()
+	g.pruneMemberInterrupts(outbounds)
 }
 
 func getKey(metadata *adapter.InboundContext) string {
