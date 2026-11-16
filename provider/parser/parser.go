@@ -159,6 +159,10 @@ func overrideOutbounds(outbounds []option.Outbound, overrideDialerOptions *optio
 			options := outbound.Options.(*option.SnellOutboundOptions)
 			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
 			outbound.Options = options
+		case C.TypeDirect:
+		default:
+			// every other protocol (ssh, naive, mieru, ...) still dials
+			overrideDialerWrapper(outbound.Options, overrideDialerOptions, tags, providerTag)
 		}
 		parsedOutbounds = append(parsedOutbounds, outbound)
 	}
@@ -180,10 +184,18 @@ func overrideEndpoints(endpoints []option.Endpoint, overrideDialerOptions *optio
 			options := ep.Options.(*option.TailscaleEndpointOptions)
 			options.DialerOptions = overrideDialerOption(options.DialerOptions, overrideDialerOptions, tags, providerTag)
 			ep.Options = options
+		default:
+			overrideDialerWrapper(ep.Options, overrideDialerOptions, tags, providerTag)
 		}
 		parsedEndpoints = append(parsedEndpoints, ep)
 	}
 	return parsedEndpoints
+}
+
+func overrideDialerWrapper(options any, overrideDialerOptions *option.OverrideDialerOptions, tags []string, providerTag string) {
+	if wrapper, isWrapper := options.(option.DialerOptionsWrapper); isWrapper {
+		wrapper.ReplaceDialerOptions(overrideDialerOption(wrapper.TakeDialerOptions(), overrideDialerOptions, tags, providerTag))
+	}
 }
 
 func overrideDialerOption(options option.DialerOptions, overrideDialerOptions *option.OverrideDialerOptions, tags []string, providerTag string) option.DialerOptions {
