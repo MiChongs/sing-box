@@ -20,6 +20,12 @@
   "idle_session_timeout": "30s",
   "min_idle_session": 0,
   "network": "tcp",
+  "pseudo_vpn": {
+    "enabled": false,
+    "mtu": 1400,
+    "tcp_mss_clamping": true,
+    "udp": "drop"
+  },
   "tls": {},
   "transport": {},
 
@@ -92,6 +98,54 @@ AnyX 密码。
 #### transport
 
 V2Ray 传输层配置，参阅 [V2Ray 传输层](/zh/configuration/shared/v2ray-transport/)。
+
+#### pseudo_vpn
+
+把 IP 报文转发到启用了 [`pseudo_vpn`](/zh/configuration/inbound/anyx/#pseudo_vpn) 的 AnyX 服务端。启用后该出站成为[预匹配](/zh/configuration/shared/pre-match/) `route` 的 L3 目标：从 TUN 入站路由到它的 TCP 与 ICMP 连接以 IP 报文经 AnyX 会话转发，而不是作为流代理。服务端租给客户端一个虚拟 IPv4 / IPv6 地址，出站在它与本地 TUN 地址之间做转换。
+
+* `enabled`：启用伪 VPN。
+* `mtu`：隧道 MTU，默认 `1400`；实际取该值与服务端 MTU 的较小者。
+* `tcp_mss_clamping`：钳制 TCP SYN 报文的 MSS 以适配 MTU，默认启用。
+* `udp`：UDP 的处理方式，伪 VPN 不承载 UDP。
+    * `drop`（默认）：在本地丢弃 UDP 报文。
+    * `reject`：在本地回复 ICMP 端口不可达。
+    * `transparent`：交还常规 L4 路径（例如经本出站的 UDP over TCP 或其他规则）。
+
+伪 VPN 只在预匹配中生效：连接必须来自 [TUN 入站](/zh/configuration/inbound/tun/)，并在 L3 到 L4 转换之前被路由到该出站（直接匹配、`route.final`，或作为出站组当前选中的成员）。以其他方式到达该出站的连接（SOCKS / HTTP 入站，或在 TCP 上经过 `sniff` 等需要更多连接数据的规则之后）照常作为流代理。例如：
+
+```json
+{
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
+      "auto_route": true
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "anyx",
+      "tag": "anyx-vpn",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "...",
+      "tls": { "enabled": true, "server_name": "example.com" },
+      "pseudo_vpn": { "enabled": true, "udp": "transparent" }
+    }
+  ],
+  "route": {
+    "rules": [
+      { "ip_cidr": ["10.0.0.0/8"], "action": "route", "outbound": "anyx-vpn" }
+    ],
+    "final": "anyx-vpn"
+  }
+}
+```
+
+TUN 把命中的连接转发给出站时，源地址是出站的本地端口地址（RFC 7600 的 IPv4 dummy 地址 `192.0.0.8` 与 `fd61:6e79:7876::2`）；出站在上行时把它换成租到的虚拟地址、下行时换回，并修正 TCP、UDP、ICMP 校验和以及 ICMP 差错报文的内嵌头。两个地址族总是都通告，服务端未分配的地址族会被丢弃，而不会经本地协议栈泄漏。
+
+出站启动时以及服务端报告租约失效时在后台协商地址，就绪前的报文会被丢弃。出站在重连与网络切换之间保留客户端 ID 与租约凭据，租约有效期内重新获得同一地址；重启后，只要同一用户的其他客户端没有占用，服务端会把该用户先前的地址还给它。会话丢失时按需重建，失败后指数退避，不会阻塞 TUN；已建立的连接在新会话上继续工作。
 
 ### 拨号字段
 

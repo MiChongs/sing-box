@@ -9,7 +9,13 @@
   "padding_scheme_interval": "30m",
   "min_idle_session": 0,
   "idle_session_timeout": "30s",
-  "idle_session_min_timeout": "30s"
+  "idle_session_min_timeout": "30s",
+  "pseudo_vpn": {
+    "enabled": true,
+    "mtu": 1400,
+    "tcp_mss_clamping": true,
+    "udp": "drop"
+  }
 }
 ```
 
@@ -28,6 +34,10 @@
 #### padding_scheme / padding_scheme_interval / idle_session_min_timeout
 
 仅作用于 AnyX 节点（包括经 `use_anyx` 转换的节点），参阅 [AnyX 出站](/zh/configuration/outbound/anyx/)。
+
+#### pseudo_vpn
+
+仅作用于 AnyX 节点（包括经 `use_anyx` 转换的节点）。逐字段覆写节点的 [`pseudo_vpn`](/zh/configuration/outbound/anyx/#pseudo_vpn)。节点本身没有 `pseudo_vpn` 时，仅当 `enabled` 为 `true` 才会添加。
 
 未配置的字段保留订阅中的值。显式配置空的 `client_metadata` 会清空元数据；
 `disable_reuse: false` 会显式重新启用复用。

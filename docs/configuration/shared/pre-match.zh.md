@@ -41,6 +41,7 @@ icon: material/new-box
 
 - ICMP 连接：direct 和 bridge 出站以及 WireGuard / Tailscale / OpenConnect / OpenVPN / MASQUE 端点。
 - TCP 和 UDP 连接：bridge 出站以及 WireGuard / Tailscale / OpenConnect / OpenVPN / MASQUE 端点。
+- 启用了 [`pseudo_vpn`](/zh/configuration/outbound/anyx/#pseudo_vpn) 的 AnyX 出站：TCP 与 ICMP 连接；UDP 按其 `udp` 策略处理。
 
 当没有规则匹配且默认出站为受支持的目标时，L3 转发同样生效；对于出站组，使用当前选中的出站。
 

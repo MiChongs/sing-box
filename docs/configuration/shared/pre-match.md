@@ -45,6 +45,7 @@ Supported targets:
 
 - ICMP connections: Direct and Bridge outbounds, and WireGuard / Tailscale / OpenConnect / OpenVPN / MASQUE endpoints.
 - TCP and UDP connections: Bridge outbounds, and WireGuard / Tailscale / OpenConnect / OpenVPN / MASQUE endpoints.
+- AnyX outbounds with [`pseudo_vpn`](/configuration/outbound/anyx/#pseudo_vpn): TCP and ICMP connections; UDP follows its `udp` mode.
 
 L3 forwarding also applies when no rule matches and the default outbound is a supported
 target; for outbound groups, the currently selected outbound is used.

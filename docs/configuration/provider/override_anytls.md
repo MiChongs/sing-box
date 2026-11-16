@@ -9,7 +9,13 @@
   "padding_scheme_interval": "30m",
   "min_idle_session": 0,
   "idle_session_timeout": "30s",
-  "idle_session_min_timeout": "30s"
+  "idle_session_min_timeout": "30s",
+  "pseudo_vpn": {
+    "enabled": true,
+    "mtu": 1400,
+    "tcp_mss_clamping": true,
+    "udp": "drop"
+  }
 }
 ```
 
@@ -28,6 +34,10 @@ See [AnyTLS outbound](/configuration/outbound/anytls/) and [AnyX outbound](/conf
 #### padding_scheme / padding_scheme_interval / idle_session_min_timeout
 
 AnyX only (nodes converted with `use_anyx` included), see [AnyX outbound](/configuration/outbound/anyx/).
+
+#### pseudo_vpn
+
+AnyX only (nodes converted with `use_anyx` included). Overrides the node's [`pseudo_vpn`](/configuration/outbound/anyx/#pseudo_vpn) field by field. A node without `pseudo_vpn` gets one only when `enabled` is `true`.
 
 Omitted fields preserve the subscription's values. An explicit empty `client_metadata`
 clears the metadata, and `disable_reuse: false` explicitly re-enables reuse.

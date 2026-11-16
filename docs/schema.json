@@ -295,6 +295,62 @@
       },
       "additionalProperties": false
     },
+    "AnyXPseudoVPNInboundOptions": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "interface_name": {
+          "type": "string"
+        },
+        "address": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IPPrefix"
+            },
+            {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/IPPrefix"
+              }
+            }
+          ]
+        },
+        "mtu": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "lease_duration": {
+          "$ref": "#/$defs/Duration"
+        },
+        "tcp_mss_clamping": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "AnyXPseudoVPNOutboundOptions": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mtu": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "tcp_mss_clamping": {
+          "type": "boolean"
+        },
+        "udp": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
     "AnyXUser": {
       "type": "object",
       "properties": {
@@ -7674,6 +7730,9 @@
               "additionalProperties": {
                 "$ref": "#/$defs/ServerOptions"
               }
+            },
+            "pseudo_vpn": {
+              "$ref": "#/$defs/AnyXPseudoVPNInboundOptions"
             }
           },
           "required": [
@@ -14349,6 +14408,9 @@
                 }
               ]
             },
+            "pseudo_vpn": {
+              "$ref": "#/$defs/AnyXPseudoVPNOutboundOptions"
+            },
             "idle_session_check_interval": {
               "$ref": "#/$defs/Duration"
             }
@@ -20203,6 +20265,9 @@
         },
         "idle_session_min_timeout": {
           "$ref": "#/$defs/Duration"
+        },
+        "pseudo_vpn": {
+          "$ref": "#/$defs/OverridePseudoVPNOptions"
         }
       },
       "additionalProperties": false
@@ -20367,6 +20432,26 @@
         },
         "dynamic_record_sizing_disabled": {
           "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OverridePseudoVPNOptions": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "mtu": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "tcp_mss_clamping": {
+          "type": "boolean"
+        },
+        "udp": {
+          "type": "string"
         }
       },
       "additionalProperties": false
