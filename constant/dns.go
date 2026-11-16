@@ -32,6 +32,9 @@ const (
 	DNSTypeOpenConnect = "openconnect"
 	DNSTypeOpenVPN     = "openvpn"
 	DNSTypeGroup       = "group"
+	// DNSTypeProvider answers for the nodes of an outbound provider through the
+	// DNS servers of its subscription; it is not configurable.
+	DNSTypeProvider = "provider"
 )
 
 const (

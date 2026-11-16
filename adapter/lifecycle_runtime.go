@@ -15,6 +15,12 @@ type OutboundAdder interface {
 	AddOutbound(outbound Outbound) error
 }
 
+// DNSTransportAdder is implemented by the DNS transport manager. Outbound
+// providers register the transport answering for their nodes through it.
+type DNSTransportAdder interface {
+	AddTransport(transport DNSTransport) error
+}
+
 // StartRuntimeComponent starts a component created after its manager has
 // started, running every start stage through the manager scope at once. On
 // failure the component is closed again.

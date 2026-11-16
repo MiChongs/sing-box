@@ -54,6 +54,7 @@ type ProviderRemote struct {
 	lastEtag         string
 	lastOutOpts      []option.Outbound
 	lastEPOpts       []option.Endpoint
+	lastDNSOpts      []option.DNSServerOptions
 	lastUpdated      time.Time
 	subscriptionInfo adapter.SubscriptionInfo
 	ticker           *time.Ticker
@@ -138,7 +139,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 	url := options.URL
 	exclude := (*regexp.Regexp)(options.Exclude)
 	include := (*regexp.Regexp)(options.Include)
-	return &ProviderRemote{
+	remote := &ProviderRemote{
 		Adapter:  provider.NewAdapter(ctx, router, outbound, endpointMgr, logFactory, logger, tag, C.ProviderTypeRemote, options.HealthCheck),
 		ctx:      ctx,
 		cancel:   cancel,
@@ -164,7 +165,14 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 
 		//nolint:staticcheck
 		downloadDetour: options.DownloadDetour,
-	}, nil
+	}
+	overrideDialer, err := remote.EnableProviderDNS(options.OverrideDialer)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	remote.overrideDialer = overrideDialer
+	return remote, nil
 }
 
 func (s *ProviderRemote) StartContext(ctx context.Context, startContext *adapter.HTTPStartContext) error {
@@ -317,10 +325,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 			}
 		}
 		if s.path != "" {
-			content, _ := json.Marshal(option.Options{
-				Outbounds: s.lastOutOpts,
-				Endpoints: s.lastEPOpts,
-			})
+			content, _ := json.Marshal(s.cacheOptions())
 			if err := s.saveCacheFile(hasInfo, info, content); err != nil {
 				return E.Cause(err, "save outbound provider cache file")
 			}
@@ -358,10 +363,7 @@ func (s *ProviderRemote) fetch(ctx context.Context, isStart bool) error {
 	s.lastUpdated = time.Now()
 	s.infoMu.Unlock()
 	if s.path != "" || s.cacheFile != nil {
-		content, _ := json.Marshal(option.Options{
-			Outbounds: s.lastOutOpts,
-			Endpoints: s.lastEPOpts,
-		})
+		content, _ := json.Marshal(s.cacheOptions())
 		if s.path != "" {
 			if err = s.saveCacheFile(hasInfo, info, content); err != nil {
 				return E.Cause(err, "save outbound provider cache file")
@@ -508,6 +510,7 @@ func (s *ProviderRemote) loadFromContent(contentRaw []byte) error {
 	// The cache holds already processed options, but include / exclude may
 	// have been changed in the configuration since then.
 	outboundOpts, endpointOpts = s.filter(outboundOpts, endpointOpts)
+	s.updateDNS(content)
 	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
 	s.lastOutOpts = outboundOpts
 	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
@@ -599,12 +602,55 @@ func (s *ProviderRemote) updateProviderFromContent(content string) error {
 		return err
 	}
 	outboundOpts, endpointOpts = s.filter(outboundOpts, endpointOpts)
+	s.updateDNS(content)
 	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
 	s.lastOutOpts = outboundOpts
 	s.UpdateEndpoints(s.lastEPOpts, endpointOpts)
 	s.lastEPOpts = endpointOpts
 	s.optionsChanged = false
 	return nil
+}
+
+// updateDNS applies the DNS servers carried by the subscription, or by the
+// cache written from it, when provider_domain_resolver is enabled.
+func (s *ProviderRemote) updateDNS(content string) {
+	if !s.ProviderDNSEnabled() {
+		return
+	}
+	servers := parser.ParseSubscriptionDNS(parser.ContextWithWarnHandler(s.ctx, s.logger.Warn), content)
+	s.UpdateDNSServers(servers)
+	s.infoMu.Lock()
+	s.lastDNSOpts = servers
+	s.infoMu.Unlock()
+}
+
+// cacheOptions is the processed subscription written to path / cache_file.
+// The DNS servers are kept as a group selected by dns.final, which is how
+// ParseSubscriptionDNS reads them back.
+func (s *ProviderRemote) cacheOptions() option.Options {
+	s.infoMu.RLock()
+	defer s.infoMu.RUnlock()
+	options := option.Options{
+		Outbounds: s.lastOutOpts,
+		Endpoints: s.lastEPOpts,
+	}
+	if len(s.lastDNSOpts) > 0 {
+		const groupTag = "provider"
+		servers := make([]option.DNSServerOptions, 0, len(s.lastDNSOpts)+1)
+		memberTags := make([]string, 0, len(s.lastDNSOpts))
+		for i, server := range s.lastDNSOpts {
+			server.Tag = F.ToString(i)
+			memberTags = append(memberTags, server.Tag)
+			servers = append(servers, server)
+		}
+		servers = append(servers, option.DNSServerOptions{
+			Type:    C.DNSTypeGroup,
+			Tag:     groupTag,
+			Options: &option.GroupDNSServerOptions{Servers: memberTags},
+		})
+		options.DNS = &option.DNSOptions{RawDNSOptions: option.RawDNSOptions{Servers: servers, Final: groupTag}}
+	}
+	return options
 }
 
 func (s *ProviderRemote) filter(outboundOpts []option.Outbound, endpointOpts []option.Endpoint) ([]option.Outbound, []option.Endpoint) {

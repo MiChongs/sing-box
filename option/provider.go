@@ -4,6 +4,7 @@ import (
 	"context"
 	"reflect"
 
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/schema"
 	E "github.com/sagernet/sing/common/exceptions"
 	"github.com/sagernet/sing/common/json"
@@ -176,31 +177,80 @@ type OverrideAnyTLSOptions struct {
 }
 
 type OverrideDialerOptions struct {
-	Detour               *string                            `json:"detour,omitempty" reference:"outbound"`
-	BindInterface        *string                            `json:"bind_interface,omitempty"`
-	Inet4BindAddress     *badoption.Addr                    `json:"inet4_bind_address,omitempty"`
-	Inet6BindAddress     *badoption.Addr                    `json:"inet6_bind_address,omitempty"`
-	ProtectPath          *string                            `json:"protect_path,omitempty"`
-	RoutingMark          *FwMark                            `json:"routing_mark,omitempty"`
-	ReuseAddr            *bool                              `json:"reuse_addr,omitempty"`
-	ConnectTimeout       *badoption.Duration                `json:"connect_timeout,omitempty"`
-	TCPFastOpen          *bool                              `json:"tcp_fast_open,omitempty"`
-	TCPMultiPath         *bool                              `json:"tcp_multi_path,omitempty"`
-	TCPKeepAlive         *badoption.Duration                `json:"tcp_keep_alive,omitempty"`
-	TCPKeepAliveInterval *badoption.Duration                `json:"tcp_keep_alive_interval,omitempty"`
-	UDPGSO               *bool                              `json:"udp_gso,omitempty"`
-	UDPFragment          *bool                              `json:"udp_fragment,omitempty"`
-	DomainResolver       *DomainResolveOptions              `json:"domain_resolver,omitempty"`
-	NetworkStrategy      *NetworkStrategy                   `json:"network_strategy,omitempty"`
-	NetworkType          *badoption.Listable[InterfaceType] `json:"network_type,omitempty"`
-	FallbackNetworkType  *badoption.Listable[InterfaceType] `json:"fallback_network_type,omitempty"`
-	FallbackDelay        *badoption.Duration                `json:"fallback_delay,omitempty"`
+	Detour               *string               `json:"detour,omitempty" reference:"outbound"`
+	BindInterface        *string               `json:"bind_interface,omitempty"`
+	Inet4BindAddress     *badoption.Addr       `json:"inet4_bind_address,omitempty"`
+	Inet6BindAddress     *badoption.Addr       `json:"inet6_bind_address,omitempty"`
+	ProtectPath          *string               `json:"protect_path,omitempty"`
+	RoutingMark          *FwMark               `json:"routing_mark,omitempty"`
+	ReuseAddr            *bool                 `json:"reuse_addr,omitempty"`
+	ConnectTimeout       *badoption.Duration   `json:"connect_timeout,omitempty"`
+	TCPFastOpen          *bool                 `json:"tcp_fast_open,omitempty"`
+	TCPMultiPath         *bool                 `json:"tcp_multi_path,omitempty"`
+	TCPKeepAlive         *badoption.Duration   `json:"tcp_keep_alive,omitempty"`
+	TCPKeepAliveInterval *badoption.Duration   `json:"tcp_keep_alive_interval,omitempty"`
+	UDPGSO               *bool                 `json:"udp_gso,omitempty"`
+	UDPFragment          *bool                 `json:"udp_fragment,omitempty"`
+	DomainResolver       *DomainResolveOptions `json:"domain_resolver,omitempty"`
+	// ProviderDomainResolver resolves the node server addresses through the
+	// DNS servers carried by the subscription itself.
+	ProviderDomainResolver *ProviderDomainResolverOptions     `json:"provider_domain_resolver,omitempty"`
+	NetworkStrategy        *NetworkStrategy                   `json:"network_strategy,omitempty"`
+	NetworkType            *badoption.Listable[InterfaceType] `json:"network_type,omitempty"`
+	FallbackNetworkType    *badoption.Listable[InterfaceType] `json:"fallback_network_type,omitempty"`
+	FallbackDelay          *badoption.Duration                `json:"fallback_delay,omitempty"`
 
 	TCPKeepAliveCount   *int  `json:"tcp_keep_alive_count,omitempty"`
 	DisableTCPKeepAlive *bool `json:"disable_tcp_keep_alive,omitempty"`
 
 	// Deprecated: migrated to domain resolver
 	DomainStrategy *DomainStrategy `json:"domain_strategy,omitempty" schema:"omit"`
+}
+
+type _ProviderDomainResolverOptions struct {
+	Enabled *bool `json:"enabled,omitempty"`
+	// Resolver resolves the domain names of the subscription DNS servers, and
+	// answers for the nodes while the subscription carries no usable server or
+	// all of them fail. Empty selects override_dialer.domain_resolver, then
+	// route.default_domain_resolver, then the default DNS server.
+	Resolver         string         `json:"resolver,omitempty" reference:"dns_server"`
+	ResolverStrategy DomainStrategy `json:"resolver_strategy,omitempty"`
+	OutboundStrategy DomainStrategy `json:"outbound_strategy,omitempty"`
+}
+
+// ProviderDomainResolverOptions accepts `true` / `false` or the object form.
+type ProviderDomainResolverOptions _ProviderDomainResolverOptions
+
+func (o *ProviderDomainResolverOptions) IsEnabled() bool {
+	if o == nil {
+		return false
+	}
+	return o.Enabled == nil || *o.Enabled
+}
+
+func (o ProviderDomainResolverOptions) MarshalJSON() ([]byte, error) {
+	if o.Resolver == "" && o.ResolverStrategy == DomainStrategy(C.DomainStrategyAsIS) && o.OutboundStrategy == DomainStrategy(C.DomainStrategyAsIS) {
+		return json.Marshal(o.IsEnabled())
+	}
+	return json.Marshal(_ProviderDomainResolverOptions(o))
+}
+
+func (o *ProviderDomainResolverOptions) UnmarshalJSON(content []byte) error {
+	var enabled bool
+	if json.Unmarshal(content, &enabled) == nil {
+		*o = ProviderDomainResolverOptions{Enabled: &enabled}
+		return nil
+	}
+	return json.Unmarshal(content, (*_ProviderDomainResolverOptions)(o))
+}
+
+func (o ProviderDomainResolverOptions) DescribeSchema(builder schema.Builder) (*schema.Node, error) {
+	objectForm := schema.StrictObject()
+	err := builder.FlattenStruct(objectForm, reflect.TypeFor[_ProviderDomainResolverOptions]())
+	if err != nil {
+		return nil, err
+	}
+	return schema.AnyOf(schema.BooleanNode(), objectForm), nil
 }
 
 type OverrideTLSOptions struct {

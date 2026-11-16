@@ -20265,6 +20265,32 @@
         "domain_resolver": {
           "$ref": "#/$defs/DomainResolver"
         },
+        "provider_domain_resolver": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "object",
+              "properties": {
+                "enabled": {
+                  "type": "boolean"
+                },
+                "resolver": {
+                  "type": "string",
+                  "x-tag-reference": "dns_server"
+                },
+                "resolver_strategy": {
+                  "$ref": "#/$defs/DomainStrategy"
+                },
+                "outbound_strategy": {
+                  "$ref": "#/$defs/DomainStrategy"
+                }
+              },
+              "additionalProperties": false
+            }
+          ]
+        },
         "network_strategy": {
           "type": "string",
           "enum": [

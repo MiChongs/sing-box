@@ -128,7 +128,15 @@ func NewDNSQueryOptions(ctx context.Context, domainResolver *option.DomainResolv
 		dnsQueryOptions.Transport = transport
 		return dnsQueryOptions, nil
 	}
-	if len(dnsTransport.Transports()) < 2 {
+	// Provider DNS servers only answer for their own nodes; a box whose only
+	// configured server is the default keeps resolving through it.
+	var configuredServers int
+	for _, transport := range dnsTransport.Transports() {
+		if transport.Type() != C.DNSTypeProvider {
+			configuredServers++
+		}
+	}
+	if configuredServers < 2 {
 		return adapter.DNSQueryOptions{Transport: dnsTransport.Default()}, nil
 	}
 	if newDialer {

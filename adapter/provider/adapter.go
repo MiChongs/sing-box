@@ -2,6 +2,8 @@ package provider
 
 import (
 	"context"
+	"errors"
+	"os"
 	"reflect"
 	"sync"
 	"sync/atomic"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -45,6 +48,9 @@ type Adapter struct {
 	interval time.Duration
 
 	udp *udpHealthCheck
+
+	// dns answers for the nodes when provider_domain_resolver is enabled.
+	dns *providerDNS
 }
 
 // udpHealthCheck probes the real UDP support of the provider nodes on every
@@ -179,6 +185,7 @@ func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 }
 
 func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Outbound) {
+	a.stripProviderDNS(newOpts, nil)
 	newTags := a.resolveOutboundTags(newOpts)
 	var (
 		oldOptByTag    = make(map[string]option.Outbound)
@@ -256,6 +263,7 @@ func (a *Adapter) Close() error {
 	if a.ticker != nil {
 		a.ticker.Stop()
 	}
+	defer a.closeProviderDNS()
 	a.outboundsAccess.Lock()
 	outbounds := a.outbounds
 	a.outbounds = nil
@@ -444,6 +452,7 @@ func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
 }
 
 func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.Endpoint) {
+	a.stripProviderDNS(nil, newOpts)
 	newTags := a.resolveEndpointTags(newOpts)
 	var (
 		oldOptByTag = make(map[string]option.Endpoint)
@@ -553,4 +562,99 @@ func (a *Adapter) removeEndpoint(tag string) error {
 		return E.New("endpoint manager does not support runtime removal")
 	}
 	return remover.Remove(tag)
+}
+
+// EnableProviderDNS registers the provider DNS server when
+// provider_domain_resolver is enabled, and returns the dialer overrides that
+// point the nodes at it. Call it from the provider constructor.
+func (a *Adapter) EnableProviderDNS(overrideDialer *option.OverrideDialerOptions) (*option.OverrideDialerOptions, error) {
+	if overrideDialer == nil || !overrideDialer.ProviderDomainResolver.IsEnabled() {
+		return overrideDialer, nil
+	}
+	options := overrideDialer.ProviderDomainResolver
+	transport, err := newProviderDNS(a.ctx, a.logFactory, a.providerTag, options, overrideDialer.DomainResolver)
+	if err != nil {
+		return nil, err
+	}
+	adder, loaded := transport.manager.(adapter.DNSTransportAdder)
+	if !loaded {
+		return nil, E.New("DNS transport manager does not support provider DNS")
+	}
+	err = adder.AddTransport(transport)
+	if err != nil {
+		return nil, E.Cause(err, "register provider DNS")
+	}
+	a.dns = transport
+	effective := *overrideDialer
+	var domainResolver option.DomainResolveOptions
+	if overrideDialer.DomainResolver != nil {
+		// keep timeout / cache / client_subnet, the server moves to the fallback
+		domainResolver = *overrideDialer.DomainResolver
+	}
+	domainResolver.Server = transport.Tag()
+	if options.OutboundStrategy != option.DomainStrategy(C.DomainStrategyAsIS) {
+		domainResolver.Strategy = options.OutboundStrategy
+	}
+	effective.DomainResolver = &domainResolver
+	return &effective, nil
+}
+
+// ProviderDNSEnabled reports whether the subscription DNS servers are used.
+func (a *Adapter) ProviderDNSEnabled() bool {
+	return a.dns != nil
+}
+
+// UpdateDNSServers replaces the subscription DNS servers behind the provider
+// DNS server. It does nothing when provider_domain_resolver is disabled.
+func (a *Adapter) UpdateDNSServers(servers []option.DNSServerOptions) {
+	if a.dns == nil {
+		return
+	}
+	a.dns.Update(servers)
+}
+
+func (a *Adapter) closeProviderDNS() {
+	if a.dns == nil {
+		return
+	}
+	a.dns.close()
+	remover, loaded := a.dns.manager.(adapter.RuntimeComponentRemover)
+	if loaded {
+		if err := remover.Remove(a.dns.Tag()); err != nil && !errors.Is(err, os.ErrInvalid) {
+			a.logger.Error(E.Cause(err, "close provider DNS"))
+		}
+	}
+}
+
+// stripProviderDNS drops resolvers pointing at this provider's DNS server
+// while provider_domain_resolver is disabled: a cache written with it enabled
+// still carries them, and the server no longer exists. A configured server
+// that happens to have the same tag is left alone.
+func (a *Adapter) stripProviderDNS(outbounds []option.Outbound, endpoints []option.Endpoint) {
+	if a.dns != nil {
+		return
+	}
+	tag := ProviderDNSTag(a.providerTag)
+	if manager := service.FromContext[adapter.DNSTransportManager](a.ctx); manager != nil {
+		if _, configured := manager.Transport(tag); configured {
+			return
+		}
+	}
+	strip := func(options any) {
+		wrapper, isWrapper := options.(option.DialerOptionsWrapper)
+		if !isWrapper {
+			return
+		}
+		dialerOptions := wrapper.TakeDialerOptions()
+		if dialerOptions.DomainResolver != nil && dialerOptions.DomainResolver.Server == tag {
+			dialerOptions.DomainResolver = nil
+			wrapper.ReplaceDialerOptions(dialerOptions)
+		}
+	}
+	for _, outbound := range outbounds {
+		strip(outbound.Options)
+	}
+	for _, endpoint := range endpoints {
+		strip(endpoint.Options)
+	}
 }

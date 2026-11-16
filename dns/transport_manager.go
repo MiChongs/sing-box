@@ -13,7 +13,11 @@ import (
 	E "github.com/sagernet/sing/common/exceptions"
 )
 
-var _ adapter.DNSTransportManager = (*TransportManager)(nil)
+var (
+	_ adapter.DNSTransportManager     = (*TransportManager)(nil)
+	_ adapter.DNSTransportAdder       = (*TransportManager)(nil)
+	_ adapter.RuntimeComponentRemover = (*TransportManager)(nil)
+)
 
 type TransportManager struct {
 	registry                 adapter.DNSTransportRegistry
@@ -25,6 +29,10 @@ type TransportManager struct {
 	defaultTransport         adapter.DNSTransport
 	defaultTransportFallback func() (adapter.DNSTransport, error)
 	fakeIPTransport          adapter.FakeIPTransport
+	// scope is set once the manager starts; transports added after that
+	// (outbound provider DNS) are started through it as runtime transports.
+	scope   *adapter.Scope
+	runtime map[adapter.DNSTransport]struct{}
 }
 
 func NewTransportManager(registry adapter.DNSTransportRegistry, outbound adapter.OutboundManager, defaultTag string) *TransportManager {
@@ -33,6 +41,7 @@ func NewTransportManager(registry adapter.DNSTransportRegistry, outbound adapter
 		outbound:       outbound,
 		defaultTag:     defaultTag,
 		transportByTag: make(map[string]adapter.DNSTransport),
+		runtime:        make(map[adapter.DNSTransport]struct{}),
 	}
 }
 
@@ -42,6 +51,7 @@ func (m *TransportManager) Initialize(defaultTransportFallback func() (adapter.D
 
 func (m *TransportManager) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	m.access.Lock()
+	m.scope = scope
 	if stage == adapter.StartStateInitialize {
 		if m.defaultTag != "" && m.defaultTransport == nil {
 			m.access.Unlock()
@@ -58,7 +68,11 @@ func (m *TransportManager) Start(stage adapter.StartStage, scope *adapter.Scope)
 			m.defaultTransport = defaultTransport
 		}
 	}
-	transports := m.transports
+	// Runtime transports were already started through every stage when added.
+	transports := common.Filter(m.transports, func(it adapter.DNSTransport) bool {
+		_, isRuntime := m.runtime[it]
+		return !isRuntime
+	})
 	m.access.Unlock()
 	if stage == adapter.StartStateStart {
 		return m.startTransports(scope, transports)
@@ -181,4 +195,68 @@ func (m *TransportManager) Create(ctx context.Context, logger log.ContextLogger,
 		m.fakeIPTransport = transport.(adapter.FakeIPTransport)
 	}
 	return nil
+}
+
+// AddTransport registers a transport constructed by its owner (outbound
+// providers). It never becomes the default server. Once the manager has
+// started, the transport is started through every stage before it is
+// published.
+func (m *TransportManager) AddTransport(transport adapter.DNSTransport) error {
+	tag := transport.Tag()
+	if tag == "" {
+		return os.ErrInvalid
+	}
+	m.access.Lock()
+	_, loaded := m.transportByTag[tag]
+	scope := m.scope
+	m.access.Unlock()
+	if loaded {
+		return E.New("duplicate DNS server tag: ", tag)
+	}
+	if scope != nil {
+		err := adapter.StartRuntimeComponent(scope, "dns/"+transport.Type()+"["+tag+"]", transport)
+		if err != nil {
+			return err
+		}
+	}
+	m.access.Lock()
+	if _, loaded = m.transportByTag[tag]; loaded {
+		m.access.Unlock()
+		if scope != nil {
+			_ = adapter.CloseRuntimeComponent(scope, transport)
+		}
+		return E.New("duplicate DNS server tag: ", tag)
+	}
+	m.transports = append(m.transports, transport)
+	m.transportByTag[tag] = transport
+	if scope != nil {
+		m.runtime[transport] = struct{}{}
+	}
+	m.access.Unlock()
+	return nil
+}
+
+// Remove drops a transport added at runtime. Configured servers may be
+// referenced by rules and other servers, so they cannot be removed.
+func (m *TransportManager) Remove(tag string) error {
+	m.access.Lock()
+	transport, loaded := m.transportByTag[tag]
+	if !loaded {
+		m.access.Unlock()
+		return os.ErrInvalid
+	}
+	if transport == m.defaultTransport || transport == m.fakeIPTransport {
+		m.access.Unlock()
+		return E.New("cannot remove the default or fakeip DNS server: ", tag)
+	}
+	delete(m.transportByTag, tag)
+	m.transports = common.Filter(m.transports, func(it adapter.DNSTransport) bool {
+		return it != transport
+	})
+	delete(m.runtime, transport)
+	scope := m.scope
+	m.access.Unlock()
+	// Runtime transports and those added before the manager started were both
+	// started in the manager scope.
+	return adapter.CloseRuntimeComponent(scope, transport)
 }
