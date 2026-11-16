@@ -23,6 +23,13 @@ import (
 	"github.com/sagernet/sing/common/x/list"
 )
 
+// Session 定义 AnyX 物理会话向外部上层载荷暴露的核心通道接口。
+type Session interface {
+	WriteFramePacket(cmd byte, packet []byte) error
+	Close() error
+	IsClosed() bool
+}
+
 type session struct {
 	conn         net.Conn
 	reader       *std_bufio.Reader
@@ -42,6 +49,9 @@ type session struct {
 	streamID     atomic.Uint32
 	peerVersion  atomic.Uint32
 
+	frameMu      sync.RWMutex
+	frameHandler func(session *session, cmd byte, packet []byte)
+
 	timeoutAccess    sync.Mutex
 	openTimeout      *time.Timer
 	openTimeoutArmed atomic.Bool
@@ -52,6 +62,9 @@ type session struct {
 	closeOnce sync.Once
 	closeErr  error
 	done      chan struct{}
+
+	lastHeartbeatAck atomic.Int64
+	lastActivityTime atomic.Int64
 
 	client   *Client
 	keepOnce atomic.Bool
@@ -89,13 +102,16 @@ func newClientSession(client *Client, conn net.Conn) *session {
 		done:        make(chan struct{}),
 		client:      client,
 	}
+	// lastActivityTime 只由自定义帧（PseudoVPN）更新：创建时就写入的话，普通会话的空闲寿命
+	// 会被续期判定拉长到 idle_session_timeout 之后。
+	s.lastHeartbeatAck.Store(time.Now().Unix())
 	s.startLifetimeTimer()
 	go s.heartbeatLoop()
 	return s
 }
 
 func (s *session) startLifetimeTimer() {
-	if s.client == nil {
+	if s.client == nil || s.IsClosed() {
 		return
 	}
 	maxTimeout := s.client.idleSessionTimeout
@@ -118,10 +134,26 @@ func (s *session) startLifetimeTimer() {
 	} else {
 		wait = minTimeout
 	}
+
+	s.timeoutAccess.Lock()
+	defer s.timeoutAccess.Unlock()
+	if s.IsClosed() {
+		return
+	}
+	if s.lifetimeTimer != nil {
+		s.lifetimeTimer.Stop()
+	}
 	s.lifetimeTimer = time.AfterFunc(wait, func() {
 		if s.IsClosed() {
 			return
 		}
+		now := time.Now().Unix()
+		lastActivity := s.lastActivityTime.Load()
+		if lastActivity > 0 && time.Duration(now-lastActivity)*time.Second < maxTimeout {
+			s.startLifetimeTimer()
+			return
+		}
+
 		s.streamAccess.Lock()
 		if s.IsClosed() {
 			s.streamAccess.Unlock()
@@ -179,10 +211,10 @@ func (s *session) Close() error {
 		if s.openTimeout != nil {
 			s.openTimeout.Stop()
 		}
-		s.timeoutAccess.Unlock()
 		if s.lifetimeTimer != nil {
 			s.lifetimeTimer.Stop()
 		}
+		s.timeoutAccess.Unlock()
 		s.closeErr = s.conn.Close()
 		s.streamAccess.Lock()
 		streams := s.streams
@@ -325,18 +357,128 @@ func (s *session) readLoop() error {
 					_ = s.writeFrame(commandHeartResponse, streamID, nil)
 				}()
 			}
+		case commandHeartResponse:
+			err = s.discard(length)
+			if err == nil {
+				s.lastHeartbeatAck.Store(time.Now().Unix())
+			}
 		case commandWaste:
 			if s.paddingLimit > 0 && length > s.paddingLimit {
 				return E.New("anyx: waste frame length ", length, " exceeds limit ", s.paddingLimit)
 			}
 			err = s.discard(length)
 		default:
-			err = s.discard(length)
+			s.frameMu.RLock()
+			hasHandler := s.frameHandler != nil
+			s.frameMu.RUnlock()
+			if hasHandler {
+				err = s.handleCustomFrame(header[0], length)
+			} else {
+				err = s.discard(length)
+			}
 		}
 		if err != nil {
 			return err
 		}
 	}
+}
+
+func (s *session) handleCustomFrame(cmd byte, length int) error {
+	if length == 0 {
+		return nil
+	}
+	s.lastActivityTime.Store(time.Now().Unix())
+	buffer, err := s.readFrame(length)
+	if err != nil {
+		return err
+	}
+	s.frameMu.RLock()
+	handler := s.frameHandler
+	s.frameMu.RUnlock()
+	if handler != nil {
+		// 处理函数在读循环里同步执行，约定返回后不再引用 packet，因此直接借用读缓冲，
+		// 省去每个三层报文一次分配与拷贝。
+		handler(s, cmd, buffer.Bytes())
+	}
+	buffer.Release()
+	return nil
+}
+
+// Context 返回服务端会话的上下文（含认证出的用户），客户端会话返回 nil。
+func (s *session) Context() context.Context {
+	return s.serviceContext
+}
+
+func (s *session) SetFrameHandler(handler func(session *session, cmd byte, packet []byte)) {
+	s.frameMu.Lock()
+	s.frameHandler = handler
+	s.frameMu.Unlock()
+}
+
+const (
+	// framePacketLockTimeout 是三层报文等待写锁的上限。会话被大流量的代理流占着写锁时，
+	// 报文应尽快丢弃交给上层重传，而不是长时间阻塞 TUN 写路径；超时不关闭会话。
+	framePacketLockTimeout  = time.Second
+	framePacketWriteTimeout = 5 * time.Second
+)
+
+func (s *session) WriteFramePacket(cmd byte, packet []byte) error {
+	dataLen := len(packet)
+	if dataLen == 0 {
+		return nil
+	}
+	if dataLen > maxFrameSize {
+		return E.New("anyx: frame packet too large: ", dataLen)
+	}
+	frame := buf.NewSize(frameOverhead + dataLen)
+	putFrameHeader(frame.Extend(frameOverhead), cmd, 0, dataLen)
+	common.Must1(frame.Write(packet))
+	return s.writeFrameBuffer(frame)
+}
+
+// WriteFramePackets 把多条 prefix+packet 载荷合并成一次加锁、一次写出的帧序列。
+// 超出帧长上限的报文被跳过。
+func (s *session) WriteFramePackets(cmd byte, prefix []byte, packets [][]byte) error {
+	total := 0
+	for _, packet := range packets {
+		dataLen := len(prefix) + len(packet)
+		if len(packet) == 0 || dataLen > maxFrameSize {
+			continue
+		}
+		total += frameOverhead + dataLen
+	}
+	if total == 0 {
+		return nil
+	}
+	frame := buf.NewSize(total)
+	for _, packet := range packets {
+		dataLen := len(prefix) + len(packet)
+		if len(packet) == 0 || dataLen > maxFrameSize {
+			continue
+		}
+		putFrameHeader(frame.Extend(frameOverhead), cmd, 0, dataLen)
+		common.Must1(frame.Write(prefix))
+		common.Must1(frame.Write(packet))
+	}
+	return s.writeFrameBuffer(frame)
+}
+
+func (s *session) writeFrameBuffer(frame *buf.Buffer) error {
+	err := s.lockWriteTimeout(framePacketLockTimeout)
+	if err != nil {
+		frame.Release()
+		return err
+	}
+	s.conn.SetWriteDeadline(time.Now().Add(framePacketWriteTimeout))
+	err = s.writeLocked(frame)
+	s.conn.SetWriteDeadline(time.Time{})
+	s.unlockWrite()
+	if err != nil {
+		s.Close()
+	} else {
+		s.lastActivityTime.Store(time.Now().Unix())
+	}
+	return err
 }
 
 func (s *session) handlePush(streamID uint32, length int) error {
@@ -507,6 +649,19 @@ func (s *session) lockWrite() error {
 	select {
 	case s.writeAccess <- struct{}{}:
 		return nil
+	case <-s.done:
+		return net.ErrClosed
+	}
+}
+
+func (s *session) lockWriteTimeout(timeout time.Duration) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case s.writeAccess <- struct{}{}:
+		return nil
+	case <-timer.C:
+		return os.ErrDeadlineExceeded
 	case <-s.done:
 		return net.ErrClosed
 	}
@@ -684,6 +839,12 @@ func (s *session) heartbeatLoop() {
 			return
 		case <-ticker.C:
 			if s.IsClosed() {
+				return
+			}
+			lastAck := s.lastHeartbeatAck.Load()
+			if lastAck > 0 && time.Now().Unix()-lastAck > 90 {
+				s.logger.Debug("anyx: session heartbeat timeout")
+				_ = s.Close()
 				return
 			}
 			_ = s.writeFrame(commandHeartRequest, 0, nil)

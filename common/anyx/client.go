@@ -43,6 +43,7 @@ type ClientOptions struct {
 	MinIdleSession           int
 	DisableReuse             bool
 	Logger                   logger.ContextLogger
+	FrameHandler             func(cmd byte, packet []byte)
 }
 
 type Client struct {
@@ -64,6 +65,7 @@ type Client struct {
 	closeChan    chan struct{}
 	sessions     map[*session]struct{}
 	idleSessions list.List[*session]
+	frameHandler func(cmd byte, packet []byte)
 }
 
 func NewClient(options ClientOptions) (*Client, error) {
@@ -100,6 +102,7 @@ func NewClient(options ClientOptions) (*Client, error) {
 		disableReuse:          options.DisableReuse,
 		sessions:              make(map[*session]struct{}),
 		closeChan:             make(chan struct{}),
+		frameHandler:          options.FrameHandler,
 	}
 	if client.logger == nil {
 		client.logger = logger.NOP()
@@ -181,6 +184,16 @@ func (c *Client) DialContext(ctx context.Context, destination M.Socksaddr) (net.
 	return opened, nil
 }
 
+// GetOrDialSession 供上层按需索取一个可用物理会话，优先复用空闲连接，无可用连接则触发拨号新建。
+func (c *Client) GetOrDialSession(ctx context.Context) (Session, error) {
+	if !c.disableReuse {
+		if idle := c.takeIdleSession(); idle != nil {
+			return idle, nil
+		}
+	}
+	return c.createSession(ctx)
+}
+
 func (c *Client) createSession(ctx context.Context) (*session, error) {
 	c.access.Lock()
 	closed := c.closed
@@ -209,6 +222,11 @@ func (c *Client) createSession(ctx context.Context) (*session, error) {
 	}
 	conn.SetWriteDeadline(time.Time{})
 	created := newClientSession(c, conn)
+	if c.frameHandler != nil {
+		created.SetFrameHandler(func(_ *session, cmd byte, packet []byte) {
+			c.frameHandler(cmd, packet)
+		})
+	}
 	c.access.Lock()
 	if c.closed {
 		c.access.Unlock()

@@ -32,17 +32,21 @@ type ServiceOptions struct {
 	Handler               N.TCPConnectionHandlerEx
 	FallbackHandler       N.TCPConnectionHandlerEx
 	Logger                logger.ContextLogger
+	FrameHandler          func(session Session, cmd byte, packet []byte)
+	SessionCloseHandler   func(session Session)
 }
 
 type Service struct {
-	password        [passwordLen]byte
-	padding         common.TypedValue[*paddingFactory]
-	paddingLimit    int
-	handler         N.TCPConnectionHandlerEx
-	fallbackHandler N.TCPConnectionHandlerEx
-	logger          logger.ContextLogger
-	closeOnce       sync.Once
-	closeChan       chan struct{}
+	password            [passwordLen]byte
+	padding             common.TypedValue[*paddingFactory]
+	paddingLimit        int
+	handler             N.TCPConnectionHandlerEx
+	fallbackHandler     N.TCPConnectionHandlerEx
+	logger              logger.ContextLogger
+	frameHandler        func(session Session, cmd byte, packet []byte)
+	sessionCloseHandler func(session Session)
+	closeOnce           sync.Once
+	closeChan           chan struct{}
 }
 
 func newService(options ServiceOptions) (*Service, error) {
@@ -58,12 +62,15 @@ func newService(options ServiceOptions) (*Service, error) {
 	if paddingLimit <= 0 {
 		paddingLimit = defaultPaddingLimit
 	}
+
 	service := &Service{
-		paddingLimit:    paddingLimit,
-		handler:         options.Handler,
-		fallbackHandler: options.FallbackHandler,
-		logger:          options.Logger,
-		closeChan:       make(chan struct{}),
+		paddingLimit:        paddingLimit,
+		handler:             options.Handler,
+		fallbackHandler:     options.FallbackHandler,
+		logger:              options.Logger,
+		frameHandler:        options.FrameHandler,
+		sessionCloseHandler: options.SessionCloseHandler,
+		closeChan:           make(chan struct{}),
 	}
 	if service.logger == nil {
 		service.logger = logger.NOP()
@@ -216,8 +223,20 @@ func (s *Service) serve(ctx context.Context, conn net.Conn, source M.Socksaddr, 
 		}
 	}
 	serving := newServerSession(ctx, s, conn, source)
+	defer func() {
+		serving.Close()
+		if s.sessionCloseHandler != nil {
+			s.sessionCloseHandler(serving)
+		}
+	}()
+
+	if s.frameHandler != nil {
+		serving.SetFrameHandler(func(_ *session, cmd byte, packet []byte) {
+			s.frameHandler(serving, cmd, packet)
+		})
+	}
+
 	err = serving.readLoop()
-	serving.Close()
 	if E.IsClosedOrCanceled(err) {
 		err = nil
 	} else {

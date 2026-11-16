@@ -9,6 +9,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	anyx "github.com/sagernet/sing-box/common/anyx"
+	"github.com/sagernet/sing-box/common/anyx/pseudovpn"
 	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing-box/common/tls"
 	"github.com/sagernet/sing-box/common/uot"
@@ -53,13 +54,37 @@ type Inbound struct {
 	service                  *anyx.MultiService[string]
 	fallbackAddr             M.Socksaddr
 	fallbackAddrTLSNextProto map[string]M.Socksaddr
+	pseudoVPNEngine          *pseudovpn.ServerEngine
 }
 
 func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.AnyXInboundOptions) (adapter.Inbound, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
 	inbound := &Inbound{
 		Adapter: inbound.NewAdapter(C.TypeAnyX, tag),
 		router:  uot.NewRouter(router, logger),
 		logger:  logger,
+	}
+
+	var pseudoVPNEngine *pseudovpn.ServerEngine
+	if options.PseudoVPN != nil && options.PseudoVPN.Enabled {
+		engine, err := pseudovpn.NewServerEngine(pseudovpn.ServerEngineOptions{
+			Context:        ctx,
+			Address:        options.PseudoVPN.Address,
+			InterfaceName:  options.PseudoVPN.InterfaceName,
+			MTU:            options.PseudoVPN.MTU,
+			LeaseDuration:  options.PseudoVPN.LeaseDuration.Build(),
+			TCPMSSClamping: options.PseudoVPN.TCPMSSClamping,
+			UserOf:         pseudoVPNSessionUser,
+			Logger:         logger,
+		})
+		if err != nil {
+			return nil, err
+		}
+		pseudoVPNEngine = engine
+		inbound.pseudoVPNEngine = engine
 	}
 
 	if options.TLS != nil && options.TLS.Enabled {
@@ -114,6 +139,22 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		fallbackHandler = adapter.NewUpstreamContextHandler(inbound.fallbackConnection, nil)
 	}
 
+	var frameHandler func(session anyx.Session, cmd byte, packet []byte)
+	var sessionCloseHandler func(session anyx.Session)
+	if pseudoVPNEngine != nil {
+		frameHandler = func(session anyx.Session, cmd byte, packet []byte) {
+			if cmd == pseudovpn.FrameCommandPseudoVPN {
+				// 写 TUN 失败是逐包的（如对端网卡缓冲满），按 Debug 记录以免刷屏。
+				if err := pseudoVPNEngine.HandleUplink(session, packet); err != nil {
+					logger.Debug("anyx inbound: pseudovpn handle uplink: ", err)
+				}
+			}
+		}
+		sessionCloseHandler = func(session anyx.Session) {
+			pseudoVPNEngine.UnregisterSession(session)
+		}
+	}
+
 	service, err := anyx.NewMultiService[string](anyx.ServiceOptions{
 		PaddingScheme:         paddingScheme,
 		PaddingSchemeInterval: options.PaddingSchemeInterval.Build(),
@@ -121,6 +162,8 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		Handler:               (*inboundHandler)(inbound),
 		FallbackHandler:       fallbackHandler,
 		Logger:                logger,
+		FrameHandler:          frameHandler,
+		SessionCloseHandler:   sessionCloseHandler,
 	})
 	if err != nil {
 		return nil, err
@@ -146,6 +189,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 func (h *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
 	if stage != adapter.StartStateStart {
 		return nil
+	}
+	if h.pseudoVPNEngine != nil {
+		// 先登记关闭，Start 失败时已创建的 TUN 网卡与协程也会随作用域回收。
+		scope.Add(h.pseudoVPNEngine.Close)
+		if err := h.pseudoVPNEngine.Start(); err != nil {
+			return E.Cause(err, "start pseudovpn server engine")
+		}
 	}
 	if h.tlsConfig != nil {
 		err := h.tlsConfig.Start()
@@ -302,4 +352,14 @@ func (h *inboundTransportHandler) NewConnectionEx(ctx context.Context, conn net.
 	h.logger.InfoContext(ctx, "inbound connection from ", metadata.Source)
 	ctx = adapter.WithContext(ctx, &metadata)
 	(*Inbound)(h).dispatchStream(ctx, conn, metadata, onClose)
+}
+
+// pseudoVPNSessionUser 取出 AnyX 服务端会话认证出的用户名，供伪 VPN 按用户做粘性地址分配。
+func pseudoVPNSessionUser(session pseudovpn.Session) string {
+	contextSession, hasContext := session.(interface{ Context() context.Context })
+	if !hasContext {
+		return ""
+	}
+	user, _ := auth.UserFromContext[string](contextSession.Context())
+	return user
 }

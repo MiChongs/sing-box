@@ -440,4 +440,37 @@ func overrideAnyXOptions(options *option.AnyXOutboundOptions, overrideOptions *o
 	if overrideOptions.IdleSessionMinTimeout != nil {
 		options.IdleSessionMinTimeout = *overrideOptions.IdleSessionMinTimeout
 	}
+	if overrideOptions.PseudoVPN != nil {
+		options.PseudoVPN = overridePseudoVPNOption(options.PseudoVPN, overrideOptions.PseudoVPN)
+	}
+}
+
+// overridePseudoVPNOption never mutates the node's own options: subscription
+// options are compared against the previous round to decide what to rebuild.
+func overridePseudoVPNOption(options *option.AnyXPseudoVPNOutboundOptions, overrideOptions *option.OverridePseudoVPNOptions) *option.AnyXPseudoVPNOutboundOptions {
+	if overrideOptions == nil {
+		return options
+	}
+	if options == nil {
+		if overrideOptions.Enabled == nil || !*overrideOptions.Enabled {
+			return nil
+		}
+		options = &option.AnyXPseudoVPNOutboundOptions{}
+	} else {
+		optionsCopy := *options
+		options = &optionsCopy
+	}
+	if overrideOptions.Enabled != nil {
+		options.Enabled = *overrideOptions.Enabled
+	}
+	if overrideOptions.MTU != nil {
+		options.MTU = *overrideOptions.MTU
+	}
+	if overrideOptions.TCPMSSClamping != nil {
+		options.TCPMSSClamping = overrideOptions.TCPMSSClamping
+	}
+	if overrideOptions.UDP != nil {
+		options.UDP = *overrideOptions.UDP
+	}
+	return options
 }

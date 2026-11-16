@@ -174,6 +174,16 @@ type OverrideAnyTLSOptions struct {
 	MinIdleSession        *int                        `json:"min_idle_session,omitempty"`
 	IdleSessionTimeout    *badoption.Duration         `json:"idle_session_timeout,omitempty"`
 	IdleSessionMinTimeout *badoption.Duration         `json:"idle_session_min_timeout,omitempty"`
+	PseudoVPN             *OverridePseudoVPNOptions   `json:"pseudo_vpn,omitempty"`
+}
+
+// OverridePseudoVPNOptions overrides the pseudo VPN options of AnyX nodes,
+// including anytls nodes converted with use_anyx.
+type OverridePseudoVPNOptions struct {
+	Enabled        *bool   `json:"enabled,omitempty"`
+	MTU            *uint32 `json:"mtu,omitempty"`
+	TCPMSSClamping *bool   `json:"tcp_mss_clamping,omitempty"`
+	UDP            *string `json:"udp,omitempty"`
 }
 
 type OverrideDialerOptions struct {
