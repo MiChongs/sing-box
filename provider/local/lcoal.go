@@ -120,7 +120,7 @@ func NewProviderLocal(ctx context.Context, router adapter.Router, logFactory log
 	provider.watcher = watcher
 	// last: a registered provider DNS server must not outlive a failed
 	// constructor
-	overrideDialer, err := provider.EnableProviderDNS(options.OverrideDialer)
+	overrideDialer, err := provider.EnableProviderDNS(options.OverrideDialer, parser.DNSDialerOptions(options.OverrideDialer))
 	if err != nil {
 		_ = watcher.Close()
 		return nil, err

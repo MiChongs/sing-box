@@ -3,10 +3,12 @@ package route
 import (
 	"context"
 	"slices"
+	"strings"
 	"sync/atomic"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/urltest"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/clashmode"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
@@ -246,6 +248,8 @@ func (m *ReferenceManager) update() {
 		}
 	}
 
+	referenceProviderTransports(transportManager, referencedOutbounds, referencedTransports)
+
 	devicePaused := m.devicePaused.Load()
 	keepIdle := make(map[any]bool)
 	for _, outbound := range outboundManager.Outbounds() {
@@ -376,4 +380,37 @@ func enabledRuleOptions[O any, R adapter.Rule](options []O, runtime []R) []O {
 		return options
 	}
 	return enabled
+}
+
+// referenceProviderTransports marks provider DNS servers referenced. They are
+// named by the domain_resolver of their provider's nodes, which no
+// configuration reference covers: they are in use while any of those nodes
+// is, together with their fallback.
+func referenceProviderTransports(transportManager adapter.DNSTransportManager, referencedOutbounds map[string]bool, referencedTransports map[string]bool) {
+	var queue []string
+	for _, transport := range transportManager.Transports() {
+		if transport.Type() != C.DNSTypeProvider {
+			continue
+		}
+		nodePrefix := strings.TrimSuffix(transport.Tag(), "-dns") + "/"
+		for outboundTag, referenced := range referencedOutbounds {
+			if referenced && strings.HasPrefix(outboundTag, nodePrefix) {
+				queue = append(queue, transport.Tag())
+				break
+			}
+		}
+	}
+	for len(queue) > 0 {
+		tag := queue[0]
+		queue = queue[1:]
+		if tag == "" || referencedTransports[tag] {
+			continue
+		}
+		transport, loaded := transportManager.Transport(tag)
+		if !loaded {
+			continue
+		}
+		referencedTransports[tag] = true
+		queue = append(queue, transport.Dependencies()...)
+	}
 }

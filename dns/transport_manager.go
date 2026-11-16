@@ -33,6 +33,9 @@ type TransportManager struct {
 	// (outbound provider DNS) are started through it as runtime transports.
 	scope   *adapter.Scope
 	runtime map[adapter.DNSTransport]struct{}
+	// added holds the transports registered through AddTransport, the only
+	// ones Remove may drop.
+	added map[adapter.DNSTransport]struct{}
 }
 
 func NewTransportManager(registry adapter.DNSTransportRegistry, outbound adapter.OutboundManager, defaultTag string) *TransportManager {
@@ -42,6 +45,7 @@ func NewTransportManager(registry adapter.DNSTransportRegistry, outbound adapter
 		defaultTag:     defaultTag,
 		transportByTag: make(map[string]adapter.DNSTransport),
 		runtime:        make(map[adapter.DNSTransport]struct{}),
+		added:          make(map[adapter.DNSTransport]struct{}),
 	}
 }
 
@@ -229,6 +233,7 @@ func (m *TransportManager) AddTransport(transport adapter.DNSTransport) error {
 	}
 	m.transports = append(m.transports, transport)
 	m.transportByTag[tag] = transport
+	m.added[transport] = struct{}{}
 	if scope != nil {
 		m.runtime[transport] = struct{}{}
 	}
@@ -245,10 +250,11 @@ func (m *TransportManager) Remove(tag string) error {
 		m.access.Unlock()
 		return os.ErrInvalid
 	}
-	if transport == m.defaultTransport || transport == m.fakeIPTransport {
+	if _, isAdded := m.added[transport]; !isAdded {
 		m.access.Unlock()
-		return E.New("cannot remove the default or fakeip DNS server: ", tag)
+		return E.New("cannot remove configured DNS server: ", tag)
 	}
+	delete(m.added, transport)
 	delete(m.transportByTag, tag)
 	m.transports = common.Filter(m.transports, func(it adapter.DNSTransport) bool {
 		return it != transport

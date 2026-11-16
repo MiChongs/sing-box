@@ -3,6 +3,8 @@ package route
 import (
 	"testing"
 
+	"github.com/sagernet/sing-box/adapter"
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 
 	"github.com/stretchr/testify/require"
@@ -86,4 +88,42 @@ func TestAppendDomainResolverIncludesBridgeResolver(t *testing.T) {
 	require.Equal(t, []string{"bridge-dns"}, appendDomainResolver(nil, options))
 	options.DomainResolver = nil
 	require.Empty(t, appendDomainResolver(nil, options))
+}
+
+type referenceTestTransport struct {
+	adapter.DNSTransport
+	tag          string
+	transport    string
+	dependencies []string
+}
+
+func (t *referenceTestTransport) Tag() string            { return t.tag }
+func (t *referenceTestTransport) Type() string           { return t.transport }
+func (t *referenceTestTransport) Dependencies() []string { return t.dependencies }
+
+type referenceTestTransportManager struct {
+	adapter.DNSTransportManager
+	transports []adapter.DNSTransport
+}
+
+func (m *referenceTestTransportManager) Transports() []adapter.DNSTransport { return m.transports }
+
+func (m *referenceTestTransportManager) Transport(tag string) (adapter.DNSTransport, bool) {
+	for _, transport := range m.transports {
+		if transport.Tag() == tag {
+			return transport, true
+		}
+	}
+	return nil, false
+}
+
+func TestReferenceProviderTransports(t *testing.T) {
+	manager := &referenceTestTransportManager{transports: []adapter.DNSTransport{
+		&referenceTestTransport{tag: "bootstrap", transport: C.DNSTypeUDP},
+		&referenceTestTransport{tag: "sub-dns", transport: C.DNSTypeProvider, dependencies: []string{"bootstrap"}},
+		&referenceTestTransport{tag: "idle-dns", transport: C.DNSTypeProvider},
+	}}
+	referenced := make(map[string]bool)
+	referenceProviderTransports(manager, map[string]bool{"sub/node-1": true, "selector": true}, referenced)
+	require.Equal(t, map[string]bool{"sub-dns": true, "bootstrap": true}, referenced)
 }

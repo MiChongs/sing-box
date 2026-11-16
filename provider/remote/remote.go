@@ -166,7 +166,7 @@ func NewProviderRemote(ctx context.Context, router adapter.Router, logFactory lo
 		//nolint:staticcheck
 		downloadDetour: options.DownloadDetour,
 	}
-	overrideDialer, err := remote.EnableProviderDNS(options.OverrideDialer)
+	overrideDialer, err := remote.EnableProviderDNS(options.OverrideDialer, parser.DNSDialerOptions(options.OverrideDialer))
 	if err != nil {
 		cancel()
 		return nil, err

@@ -54,11 +54,17 @@ When enabled, the provider registers a DNS server named `<provider tag>-dns` (ty
 * Clash: `dns.proxy-server-nameserver`, else `dns.nameserver`; nothing when `dns.enable` is `false`. The mihomo syntax is supported: plain IP (UDP), `udp://`, `tcp://`, `tls://`, `quic://`, `https://`, `h3://`, and the `#h3=true` / `#skip-cert-verify=true` params. `system`, `dhcp://` and `rcode://` are ignored, and so is a proxy or interface name after `#`: subscription DNS always dials directly.
 * sing-box: the server selected by `route.default_domain_resolver`, else `dns.final`, else the first server; a `group` expands to its members.
 
-Only `udp`, `tcp`, `tls`, `quic`, `https` and `h3` servers are kept and duplicates are merged; a server that fails to parse is skipped without failing the node import. Subscription DNS servers always dial directly (a `detour` in the subscription is dropped). Several servers are queried concurrently and the fastest NOERROR / NXDOMAIN answer wins.
+Only `udp`, `tcp`, `tls`, `quic`, `https` and `h3` servers are kept and duplicates are merged; a server that fails to parse is skipped without failing the node import. Several servers are queried concurrently and the fastest NOERROR / NXDOMAIN answer wins.
+
+Subscription DNS servers never take the `detour` (resolving node addresses through a node loops) and dial with the other `override_dialer` fields (`bind_interface`, `routing_mark`, `inet4_bind_address`, `network_strategy`, ...); dial fields and TLS file paths (`certificate_path`, ...) the subscription sets for its DNS servers are ignored.
+
+The subscription DNS uses at most half of a query's timeout, leaving the rest to the fallback; after none of the subscription DNS servers answered, the fallback answers alone for 30 seconds.
 
 Updating the subscription only swaps the DNS servers: nodes are not recreated for it, and an unchanged list keeps its connections. Remote providers cache the DNS servers together with the nodes.
 
-When the subscription carries no usable server, or all of them fail, queries fall back to `resolver`.
+When the subscription carries no usable server, or all of them fail, queries fall back to `resolver`. Provider DNS servers of several providers falling back to each other fail the query instead of looping.
+
+After disabling this option, cached nodes naming `<provider tag>-dns` or another DNS server that no longer exists use `override_dialer.domain_resolver` (or the default resolution when unset).
 
 ##### enabled
 

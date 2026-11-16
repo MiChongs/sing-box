@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -112,7 +113,7 @@ func newTestProviderDNS(t *testing.T, fallback *fakeDNSTransport) (*providerDNS,
 	registry := &fakeDNSRegistry{}
 	ctx := service.ContextWith[adapter.DNSTransportManager](context.Background(), manager)
 	ctx = service.ContextWith[adapter.DNSTransportRegistry](ctx, registry)
-	transport, err := newProviderDNS(ctx, log.NewNOPFactory(), "sub", &option.ProviderDomainResolverOptions{}, nil)
+	transport, err := newProviderDNS(ctx, log.NewNOPFactory(), "sub", &option.ProviderDomainResolverOptions{}, nil, option.DialerOptions{})
 	require.NoError(t, err)
 	scope := adapter.NewScope(ctx, log.NewNOPFactory().Logger())
 	for _, stage := range adapter.ListStartStages {
@@ -216,7 +217,7 @@ func TestProviderDNSPendingBeforeStart(t *testing.T) {
 	registry := &fakeDNSRegistry{}
 	ctx := service.ContextWith[adapter.DNSTransportManager](context.Background(), manager)
 	ctx = service.ContextWith[adapter.DNSTransportRegistry](ctx, registry)
-	transport, err := newProviderDNS(ctx, log.NewNOPFactory(), "sub", &option.ProviderDomainResolverOptions{}, nil)
+	transport, err := newProviderDNS(ctx, log.NewNOPFactory(), "sub", &option.ProviderDomainResolverOptions{}, nil, option.DialerOptions{})
 	require.NoError(t, err)
 	transport.Update([]option.DNSServerOptions{udpServer("ok.example")})
 	require.Empty(t, registry.created, "members wait for the transport to start")
@@ -233,10 +234,10 @@ func TestProviderDNSResolverValidation(t *testing.T) {
 	manager := &fakeDNSManager{transports: map[string]adapter.DNSTransport{}}
 	ctx := service.ContextWith[adapter.DNSTransportManager](context.Background(), manager)
 	ctx = service.ContextWith[adapter.DNSTransportRegistry](ctx, &fakeDNSRegistry{})
-	_, err := newProviderDNS(ctx, log.NewNOPFactory(), "sub", &option.ProviderDomainResolverOptions{Resolver: "sub-dns"}, nil)
+	_, err := newProviderDNS(ctx, log.NewNOPFactory(), "sub", &option.ProviderDomainResolverOptions{Resolver: "sub-dns"}, nil, option.DialerOptions{})
 	require.Error(t, err)
 
-	transport, err := newProviderDNS(ctx, log.NewNOPFactory(), "sub", &option.ProviderDomainResolverOptions{Resolver: "missing"}, nil)
+	transport, err := newProviderDNS(ctx, log.NewNOPFactory(), "sub", &option.ProviderDomainResolverOptions{Resolver: "missing"}, nil, option.DialerOptions{})
 	require.NoError(t, err)
 	require.Equal(t, []string{"missing"}, transport.Dependencies())
 	scope := adapter.NewScope(ctx, log.NewNOPFactory().Logger())
@@ -244,30 +245,117 @@ func TestProviderDNSResolverValidation(t *testing.T) {
 	require.Error(t, transport.Start(adapter.StartStateStart, scope))
 
 	// override_dialer.domain_resolver becomes the fallback
-	transport, err = newProviderDNS(ctx, log.NewNOPFactory(), "sub", &option.ProviderDomainResolverOptions{}, &option.DomainResolveOptions{Server: "bootstrap"})
+	transport, err = newProviderDNS(ctx, log.NewNOPFactory(), "sub", &option.ProviderDomainResolverOptions{}, &option.DomainResolveOptions{Server: "bootstrap"}, option.DialerOptions{})
 	require.NoError(t, err)
 	require.Equal(t, "bootstrap", transport.fallbackTag())
 }
 
-func TestStripProviderDNS(t *testing.T) {
-	t.Parallel()
-	a := &Adapter{ctx: context.Background(), providerTag: "sub"}
-	outbounds := []option.Outbound{
-		{Type: C.TypeSOCKS, Tag: "a", Options: &option.SOCKSOutboundOptions{DialerOptions: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{DomainResolver: &option.DomainResolveOptions{Server: "sub-dns"}}}}},
-		{Type: C.TypeSOCKS, Tag: "b", Options: &option.SOCKSOutboundOptions{DialerOptions: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{DomainResolver: &option.DomainResolveOptions{Server: "other"}}}}},
-	}
-	a.stripProviderDNS(outbounds, nil)
-	require.Nil(t, outbounds[0].Options.(*option.SOCKSOutboundOptions).DomainResolver)
-	require.Equal(t, "other", outbounds[1].Options.(*option.SOCKSOutboundOptions).DomainResolver.Server)
+func socksWithResolver(tag string, server string) option.Outbound {
+	return option.Outbound{Type: C.TypeSOCKS, Tag: tag, Options: &option.SOCKSOutboundOptions{DialerOptions: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{DomainResolver: &option.DomainResolveOptions{Server: server}}}}}
 }
 
-func TestStripProviderDNSKeepsConfiguredServer(t *testing.T) {
+func resolverOf(outbound option.Outbound) *option.DomainResolveOptions {
+	return outbound.Options.(*option.SOCKSOutboundOptions).DomainResolver
+}
+
+func TestRepairDomainResolvers(t *testing.T) {
 	t.Parallel()
-	manager := &fakeDNSManager{transports: map[string]adapter.DNSTransport{"sub-dns": &fakeDNSTransport{tag: "sub-dns"}}}
-	a := &Adapter{ctx: service.ContextWith[adapter.DNSTransportManager](context.Background(), manager), providerTag: "sub"}
-	outbounds := []option.Outbound{
-		{Type: C.TypeSOCKS, Tag: "a", Options: &option.SOCKSOutboundOptions{DialerOptions: option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{DomainResolver: &option.DomainResolveOptions{Server: "sub-dns"}}}}},
-	}
-	a.stripProviderDNS(outbounds, nil)
-	require.NotNil(t, outbounds[0].Options.(*option.SOCKSOutboundOptions).DomainResolver, "a configured server named like the provider DNS is kept")
+	manager := &fakeDNSManager{transports: map[string]adapter.DNSTransport{"configured": &fakeDNSTransport{tag: "configured"}, "sub-dns": &fakeDNSTransport{tag: "sub-dns"}}}
+	ctx := service.ContextWith[adapter.DNSTransportManager](context.Background(), manager)
+
+	// provider_domain_resolver disabled, override_dialer.domain_resolver set:
+	// a cached reference to the old provider DNS (or another provider tag)
+	// is restored to the configured resolver
+	a := &Adapter{ctx: ctx, providerTag: "renamed", logger: log.NewNOPFactory().Logger()}
+	_, err := a.EnableProviderDNS(&option.OverrideDialerOptions{DomainResolver: &option.DomainResolveOptions{Server: "configured", Strategy: option.DomainStrategy(C.DomainStrategyIPv4Only)}}, option.DialerOptions{})
+	require.NoError(t, err)
+	outbounds := []option.Outbound{socksWithResolver("a", "old-dns"), socksWithResolver("b", "configured"), socksWithResolver("c", "sub-dns")}
+	a.repairDomainResolvers(outbounds, nil)
+	require.Equal(t, "configured", resolverOf(outbounds[0]).Server)
+	require.Equal(t, option.DomainStrategy(C.DomainStrategyIPv4Only), resolverOf(outbounds[0]).Strategy)
+	require.Equal(t, "configured", resolverOf(outbounds[1]).Server)
+	require.Equal(t, "sub-dns", resolverOf(outbounds[2]).Server, "existing servers are kept, whatever their name")
+
+	// no override resolver: the dangling reference is dropped
+	a = &Adapter{ctx: ctx, providerTag: "sub", logger: log.NewNOPFactory().Logger()}
+	_, err = a.EnableProviderDNS(nil, option.DialerOptions{})
+	require.NoError(t, err)
+	outbounds = []option.Outbound{socksWithResolver("a", "missing")}
+	a.repairDomainResolvers(outbounds, nil)
+	require.Nil(t, resolverOf(outbounds[0]))
+
+	// inline providers keep their configuration untouched
+	a = &Adapter{ctx: ctx, providerTag: "inline"}
+	outbounds = []option.Outbound{socksWithResolver("a", "missing")}
+	a.repairDomainResolvers(outbounds, nil)
+	require.Equal(t, "missing", resolverOf(outbounds[0]).Server)
+}
+
+// blockingDNSTransport never answers before the context ends.
+type blockingDNSTransport struct {
+	fakeDNSTransport
+}
+
+func (t *blockingDNSTransport) Exchange(ctx context.Context, _ *mDNS.Msg) (*mDNS.Msg, error) {
+	t.queries.Add(1)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestProviderDNSTimeoutFallsBack(t *testing.T) {
+	t.Parallel()
+	fallback := &fakeDNSTransport{tag: "default", dnsType: C.DNSTypeUDP}
+	transport, _, _ := newTestProviderDNS(t, fallback)
+	blocked := &blockingDNSTransport{fakeDNSTransport{tag: "blocked"}}
+	members := []providerDNSMember{{transport: blocked, name: "blocked"}}
+	transport.members.Store(&members)
+
+	message := new(mDNS.Msg)
+	message.SetQuestion("node.example.", mDNS.TypeA)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	response, err := transport.Exchange(ctx, message)
+	require.NoError(t, err, "a blocked subscription DNS leaves the fallback time to answer")
+	require.Equal(t, mDNS.RcodeSuccess, response.Rcode)
+	require.EqualValues(t, 1, fallback.queries.Load())
+
+	// the blocked members rest: the next query goes to the fallback directly
+	response, err = transport.Exchange(context.Background(), message)
+	require.NoError(t, err)
+	require.Equal(t, mDNS.RcodeSuccess, response.Rcode)
+	require.EqualValues(t, 1, blocked.queries.Load())
+	require.EqualValues(t, 2, fallback.queries.Load())
+}
+
+func TestProviderDNSFallbackLoop(t *testing.T) {
+	t.Parallel()
+	manager := &fakeDNSManager{transports: map[string]adapter.DNSTransport{}}
+	ctx := service.ContextWith[adapter.DNSTransportManager](context.Background(), manager)
+	ctx = service.ContextWith[adapter.DNSTransportRegistry](ctx, &fakeDNSRegistry{})
+	a, err := newProviderDNS(ctx, log.NewNOPFactory(), "a", &option.ProviderDomainResolverOptions{Resolver: "b-dns"}, nil, option.DialerOptions{})
+	require.NoError(t, err)
+	b, err := newProviderDNS(ctx, log.NewNOPFactory(), "b", &option.ProviderDomainResolverOptions{Resolver: "a-dns"}, nil, option.DialerOptions{})
+	require.NoError(t, err)
+	manager.transports["a-dns"] = a
+	manager.transports["b-dns"] = b
+	message := new(mDNS.Msg)
+	message.SetQuestion("node.example.", mDNS.TypeA)
+	_, err = a.Exchange(context.Background(), message)
+	require.ErrorContains(t, err, "loop", "mutual fallback fails instead of overflowing the stack")
+}
+
+func TestProviderDNSEnvironmentAndDialer(t *testing.T) {
+	t.Parallel()
+	fallback := &fakeDNSTransport{tag: "default", dnsType: C.DNSTypeUDP}
+	transport, registry, _ := newTestProviderDNS(t, fallback)
+	transport.memberDialer = option.DialerOptions{AbstractDialerOptions: option.AbstractDialerOptions{BindInterface: "wan0"}}
+	before := transport.Environment()
+	server := udpServer("ok.example")
+	server.Options.(*option.RemoteDNSServerOptions).BindInterface = "subscription-chosen"
+	transport.Update([]option.DNSServerOptions{server})
+	require.NotEqual(t, before, transport.Environment(), "new members invalidate cached answers")
+	created := registry.options[0].(*option.RemoteDNSServerOptions)
+	require.Equal(t, "wan0", created.BindInterface, "members dial with override_dialer, not the subscription")
+	require.Empty(t, created.Detour)
+	require.True(t, registry.created[0].keepIdle.Load(), "members keep idle connections by default")
 }

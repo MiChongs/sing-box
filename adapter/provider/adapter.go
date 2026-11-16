@@ -51,6 +51,12 @@ type Adapter struct {
 
 	// dns answers for the nodes when provider_domain_resolver is enabled.
 	dns *providerDNS
+	// subscription is set for local / remote providers: their nodes come
+	// from subscription content or its cache, whose resolvers may name DNS
+	// servers this box does not have.
+	subscription bool
+	// nodeResolver is the domain_resolver override_dialer gives the nodes.
+	nodeResolver *option.DomainResolveOptions
 }
 
 // udpHealthCheck probes the real UDP support of the provider nodes on every
@@ -185,7 +191,7 @@ func (a *Adapter) resolveOutboundTags(newOpts []option.Outbound) []string {
 }
 
 func (a *Adapter) UpdateOutbounds(oldOpts []option.Outbound, newOpts []option.Outbound) {
-	a.stripProviderDNS(newOpts, nil)
+	a.repairDomainResolvers(newOpts, nil)
 	newTags := a.resolveOutboundTags(newOpts)
 	var (
 		oldOptByTag    = make(map[string]option.Outbound)
@@ -452,7 +458,7 @@ func (a *Adapter) resolveEndpointTags(newOpts []option.Endpoint) []string {
 }
 
 func (a *Adapter) UpdateEndpoints(oldOpts []option.Endpoint, newOpts []option.Endpoint) {
-	a.stripProviderDNS(nil, newOpts)
+	a.repairDomainResolvers(nil, newOpts)
 	newTags := a.resolveEndpointTags(newOpts)
 	var (
 		oldOptByTag = make(map[string]option.Endpoint)
@@ -564,15 +570,22 @@ func (a *Adapter) removeEndpoint(tag string) error {
 	return remover.Remove(tag)
 }
 
-// EnableProviderDNS registers the provider DNS server when
-// provider_domain_resolver is enabled, and returns the dialer overrides that
-// point the nodes at it. Call it from the provider constructor.
-func (a *Adapter) EnableProviderDNS(overrideDialer *option.OverrideDialerOptions) (*option.OverrideDialerOptions, error) {
-	if overrideDialer == nil || !overrideDialer.ProviderDomainResolver.IsEnabled() {
+// EnableProviderDNS prepares the dialer overrides of a subscription
+// provider: when provider_domain_resolver is enabled it registers the
+// provider DNS server and points the nodes at it. memberDialer carries the
+// override_dialer dial fields the subscription DNS servers dial with. Call it
+// from the provider constructor, last.
+func (a *Adapter) EnableProviderDNS(overrideDialer *option.OverrideDialerOptions, memberDialer option.DialerOptions) (*option.OverrideDialerOptions, error) {
+	a.subscription = true
+	if overrideDialer == nil {
+		return nil, nil
+	}
+	a.nodeResolver = overrideDialer.DomainResolver
+	if !overrideDialer.ProviderDomainResolver.IsEnabled() {
 		return overrideDialer, nil
 	}
 	options := overrideDialer.ProviderDomainResolver
-	transport, err := newProviderDNS(a.ctx, a.logFactory, a.providerTag, options, overrideDialer.DomainResolver)
+	transport, err := newProviderDNS(a.ctx, a.logFactory, a.providerTag, options, overrideDialer.DomainResolver, memberDialer)
 	if err != nil {
 		return nil, err
 	}
@@ -596,6 +609,7 @@ func (a *Adapter) EnableProviderDNS(overrideDialer *option.OverrideDialerOptions
 		domainResolver.Strategy = options.OutboundStrategy
 	}
 	effective.DomainResolver = &domainResolver
+	a.nodeResolver = &domainResolver
 	return &effective, nil
 }
 
@@ -626,35 +640,46 @@ func (a *Adapter) closeProviderDNS() {
 	}
 }
 
-// stripProviderDNS drops resolvers pointing at this provider's DNS server
-// while provider_domain_resolver is disabled: a cache written with it enabled
-// still carries them, and the server no longer exists. A configured server
-// that happens to have the same tag is left alone.
-func (a *Adapter) stripProviderDNS(outbounds []option.Outbound, endpoints []option.Endpoint) {
-	if a.dns != nil {
+// repairDomainResolvers points node resolvers naming a DNS server this box
+// does not have at the current override_dialer resolver (or drops them).
+// Such resolvers come from a cache written while provider_domain_resolver
+// was enabled, a cache written under another provider tag sharing the same
+// path, or a sing-box subscription naming its own DNS servers; the node would
+// otherwise fail to be created.
+func (a *Adapter) repairDomainResolvers(outbounds []option.Outbound, endpoints []option.Endpoint) {
+	if !a.subscription {
 		return
 	}
-	tag := ProviderDNSTag(a.providerTag)
-	if manager := service.FromContext[adapter.DNSTransportManager](a.ctx); manager != nil {
-		if _, configured := manager.Transport(tag); configured {
-			return
-		}
+	manager := service.FromContext[adapter.DNSTransportManager](a.ctx)
+	if manager == nil {
+		return
 	}
-	strip := func(options any) {
+	repair := func(tag string, options any) {
 		wrapper, isWrapper := options.(option.DialerOptionsWrapper)
 		if !isWrapper {
 			return
 		}
 		dialerOptions := wrapper.TakeDialerOptions()
-		if dialerOptions.DomainResolver != nil && dialerOptions.DomainResolver.Server == tag {
-			dialerOptions.DomainResolver = nil
-			wrapper.ReplaceDialerOptions(dialerOptions)
+		if dialerOptions.DomainResolver == nil || dialerOptions.DomainResolver.Server == "" {
+			return
 		}
+		if _, loaded := manager.Transport(dialerOptions.DomainResolver.Server); loaded {
+			return
+		}
+		missing := dialerOptions.DomainResolver.Server
+		if a.nodeResolver != nil && a.nodeResolver.Server != "" {
+			resolver := *a.nodeResolver
+			dialerOptions.DomainResolver = &resolver
+		} else {
+			dialerOptions.DomainResolver = nil
+		}
+		wrapper.ReplaceDialerOptions(dialerOptions)
+		a.logger.Debug("node ", tag, ": DNS server ", missing, " not found, use the provider resolver")
 	}
 	for _, outbound := range outbounds {
-		strip(outbound.Options)
+		repair(outbound.Tag, outbound.Options)
 	}
 	for _, endpoint := range endpoints {
-		strip(endpoint.Options)
+		repair(endpoint.Tag, endpoint.Options)
 	}
 }

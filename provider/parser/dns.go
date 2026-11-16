@@ -3,6 +3,7 @@ package parser
 import (
 	"context"
 	"net"
+	"net/netip"
 	"net/url"
 	"reflect"
 	"strconv"
@@ -233,6 +234,11 @@ func ParseClashNameserver(raw string) (option.DNSServerOptions, bool) {
 		switch strings.ToLower(raw) {
 		case "system", "dhcp":
 			return option.DNSServerOptions{}, false
+		}
+		if address, err := netip.ParseAddr(raw); err == nil && address.Is6() {
+			// mihomo accepts a bare IPv6 address; url.Parse would take its
+			// last group for a port
+			raw = "[" + raw + "]"
 		}
 		raw = "udp://" + raw
 	}

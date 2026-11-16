@@ -40,6 +40,8 @@ func TestParseClashNameserver(t *testing.T) {
 	}{
 		{raw: "223.5.5.5", ok: true, expect: expect{dnsType: C.DNSTypeUDP, server: "223.5.5.5", port: 53}},
 		{raw: "223.5.5.5:5353", ok: true, expect: expect{dnsType: C.DNSTypeUDP, server: "223.5.5.5", port: 5353}},
+		{raw: "2400:3200::1", ok: true, expect: expect{dnsType: C.DNSTypeUDP, server: "2400:3200::1", port: 53}},
+		{raw: "2001:4860:4860::8888", ok: true, expect: expect{dnsType: C.DNSTypeUDP, server: "2001:4860:4860::8888", port: 53}},
 		{raw: "[2400:3200::1]:53", ok: true, expect: expect{dnsType: C.DNSTypeUDP, server: "2400:3200::1", port: 53}},
 		{raw: "udp://8.8.8.8", ok: true, expect: expect{dnsType: C.DNSTypeUDP, server: "8.8.8.8", port: 53}},
 		{raw: "tcp://8.8.8.8:5353", ok: true, expect: expect{dnsType: C.DNSTypeTCP, server: "8.8.8.8", port: 5353}},

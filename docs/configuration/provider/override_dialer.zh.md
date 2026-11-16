@@ -54,11 +54,17 @@
 * Clash 订阅：`dns.proxy-server-nameserver`，为空时使用 `dns.nameserver`；`dns.enable: false` 时不提取。支持 mihomo 写法：纯 IP（UDP）、`udp://`、`tcp://`、`tls://`、`quic://`、`https://`、`h3://`，以及 `#h3=true`、`#skip-cert-verify=true` 参数。`system`、`dhcp://`、`rcode://` 被忽略；`#` 后的代理 / 网卡名被忽略，订阅 DNS 始终直连。
 * sing-box 订阅：`route.default_domain_resolver` 指向的服务器，不存在时使用 `dns.final`，再不存在时使用第一个服务器；指向 `group` 时使用它的成员。
 
-只保留 `udp`、`tcp`、`tls`、`quic`、`https`、`h3` 服务器，重复项会合并；单个服务器解析失败只会被跳过，不会影响节点导入。订阅 DNS 服务器始终直连（订阅里的 `detour` 会被移除），多个服务器并发查询并采用最快的 NOERROR / NXDOMAIN 应答。
+只保留 `udp`、`tcp`、`tls`、`quic`、`https`、`h3` 服务器，重复项会合并；单个服务器解析失败只会被跳过，不会影响节点导入。多个服务器并发查询并采用最快的 NOERROR / NXDOMAIN 应答。
+
+订阅 DNS 服务器不经过 `detour`（通过节点解析节点地址会形成环路），使用 `override_dialer` 的其余拨号字段（`bind_interface`、`routing_mark`、`inet4_bind_address`、`network_strategy` 等）；订阅里为 DNS 服务器指定的拨号字段和 TLS 文件路径（`certificate_path` 等）会被忽略。
+
+订阅 DNS 最多使用一次查询一半的超时时间，剩余时间留给回落；所有订阅 DNS 服务器都没有响应时，之后 30 秒内的查询直接使用回落。
 
 订阅更新时只替换 DNS 服务器本身，节点不会因此重建；DNS 列表没有变化时，已有连接保持不变。远程订阅的 DNS 服务器会和节点一起写入缓存。
 
-当订阅中没有可用的 DNS 服务器，或所有服务器都失败时，查询回落到 `resolver`。
+当订阅中没有可用的 DNS 服务器，或所有服务器都失败时，查询回落到 `resolver`。多个订阅的 provider DNS 互相回落时，查询会直接报错而不会循环。
+
+关闭本选项后，缓存中指向 `<订阅 tag>-dns` 等已不存在服务器的节点会改用 `override_dialer.domain_resolver`（未设置时使用默认解析）。
 
 ##### enabled
 

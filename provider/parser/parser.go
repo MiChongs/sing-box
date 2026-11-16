@@ -192,6 +192,21 @@ func overrideEndpoints(endpoints []option.Endpoint, overrideDialerOptions *optio
 	return parsedEndpoints
 }
 
+// DNSDialerOptions are the dial fields of override_dialer the subscription
+// DNS servers dial with: everything but detour and the resolvers.
+func DNSDialerOptions(overrideDialerOptions *option.OverrideDialerOptions) option.DialerOptions {
+	if overrideDialerOptions == nil {
+		return option.DialerOptions{}
+	}
+	dialerOverride := *overrideDialerOptions
+	dialerOverride.Detour = nil
+	dialerOverride.DomainResolver = nil
+	dialerOverride.ProviderDomainResolver = nil
+	//nolint:staticcheck
+	dialerOverride.DomainStrategy = nil
+	return overrideDialerOption(option.DialerOptions{}, &dialerOverride, nil, "")
+}
+
 func overrideDialerWrapper(options any, overrideDialerOptions *option.OverrideDialerOptions, tags []string, providerTag string) {
 	if wrapper, isWrapper := options.(option.DialerOptionsWrapper); isWrapper {
 		wrapper.ReplaceDialerOptions(overrideDialerOption(wrapper.TakeDialerOptions(), overrideDialerOptions, tags, providerTag))

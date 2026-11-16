@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -21,9 +22,36 @@ import (
 )
 
 var (
-	_ adapter.DNSTransport         = (*providerDNS)(nil)
-	_ adapter.IdleConnectionKeeper = (*providerDNS)(nil)
+	_ adapter.DNSTransport                = (*providerDNS)(nil)
+	_ adapter.DNSTransportWithEnvironment = (*providerDNS)(nil)
+	_ adapter.IdleConnectionKeeper        = (*providerDNS)(nil)
 )
+
+const (
+	// defaultMemberTimeout bounds the subscription DNS when the query has no
+	// deadline of its own.
+	defaultMemberTimeout = 5 * time.Second
+	// membersDownDuration is how long the fallback answers alone after every
+	// subscription DNS server failed, so a blocked subscription DNS does not
+	// cost each lookup half of its timeout.
+	membersDownDuration = 30 * time.Second
+)
+
+type providerDNSVisitedKey struct{}
+
+// visitProviderDNS records the provider DNS servers a query passed through,
+// so provider DNS servers falling back to each other cannot loop.
+func visitProviderDNS(ctx context.Context, tag string) (context.Context, bool) {
+	visited, _ := ctx.Value(providerDNSVisitedKey{}).([]string)
+	for _, it := range visited {
+		if it == tag {
+			return ctx, false
+		}
+	}
+	next := make([]string, len(visited), len(visited)+1)
+	copy(next, visited)
+	return context.WithValue(ctx, providerDNSVisitedKey{}, append(next, tag)), true
+}
 
 // ProviderDNSTag is the DNS server the nodes of a provider with
 // provider_domain_resolver resolve their server addresses through.
@@ -51,9 +79,14 @@ type providerDNS struct {
 	resolverStrategy option.DomainStrategy
 	manager          adapter.DNSTransportManager
 	registry         adapter.DNSTransportRegistry
+	// memberDialer carries the override_dialer fields every member dials
+	// with (bind_interface, routing_mark, ...), without detour and resolver.
+	memberDialer option.DialerOptions
 
-	members  atomic.Pointer[[]providerDNSMember]
-	keepIdle atomic.Bool
+	members     atomic.Pointer[[]providerDNSMember]
+	generation  atomic.Uint64
+	membersDown atomic.Int64
+	keepIdle    atomic.Bool
 
 	access  sync.Mutex
 	scope   *adapter.Scope
@@ -62,7 +95,7 @@ type providerDNS struct {
 	pending []option.DNSServerOptions
 }
 
-func newProviderDNS(ctx context.Context, logFactory log.Factory, providerTag string, options *option.ProviderDomainResolverOptions, overrideResolver *option.DomainResolveOptions) (*providerDNS, error) {
+func newProviderDNS(ctx context.Context, logFactory log.Factory, providerTag string, options *option.ProviderDomainResolverOptions, overrideResolver *option.DomainResolveOptions, memberDialer option.DialerOptions) (*providerDNS, error) {
 	manager := service.FromContext[adapter.DNSTransportManager](ctx)
 	if manager == nil {
 		return nil, E.New("missing DNS transport manager")
@@ -79,7 +112,9 @@ func newProviderDNS(ctx context.Context, logFactory log.Factory, providerTag str
 	if resolver == tag {
 		return nil, E.New("provider_domain_resolver.resolver cannot be the provider DNS server itself: ", tag)
 	}
-	return &providerDNS{
+	memberDialer.Detour = ""
+	memberDialer.DomainResolver = nil
+	transport := &providerDNS{
 		ctx:              ctx,
 		logger:           logFactory.NewLogger(F.ToString("dns/", C.DNSTypeProvider, "[", tag, "]")),
 		logFactory:       logFactory,
@@ -89,7 +124,18 @@ func newProviderDNS(ctx context.Context, logFactory log.Factory, providerTag str
 		resolverStrategy: options.ResolverStrategy,
 		manager:          manager,
 		registry:         registry,
-	}, nil
+		memberDialer:     memberDialer,
+	}
+	// kept until the reference manager decides otherwise, like configured
+	// HTTPS servers
+	transport.keepIdle.Store(true)
+	return transport, nil
+}
+
+// Environment changes whenever the members change, so answers cached from
+// the previous servers (or from the fallback) are not served for them.
+func (t *providerDNS) Environment() []string {
+	return []string{strconv.FormatUint(t.generation.Load(), 10)}
 }
 
 func (t *providerDNS) Type() string {
@@ -156,12 +202,13 @@ func (t *providerDNS) applyLocked(servers []option.DNSServerOptions) {
 		t.logger.Info("subscription carries no usable DNS server, nodes resolve through ", t.fallbackName())
 	}
 	resolver, strategy := t.memberResolver()
+	keepIdle := t.keepIdle.Load()
 	members := make([]providerDNSMember, 0, len(servers))
 	var names []string
 	for i, server := range servers {
 		name := describeDNSServer(server)
 		memberTag := F.ToString(t.tag, "/", i)
-		memberOptions, err := memberOptions(server, resolver, strategy)
+		memberOptions, err := memberOptions(server, t.memberDialer, resolver, strategy)
 		if err != nil {
 			t.logger.Warn("skip subscription DNS server ", name, ": ", err)
 			continue
@@ -178,7 +225,7 @@ func (t *providerDNS) applyLocked(servers []option.DNSServerOptions) {
 			continue
 		}
 		if keeper, isKeeper := transport.(adapter.IdleConnectionKeeper); isKeeper {
-			keeper.SetKeepIdleConnections(t.keepIdle.Load())
+			keeper.SetKeepIdleConnections(keepIdle)
 		}
 		members = append(members, providerDNSMember{transport: transport, name: name})
 		names = append(names, name)
@@ -192,6 +239,8 @@ func (t *providerDNS) applyLocked(servers []option.DNSServerOptions) {
 	}
 	old := t.members.Swap(&members)
 	t.applied = servers
+	t.generation.Add(1)
+	t.membersDown.Store(0)
 	if old != nil {
 		for _, member := range *old {
 			// Exchanges still on the old member fail and fall back.
@@ -221,6 +270,10 @@ func (t *providerDNS) Reset() {
 }
 
 func (t *providerDNS) SetKeepIdleConnections(keep bool) {
+	// serialized with applyLocked, so members created meanwhile cannot keep
+	// the previous value
+	t.access.Lock()
+	defer t.access.Unlock()
 	t.keepIdle.Store(keep)
 	for _, member := range t.loadMembers() {
 		if keeper, isKeeper := member.transport.(adapter.IdleConnectionKeeper); isKeeper {
@@ -252,13 +305,16 @@ func (t *providerDNS) ExchangeAsync(ctx context.Context, message *mDNS.Msg, call
 }
 
 func (t *providerDNS) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
-	members := t.loadMembers()
+	ctx, first := visitProviderDNS(ctx, t.tag)
+	if !first {
+		return nil, E.New("provider DNS fallback loop through ", t.tag)
+	}
 	var (
 		response *mDNS.Msg
 		err      error
 	)
-	if len(members) > 0 {
-		response, err = t.exchangeMembers(ctx, members, message)
+	if members := t.loadMembers(); len(members) > 0 && !t.membersAreDown() {
+		response, err = t.exchangeMembersWithBudget(ctx, members, message)
 		if err == nil {
 			return response, nil
 		}
@@ -291,6 +347,32 @@ func (t *providerDNS) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Ms
 		return nil, fallbackExchangeErr
 	}
 	return fallbackResponse, nil
+}
+
+// exchangeMembersWithBudget leaves the fallback at least half of the query
+// time: members without a timeout of their own would otherwise use all of it
+// when the subscription DNS is blocked.
+func (t *providerDNS) exchangeMembersWithBudget(ctx context.Context, members []providerDNSMember, message *mDNS.Msg) (*mDNS.Msg, error) {
+	budget := defaultMemberTimeout
+	if deadline, hasDeadline := ctx.Deadline(); hasDeadline {
+		budget = time.Until(deadline) / 2
+	}
+	memberCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	response, err := t.exchangeMembers(memberCtx, members, message)
+	if err != nil && response == nil && ctx.Err() == nil {
+		// no member answered at all: rest them for a while
+		t.membersDown.Store(time.Now().Add(membersDownDuration).UnixNano())
+		t.logger.DebugContext(ctx, "subscription DNS unreachable, use the fallback for ", membersDownDuration)
+	} else if err == nil {
+		t.membersDown.Store(0)
+	}
+	return response, err
+}
+
+func (t *providerDNS) membersAreDown() bool {
+	until := t.membersDown.Load()
+	return until != 0 && time.Now().UnixNano() < until
 }
 
 // exchangeMembers races the members and returns the first conclusive answer
@@ -329,6 +411,9 @@ func (t *providerDNS) exchangeMembers(ctx context.Context, members []providerDNS
 		var r result
 		select {
 		case <-ctx.Done():
+			if inconclusive != nil {
+				return inconclusive, ctx.Err()
+			}
 			return nil, ctx.Err()
 		case r = <-results:
 		}
@@ -409,14 +494,15 @@ func (t *providerDNS) memberResolver() (string, option.DomainStrategy) {
 	return tag, strategy
 }
 
-// memberOptions copies the subscription server options for this box: they
-// dial directly (a detour would name a subscription outbound, and resolving
-// node addresses through a node loops), and server names resolve through
-// the fallback resolver.
-func memberOptions(server option.DNSServerOptions, resolver string, strategy option.DomainStrategy) (any, error) {
+// memberOptions copies the subscription server options for this box. The
+// dial fields come from override_dialer, not from the subscription (which
+// could bind interfaces or name outbounds of its own); members never take a
+// detour, as resolving node addresses through a node loops; server names
+// resolve through the fallback resolver; TLS files of the subscription are
+// not read.
+func memberOptions(server option.DNSServerOptions, dialer option.DialerOptions, resolver string, strategy option.DomainStrategy) (any, error) {
 	rewrite := func(local *option.RawLocalDNSServerOptions, address option.DNSServerAddressOptions) error {
-		local.Detour = ""
-		local.DomainResolver = nil
+		local.DialerOptions = dialer
 		if address.ServerIsDomain() {
 			if resolver == "" {
 				return E.New("no DNS server to resolve ", address.Server)
@@ -425,15 +511,32 @@ func memberOptions(server option.DNSServerOptions, resolver string, strategy opt
 		}
 		return nil
 	}
+	stripTLSFiles := func(container *option.OutboundTLSOptionsContainer) {
+		if container.TLS == nil {
+			return
+		}
+		tlsOptions := *container.TLS
+		tlsOptions.CertificatePath = ""
+		tlsOptions.ClientCertificatePath = ""
+		tlsOptions.ClientKeyPath = ""
+		if tlsOptions.ECH != nil {
+			echOptions := *tlsOptions.ECH
+			echOptions.ConfigPath = ""
+			tlsOptions.ECH = &echOptions
+		}
+		container.TLS = &tlsOptions
+	}
 	switch options := server.Options.(type) {
 	case *option.RemoteDNSServerOptions:
 		copied := *options
 		return &copied, rewrite(&copied.RawLocalDNSServerOptions, copied.DNSServerAddressOptions)
 	case *option.RemoteTLSDNSServerOptions:
 		copied := *options
+		stripTLSFiles(&copied.OutboundTLSOptionsContainer)
 		return &copied, rewrite(&copied.RawLocalDNSServerOptions, copied.DNSServerAddressOptions)
 	case *option.RemoteHTTPSDNSServerOptions:
 		copied := *options
+		stripTLSFiles(&copied.OutboundTLSOptionsContainer)
 		return &copied, rewrite(&copied.RawLocalDNSServerOptions, copied.DNSServerAddressOptions)
 	default:
 		return nil, E.New("unsupported server type: ", server.Type)
