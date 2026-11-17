@@ -4,7 +4,9 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"os"
 	"testing"
+	"time"
 
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -84,6 +86,25 @@ func TestPreRouteBypass(t *testing.T) {
 		require.Same(t, next, selected)
 		require.False(t, metadata.PreRouteBypassMatched)
 	})
+	t.Run("sniffed host overrides a learned domain", func(t *testing.T) {
+		router := newBypassTestRouter()
+		router.rules = []adapter.Rule{next}
+		// The address was learned for a bypassed site, but this connection
+		// names another site on the same CDN edge: it must not bypass.
+		metadata := newMetadata(newBypassTestRule(t, `{"domain_suffix": ["cn.example"]}`), func(netip.Addr) (string, bool) {
+			return "www.cn.example", true
+		})
+		metadata.Destination = M.ParseSocksaddr("104.21.4.123:8080")
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		go client.Write([]byte("GET / HTTP/1.1\r\nHost: video.foreign.example\r\n\r\n"))
+		selected, _, buffers, _, err := router.matchRule(context.Background(), &metadata, server, nil)
+		require.NoError(t, err)
+		require.Same(t, next, selected)
+		require.False(t, metadata.PreRouteBypassMatched)
+		buf.ReleaseMulti(buffers)
+	})
 	t.Run("sniffed payload is replayed", func(t *testing.T) {
 		router := newBypassTestRouter()
 		router.rules = []adapter.Rule{next}
@@ -105,4 +126,11 @@ func TestPreRouteBypass(t *testing.T) {
 	})
 }
 
+// bypassTestPacketConn has no datagram to sniff.
 type bypassTestPacketConn struct{ N.PacketConn }
+
+func (*bypassTestPacketConn) SetReadDeadline(time.Time) error { return nil }
+
+func (*bypassTestPacketConn) ReadPacket(*buf.Buffer) (M.Socksaddr, error) {
+	return M.Socksaddr{}, os.ErrDeadlineExceeded
+}

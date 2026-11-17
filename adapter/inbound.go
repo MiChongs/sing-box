@@ -45,10 +45,9 @@ type InboundManager interface {
 }
 
 // PreRouteBypass is evaluated by the router before any route rule, on a copy
-// of the connection metadata completed with process information and a domain
-// (FakeIP, DNS reverse mapping, LookupDomain, then sniffing when NeedDomain
-// and nothing else named the destination). A match routes the connection to
-// Outbound.
+// of the connection metadata completed with process information and a domain:
+// a FakeIP domain, else the sniffed host when NeedDomain, else the DNS
+// reverse mapping or LookupDomain. A match routes the connection to Outbound.
 type PreRouteBypass struct {
 	Rule        HeadlessRule
 	Outbound    Outbound

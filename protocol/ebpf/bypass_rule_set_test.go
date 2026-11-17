@@ -215,3 +215,37 @@ func TestBypassLearnedTable(t *testing.T) {
 		t.Fatal("IPv4-mapped addresses must be stored unmapped")
 	}
 }
+
+// An address that also answers a domain outside the rule-set (a CDN edge)
+// must never stay bypassed in the kernel: that would bypass every site on it.
+func TestBypassRuleSetSharedAddressIsWithdrawn(t *testing.T) {
+	t.Parallel()
+	inbound := newBypassTestInbound(t, newBypassTestRuleSet(t, "direct", `[{"domain_suffix": ["cn.example"]}]`))
+	state := &inbound.localBypassRules
+	inbound.observeBypassDNSResponse(dnsAnswer("www.cn.example", 300, "104.21.4.123"))
+	inbound.refreshDirtyRuleSets()
+	if !bypassPolicyContains(state.policy, "104.21.4.123") {
+		t.Fatal("exclusive address must be learned")
+	}
+	// Another site on the same edge resolves: the bypass is withdrawn before
+	// the answer reaches its client, without waiting for the worker.
+	inbound.observeBypassDNSResponse(dnsAnswer("video.foreign.example", 300, "104.21.4.123"))
+	if bypassPolicyContains(state.policy, "104.21.4.123") {
+		t.Fatal("shared address still bypassed in the kernel")
+	}
+	if _, loaded := inbound.preRouteBypass(false).LookupDomain(netip.MustParseAddr("104.21.4.123")); loaded {
+		t.Fatal("a shared address must not name a domain")
+	}
+	inbound.observeBypassDNSResponse(dnsAnswer("www.cn.example", 300, "104.21.4.123"))
+	if state.learned.len() != 0 {
+		t.Fatal("a shared address must not be learned again")
+	}
+
+	// Seen for an unrelated domain first: never learned.
+	inbound.observeBypassDNSResponse(dnsAnswer("cdn.foreign.example", 300, "172.67.1.1"))
+	inbound.observeBypassDNSResponse(dnsAnswer("img.cn.example", 300, "172.67.1.1"))
+	inbound.refreshDirtyRuleSets()
+	if bypassPolicyContains(state.policy, "172.67.1.1") {
+		t.Fatal("an address first seen for another domain must not be learned")
+	}
+}

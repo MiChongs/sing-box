@@ -14,7 +14,8 @@ import (
 // route rule. The rule is matched on a copy of the metadata so the domain it
 // completes and any sniff result do not leak into route rules that did not
 // ask for them; sniffed payload is returned and replayed to the connection
-// either way.
+// either way. A sniffed host takes precedence over every address-derived
+// domain; LookupDomain only serves connections that name no host at all.
 func (r *Router) matchPreRouteBypass(
 	ctx context.Context, metadata *adapter.InboundContext, bypass *adapter.PreRouteBypass,
 	inputConn net.Conn, inputPacketConn N.PacketConn,
@@ -24,12 +25,11 @@ func (r *Router) matchPreRouteBypass(
 	}
 	probe := *metadata
 	probe.PreRouteBypass = nil
-	if !preRouteBypassHasDomain(&probe) && bypass.LookupDomain != nil && probe.Destination.IsIP() {
-		if domain, loaded := bypass.LookupDomain(probe.Destination.Addr); loaded {
-			probe.Domain = domain
-		}
-	}
-	if bypass.NeedDomain && !preRouteBypassHasDomain(&probe) {
+	// The host a connection actually names is the only exact domain for an
+	// address destination: an address shared by many domains (any CDN) maps
+	// back to whichever domain resolved it last, so a reverse-mapped or
+	// learned domain must never decide before sniffing had its chance.
+	if bypass.NeedDomain && !probe.Destination.IsDomain() && probe.SniffHost == "" {
 		buffer, newPacketBuffers, err := r.actionSniff(ctx, &probe, &R.RuleActionSniff{}, inputConn, inputPacketConn, nil, nil)
 		if buffer != nil {
 			buffers = append(buffers, buffer)
@@ -38,6 +38,11 @@ func (r *Router) matchPreRouteBypass(
 		if err != nil {
 			fatalErr = err
 			return
+		}
+	}
+	if !preRouteBypassHasDomain(&probe) && bypass.LookupDomain != nil && probe.Destination.IsIP() {
+		if domain, loaded := bypass.LookupDomain(probe.Destination.Addr); loaded {
+			probe.Domain = domain
 		}
 	}
 	probe.ResetRuleCache()

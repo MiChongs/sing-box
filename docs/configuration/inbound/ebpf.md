@@ -230,21 +230,30 @@ Each rule is enforced at the cheapest layer that can decide it exactly:
   same way) is enforced by the kernel. Its CIDRs go into the data plane's
   bypass map directly. Its domains are learned: when sing-box's DNS answers a
   matching name with real A/AAAA records, those addresses are added to the
-  same map for the record TTL (at least 5 minutes, at most 24 hours, up to
-  16384 addresses per scope), so later connections never enter sing-box.
+  same map for the record TTL (at least 1 minute, at most 1 hour, up to 16384
+  addresses per scope), so later connections never enter sing-box. Bypassing
+  an address bypasses every site behind it, so only addresses exclusive to
+  matching domains are learned: an address that sing-box DNS also returned
+  for any other name (a CDN edge serving many sites) is treated as shared for
+  24 hours, withdrawn from the kernel before that answer reaches its client,
+  and decided per connection in userspace instead.
 * Any other rule (ports, `network`, process, package or user, source address,
   logical `and`, `invert`, or an address condition combined with any of these)
   cannot be decided before the connection exists. Such connections are
   intercepted and matched in userspace against the whole rule set before any
-  route rule, with the process, the FakeIP or DNS-mapped domain, the learned
-  domain and, when nothing else names the destination, a sniffed TLS/HTTP/QUIC
-  domain. A match leaves through a built-in direct outbound, still visible in
+  route rule, with the process and the domain the connection names: the FakeIP
+  domain, else the sniffed TLS/HTTP/QUIC host, else (for connections carrying
+  no host) the DNS-mapped or learned domain. An address-derived domain never
+  overrides a sniffed host, because a shared address maps back to whichever
+  site resolved it last. A match leaves through a built-in direct outbound, still visible in
   the Clash API with rule `ebpf local.bypass_rule_set`.
 
 Userspace matching also covers the first connections made before a learned
 address reaches the kernel and domains resolved without sing-box (for example
 DNS-over-HTTPS in the application). Domain learning only sees DNS that sing-box
-answers, so `dns_mode: hijack` gives the best coverage. A domain answered with
+answers, so `dns_mode: hijack` gives the best coverage: an address shared with
+a site resolved elsewhere cannot be recognized as shared, which is why learned
+addresses expire with their TTL. A domain answered with
 a FakeIP address is never learned, since the FakeIP range stays intercepted:
 return real addresses for such domains through a DNS rule if they should
 bypass in the kernel.

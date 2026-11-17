@@ -16,11 +16,16 @@ import (
 )
 
 const (
-	// A DNS answer is cached by clients beyond its TTL, and a domain that
-	// stops bypassing for a short-TTL record would make established clients
-	// fall back to the proxy, so learned addresses live at least this long.
-	bypassLearnedMinLifetime = 5 * time.Minute
-	bypassLearnedMaxLifetime = 24 * time.Hour
+	// Clients cache an answer a little beyond its TTL; an address kept much
+	// longer than that may have been handed to another domain meanwhile, so
+	// learned addresses follow the TTL within a narrow window.
+	bypassLearnedMinLifetime = time.Minute
+	bypassLearnedMaxLifetime = time.Hour
+	// bypassSharedLifetime keeps an address that also answered a domain
+	// outside the rule-set out of the kernel policy. Addresses shared by many
+	// domains (CDNs) stay shared, so this is long.
+	bypassSharedLifetime = 24 * time.Hour
+	bypassSharedCapacity = 65536
 	// bypassLearnedCapacity bounds learned addresses per scope. It leaves the
 	// destination LPM (65536 entries per family) to configured prefixes.
 	bypassLearnedCapacity      = 16384
@@ -121,17 +126,23 @@ type bypassLearnedEntry struct {
 }
 
 // bypassLearnedTable holds the addresses DNS answered for domains a scope's
-// bypass_rule_set matches. It is written from the DNS path and read when the
-// kernel policy is rebuilt and when the router recovers a destination domain.
+// bypass_rule_set matches, and only those that no other domain was seen to
+// use: bypassing an address in the kernel bypasses every domain behind it, so
+// an address that also answered a domain outside the rule-set (a CDN edge
+// serving many sites) is recorded as shared and never learned while that
+// record lives. It is written from the DNS path and read when the kernel
+// policy is rebuilt and when the router recovers a destination domain.
 type bypassLearnedTable struct {
-	access   sync.Mutex
-	entries  map[netip.Addr]bypassLearnedEntry
-	capacity int
-	now      func() time.Time
+	access         sync.Mutex
+	entries        map[netip.Addr]bypassLearnedEntry
+	shared         map[netip.Addr]time.Time
+	capacity       int
+	sharedCapacity int
+	now            func() time.Time
 }
 
 func newBypassLearnedTable(capacity int) *bypassLearnedTable {
-	return &bypassLearnedTable{capacity: capacity, now: time.Now}
+	return &bypassLearnedTable{capacity: capacity, sharedCapacity: bypassSharedCapacity, now: time.Now}
 }
 
 func bypassLearnedLifetime(ttl uint32) time.Duration {
@@ -145,6 +156,9 @@ func (t *bypassLearnedTable) learn(address netip.Addr, domain string, lifetime t
 	t.access.Lock()
 	defer t.access.Unlock()
 	now := t.now()
+	if until, shared := t.shared[address]; shared && until.After(now) {
+		return false
+	}
 	expireAt := now.Add(lifetime)
 	if entry, loaded := t.entries[address]; loaded {
 		if expireAt.After(entry.expireAt) {
@@ -162,6 +176,42 @@ func (t *bypassLearnedTable) learn(address netip.Addr, domain string, lifetime t
 	}
 	t.entries[address] = bypassLearnedEntry{domain: domain, expireAt: expireAt}
 	return true
+}
+
+// markShared records that address answered a domain outside the rule-set
+// and reports whether a learned address had to be withdrawn for it.
+func (t *bypassLearnedTable) markShared(address netip.Addr) bool {
+	address = address.Unmap()
+	t.access.Lock()
+	defer t.access.Unlock()
+	now := t.now()
+	if t.shared == nil {
+		t.shared = make(map[netip.Addr]time.Time)
+	}
+	if _, loaded := t.shared[address]; !loaded && len(t.shared) >= t.sharedCapacity {
+		var (
+			victim   netip.Addr
+			earliest time.Time
+		)
+		for sharedAddress, until := range t.shared {
+			if !until.After(now) {
+				delete(t.shared, sharedAddress)
+				continue
+			}
+			if !victim.IsValid() || until.Before(earliest) {
+				victim, earliest = sharedAddress, until
+			}
+		}
+		if len(t.shared) >= t.sharedCapacity && victim.IsValid() {
+			delete(t.shared, victim)
+		}
+	}
+	t.shared[address] = now.Add(bypassSharedLifetime)
+	if _, learned := t.entries[address]; learned {
+		delete(t.entries, address)
+		return true
+	}
+	return false
 }
 
 // evictLocked frees one slot: expired entries first, otherwise the entry
@@ -206,6 +256,11 @@ func (t *bypassLearnedTable) sweep() bool {
 		if !entry.expireAt.After(now) {
 			delete(t.entries, address)
 			removed = true
+		}
+	}
+	for address, until := range t.shared {
+		if !until.After(now) {
+			delete(t.shared, address)
 		}
 	}
 	return removed
@@ -283,10 +338,11 @@ func (i *Inbound) observeBypassDNSResponse(message *mDNS.Msg, response *mDNS.Msg
 	for _, shared := range []bool{false, true} {
 		state, _, _ := i.ruleSetScope(shared)
 		matcher := state.domainMatcher.Load()
-		if matcher == nil || !matcher.match(domain) {
+		if matcher == nil || state.learned == nil {
 			continue
 		}
-		changed := false
+		matched := matcher.match(domain)
+		var learned, withdrawn bool
 		for _, answer := range response.Answer {
 			var (
 				address netip.Addr
@@ -302,16 +358,44 @@ func (i *Inbound) observeBypassDNSResponse(message *mDNS.Msg, response *mDNS.Msg
 			default:
 				continue
 			}
-			if !i.bypassLearnable(shared, address) {
+			if !address.IsValid() {
 				continue
 			}
-			if state.learned.learn(address, domain, bypassLearnedLifetime(ttl)) {
-				changed = true
+			if !matched {
+				// Every answer counts, not only learned addresses: one that is
+				// first seen for an unrelated domain must never be learned.
+				if state.learned.markShared(address) {
+					withdrawn = true
+				}
+				continue
+			}
+			if i.bypassLearnable(shared, address) && state.learned.learn(address, domain, bypassLearnedLifetime(ttl)) {
+				learned = true
 			}
 		}
-		if changed {
+		if withdrawn {
+			// The client receives this answer next and may connect at once:
+			// withdraw the kernel bypass before the response is delivered.
+			i.refreshBypassScopeNow(shared)
+		} else if learned {
 			i.markBypassLearnedDirty(shared)
 		}
+	}
+}
+
+// refreshBypassScopeNow applies a scope's policy synchronously. A failure is
+// left to the worker's retry like any other refresh.
+func (i *Inbound) refreshBypassScopeNow(shared bool) {
+	i.bypassRuleSetAccess.Lock()
+	defer i.bypassRuleSetAccess.Unlock()
+	state, name, _ := i.ruleSetScope(shared)
+	if !state.started {
+		return
+	}
+	if err := i.refreshRuleSetsLocked(shared, false); err != nil {
+		state.needsRetry = true
+		i.policyWarnings.warn(i.logger, "withdraw shared address from ", name, ": ", err)
+		i.notifyTCInterfaceUpdate()
 	}
 }
 
