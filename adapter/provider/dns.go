@@ -87,13 +87,13 @@ type providerDNS struct {
 	// DNS server at all.
 	fallback bool
 
-	members     atomic.Pointer[[]providerDNSMember]
+	members atomic.Pointer[[]providerDNSMember]
 	// carriesServers is set while the subscription lists DNS servers, even
 	// if none of them could be created.
 	carriesServers atomic.Bool
-	generation  atomic.Uint64
-	membersDown atomic.Int64
-	keepIdle    atomic.Bool
+	generation     atomic.Uint64
+	membersDown    atomic.Int64
+	keepIdle       atomic.Bool
 
 	access  sync.Mutex
 	scope   *adapter.Scope
