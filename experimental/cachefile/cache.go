@@ -3,6 +3,7 @@ package cachefile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"sync"
@@ -303,7 +304,7 @@ func (c *CacheFile) view(fn func(tx *bbolt.Tx) error) (err error) {
 		r := recover()
 		if r != nil {
 			c.resetDB(db, r)
-			err = E.New("database corrupted: ", r)
+			err = E.New("database corrupted: ", fmt.Sprint(r))
 		}
 	}()
 	return db.View(fn)
@@ -315,14 +316,14 @@ func (c *CacheFile) batch(fn func(tx *bbolt.Tx) error) (err error) {
 		r := recover()
 		if r != nil {
 			c.resetDB(db, r)
-			err = E.New("database corrupted: ", r)
+			err = E.New("database corrupted: ", fmt.Sprint(r))
 		}
 	}()
 	err = db.Batch(fn)
 	var panicErr bbolt.PanickedError
 	if errors.As(err, &panicErr) {
 		c.resetDB(db, panicErr.Reason)
-		return E.New("database corrupted: ", panicErr.Reason)
+		return E.New("database corrupted: ", fmt.Sprint(panicErr.Reason))
 	}
 	return err
 }
@@ -333,7 +334,7 @@ func (c *CacheFile) update(fn func(tx *bbolt.Tx) error) (err error) {
 		r := recover()
 		if r != nil {
 			c.resetDB(db, r)
-			err = E.New("database corrupted: ", r)
+			err = E.New("database corrupted: ", fmt.Sprint(r))
 		}
 	}()
 	return db.Update(fn)
@@ -345,7 +346,7 @@ func (c *CacheFile) resetDB(failedDB *bbolt.DB, reason any) {
 	if c.DB != failedDB {
 		return
 	}
-	c.logger.Error("database corrupted: ", reason, ": resetting")
+	c.logger.Error("database corrupted: ", fmt.Sprint(reason), ": resetting")
 	failedDB.Close()
 	filemanager.Remove(c.ctx, c.path)
 	db, err := bbolt.Open(c.path, 0o666, &databaseOptions)

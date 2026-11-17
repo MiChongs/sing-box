@@ -1241,7 +1241,14 @@ func (e *ServerEngine) Start() error {
 		e.tunIf = nil
 		return err
 	}
-	e.logger.Info("pseudovpn: started interface ", e.tunOptions.Name, " ", e.tunOptions.Inet4Address, " ", e.tunOptions.Inet6Address, ", mtu ", e.mtu)
+	var addresses []string
+	for _, prefix := range e.tunOptions.Inet4Address {
+		addresses = append(addresses, prefix.String())
+	}
+	for _, prefix := range e.tunOptions.Inet6Address {
+		addresses = append(addresses, prefix.String())
+	}
+	e.logger.Info("pseudovpn: started interface ", e.tunOptions.Name, " ", strings.Join(addresses, " "), ", mtu ", e.mtu)
 	go e.tunReadLoop(e.tunIf)
 	return nil
 }

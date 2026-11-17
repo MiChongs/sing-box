@@ -2,6 +2,7 @@ package v2rayxhttp
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tls"
@@ -45,7 +46,7 @@ func serverAdapter(
 ) (adapter.V2RayServerTransport, error) {
 	opts, ok := options.(*option.V2RayXHTTPOptions)
 	if !ok {
-		return nil, E.New("xhttp: invalid options type ", options)
+		return nil, E.New("xhttp: invalid options type ", fmt.Sprintf("%T", options))
 	}
 	return NewServer(ctx, logger, opts, tlsConfig, handler)
 }
@@ -59,7 +60,7 @@ func clientAdapter(
 ) (adapter.V2RayClientTransport, error) {
 	opts, ok := options.(*option.V2RayXHTTPOptions)
 	if !ok {
-		return nil, E.New("xhttp: invalid options type ", options)
+		return nil, E.New("xhttp: invalid options type ", fmt.Sprintf("%T", options))
 	}
 	return NewClient(ctx, dialer, serverAddr, opts, tlsConfig)
 }
