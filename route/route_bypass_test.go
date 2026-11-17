@@ -18,6 +18,7 @@ import (
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 
+	mDNS "github.com/miekg/dns"
 	"github.com/stretchr/testify/require"
 )
 
@@ -124,6 +125,92 @@ func TestPreRouteBypass(t *testing.T) {
 		require.Equal(t, request, buffers[0].Bytes())
 		buf.ReleaseMulti(buffers)
 	})
+	t.Run("route sniff rule reuses the payload after a miss", func(t *testing.T) {
+		// The client sent its whole first flight and now waits for the
+		// server: the route's own sniff rule must get the host from the
+		// payload the bypass already read, not from another read.
+		router := newBypassTestRouter()
+		sniffRule := &preMatchQUICRule{action: &R.RuleActionSniff{}}
+		router.rules = []adapter.Rule{sniffRule, next}
+		metadata := newMetadata(newBypassTestRule(t, `{"domain_suffix": ["cn.example"]}`), nil)
+		metadata.Destination = M.ParseSocksaddr("192.0.2.10:8080")
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		request := []byte("GET / HTTP/1.1\r\nHost: www.google.example\r\n\r\n")
+		go client.Write(request)
+		start := time.Now()
+		selected, _, buffers, _, err := router.matchRule(context.Background(), &metadata, server, nil)
+		require.NoError(t, err)
+		require.Same(t, next, selected)
+		require.False(t, metadata.PreRouteBypassMatched)
+		require.Equal(t, "www.google.example", metadata.SniffHost, "domain rules need the sniffed host")
+		require.Equal(t, C.ProtocolHTTP, metadata.Protocol)
+		require.NoError(t, metadata.SniffError)
+		require.Less(t, time.Since(start), C.ReadPayloadTimeout, "no second read of the connection")
+		require.Len(t, buffers, 1, "payload is replayed once")
+		require.Equal(t, request, buffers[0].Bytes())
+		buf.ReleaseMulti(buffers)
+	})
+	t.Run("silent connection is not waited for twice", func(t *testing.T) {
+		router := newBypassTestRouter()
+		sniffRule := &preMatchQUICRule{action: &R.RuleActionSniff{}}
+		router.rules = []adapter.Rule{sniffRule, next}
+		metadata := newMetadata(newBypassTestRule(t, `{"domain_suffix": ["cn.example"]}`), nil)
+		metadata.Destination = M.ParseSocksaddr("192.0.2.10:8080")
+		client, server := net.Pipe()
+		defer client.Close()
+		defer server.Close()
+		start := time.Now()
+		selected, _, buffers, _, err := router.matchRule(context.Background(), &metadata, server, nil)
+		require.NoError(t, err)
+		require.Same(t, next, selected)
+		require.Empty(t, buffers)
+		require.Error(t, metadata.SniffError)
+		require.Less(t, time.Since(start), 2*C.ReadPayloadTimeout-50*time.Millisecond)
+	})
+	t.Run("route sniff rule reuses the datagram after a miss", func(t *testing.T) {
+		router := newBypassTestRouter()
+		sniffRule := &preMatchQUICRule{action: &R.RuleActionSniff{}}
+		router.rules = []adapter.Rule{sniffRule, next}
+		metadata := newMetadata(newBypassTestRule(t, `{"domain_suffix": ["cn.example"]}`), nil)
+		metadata.Network = N.NetworkUDP
+		metadata.Destination = M.ParseSocksaddr("192.0.2.10:5353")
+		query := new(mDNS.Msg)
+		query.SetQuestion("www.google.example.", mDNS.TypeA)
+		payload, err := query.Pack()
+		require.NoError(t, err)
+		packetConn := &bypassTestQueuedPacketConn{packets: [][]byte{payload}, destination: metadata.Destination}
+		selected, _, _, packetBuffers, err := router.matchRule(context.Background(), &metadata, nil, packetConn)
+		require.NoError(t, err)
+		require.Same(t, next, selected)
+		require.False(t, metadata.PreRouteBypassMatched)
+		require.Equal(t, C.ProtocolDNS, metadata.Protocol, "the route sniff rule sniffed the buffered datagram")
+		require.Equal(t, 1, packetConn.reads, "the datagram is read once")
+		require.Len(t, packetBuffers, 1, "the datagram is replayed once")
+		require.Equal(t, payload, packetBuffers[0].Buffer.Bytes())
+		N.ReleaseMultiPacketBuffer(packetBuffers)
+	})
+}
+
+// bypassTestQueuedPacketConn delivers its queued datagrams, then times out.
+type bypassTestQueuedPacketConn struct {
+	N.PacketConn
+	packets     [][]byte
+	destination M.Socksaddr
+	reads       int
+}
+
+func (*bypassTestQueuedPacketConn) SetReadDeadline(time.Time) error { return nil }
+
+func (c *bypassTestQueuedPacketConn) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
+	c.reads++
+	if len(c.packets) == 0 {
+		return M.Socksaddr{}, os.ErrDeadlineExceeded
+	}
+	_, err := buffer.Write(c.packets[0])
+	c.packets = c.packets[1:]
+	return c.destination, err
 }
 
 // bypassTestPacketConn has no datagram to sniff.

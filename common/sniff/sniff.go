@@ -38,12 +38,26 @@ func Skip(metadata *adapter.InboundContext) bool {
 	return false
 }
 
+// PeekStream sniffs the first payload of conn. buffers hold payload already
+// read from conn by an earlier sniff; newly read payload is appended to buffer.
+//
+// Payload in buffers is sniffed before conn is read again: a client that sent
+// its whole first flight is waiting for the server, so another read would only
+// time out and lose the result. conn is read further only when a sniffer
+// reports ErrNeedMoreData.
 func PeekStream(ctx context.Context, metadata *adapter.InboundContext, conn net.Conn, buffers []*buf.Buffer, buffer *buf.Buffer, timeout time.Duration, sniffers ...StreamSniffer) error {
 	if timeout == 0 {
 		timeout = C.ReadPayloadTimeout
 	}
-	deadline := time.Now().Add(timeout)
 	var sniffError error
+	buffered := len(buffers) > 0
+	if buffered {
+		sniffError = sniffStream(ctx, metadata, buffers, sniffers)
+		if sniffError == nil || !errors.Is(sniffError, ErrNeedMoreData) {
+			return sniffError
+		}
+	}
+	deadline := time.Now().Add(timeout)
 	for i := 0; ; i++ {
 		err := conn.SetReadDeadline(deadline)
 		if err != nil {
@@ -52,25 +66,30 @@ func PeekStream(ctx context.Context, metadata *adapter.InboundContext, conn net.
 		_, err = buffer.ReadOnceFrom(conn)
 		_ = conn.SetReadDeadline(time.Time{})
 		if err != nil {
-			if i > 0 {
+			if i > 0 || buffered {
 				break
 			}
 			return E.Cause(err, "read payload")
 		}
-		sniffError = nil
-		for _, sniffer := range sniffers {
-			reader := io.MultiReader(common.Map(append(buffers, buffer), func(it *buf.Buffer) io.Reader {
-				return bytes.NewReader(it.Bytes())
-			})...)
-			err = sniffer(ctx, metadata, reader)
-			if err == nil {
-				return nil
-			}
-			sniffError = E.Errors(sniffError, err)
-		}
-		if !errors.Is(sniffError, ErrNeedMoreData) {
+		sniffError = sniffStream(ctx, metadata, append(buffers, buffer), sniffers)
+		if sniffError == nil || !errors.Is(sniffError, ErrNeedMoreData) {
 			break
 		}
+	}
+	return sniffError
+}
+
+func sniffStream(ctx context.Context, metadata *adapter.InboundContext, buffers []*buf.Buffer, sniffers []StreamSniffer) error {
+	var sniffError error
+	for _, sniffer := range sniffers {
+		reader := io.MultiReader(common.Map(buffers, func(it *buf.Buffer) io.Reader {
+			return bytes.NewReader(it.Bytes())
+		})...)
+		err := sniffer(ctx, metadata, reader)
+		if err == nil {
+			return nil
+		}
+		sniffError = E.Errors(sniffError, err)
 	}
 	return sniffError
 }

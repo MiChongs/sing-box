@@ -14,7 +14,8 @@ import (
 // route rule. The rule is matched on a copy of the metadata so the domain it
 // completes and any sniff result do not leak into route rules that did not
 // ask for them; sniffed payload is returned and replayed to the connection
-// either way. A sniffed host takes precedence over every address-derived
+// either way, and a later sniff rule sniffs that payload again without reading
+// the connection. A sniffed host takes precedence over every address-derived
 // domain; LookupDomain only serves connections that name no host at all.
 func (r *Router) matchPreRouteBypass(
 	ctx context.Context, metadata *adapter.InboundContext, bypass *adapter.PreRouteBypass,
@@ -38,6 +39,13 @@ func (r *Router) matchPreRouteBypass(
 		if err != nil {
 			fatalErr = err
 			return
+		}
+		if buffer == nil && len(newPacketBuffers) == 0 && probe.SniffError != nil {
+			// Nothing arrived within the sniff timeout (a server-first
+			// protocol): record it so an identical sniff rule does not wait
+			// for the same silence again.
+			metadata.SnifferNames = probe.SnifferNames
+			metadata.SniffError = probe.SniffError
 		}
 	}
 	if !preRouteBypassHasDomain(&probe) && bypass.LookupDomain != nil && probe.Destination.IsIP() {
