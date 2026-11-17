@@ -295,6 +295,14 @@ IPv4 分片与非 atomic IPv6 分片按设计绕过，因为各 hook 上不一�
 tuple；五元组代理不能安全地单独重定向后续分片。若不应出现分片，应抓取受影响接口
 两侧报文，判断 MTU、PMTU discovery、上游隧道或发送端是否制造了分片。
 
+对于 `bypass_rule_set`，`local_bypass_rule_set` 与 `shared_bypass_rule_set` 报告每个范围如何
+执行规则集：`KernelPrefixes` 是写入内核 bypass map 的规则集 CIDR 数量，`LearnedAddresses`
+是由 DNS 学习加入的地址数量；`UserspaceMatching` 为 true 表示规则集中存在需要在路由前对被接管
+连接匹配的规则或域名，`UserspaceBypasses` 统计命中后直接连接的次数。应绕过的域名若只增长
+`UserspaceBypasses` 而 `LearnedAddresses` 不变，说明它不经 sing-box DNS 解析或被应答为 FakeIP
+地址；应绕过却被代理的连接，说明以路由器能得到的连接信息无法命中任何规则（查看路由器为它记录的
+域名）。
+
 怀疑校验和或硬件 offload 时，请使用专门的
 [校验和/offload 验证流程](/zh/manual/misc/ebpf-checksum-offload-verification/)。发送侧抓包
 可能在网卡完成 offload 前看到不完整校验和，应以接收 payload 与远端抓包为准。

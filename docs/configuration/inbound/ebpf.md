@@ -218,11 +218,41 @@ IPv6 `fd7a:115c:a1e0::/48`) intercepted so tailnet traffic can reach a
 
 ### local.bypass_rule_set
 
-Rule sets whose destination IP CIDRs bypass the local data plane. Non-IP rules
-are ignored. This policy is independent from `shared.bypass_rule_set` and is
-updated transactionally across the active local backends. Rule-set callbacks
-only queue a generation change; the policy worker coalesces rapid updates and
-performs the kernel map transaction outside the rule-set callback.
+Rule sets whose matching traffic bypasses the proxy: it leaves directly instead
+of being routed. Every rule type is supported and matches exactly as in a route
+rule. This policy is independent from `shared.bypass_rule_set`.
+
+Each rule is enforced at the cheapest layer that can decide it exactly:
+
+* A rule whose only condition is the destination address (`ip_cidr` and the
+  domain items `domain`, `domain_suffix`, `domain_keyword`, `domain_regex`,
+  AdGuard domains, which a rule ORs together; logical `or` rules are split the
+  same way) is enforced by the kernel. Its CIDRs go into the data plane's
+  bypass map directly. Its domains are learned: when sing-box's DNS answers a
+  matching name with real A/AAAA records, those addresses are added to the
+  same map for the record TTL (at least 5 minutes, at most 24 hours, up to
+  16384 addresses per scope), so later connections never enter sing-box.
+* Any other rule (ports, `network`, process, package or user, source address,
+  logical `and`, `invert`, or an address condition combined with any of these)
+  cannot be decided before the connection exists. Such connections are
+  intercepted and matched in userspace against the whole rule set before any
+  route rule, with the process, the FakeIP or DNS-mapped domain, the learned
+  domain and, when nothing else names the destination, a sniffed TLS/HTTP/QUIC
+  domain. A match leaves through a built-in direct outbound, still visible in
+  the Clash API with rule `ebpf local.bypass_rule_set`.
+
+Userspace matching also covers the first connections made before a learned
+address reaches the kernel and domains resolved without sing-box (for example
+DNS-over-HTTPS in the application). Domain learning only sees DNS that sing-box
+answers, so `dns_mode: hijack` gives the best coverage. A domain answered with
+a FakeIP address is never learned, since the FakeIP range stays intercepted:
+return real addresses for such domains through a DNS rule if they should
+bypass in the kernel.
+
+The kernel policy is updated transactionally across the active local
+backends. Rule-set callbacks and learned addresses only queue a change; the
+policy worker coalesces bursts and performs the kernel map transaction outside
+the callback.
 
 ### local.include_uid
 
@@ -341,9 +371,12 @@ prefixes; overlapping prefixes are resolved by the normal final-action policy.
 
 ### shared.bypass_rule_set
 
-Rule sets whose destination IP CIDRs bypass the shared data plane. Non-IP rules
-are ignored. This policy is independent from `local.bypass_rule_set` and is
-updated transactionally across the active shared backends.
+Same as `local.bypass_rule_set`, for the shared data plane: kernel-enforced
+CIDRs and learned addresses bypass it, and every other rule is matched in
+userspace for intercepted clients, whose matching connections are then made
+directly by this device. This policy is independent from
+`local.bypass_rule_set` and is updated transactionally across the active
+shared backends.
 
 ### shared.include_source_cidr
 

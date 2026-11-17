@@ -198,9 +198,29 @@ local 和 shared 的集合完全独立，本机强制接管前缀不会传播到
 
 ### local.bypass_rule_set
 
-目标 IP CIDR 命中这些规则集时绕过 local 数据面，非 IP 规则会被忽略。该策略与
-`shared.bypass_rule_set` 独立，并以事务方式更新所有启用的 local 后端。规则集回调只记录
-新的代数并唤醒策略 worker；快速连续更新会被合并，内核 map 事务在回调之外执行。
+命中这些规则集的流量绕过代理、直接连接，不再经过路由规则。支持全部规则类型，匹配语义与路由规则中的
+规则集完全一致。该策略与 `shared.bypass_rule_set` 独立。
+
+每条规则在能精确判定它的最低一层执行：
+
+* 只含目标地址条件的规则（`ip_cidr` 以及 `domain`、`domain_suffix`、`domain_keyword`、
+  `domain_regex`、AdGuard 域名这些在同一条规则内为「或」关系的条件；`or` 逻辑规则按同样方式拆分）
+  由内核执行。其中的 CIDR 直接写入数据面的 bypass map；其中的域名通过学习生效：sing-box 的 DNS
+  以真实 A/AAAA 记录应答命中的域名时，这些地址按记录 TTL（最少 5 分钟、最多 24 小时，每个范围最多
+  16384 个地址）加入同一个 map，之后的连接不再进入 sing-box。
+* 其他规则（端口、`network`、进程/包名/用户、来源地址、`and` 逻辑规则、`invert`，或者地址条件与
+  上述任一条件组合）在连接建立前无法判定。这类连接会被接管，并在匹配任何路由规则之前，于用户态用整个
+  规则集匹配；匹配时会补全进程信息、FakeIP 或 DNS 映射的域名、学习到的域名，在都没有时嗅探
+  TLS/HTTP/QUIC 域名。命中的连接经内置的直连出站发出，在 Clash API 中仍可见，规则显示为
+  `ebpf local.bypass_rule_set`。
+
+用户态匹配同时覆盖学习到的地址写入内核之前的最初几个连接，以及不经 sing-box 解析的域名（例如应用自己的
+DNS-over-HTTPS）。域名学习只能看到由 sing-box 应答的 DNS，`dns_mode: hijack` 覆盖最完整。以 FakeIP
+地址应答的域名不会被学习，因为 FakeIP 范围始终被接管；如需让这类域名在内核层绕过，请用 DNS 规则为它们
+返回真实地址。
+
+内核策略以事务方式更新所有启用的 local 后端。规则集回调与新学习的地址只记录变化并唤醒策略 worker；
+突发的更新会被合并，内核 map 事务在回调之外执行。
 
 ### local.include_uid
 
@@ -305,8 +325,9 @@ raw-IP、PPP/PPPoE 和受支持的隧道链路应使用 `socket_assign`。local 
 
 ### shared.bypass_rule_set
 
-目标 IP CIDR 命中这些规则集时绕过 shared 数据面，非 IP 规则会被忽略。该策略与
-`local.bypass_rule_set` 独立，并以事务方式更新所有启用的 shared 后端。
+与 `local.bypass_rule_set` 相同，但作用于 shared 数据面：内核执行的 CIDR 与学习到的地址直接绕过，
+其他规则对被接管的客户端在用户态匹配，命中的连接由本机直接发出。该策略与 `local.bypass_rule_set`
+独立，并以事务方式更新所有启用的 shared 后端。
 
 ### shared.include_source_cidr
 

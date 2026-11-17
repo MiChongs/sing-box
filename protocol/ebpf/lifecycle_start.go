@@ -17,6 +17,13 @@ import (
 )
 
 func (i *Inbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
+	// The bypass_rule_set direct outbound is owned by this inbound rather
+	// than the outbound manager, so it follows the inbound's lifecycle.
+	if starter, isStarter := i.bypassOutbound.(adapter.Lifecycle); isStarter && scope != nil {
+		if err := starter.Start(stage, scope); err != nil {
+			return E.Cause(err, "start eBPF bypass_rule_set direct outbound")
+		}
+	}
 	switch stage {
 	case adapter.StartStateInitialize:
 		if scope == nil {

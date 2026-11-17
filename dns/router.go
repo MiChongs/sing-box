@@ -46,6 +46,7 @@ type Router struct {
 	rules                  []adapter.DNSRule
 	defaultDomainStrategy  C.DomainStrategy
 	dnsReverseMapping      *freelru.Cache[netip.Addr, string]
+	responseObservers      dnsResponseObservers
 	platformInterface      adapter.PlatformInterface
 	legacyDNSMode          bool
 	rulesAccess            sync.RWMutex
@@ -1189,7 +1190,14 @@ func (r *Router) prepareExchange(ctx context.Context, message *mDNS.Msg) (*dnsEx
 	}, nil, nil
 }
 
+func (r *Router) RegisterDNSResponseObserver(observer adapter.DNSResponseObserver) func() {
+	return r.responseObservers.register(observer)
+}
+
 func (r *Router) recordReverseMapping(message *mDNS.Msg, response *mDNS.Msg, transport adapter.DNSTransport) {
+	if response != nil && len(response.Answer) > 0 && (transport == nil || transport.Type() != C.DNSTypeFakeIP) {
+		r.responseObservers.notify(message, response)
+	}
 	if r.dnsReverseMapping != nil && len(message.Question) > 0 && response != nil && len(response.Answer) > 0 {
 		if transport == nil || transport.Type() != C.DNSTypeFakeIP {
 			for _, answer := range response.Answer {

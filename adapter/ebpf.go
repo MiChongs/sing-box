@@ -173,6 +173,10 @@ type EBPFBypassRuleSetDiagnostics struct {
 	ExpectedPolicyVersion uint64
 	RetryCount            uint64
 	BackendState          map[string]EBPFBypassRuleSetBackendState
+	KernelPrefixes        int
+	LearnedAddresses      int
+	UserspaceMatching     bool
+	UserspaceBypasses     uint64
 }
 
 type EBPFUDPNATDiagnostics struct {

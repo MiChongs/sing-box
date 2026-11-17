@@ -85,6 +85,7 @@ func (i *Inbound) NewConnection(
 		metadata.Source = M.SocksaddrFromNet(conn.RemoteAddr())
 		metadata.Destination = M.SocksaddrFromNetIP(original.Destination)
 		metadata.ProcessInfo = i.lookupProcessInfo(original.SocketCookie)
+		metadata.PreRouteBypass = i.preRouteBypass(false)
 		i.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 		return
 	}
@@ -186,6 +187,9 @@ func (i *Inbound) NewPacketConnectionEx(
 		if binding, found := clientState.redirectBinding(destination.AddrPort()); found {
 			metadata.UDPConnect = binding.connected
 		}
+	}
+	if keyLoaded {
+		metadata.PreRouteBypass = i.preRouteBypass(key.Scope == udpSessionScopeSharedTC || key.Scope == udpSessionScopeSharedRewrite)
 	}
 	i.router.RoutePacketConnectionEx(ctx, conn, metadata, onClose)
 }

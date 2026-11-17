@@ -17,6 +17,7 @@ import (
 	"github.com/sagernet/sing-box/internal/ebpfcleanup"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing-box/protocol/direct"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
 	N "github.com/sagernet/sing/common/network"
@@ -188,6 +189,8 @@ type Inbound struct {
 	bypassRuleSetAccess       sync.Mutex
 	localBypassRules          bypassRuleSetState
 	sharedBypassRules         bypassRuleSetState
+	bypassDNSUnregister       func()
+	bypassOutbound            adapter.Outbound
 	inboundResources
 	inboundWorkers
 	inboundDiagnostics
@@ -401,6 +404,16 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	}
 	if err = loadRuleSets("shared", &inbound.sharedBypassRules.ruleSets, options.Shared.BypassRuleSet); err != nil {
 		return nil, err
+	}
+	inbound.localBypassRules.learned = newBypassLearnedTable(bypassLearnedCapacity)
+	inbound.sharedBypassRules.learned = newBypassLearnedTable(bypassLearnedCapacity)
+	if len(inbound.localBypassRules.ruleSets) > 0 || len(inbound.sharedBypassRules.ruleSets) > 0 {
+		// Connections a bypass rule-set matches in userspace leave through a
+		// default direct dialer, which registers its sockets for self-bypass.
+		inbound.bypassOutbound, err = direct.NewOutbound(ctx, router, logger, tag+"/bypass", option.DirectOutboundOptions{})
+		if err != nil {
+			return nil, E.Cause(err, "create bypass_rule_set direct outbound")
+		}
 	}
 	udpTimeout := C.UDPTimeout
 	if options.UDPTimeout != 0 {

@@ -360,6 +360,18 @@ safely redirect later fragments independently. If fragmentation is unexpected,
 capture both sides of the affected interface and determine whether MTU, PMTU
 discovery, an upstream tunnel, or the sender created it.
 
+For `bypass_rule_set`, `local_bypass_rule_set` and `shared_bypass_rule_set`
+report how each scope enforces its rule sets. `KernelPrefixes` counts the
+rule-set CIDRs in the kernel bypass map and `LearnedAddresses` the
+DNS-learned addresses added to it. `UserspaceMatching` is true when the rule
+sets contain rules or domains that intercepted connections are matched against
+before routing, and `UserspaceBypasses` counts the connections that matched and
+left directly. A domain that should bypass but keeps increasing
+`UserspaceBypasses` without growing `LearnedAddresses` is resolved outside
+sing-box DNS or answered with FakeIP addresses; a connection that should bypass
+but is proxied matches no rule with the metadata available to the router (check
+the domain the router logs for it).
+
 For checksum or hardware-offload suspicion, use the dedicated
 [checksum/offload verification](/manual/misc/ebpf-checksum-offload-verification/)
 procedure. A sending-side capture can show incomplete checksums before the NIC

@@ -61,6 +61,14 @@ type scopedBypassRuleSetDiagnostics struct {
 	ExpectedPolicyVersion uint64
 	RetryCount            uint64
 	BackendState          map[string]BypassRuleSetBackendState
+	// KernelPrefixes counts the rule-set prefixes enforced by the data plane,
+	// LearnedAddresses the DNS-learned addresses added to them.
+	KernelPrefixes   int
+	LearnedAddresses int
+	// UserspaceMatching reports that intercepted connections are matched
+	// against the rule-sets before routing; UserspaceBypasses counts matches.
+	UserspaceMatching bool
+	UserspaceBypasses uint64
 }
 
 // EBPFPolicyEpochDiagnostics makes the two independently updated policy

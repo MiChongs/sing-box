@@ -110,10 +110,13 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	}
 	selectedRule, _, buffers, _, err := r.matchRule(ctx, &metadata, conn, nil)
 	if err != nil {
+		buf.ReleaseMulti(buffers)
 		return err
 	}
 	var selectedOutbound adapter.Outbound
-	if selectedRule != nil {
+	if metadata.PreRouteBypassMatched {
+		selectedOutbound = metadata.PreRouteBypass.Outbound
+	} else if selectedRule != nil {
 		switch action := selectedRule.Action().(type) {
 		case *R.RuleActionRoute:
 			var loaded bool
@@ -146,7 +149,7 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 			return nil
 		}
 	}
-	if selectedRule == nil {
+	if selectedRule == nil && selectedOutbound == nil {
 		selectedOutbound = r.outbound.Default()
 	}
 	chain, err := resolveOutbound(selectedOutbound, N.NetworkTCP, &metadata)
@@ -157,7 +160,9 @@ func (r *Router) routeConnection(ctx context.Context, conn net.Conn, metadata ad
 	for _, buffer := range buffers {
 		conn = bufio.NewCachedConn(conn, buffer)
 	}
-	if selectedRule != nil {
+	if metadata.PreRouteBypassMatched {
+		metadata.RouteRule = metadata.PreRouteBypass.Description
+	} else if selectedRule != nil {
 		metadata.RouteRule = selectedRule.String()
 	}
 	metadata.RouteOutbound = selectedOutbound.Tag()
@@ -315,11 +320,14 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 	}
 	selectedRule, _, _, packetBuffers, err := r.matchRule(ctx, &metadata, nil, conn)
 	if err != nil {
+		N.ReleaseMultiPacketBuffer(packetBuffers)
 		return err
 	}
 	var selectedOutbound adapter.Outbound
 	var selectReturn bool
-	if selectedRule != nil {
+	if metadata.PreRouteBypassMatched {
+		selectedOutbound = metadata.PreRouteBypass.Outbound
+	} else if selectedRule != nil {
 		switch action := selectedRule.Action().(type) {
 		case *R.RuleActionRoute:
 			var loaded bool
@@ -348,7 +356,7 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 			return r.hijackDNSPacket(ctx, conn, packetBuffers, metadata, onClose)
 		}
 	}
-	if selectedRule == nil || selectReturn {
+	if (selectedRule == nil && selectedOutbound == nil) || selectReturn {
 		selectedOutbound = r.outbound.Default()
 	}
 	chain, err := resolveOutbound(selectedOutbound, N.NetworkUDP, &metadata)
@@ -360,7 +368,9 @@ func (r *Router) routePacketConnection(ctx context.Context, conn N.PacketConn, m
 		conn = bufio.NewCachedPacketConn(conn, buffer.Buffer, buffer.Destination)
 		N.PutPacketBuffer(buffer)
 	}
-	if selectedRule != nil {
+	if metadata.PreRouteBypassMatched {
+		metadata.RouteRule = metadata.PreRouteBypass.Description
+	} else if selectedRule != nil {
 		metadata.RouteRule = selectedRule.String()
 	}
 	metadata.RouteOutbound = selectedOutbound.Tag()
@@ -808,6 +818,14 @@ func (r *Router) matchRule(
 	fatalErr = r.prepareMatchMetadata(ctx, metadata)
 	if fatalErr != nil {
 		return
+	}
+	if bypass := metadata.PreRouteBypass; bypass != nil && (inputConn != nil || inputPacketConn != nil) {
+		var matched bool
+		matched, buffers, packetBuffers, fatalErr = r.matchPreRouteBypass(ctx, metadata, bypass, inputConn, inputPacketConn)
+		if fatalErr != nil || matched {
+			metadata.PreRouteBypassMatched = matched
+			return
+		}
 	}
 
 match:

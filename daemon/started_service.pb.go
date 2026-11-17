@@ -8758,6 +8758,10 @@ type EBPFBypassRuleSetDiagnostics struct {
 	ExpectedPolicyVersion uint64                                    `protobuf:"varint,4,opt,name=expectedPolicyVersion,proto3" json:"expectedPolicyVersion,omitempty"`
 	RetryCount            uint64                                    `protobuf:"varint,5,opt,name=retryCount,proto3" json:"retryCount,omitempty"`
 	BackendState          map[string]*EBPFBypassRuleSetBackendState `protobuf:"bytes,6,rep,name=backendState,proto3" json:"backendState,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
+	KernelPrefixes        int64                                     `protobuf:"varint,7,opt,name=kernelPrefixes,proto3" json:"kernelPrefixes,omitempty"`
+	LearnedAddresses      int64                                     `protobuf:"varint,8,opt,name=learnedAddresses,proto3" json:"learnedAddresses,omitempty"`
+	UserspaceMatching     bool                                      `protobuf:"varint,9,opt,name=userspaceMatching,proto3" json:"userspaceMatching,omitempty"`
+	UserspaceBypasses     uint64                                    `protobuf:"varint,10,opt,name=userspaceBypasses,proto3" json:"userspaceBypasses,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -8832,6 +8836,34 @@ func (x *EBPFBypassRuleSetDiagnostics) GetBackendState() map[string]*EBPFBypassR
 		return x.BackendState
 	}
 	return nil
+}
+
+func (x *EBPFBypassRuleSetDiagnostics) GetKernelPrefixes() int64 {
+	if x != nil {
+		return x.KernelPrefixes
+	}
+	return 0
+}
+
+func (x *EBPFBypassRuleSetDiagnostics) GetLearnedAddresses() int64 {
+	if x != nil {
+		return x.LearnedAddresses
+	}
+	return 0
+}
+
+func (x *EBPFBypassRuleSetDiagnostics) GetUserspaceMatching() bool {
+	if x != nil {
+		return x.UserspaceMatching
+	}
+	return false
+}
+
+func (x *EBPFBypassRuleSetDiagnostics) GetUserspaceBypasses() uint64 {
+	if x != nil {
+		return x.UserspaceBypasses
+	}
+	return 0
 }
 
 type EBPFUDPReplySocketDiagnostics struct {
@@ -10096,7 +10128,7 @@ const file_daemon_started_service_proto_rawDesc = "" +
 	"\x04slot\x18\a \x01(\x05R\x04slot\"O\n" +
 	"\x1dEBPFBypassRuleSetBackendState\x12\x18\n" +
 	"\aversion\x18\x01 \x01(\x04R\aversion\x12\x14\n" +
-	"\x05known\x18\x02 \x01(\bR\x05known\"\x98\x03\n" +
+	"\x05known\x18\x02 \x01(\bR\x05known\"\xc8\x04\n" +
 	"\x1cEBPFBypassRuleSetDiagnostics\x12\x1e\n" +
 	"\n" +
 	"consistent\x18\x01 \x01(\bR\n" +
@@ -10107,7 +10139,12 @@ const file_daemon_started_service_proto_rawDesc = "" +
 	"\n" +
 	"retryCount\x18\x05 \x01(\x04R\n" +
 	"retryCount\x12Z\n" +
-	"\fbackendState\x18\x06 \x03(\v26.daemon.EBPFBypassRuleSetDiagnostics.BackendStateEntryR\fbackendState\x1af\n" +
+	"\fbackendState\x18\x06 \x03(\v26.daemon.EBPFBypassRuleSetDiagnostics.BackendStateEntryR\fbackendState\x12&\n" +
+	"\x0ekernelPrefixes\x18\a \x01(\x03R\x0ekernelPrefixes\x12*\n" +
+	"\x10learnedAddresses\x18\b \x01(\x03R\x10learnedAddresses\x12,\n" +
+	"\x11userspaceMatching\x18\t \x01(\bR\x11userspaceMatching\x12,\n" +
+	"\x11userspaceBypasses\x18\n" +
+	" \x01(\x04R\x11userspaceBypasses\x1af\n" +
 	"\x11BackendStateEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12;\n" +
 	"\x05value\x18\x02 \x01(\v2%.daemon.EBPFBypassRuleSetBackendStateR\x05value:\x028\x01\"\x8f\x01\n" +

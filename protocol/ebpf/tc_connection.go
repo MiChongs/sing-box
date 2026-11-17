@@ -57,6 +57,7 @@ func (i *Inbound) newTCConnection(
 	if assignment.Path == commonEBPF.TCPathShared && assignment.SourceMACValid != 0 {
 		metadata.SourceMACAddress = net.HardwareAddr(assignment.SourceMAC[:])
 	}
+	metadata.PreRouteBypass = i.preRouteBypass(assignment.Path == commonEBPF.TCPathShared)
 	i.router.RouteConnectionEx(ctx, conn, metadata, onClose)
 }
 

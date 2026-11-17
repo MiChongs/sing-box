@@ -977,6 +977,10 @@ message EBPFBypassRuleSetDiagnostics {
   uint64 expectedPolicyVersion = 4;
   uint64 retryCount = 5;
   map<string, EBPFBypassRuleSetBackendState> backendState = 6;
+  int64 kernelPrefixes = 7;
+  int64 learnedAddresses = 8;
+  bool userspaceMatching = 9;
+  uint64 userspaceBypasses = 10;
 }
 
 message EBPFUDPReplySocketDiagnostics {

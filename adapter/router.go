@@ -145,6 +145,34 @@ type RuleSet interface {
 
 type RuleSetUpdateCallback func(it RuleSet)
 
+// RuleSetPreMatchPlan splits a rule-set into the parts a data plane can
+// enforce before a connection exists, where only the destination address is
+// known. DestinationIPSets and MatchDomain are exact: they come only from
+// rules whose single condition is the destination address group (ip_cidr and
+// domain items, which a rule ORs together), so matching either is the same as
+// matching the rule. Every other rule needs connection metadata and is
+// reported through Residual; Match on the whole rule-set stays authoritative
+// for those.
+type RuleSetPreMatchPlan struct {
+	DestinationIPSets []*netipx.IPSet
+	// MatchDomain reports whether a domain-only rule matches the name. It is
+	// nil when the rule-set has no such rule.
+	MatchDomain func(domain string) bool
+	// Residual is set when some rule cannot be decided from the destination
+	// address alone.
+	Residual bool
+	// NeedDomain is set when any rule has a domain condition.
+	NeedDomain bool
+	// NeedProcess is set when any rule has a process condition.
+	NeedProcess bool
+}
+
+// RuleSetPreMatchPlanner is implemented by rule-sets that can describe their
+// rules for pre-connection data planes.
+type RuleSetPreMatchPlanner interface {
+	PreMatchPlan() RuleSetPreMatchPlan
+}
+
 type DNSRuleSetUpdateValidator interface {
 	ValidateRuleSetMetadataUpdate(tag string, metadata RuleSetMetadata) error
 }

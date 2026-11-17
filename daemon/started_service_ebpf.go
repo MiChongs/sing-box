@@ -232,6 +232,10 @@ func marshalEBPFBypassRuleSetDiagnostics(source adapter.EBPFBypassRuleSetDiagnos
 		ExpectedPolicyVersion: source.ExpectedPolicyVersion,
 		RetryCount:            source.RetryCount,
 		BackendState:          make(map[string]*EBPFBypassRuleSetBackendState, len(source.BackendState)),
+		KernelPrefixes:        int64(source.KernelPrefixes),
+		LearnedAddresses:      int64(source.LearnedAddresses),
+		UserspaceMatching:     source.UserspaceMatching,
+		UserspaceBypasses:     source.UserspaceBypasses,
 	}
 	for name, state := range source.BackendState {
 		destination.BackendState[name] = &EBPFBypassRuleSetBackendState{Version: state.Version, Known: state.Known}

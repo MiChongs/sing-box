@@ -44,6 +44,21 @@ type InboundManager interface {
 	Create(ctx context.Context, router Router, logger log.ContextLogger, tag string, inboundType string, options any) error
 }
 
+// PreRouteBypass is evaluated by the router before any route rule, on a copy
+// of the connection metadata completed with process information and a domain
+// (FakeIP, DNS reverse mapping, LookupDomain, then sniffing when NeedDomain
+// and nothing else named the destination). A match routes the connection to
+// Outbound.
+type PreRouteBypass struct {
+	Rule        HeadlessRule
+	Outbound    Outbound
+	Description string
+	NeedDomain  bool
+	// LookupDomain resolves a destination address to a domain the inbound
+	// learned for it.
+	LookupDomain func(address netip.Addr) (string, bool)
+}
+
 type InboundContext struct {
 	Inbound     string
 	InboundType string
@@ -114,6 +129,12 @@ type InboundContext struct {
 	FakeIP                              bool
 	PreMatch                            bool
 	DestOverride                        bool
+	// PreRouteBypass is set by an inbound whose traffic was intercepted below
+	// the router and that must let part of it bypass every route rule.
+	PreRouteBypass *PreRouteBypass `json:"-"`
+	// PreRouteBypassMatched reports that PreRouteBypass matched and the
+	// connection uses its outbound.
+	PreRouteBypassMatched bool
 
 	// rule cache
 

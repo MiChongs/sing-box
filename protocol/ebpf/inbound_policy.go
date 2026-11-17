@@ -6,7 +6,10 @@ import (
 	"context"
 	"net/netip"
 	"reflect"
+	"slices"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
@@ -27,6 +30,19 @@ type bypassRuleSetState struct {
 	dirty                                      bool
 	needsRetry, inconsistent                   bool
 	tc, cgroup, shared                         bypassRuleSetBackendVersion
+
+	// plan is recompiled when the rule-sets change (generation moves);
+	// learned-address changes reuse it.
+	plan           bypassScopePlan
+	planGeneration uint64
+	planValid      bool
+	learned        *bypassLearnedTable
+	learnedDirty   bool
+	// domainMatcher and preRouteBypass are read without the rule-set lock by
+	// the DNS path and the connection path.
+	domainMatcher     atomic.Pointer[bypassDomainMatcher]
+	preRouteBypass    atomic.Pointer[adapter.PreRouteBypass]
+	userspaceBypasses atomic.Uint64
 }
 
 type bypassRuleSetBackendVersion struct {
@@ -93,6 +109,7 @@ func (i *Inbound) startBypassRuleSets() error {
 			return err
 		}
 	}
+	i.startBypassDNSObserverLocked()
 	i.startBypassRuleSetWorkerLocked()
 	i.bypassRuleSetAccess.Unlock()
 	return nil
@@ -131,17 +148,34 @@ func (i *Inbound) stopBypassRuleSetWorker() {
 
 func (i *Inbound) bypassRuleSetWorker(ctx context.Context, done chan struct{}) {
 	defer close(done)
+	sweepTicker := time.NewTicker(bypassLearnedSweepInterval)
+	defer sweepTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-sweepTicker.C:
+			i.sweepBypassLearned()
+			continue
 		case <-i.policyWake:
-			i.refreshDirtyRuleSets()
+		}
+		if !i.refreshDirtyRuleSets() {
+			continue
+		}
+		// DNS answers arrive in bursts; let them accumulate into the next
+		// kernel update instead of rebuilding the policy for each one.
+		cooldown := time.NewTimer(bypassLearnedRefreshCooldown)
+		select {
+		case <-ctx.Done():
+			cooldown.Stop()
+			return
+		case <-cooldown.C:
 		}
 	}
 }
 
-func (i *Inbound) refreshDirtyRuleSets() {
+// refreshDirtyRuleSets reports whether a learned-address change was applied.
+func (i *Inbound) refreshDirtyRuleSets() (learned bool) {
 	i.bypassRuleSetAccess.Lock()
 	defer i.bypassRuleSetAccess.Unlock()
 	for _, shared := range []bool{false, true} {
@@ -149,6 +183,7 @@ func (i *Inbound) refreshDirtyRuleSets() {
 		if !state.started || !state.dirty {
 			continue
 		}
+		learned = learned || state.learnedDirty
 		state.dirty = false
 		if err := i.refreshRuleSetsLocked(shared, false); err != nil {
 			state.needsRetry = true
@@ -156,8 +191,10 @@ func (i *Inbound) refreshDirtyRuleSets() {
 			i.notifyTCInterfaceUpdate()
 		}
 	}
+	return
 }
 func (i *Inbound) stopBypassRuleSetsLocked() {
+	i.stopBypassDNSObserverLocked()
 	for _, state := range []*bypassRuleSetState{&i.localBypassRules, &i.sharedBypassRules} {
 		if !state.started {
 			continue
@@ -168,6 +205,9 @@ func (i *Inbound) stopBypassRuleSetsLocked() {
 		}
 		state.callbacks = nil
 		state.started = false
+		state.planValid = false
+		state.domainMatcher.Store(nil)
+		state.preRouteBypass.Store(nil)
 	}
 }
 
@@ -238,15 +278,13 @@ func (i *Inbound) refreshSharedBypassRuleSetsLocked(startup bool) error {
 }
 func (i *Inbound) refreshRuleSetsLocked(shared, startup bool) error {
 	state, name, initial := i.ruleSetScope(shared)
-	var prefixes []netip.Prefix
-	for _, ruleSet := range state.ruleSets {
-		ipSets := ruleSet.ExtractIPSet()
-		if startup && len(ipSets) == 0 {
-			i.logger.Warn(name, ": no destination IP CIDR rules found in rule-set: ", ruleSet.Name())
-		}
-		for _, ipSet := range ipSets {
-			prefixes = append(prefixes, ipSet.Prefixes()...)
-		}
+	if startup || !state.planValid || state.planGeneration != state.generation {
+		i.updateBypassScopePlanLocked(state, name, startup)
+	}
+	state.learnedDirty = false
+	prefixes := slices.Clone(state.plan.prefixes)
+	if state.learned != nil {
+		prefixes = append(prefixes, state.learned.prefixes()...)
 	}
 	dynamic, err := i.compileBypassCIDRDecisions(prefixes)
 	if err != nil {
@@ -261,6 +299,48 @@ func (i *Inbound) refreshRuleSetsLocked(shared, startup bool) error {
 	}
 	state.appliedGeneration = state.generation
 	return nil
+}
+
+// updateBypassScopePlanLocked recompiles a scope's rule-sets into kernel
+// prefixes, the DNS learning matcher and the userspace bypass.
+func (i *Inbound) updateBypassScopePlanLocked(state *bypassRuleSetState, name string, startup bool) {
+	plan := compileBypassScopePlan(state.ruleSets)
+	state.plan = plan
+	state.planGeneration = state.generation
+	state.planValid = true
+	if state.learned != nil {
+		state.learned.retain(plan.matchDomain)
+	}
+	if plan.matchDomain != nil {
+		state.domainMatcher.Store(&bypassDomainMatcher{match: plan.matchDomain})
+	} else {
+		state.domainMatcher.Store(nil)
+	}
+	if (plan.userspace || plan.matchDomain != nil) && i.bypassOutbound != nil && len(state.ruleSets) > 0 {
+		bypass := &adapter.PreRouteBypass{
+			Rule:        &bypassRuleSetMatcher{ruleSets: state.ruleSets, matched: &state.userspaceBypasses},
+			Outbound:    i.bypassOutbound,
+			Description: "ebpf " + name,
+			NeedDomain:  plan.needDomain,
+		}
+		if learned := state.learned; learned != nil {
+			bypass.LookupDomain = learned.lookup
+		}
+		state.preRouteBypass.Store(bypass)
+	} else {
+		state.preRouteBypass.Store(nil)
+	}
+	if startup && len(state.ruleSets) > 0 {
+		i.logger.Info(name, ": ", len(plan.prefixes), " destination prefixes enforced in kernel, domain learning ",
+			enabledString(plan.matchDomain != nil), ", userspace matching ", enabledString(plan.userspace || plan.matchDomain != nil))
+	}
+}
+
+func enabledString(enabled bool) string {
+	if enabled {
+		return "on"
+	}
+	return "off"
 }
 
 func revertBypassCIDRBackends(applied []bypassCIDRAppliedBackend, warn func(string, error)) []string {

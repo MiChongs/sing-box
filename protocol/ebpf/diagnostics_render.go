@@ -73,8 +73,8 @@ func (d EBPFDiagnostics) WriteText(w io.Writer) error {
 	if d.LastError != "" {
 		lines = append(lines, fmt.Sprintf("Last error (%s): %s", d.LastErrorAt.Format(time.RFC3339), d.LastError))
 	}
-	lines = append(lines, fmt.Sprintf("local.bypass_rule_set: consistent=%t pending=%t version=%d", d.LocalBypassRuleSet.Consistent, d.LocalBypassRuleSet.Pending, d.LocalBypassRuleSet.PolicyVersion))
-	lines = append(lines, fmt.Sprintf("shared.bypass_rule_set: consistent=%t pending=%t version=%d", d.SharedBypassRuleSet.Consistent, d.SharedBypassRuleSet.Pending, d.SharedBypassRuleSet.PolicyVersion))
+	lines = append(lines, fmt.Sprintf("local.bypass_rule_set: consistent=%t pending=%t version=%d kernel_prefixes=%d learned=%d userspace=%t userspace_bypasses=%d", d.LocalBypassRuleSet.Consistent, d.LocalBypassRuleSet.Pending, d.LocalBypassRuleSet.PolicyVersion, d.LocalBypassRuleSet.KernelPrefixes, d.LocalBypassRuleSet.LearnedAddresses, d.LocalBypassRuleSet.UserspaceMatching, d.LocalBypassRuleSet.UserspaceBypasses))
+	lines = append(lines, fmt.Sprintf("shared.bypass_rule_set: consistent=%t pending=%t version=%d kernel_prefixes=%d learned=%d userspace=%t userspace_bypasses=%d", d.SharedBypassRuleSet.Consistent, d.SharedBypassRuleSet.Pending, d.SharedBypassRuleSet.PolicyVersion, d.SharedBypassRuleSet.KernelPrefixes, d.SharedBypassRuleSet.LearnedAddresses, d.SharedBypassRuleSet.UserspaceMatching, d.SharedBypassRuleSet.UserspaceBypasses))
 	lines = append(lines, fmt.Sprintf("policy_epoch: local=%d/%d shared=%d/%d converged=%t", d.PolicyEpoch.LocalConfirmed, d.PolicyEpoch.LocalExpected, d.PolicyEpoch.SharedConfirmed, d.PolicyEpoch.SharedExpected, d.PolicyEpoch.Converged))
 	lines = append(lines, fmt.Sprintf("UDP sessions: %d", d.UDPSessionCount))
 	lines = append(lines, fmt.Sprintf(

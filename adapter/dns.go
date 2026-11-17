@@ -25,6 +25,17 @@ type DNSRouter interface {
 	ResetNetwork()
 }
 
+// DNSResponseObserver receives every successful DNS router response that
+// carries real addresses: responses from FakeIP servers are not reported. It
+// runs on the DNS path and must not block.
+type DNSResponseObserver func(message *dns.Msg, response *dns.Msg)
+
+// DNSResponseObserverRegistry is implemented by DNS routers that can report
+// their responses.
+type DNSResponseObserverRegistry interface {
+	RegisterDNSResponseObserver(observer DNSResponseObserver) (unregister func())
+}
+
 type DNSClient interface {
 	Start()
 	Exchange(ctx context.Context, transport DNSTransport, message *dns.Msg, options DNSQueryOptions, responseChecker func(response *dns.Msg) bool) (*dns.Msg, error)

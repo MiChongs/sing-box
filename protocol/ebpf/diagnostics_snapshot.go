@@ -265,6 +265,7 @@ func (i *Inbound) diagnosticsLocked() EBPFDiagnostics {
 		RetryCount:            i.localBypassRules.retryCount,
 		BackendState:          make(map[string]BypassRuleSetBackendState, 2),
 	}
+	i.localBypassRules.fillDiagnostics(&localState)
 	if i.localSocketAssignEnabled() && runtime.tcBackend() != nil {
 		localState.BackendState["TC"] = BypassRuleSetBackendState{Version: i.localBypassRules.tc.version, Known: i.localBypassRules.tc.known}
 	}
@@ -279,6 +280,7 @@ func (i *Inbound) diagnosticsLocked() EBPFDiagnostics {
 		RetryCount:            i.sharedBypassRules.retryCount,
 		BackendState:          make(map[string]BypassRuleSetBackendState, 2),
 	}
+	i.sharedBypassRules.fillDiagnostics(&sharedState)
 	if shared := runtime.sharedRewrite; shared != nil && shared.sharedBackendInstance() != nil {
 		sharedState.BackendState["packet_rewrite"] = BypassRuleSetBackendState{Version: i.sharedBypassRules.shared.version, Known: i.sharedBypassRules.shared.known}
 	}

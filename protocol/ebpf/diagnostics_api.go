@@ -130,6 +130,10 @@ func diagnosticsForAPI(diagnostics EBPFDiagnostics) adapter.EBPFRuntimeDiagnosti
 			ExpectedPolicyVersion: diagnostics.LocalBypassRuleSet.ExpectedPolicyVersion,
 			RetryCount:            diagnostics.LocalBypassRuleSet.RetryCount,
 			BackendState:          convertBypassRuleSetBackendState(diagnostics.LocalBypassRuleSet.BackendState),
+			KernelPrefixes:        diagnostics.LocalBypassRuleSet.KernelPrefixes,
+			LearnedAddresses:      diagnostics.LocalBypassRuleSet.LearnedAddresses,
+			UserspaceMatching:     diagnostics.LocalBypassRuleSet.UserspaceMatching,
+			UserspaceBypasses:     diagnostics.LocalBypassRuleSet.UserspaceBypasses,
 		},
 		SharedBypassRuleSet: adapter.EBPFBypassRuleSetDiagnostics{
 			Consistent:            diagnostics.SharedBypassRuleSet.Consistent,
@@ -138,6 +142,10 @@ func diagnosticsForAPI(diagnostics EBPFDiagnostics) adapter.EBPFRuntimeDiagnosti
 			ExpectedPolicyVersion: diagnostics.SharedBypassRuleSet.ExpectedPolicyVersion,
 			RetryCount:            diagnostics.SharedBypassRuleSet.RetryCount,
 			BackendState:          convertBypassRuleSetBackendState(diagnostics.SharedBypassRuleSet.BackendState),
+			KernelPrefixes:        diagnostics.SharedBypassRuleSet.KernelPrefixes,
+			LearnedAddresses:      diagnostics.SharedBypassRuleSet.LearnedAddresses,
+			UserspaceMatching:     diagnostics.SharedBypassRuleSet.UserspaceMatching,
+			UserspaceBypasses:     diagnostics.SharedBypassRuleSet.UserspaceBypasses,
 		},
 		PolicyEpoch: adapter.EBPFPolicyEpochDiagnostics{
 			LocalConfirmed:  diagnostics.PolicyEpoch.LocalConfirmed,
