@@ -143,7 +143,6 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 		markFunc := networkManager.AutoRedirectOutputMarkFunc()
 		dialer.Control = control.Append(dialer.Control, markFunc)
 		listenConfig.Control = control.Append(listenConfig.Control, markFunc)
-		dialer.Control, listenConfig.Control = appendEBPFSelfBypass(networkManager, dialer.Control, listenConfig.Control)
 	}
 	if options.ReuseAddr {
 		listenConfig.Control = control.Append(listenConfig.Control, control.ReuseAddr())
@@ -242,6 +241,12 @@ func NewDefault(ctx context.Context, options option.DialerOptions) (*DefaultDial
 	if options.TCPMultiPath {
 		dialer4.SetMultipathTCP(true)
 	}
+	if networkManager != nil {
+		appendEBPFSelfBypassDialer(networkManager, &dialer4)
+		appendEBPFSelfBypassDialer(networkManager, &dialer6)
+		appendEBPFSelfBypassDialer(networkManager, &udpDialer4)
+		appendEBPFSelfBypassDialer(networkManager, &udpDialer6)
+	}
 	tcpDialer4 := tfo.Dialer{Dialer: dialer4, DisableTFO: !options.TCPFastOpen}
 	tcpDialer6 := tfo.Dialer{Dialer: dialer6, DisableTFO: !options.TCPFastOpen}
 	return &DefaultDialer{
@@ -316,9 +321,9 @@ func (d *DefaultDialer) DialContext(ctx context.Context, network string, address
 			switch N.NetworkName(network) {
 			case N.NetworkUDP:
 				if !address.IsIPv6() {
-					return d.udpDialer4.DialContext(ctx, network, address.String())
+					return d.dialWithSelfBypass(ctx, d.udpDialer4, network, address.String())
 				} else {
-					return d.udpDialer6.DialContext(ctx, network, address.String())
+					return d.dialWithSelfBypass(ctx, d.udpDialer6, network, address.String())
 				}
 			}
 			if !address.IsIPv6() {
@@ -509,6 +514,11 @@ func (d *DefaultDialer) trackConn(ctx context.Context, destination M.Socksaddr, 
 func (d *DefaultDialer) trackPacketConn(ctx context.Context, destination M.Socksaddr, conn net.PacketConn, err error) (net.PacketConn, error) {
 	if err != nil {
 		return conn, err
+	}
+	// Register the kernel socket before any wrapper hides its SyscallConn.
+	if err = RegisterEBPFSelfBypassPacketConn(d.networkManager, conn); err != nil {
+		_ = conn.Close()
+		return nil, err
 	}
 	if d.disableGSO {
 		if udpConn, loaded := conn.(*net.UDPConn); loaded {

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing/common/buf"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
@@ -78,6 +79,23 @@ func TestTCPacketWriterBatchesByReplySource(t *testing.T) {
 	}
 	if received["first-a"] != firstSource || received["first-b"] != firstSource || received["second"] != secondSource {
 		t.Fatalf("unexpected batch reply sources: %v", received)
+	}
+}
+
+func TestSelfBypassSocketRegistrationContract(t *testing.T) {
+	tracker, err := commonEBPF.NewSelfBypassWithCapacity(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+
+	inbound := &Inbound{inboundResources: inboundResources{selfBypass: tracker}}
+	if !inbound.selfBypassNeedsSocketRegistration() {
+		t.Fatal("userspace self-bypass mode must register sockets")
+	}
+	inbound.selfBypassCgroup = true
+	if !inbound.selfBypassNeedsSocketRegistration() {
+		t.Fatal("registration must follow the selected producer, not an inbound attachment flag")
 	}
 }
 

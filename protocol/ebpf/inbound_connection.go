@@ -13,6 +13,7 @@ import (
 
 	commonEBPF "github.com/MiChongs/sing-ebpf"
 	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/common/listener"
 	"github.com/sagernet/sing/common/buf"
 	"github.com/sagernet/sing/common/control"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -23,7 +24,39 @@ import (
 )
 
 func (i *Inbound) closeListeners() error {
-	return E.Errors(i.listeners.close(), i.tcListeners.close())
+	return E.Errors(
+		i.listeners.closeWithCleanup(i.unregisterListenerSockets),
+		i.tcListeners.closeWithCleanup(i.unregisterListenerSockets),
+	)
+}
+
+func (i *Inbound) unregisterListenerSockets(current *listener.Listener) error {
+	if i.selfBypass == nil || !i.selfBypass.NeedsUserspaceUnregister() {
+		return nil
+	}
+	var unregisterErr error
+	unregister := func(conn syscall.Conn) {
+		rawConn, err := conn.SyscallConn()
+		if err != nil {
+			unregisterErr = E.Errors(unregisterErr, err)
+			return
+		}
+		cookie, err := i.selfBypass.SocketCookie(rawConn)
+		if err != nil {
+			unregisterErr = E.Errors(unregisterErr, err)
+			return
+		}
+		unregisterErr = E.Errors(unregisterErr, i.selfBypass.UnregisterSocket(commonEBPF.SocketRegistration{Cookie: cookie}))
+	}
+	if tcpListener := current.TCPListener(); tcpListener != nil {
+		if conn, loaded := tcpListener.(syscall.Conn); loaded {
+			unregister(conn)
+		}
+	}
+	if udpConn := current.UDPConn(); udpConn != nil {
+		unregister(udpConn)
+	}
+	return unregisterErr
 }
 
 func (i *Inbound) NewConnection(
@@ -207,11 +240,57 @@ func (i *Inbound) socketControl(ipv6Listener bool) control.Func {
 		if configureErr != nil {
 			return configureErr
 		}
-		if i.selfBypass == nil {
-			return nil
-		}
-		return i.selfBypass.RegisterSocket(rawConn)
+		// Registration happens after a successful bind. Control runs before
+		// bind, so registering here would leak a cookie when listen fails.
+		return nil
 	}
+}
+
+func (i *Inbound) registerListenerSocket(current *listener.Listener) error {
+	if !i.selfBypassNeedsSocketRegistration() {
+		return nil
+	}
+	var registerErr error
+	var registered []commonEBPF.SocketRegistration
+	register := func(conn syscall.Conn) {
+		if registerErr != nil {
+			return
+		}
+		rawConn, err := conn.SyscallConn()
+		if err != nil {
+			registerErr = err
+			return
+		}
+		var registration commonEBPF.SocketRegistration
+		if registration, registerErr = i.selfBypass.RegisterSocket(rawConn); registerErr == nil && registration.Active() {
+			registered = append(registered, registration)
+		}
+	}
+	if tcpListener := current.TCPListener(); tcpListener != nil {
+		if conn, loaded := tcpListener.(syscall.Conn); loaded {
+			register(conn)
+		} else {
+			return E.New("eBPF TCP listener does not expose syscall.Conn")
+		}
+	}
+	if udpConn := current.UDPConn(); udpConn != nil {
+		register(udpConn)
+	}
+	if registerErr != nil {
+		for index := len(registered) - 1; index >= 0; index-- {
+			registerErr = E.Errors(registerErr, i.selfBypass.UnregisterSocket(registered[index]))
+		}
+	}
+	return registerErr
+}
+
+// selfBypassNeedsSocketRegistration reports whether listener sockets need
+// userspace cookie registration.
+func (i *Inbound) selfBypassNeedsSocketRegistration() bool {
+	if i.selfBypass == nil {
+		return false
+	}
+	return i.selfBypass.NeedsUserspaceRegistration()
 }
 
 func redirectAddressFromOOB(oob []byte) (netip.Addr, error) {

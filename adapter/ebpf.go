@@ -4,7 +4,7 @@ import "time"
 
 // EBPFDiagnosticsSchemaVersion versions the complete GetEBPFDiagnostics
 // response. It remains available even when no eBPF inbound is running.
-const EBPFDiagnosticsSchemaVersion = 18
+const EBPFDiagnosticsSchemaVersion = 26
 
 // EBPFDiagnosticsProvider exposes a running inbound's eBPF state to the
 // sing-box API without coupling the API service to the optional eBPF package.
@@ -35,18 +35,21 @@ type EBPFMapOccupancyDiagnostics struct {
 }
 
 type EBPFMapDiagnostics struct {
-	ID         uint32
-	Name       string
-	Category   string
-	Type       string
-	MaxEntries uint32
-	KeySize    uint32
-	ValueSize  uint32
-	Flags      uint32
-	Entries    uint32
-	Supported  bool
-	Error      string
-	Pressure   string
+	ID                uint32
+	Name              string
+	Category          string
+	Type              string
+	MaxEntries        uint32
+	KeySize           uint32
+	ValueSize         uint32
+	Flags             uint32
+	Entries           uint32
+	Supported         bool
+	Error             string
+	Pressure          string
+	OccupancyMode     string
+	EvictionMode      string
+	AdmissionCritical bool
 }
 
 type EBPFRuntimeDiagnostics struct {
@@ -55,19 +58,30 @@ type EBPFRuntimeDiagnostics struct {
 	Tag           string
 	State         string
 
-	LocalEnabled                 bool
-	LocalDataPlane               string
-	LocalCgroupAttachMode        string
-	LocalSelfBypassMode          string
-	LocalSelfBypassCleanupMode   string
-	LocalUDPCleanupMode          string
-	LocalUDPUserspaceCleanupMode string
-	LocalUDPStorageMode          string
-	LocalUDPTimeMode             string
-	LocalUDPState                string
-	LocalUDPRecoveryMode         string
-	LocalUDPMapPressure          string
-	LocalUDPNetworkGeneration    uint32
+	LocalEnabled                    bool
+	LocalDataPlane                  string
+	LocalCgroupAttachMode           string
+	LocalSelfBypassDecision         string
+	LocalSelfBypassProducer         string
+	LocalSelfBypassVisibility       string
+	LocalSelfBypassCleanup          string
+	LocalSelfBypassReclaim          string
+	LocalSelfBypassAttachment       string
+	LocalSelfBypassFallbackReason   string
+	LocalSelfBypassReclaimAttempts  uint64
+	LocalSelfBypassReclaimedSockets uint64
+	LocalSelfBypassReclaimFailures  uint64
+	LocalSelfBypassReclaimLastAt    *time.Time
+	LocalSelfBypassStorageFailures  uint64
+	LocalSelfBypassCookieFallbacks  uint64
+	LocalUDPCleanupMode             string
+	LocalUDPUserspaceCleanupMode    string
+	LocalUDPStorageMode             string
+	LocalUDPTimeMode                string
+	LocalUDPState                   string
+	LocalUDPRecoveryMode            string
+	LocalUDPMapPressure             string
+	LocalUDPNetworkGeneration       uint32
 	// LocalUDPReleaseObserver reports whether UDP socket releases are
 	// delivered to userspace as notifications. When they are not,
 	// LocalUDPReleaseFallbackReason names the step that fell back.
@@ -104,6 +118,9 @@ type EBPFRuntimeDiagnostics struct {
 	TCAssignmentSweepFailureMap   string
 	TCAssignmentSweepScanned      uint64
 	TCAssignmentSweepRemoved      uint64
+	TCAssignmentSweepMissing      uint64
+	TCAssignmentSweepSuperseded   uint64
+	TCAssignmentSweepInFlight     uint64
 	TCAssignmentSweepComplete     bool
 	TCAssignmentSweepEntries      uint64
 	TCAssignmentSweepCapacity     uint64
@@ -167,6 +184,12 @@ type EBPFUDPNATDiagnostics struct {
 	SocketReleaseMatched           uint64
 	PendingReleaseCapacityRejected uint64
 	ReleaseNotificationDrops       uint64
+	RedirectAdmissionFailures      uint64
+	UDPTokenAdmissionFailures      uint64
+	UDPTokenReverseFailures        uint64
+	UDPPeerAdmissionFailures       uint64
+	TCPPeerAdmissionFailures       uint64
+	UDPRecoveryAdmissionFailures   uint64
 }
 
 type EBPFAttachmentDiagnostics struct {

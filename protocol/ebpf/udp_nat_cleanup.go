@@ -166,6 +166,8 @@ func (s *udpNATService) cleanupLoop() {
 }
 
 func (s *udpNATService) cleanupEntry(entry *udpNATCleanupEntry) {
+	s.cacheAccess.Lock()
+	defer s.cacheAccess.Unlock()
 	conn, lifetime, loaded := s.cache.PeekWithLifetime(entry.conn.key)
 	if !loaded || conn != entry.conn || lifetime.IsZero() {
 		return

@@ -261,8 +261,44 @@ func validateSharedOptions(enabled bool, options option.EBPFSharedOptions) error
 		len(options.BypassExclude) > 0 ||
 		len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
 		len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0 ||
-		len(options.BypassPort) > 0 || len(options.BypassPortRange) > 0 {
+		len(options.BypassPort) > 0 || len(options.BypassPortRange) > 0 ||
+		len(options.BypassRuleSet) > 0 {
 		return E.New("shared options require shared interception")
+	}
+	return nil
+}
+
+func validatePortPolicyCapacity(name string, ranges []portRange, dnsMode string, enableTCP, enableUDP bool) error {
+	entries := make(map[uint32]struct{})
+	add := func(protocol uint8, port uint16) {
+		entries[uint32(protocol)<<16|uint32(port)] = struct{}{}
+	}
+	for _, portRange := range ranges {
+		for port := portRange.Start; port <= portRange.End; port++ {
+			if port == 53 && dnsMode != dnsModeOff {
+				continue
+			}
+			if enableTCP {
+				add(commonEBPF.ProtocolTCP, port)
+			}
+			if enableUDP {
+				add(commonEBPF.ProtocolUDP, port)
+			}
+			if port == portRange.End {
+				break
+			}
+		}
+	}
+	if dnsMode == dnsModeHijack || dnsMode == dnsModeRespectPolicy || dnsMode == dnsModeOff {
+		if enableTCP {
+			add(commonEBPF.ProtocolTCP, 53)
+		}
+		if enableUDP {
+			add(commonEBPF.ProtocolUDP, 53)
+		}
+	}
+	if len(entries) > commonEBPF.TCPolicyPortCapacity {
+		return E.New(name, " expands to ", len(entries), " port policy entries, exceeding eBPF TC port policy capacity ", commonEBPF.TCPolicyPortCapacity)
 	}
 	return nil
 }

@@ -22,7 +22,6 @@ service StartedService {
   rpc SelectOutbound(SelectOutboundRequest) returns (google.protobuf.Empty) {}
   rpc SetGroupExpand(SetGroupExpandRequest) returns (google.protobuf.Empty) {}
 
-
   rpc SubscribeConnections(SubscribeConnectionsRequest) returns(stream ConnectionEvents) {}
   rpc CloseConnection(CloseConnectionRequest) returns(google.protobuf.Empty) {}
   rpc CloseAllConnections(google.protobuf.Empty) returns(google.protobuf.Empty) {}
@@ -154,7 +153,6 @@ message ClashModeStatus {
   repeated string modeList = 1;
   string currentMode = 2;
 }
-
 
 message SubscribeConnectionsRequest {
   int64 interval = 1;
@@ -855,6 +853,9 @@ message EBPFMapDiagnostics {
   string error = 10;
   string pressure = 11;
   string category = 12;
+	string occupancyMode = 13;
+	string evictionMode = 14;
+	bool admissionCritical = 15;
 }
 
 message EBPFInboundDiagnostics {
@@ -906,8 +907,8 @@ message EBPFInboundDiagnostics {
   string localUdpMapPressure = 52;
   uint32 localUdpNetworkGeneration = 53;
   EBPFPolicyEpochDiagnostics policyEpoch = 54;
-  string localSelfBypassMode = 55;
-  string localSelfBypassCleanupMode = 56;
+  reserved 55, 56;
+  reserved "localSelfBypassMode", "localSelfBypassCleanupMode";
   bool localUdpReleaseObserver = 57;
   string localUdpReleaseFallbackReason = 58;
   string localUdpReleaseProgram = 59;
@@ -933,6 +934,25 @@ message EBPFInboundDiagnostics {
   bool tcReturnSweepUsageKnown = 79;
   string tcAssignmentSweepFailureMap = 80;
   int32 tcRoutingSlot = 81;
+  uint64 tcAssignmentSweepMissing = 82;
+  uint64 tcAssignmentSweepSuperseded = 83;
+  uint64 tcAssignmentSweepInFlight = 84;
+  reserved 85;
+  string localSelfBypassFallbackReason = 86;
+  reserved 87 to 91;
+  reserved "localSelfBypassOwner", "localSelfBypassMetadata";
+  string localSelfBypassDecision = 92;
+  string localSelfBypassProducer = 93;
+  string localSelfBypassVisibility = 94;
+  string localSelfBypassCleanup = 95;
+  string localSelfBypassReclaim = 96;
+  string localSelfBypassAttachment = 97;
+  uint64 localSelfBypassReclaimAttempts = 98;
+  uint64 localSelfBypassReclaimedSockets = 99;
+  uint64 localSelfBypassReclaimFailures = 100;
+  optional int64 localSelfBypassReclaimLastAt = 101;
+  uint64 localSelfBypassStorageFailures = 102;
+  uint64 localSelfBypassCookieFallbacks = 103;
 }
 
 message EBPFAttachmentDiagnostics {
@@ -999,6 +1019,12 @@ message EBPFUDPNATDiagnostics {
   uint64 socketReleaseMatched = 6;
   uint64 pendingReleaseCapacityRejected = 7;
   uint64 releaseNotificationDrops = 8;
+  uint64 redirectAdmissionFailures = 9;
+  uint64 udpTokenAdmissionFailures = 10;
+  uint64 udpTokenReverseFailures = 11;
+  uint64 udpPeerAdmissionFailures = 12;
+  uint64 tcpPeerAdmissionFailures = 13;
+  uint64 udpRecoveryAdmissionFailures = 14;
 }
 
 message EBPFPolicyEpochDiagnostics {

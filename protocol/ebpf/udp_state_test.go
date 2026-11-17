@@ -59,6 +59,35 @@ func TestUDPDirectBindingCleanupRetainsAssignmentIdentity(t *testing.T) {
 	}
 }
 
+func TestUDPClientStateReplacementKeepsNewBindings(t *testing.T) {
+	var table udpClientTable
+	client := netip.MustParseAddrPort("192.0.2.10:53000")
+	destination := netip.MustParseAddrPort("1.1.1.1:53")
+	key := udpSessionKey{Source: client, Scope: udpSessionScopeLocalTC}
+	table.setDirectBinding(key, destination, nil, 1)
+	oldState, _ := table.load(key)
+	oldState.access.Lock()
+	oldState.natOwned = true
+	oldState.access.Unlock()
+	claimed := table.claimNATState(key)
+	if claimed == oldState {
+		t.Fatal("NAT state claim reused the previous generation")
+	}
+	newDestination := netip.MustParseAddrPort("8.8.8.8:53")
+	table.setDirectBinding(key, newDestination, nil, 2)
+	cleanup := table.deleteWithCleanup(key, oldState)
+	if len(cleanup.tcAssignments) != 0 {
+		t.Fatalf("stale cleanup returned new-generation assignments: %+v", cleanup.tcAssignments)
+	}
+	current, loaded := table.load(key)
+	if !loaded || current != claimed {
+		t.Fatal("stale cleanup removed the new NAT state")
+	}
+	if _, loaded := current.redirectBinding(newDestination); !loaded {
+		t.Fatal("stale cleanup removed the new-generation binding")
+	}
+}
+
 func TestUDPClientTableSeparatesSocketCookies(t *testing.T) {
 	var table udpClientTable
 	client := netip.MustParseAddrPort("192.0.2.10:53000")
@@ -128,6 +157,33 @@ func TestSharedUDPClientTableSeparatesIngressInterfaces(t *testing.T) {
 	key, _, _, loaded := table.cachedPacketState(client, secondRedirect)
 	if !loaded || key != secondKey {
 		t.Fatalf("redirect index selected the wrong ingress session: %+v", key)
+	}
+}
+
+func TestSharedUDPClientStateReplacementKeepsNewBindings(t *testing.T) {
+	var table sharedUDPClientTable
+	client := netip.MustParseAddrPort("192.0.2.10:53000")
+	key := udpSessionKey{Source: client, Scope: udpSessionScopeSharedRewrite, InterfaceIndex: 10}
+	destination := netip.MustParseAddrPort("1.1.1.1:53")
+	redirect := netip.MustParseAddr("127.0.0.1")
+	table.setBinding(key, destination, redirect, false)
+	oldState, _ := table.load(key)
+	oldState.access.Lock()
+	oldState.natOwned = true
+	oldState.access.Unlock()
+	claimed := table.claimNATState(key)
+	if claimed == oldState {
+		t.Fatal("shared NAT state claim reused the previous generation")
+	}
+	newRedirect := netip.MustParseAddr("127.0.0.2")
+	table.setBinding(key, destination, newRedirect, false)
+	table.deleteShared(key, oldState)
+	current, loaded := table.load(key)
+	if !loaded || current != claimed {
+		t.Fatal("stale shared cleanup removed the new NAT state")
+	}
+	if binding, loaded := current.redirectBinding(destination); !loaded || binding.address != newRedirect {
+		t.Fatalf("stale shared cleanup removed the new binding: %+v", binding)
 	}
 }
 

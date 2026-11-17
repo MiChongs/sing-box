@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"context"
 	"net/netip"
 	"reflect"
 	"strings"
@@ -22,6 +23,8 @@ type bypassRuleSetState struct {
 	started                                    bool
 	policy, expectedPolicy                     []commonEBPF.CIDRDecision
 	policyVersion, expectedVersion, retryCount uint64
+	generation, appliedGeneration              uint64
+	dirty                                      bool
 	needsRetry, inconsistent                   bool
 	tc, cgroup, shared                         bypassRuleSetBackendVersion
 }
@@ -74,7 +77,6 @@ func (i *Inbound) ruleSetScope(shared bool) (*bypassRuleSetState, string, []comm
 
 func (i *Inbound) startBypassRuleSets() error {
 	i.bypassRuleSetAccess.Lock()
-	defer i.bypassRuleSetAccess.Unlock()
 	for _, shared := range []bool{false, true} {
 		state, _, _ := i.ruleSetScope(shared)
 		if state.started {
@@ -87,16 +89,73 @@ func (i *Inbound) startBypassRuleSets() error {
 		state.started = true
 		if err := i.refreshRuleSetsLocked(shared, true); err != nil {
 			i.stopBypassRuleSetsLocked()
+			i.bypassRuleSetAccess.Unlock()
 			return err
 		}
 	}
+	i.startBypassRuleSetWorkerLocked()
+	i.bypassRuleSetAccess.Unlock()
 	return nil
 }
 
 func (i *Inbound) stopBypassRuleSets() {
+	i.stopBypassRuleSetWorker()
 	i.bypassRuleSetAccess.Lock()
 	defer i.bypassRuleSetAccess.Unlock()
 	i.stopBypassRuleSetsLocked()
+}
+
+func (i *Inbound) startBypassRuleSetWorkerLocked() {
+	if i.policyCancel != nil || i.policyWake == nil {
+		return
+	}
+	ctx, cancel := context.WithCancel(i.ctx)
+	i.policyCancel = cancel
+	i.policyDone = make(chan struct{})
+	go i.bypassRuleSetWorker(ctx, i.policyDone)
+}
+
+func (i *Inbound) stopBypassRuleSetWorker() {
+	i.bypassRuleSetAccess.Lock()
+	cancel, done := i.policyCancel, i.policyDone
+	i.policyCancel = nil
+	i.policyDone = nil
+	i.bypassRuleSetAccess.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+}
+
+func (i *Inbound) bypassRuleSetWorker(ctx context.Context, done chan struct{}) {
+	defer close(done)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-i.policyWake:
+			i.refreshDirtyRuleSets()
+		}
+	}
+}
+
+func (i *Inbound) refreshDirtyRuleSets() {
+	i.bypassRuleSetAccess.Lock()
+	defer i.bypassRuleSetAccess.Unlock()
+	for _, shared := range []bool{false, true} {
+		state, name, _ := i.ruleSetScope(shared)
+		if !state.started || !state.dirty {
+			continue
+		}
+		state.dirty = false
+		if err := i.refreshRuleSetsLocked(shared, false); err != nil {
+			state.needsRetry = true
+			i.policyWarnings.warn(i.logger, "refresh ", name, ": ", err)
+			i.notifyTCInterfaceUpdate()
+		}
+	}
 }
 func (i *Inbound) stopBypassRuleSetsLocked() {
 	for _, state := range []*bypassRuleSetState{&i.localBypassRules, &i.sharedBypassRules} {
@@ -116,16 +175,17 @@ func (i *Inbound) updateBypassRuleSet(adapter.RuleSet)       { i.updateRuleSet(f
 func (i *Inbound) updateSharedBypassRuleSet(adapter.RuleSet) { i.updateRuleSet(true) }
 func (i *Inbound) updateRuleSet(shared bool) {
 	i.bypassRuleSetAccess.Lock()
-	defer i.bypassRuleSetAccess.Unlock()
-	state, name, _ := i.ruleSetScope(shared)
+	state, _, _ := i.ruleSetScope(shared)
 	if !state.started {
+		i.bypassRuleSetAccess.Unlock()
 		return
 	}
-	err := i.refreshRuleSetsLocked(shared, false)
-	state.needsRetry = err != nil
-	if err != nil {
-		i.policyWarnings.warn(i.logger, "refresh ", name, ": ", err)
-		i.notifyTCInterfaceUpdate()
+	state.generation++
+	state.dirty = true
+	i.bypassRuleSetAccess.Unlock()
+	select {
+	case i.policyWake <- struct{}{}:
+	default:
 	}
 }
 
@@ -196,7 +256,11 @@ func (i *Inbound) refreshRuleSetsLocked(shared, startup bool) error {
 	if err != nil {
 		return err
 	}
-	return i.applyRuleSetPolicyLocked(shared, policy)
+	if err := i.applyRuleSetPolicyLocked(shared, policy); err != nil {
+		return err
+	}
+	state.appliedGeneration = state.generation
+	return nil
 }
 
 func revertBypassCIDRBackends(applied []bypassCIDRAppliedBackend, warn func(string, error)) []string {

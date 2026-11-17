@@ -213,6 +213,7 @@ func TestBuildActionPolicyCombinesFakeIPAndBypassExclude(t *testing.T) {
 	inbound := &Inbound{
 		enableTCP:          true,
 		enableUDP:          true,
+		localEnabled:       true,
 		fakeIPIPv4Prefix:   fakeIP,
 		localBypassExclude: []netip.Prefix{tailnet},
 	}

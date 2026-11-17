@@ -3,6 +3,7 @@
 package dialer
 
 import (
+	"context"
 	"net"
 	"sync"
 	"syscall"
@@ -110,5 +111,36 @@ func TestOutboundPortReservationOnlyForLocalSocketAssign(t *testing.T) {
 	// UDP keeps its own binding rules.
 	if err := reserveEBPFOutboundPort("udp4", "", nil); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestSelfBypassLifecycleContract(t *testing.T) {
+	tracker, err := commonEBPF.NewSelfBypassWithCapacity(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tracker.Close()
+	if !tracker.NeedsUserspaceRegistration() || !tracker.NeedsUserspaceUnregister() {
+		t.Fatal("userspace producer must own registration and cleanup")
+	}
+}
+
+func TestAppendDialerControlPreservesControlContext(t *testing.T) {
+	var baseCalled, extraCalled bool
+	dialer := &net.Dialer{
+		ControlContext: func(context.Context, string, string, syscall.RawConn) error {
+			baseCalled = true
+			return nil
+		},
+	}
+	appendDialerControl(dialer, func(string, string, syscall.RawConn) error {
+		extraCalled = true
+		return nil
+	})
+	if err := dialer.ControlContext(context.Background(), "tcp", "127.0.0.1:1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if !baseCalled || !extraCalled {
+		t.Fatalf("control hooks were not chained: base=%v extra=%v", baseCalled, extraCalled)
 	}
 }

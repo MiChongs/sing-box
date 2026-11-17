@@ -125,6 +125,61 @@ func TestEBPFDiagnosticsIncludesEffectiveCgroupPaths(t *testing.T) {
 	}
 }
 
+func TestEBPFDiagnosticsPreservesSelfBypassPath(t *testing.T) {
+	reclaimLastAt := time.Unix(123, 0)
+	diagnostics := diagnosticsForAPI(EBPFDiagnostics{
+		LocalSelfBypassDecision:         "cgroup_tgid",
+		LocalSelfBypassProducer:         "userspace_control",
+		LocalSelfBypassVisibility:       "cookie_hash",
+		LocalSelfBypassCleanup:          "userspace_unregister",
+		LocalSelfBypassAttachment:       "bpf_link",
+		LocalSelfBypassReclaim:          "proc_fd_reclaim",
+		LocalSelfBypassFallbackReason:   "socket_release_unavailable",
+		LocalSelfBypassReclaimAttempts:  3,
+		LocalSelfBypassReclaimedSockets: 2,
+		LocalSelfBypassReclaimFailures:  1,
+		LocalSelfBypassReclaimLastAt:    &reclaimLastAt,
+		LocalSelfBypassStorageFailures:  4,
+		LocalSelfBypassCookieFallbacks:  5,
+	})
+	if diagnostics.LocalSelfBypassDecision != "cgroup_tgid" ||
+		diagnostics.LocalSelfBypassProducer != "userspace_control" ||
+		diagnostics.LocalSelfBypassVisibility != "cookie_hash" ||
+		diagnostics.LocalSelfBypassCleanup != "userspace_unregister" ||
+		diagnostics.LocalSelfBypassAttachment != "bpf_link" ||
+		diagnostics.LocalSelfBypassReclaim != "proc_fd_reclaim" ||
+		diagnostics.LocalSelfBypassFallbackReason != "socket_release_unavailable" ||
+		diagnostics.LocalSelfBypassReclaimAttempts != 3 ||
+		diagnostics.LocalSelfBypassReclaimedSockets != 2 ||
+		diagnostics.LocalSelfBypassReclaimFailures != 1 ||
+		diagnostics.LocalSelfBypassStorageFailures != 4 ||
+		diagnostics.LocalSelfBypassCookieFallbacks != 5 ||
+		diagnostics.LocalSelfBypassReclaimLastAt == nil || !diagnostics.LocalSelfBypassReclaimLastAt.Equal(reclaimLastAt) {
+		t.Fatalf("self-bypass diagnostics were not preserved: %+v", diagnostics)
+	}
+}
+
+func TestEBPFDiagnosticsPreservesUDPAdmissionCounters(t *testing.T) {
+	diagnostics := diagnosticsForAPI(EBPFDiagnostics{
+		UDPNAT: UDPNATDiagnostics{
+			RedirectAdmissionFailures:    1,
+			UDPTokenAdmissionFailures:    2,
+			UDPTokenReverseFailures:      3,
+			UDPPeerAdmissionFailures:     4,
+			TCPPeerAdmissionFailures:     5,
+			UDPRecoveryAdmissionFailures: 6,
+		},
+	})
+	if diagnostics.UDPNAT.RedirectAdmissionFailures != 1 ||
+		diagnostics.UDPNAT.UDPTokenAdmissionFailures != 2 ||
+		diagnostics.UDPNAT.UDPTokenReverseFailures != 3 ||
+		diagnostics.UDPNAT.UDPPeerAdmissionFailures != 4 ||
+		diagnostics.UDPNAT.TCPPeerAdmissionFailures != 5 ||
+		diagnostics.UDPNAT.UDPRecoveryAdmissionFailures != 6 {
+		t.Fatalf("UDP admission counters were not preserved: %+v", diagnostics.UDPNAT)
+	}
+}
+
 func TestEBPFDiagnosticsIncludesEffectiveTCState(t *testing.T) {
 	observedHealth := time.Unix(1700000000, 0)
 	observedReconcile := observedHealth.Add(time.Second)
@@ -159,12 +214,12 @@ func TestEBPFDiagnosticsIncludesEffectiveTCState(t *testing.T) {
 }
 
 func TestEBPFDiagnosticsSchemaVersionIncludesEffectiveRuntimeFields(t *testing.T) {
-	if adapter.EBPFDiagnosticsSchemaVersion != 18 {
-		t.Fatalf("schema version = %d, want 18 after adding slot diagnostics", adapter.EBPFDiagnosticsSchemaVersion)
+	if adapter.EBPFDiagnosticsSchemaVersion != 26 {
+		t.Fatalf("schema version = %d, want 26 after self-bypass storage diagnostics update", adapter.EBPFDiagnosticsSchemaVersion)
 	}
 	diagnostics := diagnosticsForAPI(EBPFDiagnostics{SchemaVersion: adapter.EBPFDiagnosticsSchemaVersion, LocalCgroupAttachMode: "link_create"})
-	if diagnostics.SchemaVersion != 18 {
-		t.Fatalf("diagnostics schema version = %d, want 18", diagnostics.SchemaVersion)
+	if diagnostics.SchemaVersion != 26 {
+		t.Fatalf("diagnostics schema version = %d, want 26", diagnostics.SchemaVersion)
 	}
 }
 
@@ -182,6 +237,17 @@ func TestDiagnosticsReportsWaitingSharedInterface(t *testing.T) {
 	}
 	if len(diagnostics.WaitingInterfaces) != 2 || diagnostics.WaitingInterfaces[0] != "wlan2" || diagnostics.WaitingInterfaces[1] != "rmnet0" {
 		t.Fatalf("waiting interfaces = %v, want [wlan2 rmnet0]", diagnostics.WaitingInterfaces)
+	}
+}
+
+func TestDiagnosticsDoesNotReportCgroupAsWaitingForInterface(t *testing.T) {
+	inbound := &Inbound{localEnabled: true, localDataPlane: "cgroup"}
+	diagnostics := inbound.Diagnostics()
+	if diagnostics.State != EBPFDiagnosticsStateNeedsAttention {
+		t.Fatalf("state = %s, want %s", diagnostics.State, EBPFDiagnosticsStateNeedsAttention)
+	}
+	if len(diagnostics.WaitingRoles) != 0 || len(diagnostics.WaitingInterfaces) != 0 {
+		t.Fatalf("cgroup diagnostics reported interface wait: roles=%v interfaces=%v", diagnostics.WaitingRoles, diagnostics.WaitingInterfaces)
 	}
 }
 

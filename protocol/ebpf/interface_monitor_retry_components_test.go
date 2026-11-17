@@ -15,13 +15,14 @@ import (
 // just sharedRewrite. It shares the same fake-timer substitution and the
 // same round-synchronization contract (one timer action per round).
 type componentRetryLoopHarness struct {
-	updates  chan struct{}
-	timer    *testRetryTimer
-	cancel   context.CancelFunc
-	finished chan struct{}
-	access   sync.Mutex
-	outcome  tcUpdateOutcome
-	ran      chan struct{}
+	updates   chan struct{}
+	timer     *testRetryTimer
+	cancel    context.CancelFunc
+	finished  chan struct{}
+	access    sync.Mutex
+	outcome   tcUpdateOutcome
+	ran       chan struct{}
+	scheduled chan struct{}
 	// schedule is the most recent value passed to onScheduleChange -- nil
 	// before the loop has armed or disarmed even once, a non-nil zero time
 	// when the loop last reported disarmed.
@@ -34,6 +35,10 @@ func (h *componentRetryLoopHarness) onScheduleChange(deadline time.Time) {
 	h.access.Lock()
 	h.schedule = &deadline
 	h.access.Unlock()
+	select {
+	case h.scheduled <- struct{}{}:
+	default:
+	}
 }
 
 // nextRetryAt reports the harness's most recently observed schedule value,
@@ -58,11 +63,12 @@ func newComponentRetryLoopHarness(t *testing.T) *componentRetryLoopHarness {
 	t.Cleanup(func() { tcRetryTimerFactory = previousFactory })
 
 	harness := &componentRetryLoopHarness{
-		updates:  make(chan struct{}, 1),
-		timer:    timer,
-		cancel:   cancel,
-		finished: make(chan struct{}),
-		ran:      make(chan struct{}, 64),
+		updates:   make(chan struct{}, 1),
+		timer:     timer,
+		cancel:    cancel,
+		finished:  make(chan struct{}),
+		ran:       make(chan struct{}, 64),
+		scheduled: make(chan struct{}, 64),
 		outcome: tcUpdateOutcome{
 			sharedRewrite: tcSharedRewriteSettled,
 			general:       tcSharedRewriteSettled,
@@ -104,6 +110,11 @@ func (h *componentRetryLoopHarness) round(t *testing.T, trigger func(), outcome 
 	case <-h.ran:
 	case <-time.After(2 * time.Second):
 		t.Fatal("update did not run")
+	}
+	select {
+	case <-h.scheduled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("schedule change was not reported after the update")
 	}
 	select {
 	case action := <-h.timer.actions:

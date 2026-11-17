@@ -33,6 +33,7 @@ type udpNATPrepareFunc func(
 // cookies, ingress interfaces, and local/shared data planes.
 type udpNATService struct {
 	cache                          *freelru.Cache[udpSessionKey, *udpNATConn]
+	cacheAccess                    sync.Mutex
 	handler                        N.UDPConnectionHandlerEx
 	prepare                        udpNATPrepareFunc
 	timeout                        time.Duration
@@ -48,9 +49,25 @@ type udpNATService struct {
 	pendingReleaseCapacityRejected atomic.Uint64
 	closed                         atomic.Bool
 	closeOnce                      sync.Once
+	startAccess                    sync.Mutex
+	started                        bool
 }
 
 func newUDPNATService(
+	handler N.UDPConnectionHandlerEx,
+	prepare udpNATPrepareFunc,
+	timeout time.Duration,
+) *udpNATService {
+	service := newIdleUDPNATService(handler, prepare, timeout)
+	service.start()
+	return service
+}
+
+// newIdleUDPNATService builds the service without its cleanup goroutine, so an
+// inbound can be constructed and closed, as for a configuration check, without
+// leaving a goroutine behind. start launches the goroutine once the inbound
+// has registered its cleanup with the lifecycle scope.
+func newIdleUDPNATService(
 	handler N.UDPConnectionHandlerEx,
 	prepare udpNATPrepareFunc,
 	timeout time.Duration,
@@ -85,9 +102,18 @@ func newUDPNATService(
 	cache.SetOnEvict(func(_ udpSessionKey, conn *udpNATConn) {
 		conn.closeFromCache()
 	})
-	service.cleanupWait.Add(1)
-	go service.cleanupLoop()
 	return service
+}
+
+func (s *udpNATService) start() {
+	s.startAccess.Lock()
+	defer s.startAccess.Unlock()
+	if s.started || s.closed.Load() {
+		return
+	}
+	s.started = true
+	s.cleanupWait.Add(1)
+	go s.cleanupLoop()
 }
 
 func (s *udpNATService) NewPacket(
@@ -127,6 +153,8 @@ func (s *udpNATService) connection(
 	destination M.Socksaddr,
 	userData any,
 ) (*udpNATConn, bool) {
+	s.cacheAccess.Lock()
+	defer s.cacheAccess.Unlock()
 	if s.closed.Load() {
 		return nil, false
 	}
@@ -264,6 +292,8 @@ func (c *udpNATConn) enqueuePacketLocked(buffer *buf.Buffer, destination M.Socks
 
 func (s *udpNATService) Purge() {
 	if s != nil {
+		s.cacheAccess.Lock()
+		defer s.cacheAccess.Unlock()
 		s.cache.Purge()
 	}
 }
@@ -357,10 +387,14 @@ func (s *udpNATService) Close() error {
 		return nil
 	}
 	s.closeOnce.Do(func() {
+		s.startAccess.Lock()
 		s.closed.Store(true)
+		s.startAccess.Unlock()
 		close(s.cleanupDone)
 		s.cleanupWait.Wait()
+		s.cacheAccess.Lock()
 		s.cache.Purge()
+		s.cacheAccess.Unlock()
 		s.cleanup.clear()
 		s.releaseAccess.Lock()
 		clear(s.releaseConnections)
@@ -521,6 +555,8 @@ func (c *udpNATConn) SetHandler(handler N.UDPHandlerEx) {
 }
 
 func (c *udpNATConn) Timeout() time.Duration {
+	c.service.cacheAccess.Lock()
+	defer c.service.cacheAccess.Unlock()
 	conn, lifetime, loaded := c.cache.PeekWithLifetime(c.key)
 	if !loaded || conn != c {
 		return 0
@@ -529,6 +565,8 @@ func (c *udpNATConn) Timeout() time.Duration {
 }
 
 func (c *udpNATConn) SetTimeout(timeout time.Duration) bool {
+	c.service.cacheAccess.Lock()
+	defer c.service.cacheAccess.Unlock()
 	updated := c.cache.UpdateLifetime(c.key, c, timeout)
 	if !updated {
 		return false
@@ -544,7 +582,9 @@ func (c *udpNATConn) SetTimeout(timeout time.Duration) bool {
 func (c *udpNATConn) Close() error {
 	c.close()
 	if !c.service.closed.Load() {
+		c.service.cacheAccess.Lock()
 		c.service.cleanup.addOrUpdate(c.cleanupEntry, time.Now())
+		c.service.cacheAccess.Unlock()
 	}
 	return nil
 }

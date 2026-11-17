@@ -231,6 +231,18 @@ func TestValidateScopedOptions(t *testing.T) {
 	if err := validateSharedOptions(false, option.EBPFSharedOptions{DefaultInterface: true}); err == nil {
 		t.Fatal("expected shared default-interface attachment to be rejected without shared mode")
 	}
+	if err := validateSharedOptions(false, option.EBPFSharedOptions{BypassRuleSet: []string{"rules"}}); err == nil {
+		t.Fatal("expected shared bypass rule-set to be rejected without shared mode")
+	}
+}
+
+func TestValidatePortPolicyCapacity(t *testing.T) {
+	if err := validatePortPolicyCapacity("local bypass_port", []portRange{{Start: 1, End: commonEBPF.TCPolicyPortCapacity / 2}}, dnsModeOff, true, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePortPolicyCapacity("local bypass_port", []portRange{{Start: 1, End: commonEBPF.TCPolicyPortCapacity/2 + 1}}, dnsModeOff, true, true); err == nil {
+		t.Fatal("expected an oversized port policy to be rejected")
+	}
 }
 
 func TestNormalizeLocalDataPlane(t *testing.T) {

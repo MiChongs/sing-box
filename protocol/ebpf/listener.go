@@ -93,6 +93,7 @@ func (i *Inbound) startTCListeners() error {
 		func(network string, ipv6 bool, port uint16) *listener.Listener {
 			return i.newInternalListenerInNamespace(tcListenerHandler{i}, network, ipv6, port, i.tcNamespace.Path())
 		},
+		i.registerListenerSocket,
 	)
 }
 
@@ -113,6 +114,7 @@ func (s *internalListenerSet) start(
 	enableIPv4 bool,
 	enableIPv6 bool,
 	newListener func(network string, ipv6 bool, port uint16) *listener.Listener,
+	register ...func(*listener.Listener) error,
 ) error {
 	s.access.Lock()
 	defer s.access.Unlock()
@@ -147,6 +149,11 @@ func (s *internalListenerSet) start(
 		if err := current.Start(); err != nil {
 			return err
 		}
+		if len(register) > 0 && register[0] != nil {
+			if err := register[0](current); err != nil {
+				return E.Errors(err, common.Close(current))
+			}
+		}
 		if spec.network == N.NetworkUDP {
 			batchWriter, created := udpio.NewOOBPacketBatchWriter(current.UDPConn(), spec.ipv6)
 			if created {
@@ -177,6 +184,10 @@ func (s *internalListenerSet) start(
 }
 
 func (s *internalListenerSet) close() error {
+	return s.closeWithCleanup(nil)
+}
+
+func (s *internalListenerSet) closeWithCleanup(cleanup func(*listener.Listener) error) error {
 	s.access.Lock()
 	defer s.access.Unlock()
 	listeners := []*listener.Listener{s.tcp4, s.tcp6, s.udp4, s.udp6}
@@ -190,6 +201,9 @@ func (s *internalListenerSet) close() error {
 	var closeErr error
 	for _, current := range listeners {
 		if current != nil {
+			if cleanup != nil {
+				closeErr = E.Errors(closeErr, cleanup(current))
+			}
 			closeErr = E.Errors(closeErr, common.Close(current))
 		}
 	}

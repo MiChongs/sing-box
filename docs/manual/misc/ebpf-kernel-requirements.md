@@ -6,8 +6,9 @@ icon: material/chip
 
 The eBPF inbound defaults to the cgroup v2 socket-address backend for local
 interception and TC `packet_rewrite` for shared interception. Local interception
-may explicitly select TC, while shared interception may explicitly select the
-tuple-preserving `socket_assign` data plane instead.
+may explicitly select the tuple-preserving `socket_assign` data plane; shared
+interception may select the same data plane instead of the default
+`packet_rewrite` path.
 Support is determined by runtime map, program-load, helper, and attachment results
 rather than a minimum Linux version. Vendor kernels may backport, disable, or
 restrict individual facilities. The LPM-trie safety exception described below
@@ -245,11 +246,19 @@ is in the affected release range and the fix cannot be confirmed, sing-box
 rejects the policy before performing any LPM update. Kernels outside that
 range continue through the normal runtime map and update checks.
 
-The check is only required when UID, application, source-CIDR, or destination
-bypass policies contain entries. Empty policy maps are still created as part
-of the TC object but are not updated. The exact host-address policy uses
-`HASH` maps and is unaffected. A later dynamic bypass-policy update repeats the
-same guard.
+The check is required when the final policy actually contains UID, application,
+source-CIDR, or destination-bypass entries, or when a configured eBPF
+`local.bypass_rule_set` or `shared.bypass_rule_set` may publish such entries
+after a refresh. Empty policy maps are still created as part of the TC object
+but are not updated. The exact host-address policy uses `HASH` maps and is
+unaffected. A later dynamic bypass-policy update repeats the same guard.
+
+A FakeIP range alone does not require an LPM update. When a local or shared
+scope already defaults to interception and has no lower-priority pass policy,
+sing-box omits a redundant FakeIP force-intercept entry. FakeIP still requires
+the check when it must override a UID/source pass policy, private-address or
+port bypass, a configured eBPF bypass rule-set, or `fakeip_icmp: reply`. Route
+rule-sets are ordinary router policies and are not eBPF bypass rule-sets.
 
 ## Privileges
 

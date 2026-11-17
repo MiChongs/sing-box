@@ -15,7 +15,12 @@ type sharedUDPClientTable struct {
 	clientShards       [sharedUDPClientShardCount]sharedUDPClientShard
 	redirectAccess     sync.Mutex
 	redirectReferences map[sharedUDPRedirectReference]uint32
-	redirectSessions   map[sharedUDPRedirectReference]udpSessionKey
+	redirectSessions   map[sharedUDPRedirectReference]sharedUDPClientReference
+}
+
+type sharedUDPClientReference struct {
+	key   udpSessionKey
+	state *sharedUDPClientState
 }
 
 const sharedUDPClientShardCount = 16
@@ -34,6 +39,7 @@ type sharedUDPClientState struct {
 	bindings             map[netip.AddrPort]sharedUDPRedirectBinding
 	originals            map[netip.Addr]sharedUDPOriginalDestination
 	replyAliasCount      uint16
+	natOwned             bool
 }
 
 type sharedUDPRedirectBinding struct {
@@ -125,6 +131,57 @@ func (t *sharedUDPClientTable) clientShard(key udpSessionKey) *sharedUDPClientSh
 	return &t.clientShards[shardIndexForAddrPort(key.Source, sharedUDPClientShardCount)]
 }
 
+// claimNATState starts a fresh generation when the same kernel-flow key is
+// reused before the previous NAT close callback has removed its state.
+func (t *sharedUDPClientTable) claimNATState(key udpSessionKey) *sharedUDPClientState {
+	shard := t.clientShard(key)
+	shard.access.Lock()
+	defer shard.access.Unlock()
+	if state, loaded := shard.clients[key]; loaded {
+		state.access.Lock()
+		owned := state.natOwned
+		if !owned {
+			state.natOwned = true
+			state.access.Unlock()
+			return state
+		}
+		newState := &sharedUDPClientState{
+			natOwned:             true,
+			connected:            state.connected,
+			connectedDestination: state.connectedDestination,
+			sourceMAC:            append(net.HardwareAddr(nil), state.sourceMAC...),
+			bindings:             state.bindings,
+			originals:            state.originals,
+			replyAliasCount:      state.replyAliasCount,
+		}
+		newState.connectedBinding.Store(state.connectedBinding.Load())
+		state.bindings = make(map[netip.AddrPort]sharedUDPRedirectBinding)
+		state.originals = make(map[netip.Addr]sharedUDPOriginalDestination)
+		state.replyAliasCount = 0
+		state.connectedBinding.Store(nil)
+		state.access.Unlock()
+		shard.clients[key] = newState
+		t.redirectAccess.Lock()
+		for redirectKey, reference := range t.redirectSessions {
+			if reference.key == key && reference.state == state {
+				t.redirectSessions[redirectKey] = sharedUDPClientReference{key: key, state: newState}
+			}
+		}
+		t.redirectAccess.Unlock()
+		return newState
+	}
+	if shard.clients == nil {
+		shard.clients = make(map[udpSessionKey]*sharedUDPClientState)
+	}
+	state := &sharedUDPClientState{
+		natOwned:  true,
+		bindings:  make(map[netip.AddrPort]sharedUDPRedirectBinding),
+		originals: make(map[netip.Addr]sharedUDPOriginalDestination),
+	}
+	shard.clients[key] = state
+	return state
+}
+
 func (t *sharedUDPClientTable) cachedOriginal(client netip.AddrPort, redirectAddress netip.Addr) (sharedUDPOriginalDestination, bool) {
 	_, original, _, loaded := t.cachedPacketState(client, redirectAddress)
 	return original, loaded
@@ -136,13 +193,13 @@ func (t *sharedUDPClientTable) cachedPacketState(
 ) (udpSessionKey, sharedUDPOriginalDestination, bool, bool) {
 	reference := sharedUDPRedirectReference{client: client, address: redirectAddress}
 	t.redirectAccess.Lock()
-	key, loaded := t.redirectSessions[reference]
+	clientReference, loaded := t.redirectSessions[reference]
 	t.redirectAccess.Unlock()
 	if !loaded {
 		return udpSessionKey{}, sharedUDPOriginalDestination{}, false, false
 	}
-	clientState, loaded := t.load(key)
-	if !loaded {
+	clientState, loaded := t.load(clientReference.key)
+	if !loaded || clientState != clientReference.state {
 		return udpSessionKey{}, sharedUDPOriginalDestination{}, false, false
 	}
 	clientState.access.RLock()
@@ -156,7 +213,7 @@ func (t *sharedUDPClientTable) cachedPacketState(
 		binding.address == redirectAddress &&
 		binding.connected == original.original.ConnectedUDP
 	clientState.access.RUnlock()
-	return key, original, bindingReady, true
+	return clientReference.key, original, bindingReady, true
 }
 
 func (t *sharedUDPClientTable) setBinding(
@@ -335,12 +392,12 @@ func (t *sharedUDPClientTable) setClientBinding(
 	t.redirectAccess.Lock()
 	defer t.redirectAccess.Unlock()
 	if t.redirectSessions == nil {
-		t.redirectSessions = make(map[sharedUDPRedirectReference]udpSessionKey)
+		t.redirectSessions = make(map[sharedUDPRedirectReference]sharedUDPClientReference)
 	}
-	t.redirectSessions[reference] = key
+	t.redirectSessions[reference] = sharedUDPClientReference{key: key, state: clientState}
 	if oldAddressUnused {
 		oldReference := sharedUDPRedirectReference{client: key.Source, address: current.address}
-		if t.redirectSessions[oldReference] == key {
+		if old := t.redirectSessions[oldReference]; old.key == key && old.state == clientState {
 			delete(t.redirectSessions, oldReference)
 		}
 	}
@@ -383,10 +440,9 @@ func (t *sharedUDPClientTable) deleteClient(key udpSessionKey, expectedState *sh
 	shard := t.clientShard(key)
 	shard.access.Lock()
 	defer shard.access.Unlock()
-	if shard.clients[key] != expectedState {
-		return nil
+	if shard.clients[key] == expectedState {
+		delete(shard.clients, key)
 	}
-	delete(shard.clients, key)
 
 	expectedState.access.Lock()
 	defer expectedState.access.Unlock()
@@ -394,7 +450,7 @@ func (t *sharedUDPClientTable) deleteClient(key udpSessionKey, expectedState *sh
 	defer t.redirectAccess.Unlock()
 	for address := range expectedState.originals {
 		reference := sharedUDPRedirectReference{client: key.Source, address: address}
-		if t.redirectSessions[reference] == key {
+		if current := t.redirectSessions[reference]; current.key == key && current.state == expectedState {
 			delete(t.redirectSessions, reference)
 		}
 	}

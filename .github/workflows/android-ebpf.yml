@@ -51,6 +51,21 @@ jobs:
           export TAGS="$BASE_TAGS"
           make build
 
+      - name: Run eBPF control-plane tests
+        if: matrix.target.goarch == 'arm64'
+        run: go test -tags with_ebpf ./protocol/ebpf ./common/dialer ./daemon
+
+      - name: Android smoke instructions
+        if: matrix.target.goarch == 'arm64'
+        run: |
+          cat <<'EOF'
+          This workflow validates the Android eBPF build and control-plane tests.
+          A privileged device run is intentionally manual: use an ADB-root runner,
+          push the arm64 binary to /data/local/tmp/sing-box, start a minimal cgroup
+          and TC configuration, then collect `tools ebpf status --json` and logcat.
+          Do not treat this build job as proof that a vendor kernel can attach eBPF.
+          EOF
+
       - name: Upload
         uses: actions/upload-artifact@v7
         with:

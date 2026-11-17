@@ -452,30 +452,24 @@ func TestBypassRuleSetExpectedVersionTracksTheLatestAttemptEvenOnFailure(t *test
 	}
 }
 
-// TestUpdateBypassRuleSetWakesTheSchedulerOnFailure is an independent
-// review's finding: updateBypassRuleSet's failure path set
-// bypassRuleSetNeedsRetry but never actually woke the scheduler, despite
-// its own comment claiming retryBypassRuleSetIfNeededLocked would "pick
-// this back up" the same way other TC failures get retried. The scheduler
-// only runs a round on a network event or its own ten-minute health-check
-// tick (tcDriftCheckInterval) -- setting the flag alone does not cause
-// either, so the very first retry attempt for a rule-set update failure
-// would otherwise sit unnoticed for up to ten minutes, not the seconds
-// -scale exponential backoff every other TC failure in this package gets.
+// TestUpdateBypassRuleSetWakesTheScheduler verifies that a rule-set callback
+// only records a dirty generation and wakes maintenance; the potentially
+// blocking BPF update is performed by the policy worker.
 func TestUpdateBypassRuleSetWakesTheSchedulerOnFailure(t *testing.T) {
 	inbound := &Inbound{localEnabled: true, localDataPlane: localDataPlaneSocketAssign, localBypassRules: bypassRuleSetState{started: true}}
 	inbound.logger = log.NewNOPFactory().Logger()
+	inbound.policyWake = make(chan struct{}, 1)
 	inbound.tcDataPlane = newUnstartedTCRuntime(&commonEBPF.TCBackend{}) // zero value: never usable
 	inbound.interfaceMonitor.network = &testNetworkUpdateMonitor{}
 	inbound.interfaceMonitor.updates = make(chan struct{}, 1)
 
 	inbound.updateBypassRuleSet(nil)
-	if !inbound.localBypassRules.needsRetry {
-		t.Fatal("fixture failed to create a pending bypass_rule_set retry -- the backend must be unusable for this test to mean anything")
+	if !inbound.localBypassRules.dirty || inbound.localBypassRules.generation != 1 {
+		t.Fatalf("rule-set callback did not record one dirty generation: dirty=%v generation=%d", inbound.localBypassRules.dirty, inbound.localBypassRules.generation)
 	}
 	select {
-	case <-inbound.interfaceMonitor.updates:
+	case <-inbound.policyWake:
 	default:
-		t.Fatal("failed rule-set callback left the scheduler asleep; the first retry would wait for a network event or the ten-minute health tick")
+		t.Fatal("rule-set callback did not wake the policy worker")
 	}
 }

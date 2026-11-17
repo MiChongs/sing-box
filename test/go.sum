@@ -70,8 +70,8 @@ github.com/MiChongs/cronet-go/lib/windows_arm64 v0.0.0-20261029141354-a34df4d40f
 github.com/MiChongs/cronet-go/lib/windows_arm64 v0.0.0-20261029141354-a34df4d40fe1/go.mod h1:n34YyLgapgjWdKa0IoeczjAFCwD3/dxbsH5sucKw0bw=
 github.com/MiChongs/quic-go v0.0.0-20261029121315-f35e38a0ba62 h1:ZGntljYwo5cI2iD35yQ7p4eFOlg5dmNwwKC1nQr9xkc=
 github.com/MiChongs/quic-go v0.0.0-20261029121315-f35e38a0ba62/go.mod h1:Y7IbYEm6E0KhhcxlLZjjxyAZy6Fkn0anFyiXYLqhqNg=
-github.com/MiChongs/sing-ebpf v0.1.0-alpha.26 h1:SQPIrYphVMP/DFy3mL1F6SfoyXA6C+ijaiiykn9q5/M=
-github.com/MiChongs/sing-ebpf v0.1.0-alpha.26/go.mod h1:08HZT0mFSS7+0q/fegHpJna8FuUTrujnMRMfEM9vHQ4=
+github.com/MiChongs/sing-ebpf v0.1.0-beta.2.1 h1:NvdFvNH5XIUMfDzm9sK2/6yhjLxKFVORVWuzgTTWWYM=
+github.com/MiChongs/sing-ebpf v0.1.0-beta.2.1/go.mod h1:ntR5Vhm81LfzT6WhG5JmXDun8qGthvXpHQOKK7OfrVs=
 github.com/MiChongs/sing-quic v0.0.0-20261025191239-19d3492f0dc5 h1:8sB+K4BAY6ePN7n7FjoUb8UQsxxjPGBaqY46wPqL19A=
 github.com/MiChongs/sing-quic v0.0.0-20261025191239-19d3492f0dc5/go.mod h1:uD2/JolCYtQLpyDzvmmpH3ay54JSJ1U6UM8yoOYSScY=
 github.com/MiChongs/utls v0.0.0-20261029130743-8151191f6798 h1:7BMoIonm3+z4762wevNawmYZvUo4S38G/CL/5nZ7N5Y=

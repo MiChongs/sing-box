@@ -14,6 +14,11 @@ const (
 	cgroupRecoveryMaxIdle     = 30 * time.Second
 	cgroupRecoverySweepBudget = 1024
 	cgroupRecoveryQueueSize   = 1024
+	// Ring-buffer notifications are an acceleration path, not the ownership
+	// source of truth. A bounded watchdog covers kernel-side event loss and a
+	// reader that exits after a transient error without adding a full-table
+	// scan to the normal packet path.
+	cgroupRecoveryWatchdogInterval = 10 * time.Second
 )
 
 type cgroupRecoveryDeadline struct {
@@ -115,6 +120,8 @@ func (i *Inbound) runCgroupRecoveryScheduler(ctx context.Context, backend *commo
 	timer := time.NewTimer(time.Hour)
 	stopCgroupRecoveryTimer(timer)
 	defer timer.Stop()
+	watchdog := time.NewTicker(cgroupRecoveryWatchdogInterval)
+	defer watchdog.Stop()
 	var timerC <-chan time.Time
 	resetTimer := func() {
 		if len(deadlines) == 0 {
@@ -146,6 +153,15 @@ func (i *Inbound) runCgroupRecoveryScheduler(ctx context.Context, backend *commo
 				}
 			}
 			resetTimer()
+		case <-watchdog.C:
+			// The kernel release hook increments its drop counter when the
+			// ring buffer is full, but the lost event itself cannot wake this
+			// goroutine. Sweep by state as a bounded backstop so recovery does
+			// not depend on a lossless notification channel.
+			_, err := backend.SweepUDPRecovery(cgroupRecoveryMaxIdle, cgroupRecoverySweepBudget)
+			if err != nil && !backend.IsClosed() {
+				i.logger.Debug("watchdog sweep cgroup eBPF UDP recovery: ", err)
+			}
 		}
 	}
 }

@@ -43,6 +43,11 @@ jobs:
         with:
           go-version: 1.26.8
 
+      # Keep the ordinary build independent from the optional eBPF dialer
+      # integration. These packages must compile without with_ebpf as well.
+      - name: Test non-eBPF integration build
+        run: go test ./adapter ./common/dialer ./daemon
+
       - name: Test sing-box integration
         run: |
           go test -tags with_ebpf \

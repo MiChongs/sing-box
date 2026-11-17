@@ -14,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/adapter/inbound"
 	C "github.com/sagernet/sing-box/constant"
+	"github.com/sagernet/sing-box/internal/ebpfcleanup"
 	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -57,81 +58,49 @@ func RegisterInbound(registry *inbound.Registry) {
 	inbound.Register[option.EBPFInboundOptions](registry, C.TypeEBPF, NewInbound)
 }
 
-type Inbound struct {
-	inbound.Adapter
-	ctx                       context.Context
-	router                    adapter.Router
-	logger                    log.ContextLogger
-	networkManager            adapter.NetworkManager
-	localEnabled              bool
-	localDataPlane            string
-	cgroupPath                string
-	cgroupBackend             *commonEBPF.CgroupBackend
-	localRoutes               *commonEBPF.LocalRouteSet
-	redirectIPv4Prefix        netip.Prefix
-	redirectIPv6Prefix        netip.Prefix
-	selfBypass                *commonEBPF.SelfBypass
-	selfBypassCgroup          bool
-	processTracker            processTrackerOwner
-	processTrackerRollback    processTrackerOwner
-	processInfoCache          *processInfoCache
-	usePlatformProcessFinder  bool
-	listeners                 internalListenerSet
-	tcListeners               internalListenerSet
-	tcNamespace               *tcNamespace
-	tcNamespaceAccess         sync.RWMutex
-	udpNat                    *udpNATService
-	tcDataPlane               tcRuntime
-	udpTimeout                time.Duration
-	udpFragment               bool
-	enableTCP                 bool
-	enableUDP                 bool
-	localDNSMode              string
-	sharedDNSMode             string
-	localIPv6                 bool
-	localPolicy               localUIDPolicy
-	compiledPolicy            commonEBPF.CompiledPolicy
-	androidUIDOptions         *androidUIDOptions
-	sharedOptions             option.EBPFSharedOptions
-	sharedEnabled             bool
-	sharedDataPlane           string
-	sharedRewrite             *sharedRewrite
-	sharedRewriteAccess       sync.RWMutex
-	sharedIPv6                bool
-	sharedBypassPrivate       bool
-	localBypassPort           []portRange
-	sharedBypassPort          []portRange
-	localBypassExclude        []netip.Prefix
-	sharedBypassExclude       []netip.Prefix
-	tcPriority                uint16
-	networkGeneration         uint64
-	fakeIPIPv4Prefix          netip.Prefix
-	fakeIPIPv6Prefix          netip.Prefix
-	fakeIPICMPReply           bool
-	sharedIncludeMAC          []commonEBPF.MACAddress
-	sharedExcludeMAC          []commonEBPF.MACAddress
-	localInitialDestinations  []commonEBPF.CIDRDecision
-	sharedInitialDestinations []commonEBPF.CIDRDecision
-	tcDataPlaneAccess         sync.RWMutex
-	cgroupBackendAccess       sync.RWMutex
-	cgroupReleaseWait         sync.WaitGroup
-	cgroupRecoveryAccess      sync.Mutex
-	cgroupRecoveryCancel      context.CancelFunc
-	cgroupRecoveryDone        chan struct{}
-	cgroupRecoveryEvents      chan commonEBPF.UDPReleaseEvent
-	lifecycleAccess           sync.Mutex
-	interfaceMonitor          tcInterfaceMonitor
+type inboundResources struct {
+	cgroupBackend          *commonEBPF.CgroupBackend
+	localRoutes            *commonEBPF.LocalRouteSet
+	selfBypass             *commonEBPF.SelfBypass
+	processTracker         processTrackerOwner
+	processTrackerRollback processTrackerOwner
+	processInfoCache       *processInfoCache
+	listeners              internalListenerSet
+	tcListeners            internalListenerSet
+	tcNamespace            *tcNamespace
+	tcNamespaceAccess      sync.RWMutex
+	udpNat                 *udpNATService
+	tcDataPlane            tcRuntime
+	tcDataPlaneAccess      sync.RWMutex
+	cgroupBackendAccess    sync.RWMutex
+	sharedRewrite          *sharedRewrite
+	sharedRewriteAccess    sync.RWMutex
+	udpClientTable         udpClientTable
+	udpReplySockets        udpReplySocketPool
+}
+
+type inboundWorkers struct {
+	policyWake           chan struct{}
+	policyCancel         context.CancelFunc
+	policyDone           chan struct{}
+	cgroupReleaseWait    sync.WaitGroup
+	cgroupRecoveryAccess sync.Mutex
+	cgroupRecoveryCancel context.CancelFunc
+	cgroupRecoveryDone   chan struct{}
+	cgroupRecoveryEvents chan commonEBPF.UDPReleaseEvent
+	interfaceMonitor     tcInterfaceMonitor
 	// localTCAwaitingInterface is set while local TC interception has not been
 	// attached yet because no default interface was known at start. The
 	// interface monitor attaches it as soon as one is reported.
-	localTCAwaitingInterface atomic.Bool
+	localTCAwaitingInterface  atomic.Bool
+	tcAssignmentWake          chan struct{}
+	tcAssignmentJanitorAccess sync.Mutex
+	tcAssignmentJanitorCancel context.CancelFunc
+	tcAssignmentJanitorDone   chan struct{}
+}
 
-	bypassRuleSetAccess sync.Mutex
-	localBypassRules    bypassRuleSetState
-	sharedBypassRules   bypassRuleSetState
-
-	udpClientTable                udpClientTable
-	udpReplySockets               udpReplySocketPool
+type inboundDiagnostics struct {
+	networkGeneration             uint64
 	udpWarnings                   udpWarningLimiters
 	tcpWarnings                   warningLimiter
 	policyWarnings                warningLimiter
@@ -147,6 +116,9 @@ type Inbound struct {
 	tcAssignmentSweepFailureMap   atomic.Value
 	tcAssignmentSweepScanned      atomic.Uint64
 	tcAssignmentSweepRemoved      atomic.Uint64
+	tcAssignmentSweepMissing      atomic.Uint64
+	tcAssignmentSweepSuperseded   atomic.Uint64
+	tcAssignmentSweepInFlight     atomic.Uint64
 	tcAssignmentSweepComplete     atomic.Bool
 	tcAssignmentSweepEntries      atomic.Uint64
 	tcAssignmentSweepCapacity     atomic.Uint64
@@ -157,24 +129,68 @@ type Inbound struct {
 	tcAssignmentSweepFailure      atomic.Value
 	tcAssignmentSweepLastAt       atomic.Int64
 	tcAssignmentSweepPartialAt    atomic.Int64
-	tcAssignmentWake              chan struct{}
-	tcAssignmentActivityWakeAt    atomic.Int64
-	tcAssignmentJanitorAccess     sync.Mutex
-	tcAssignmentJanitorCancel     context.CancelFunc
-	tcAssignmentJanitorDone       chan struct{}
 	cgroupRecoveryQueueOverflows  atomic.Uint64
 	cgroupRecoveryQueueOverflowAt atomic.Int64
 	// diagnosticsAPICache is request-driven only. API polling can be frequent,
-	// so native per-CPU counter reads are coalesced for a short
-	// window without adding a timer or background wakeup.
+	// so native per-CPU counter reads are coalesced for a short window.
 	diagnosticsAPIAccess sync.Mutex
 	diagnosticsAPIAt     time.Time
 	diagnosticsAPIValue  adapter.EBPFRuntimeDiagnostics
-	// kernelRuntimeAPICache protects the more expensive global program/map
-	// enumeration. It remains request-driven and never starts a timer.
+	// kernelRuntimeAPICache protects expensive global program/map enumeration.
 	kernelRuntimeAPIAccess sync.Mutex
 	kernelRuntimeAPIAt     time.Time
 	kernelRuntimeAPIValue  adapter.EBPFKernelRuntimeDiagnostics
+}
+
+type Inbound struct {
+	inbound.Adapter
+	ctx                       context.Context
+	router                    adapter.Router
+	logger                    log.ContextLogger
+	networkManager            adapter.NetworkManager
+	localEnabled              bool
+	localDataPlane            string
+	cgroupPath                string
+	redirectIPv4Prefix        netip.Prefix
+	redirectIPv6Prefix        netip.Prefix
+	selfBypassCgroup          bool
+	usePlatformProcessFinder  bool
+	udpTimeout                time.Duration
+	udpFragment               bool
+	enableTCP                 bool
+	enableUDP                 bool
+	localDNSMode              string
+	sharedDNSMode             string
+	localIPv6                 bool
+	localPolicy               localUIDPolicy
+	compiledPolicy            commonEBPF.CompiledPolicy
+	androidUIDOptions         *androidUIDOptions
+	sharedOptions             option.EBPFSharedOptions
+	sharedEnabled             bool
+	sharedDataPlane           string
+	sharedIPv6                bool
+	sharedBypassPrivate       bool
+	localBypassPort           []portRange
+	sharedBypassPort          []portRange
+	localBypassExclude        []netip.Prefix
+	sharedBypassExclude       []netip.Prefix
+	tcPriority                uint16
+	fakeIPIPv4Prefix          netip.Prefix
+	fakeIPIPv6Prefix          netip.Prefix
+	fakeIPICMPReply           bool
+	retainedCleanupOnce       sync.Once
+	retainedCleanup           *ebpfcleanup.Entry
+	sharedIncludeMAC          []commonEBPF.MACAddress
+	sharedExcludeMAC          []commonEBPF.MACAddress
+	localInitialDestinations  []commonEBPF.CIDRDecision
+	sharedInitialDestinations []commonEBPF.CIDRDecision
+	lifecycleAccess           sync.Mutex
+	bypassRuleSetAccess       sync.Mutex
+	localBypassRules          bypassRuleSetState
+	sharedBypassRules         bypassRuleSetState
+	inboundResources
+	inboundWorkers
+	inboundDiagnostics
 }
 
 func (i *Inbound) localSocketAssignEnabled() bool {
@@ -271,6 +287,12 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	network := options.Network.Build()
 	enableTCP := common.Contains(network, N.NetworkTCP)
 	enableUDP := common.Contains(network, N.NetworkUDP)
+	if err = validatePortPolicyCapacity("local bypass_port", localBypassPort, localDNSMode, enableTCP, enableUDP); err != nil {
+		return nil, err
+	}
+	if err = validatePortPolicyCapacity("shared bypass_port", sharedBypassPort, sharedDNSMode, enableTCP, enableUDP); err != nil {
+		return nil, err
+	}
 	networkManager := service.FromContext[adapter.NetworkManager](ctx)
 	if networkManager == nil {
 		return nil, E.New("missing network manager")
@@ -297,11 +319,13 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 			platform := service.FromContext[adapter.PlatformInterface](ctx)
 			return platform != nil && platform.UsePlatformConnectionOwnerFinder()
 		}(),
-		localEnabled:        localEnabled,
-		localDataPlane:      localDataPlane,
-		cgroupPath:          cgroupPath,
-		selfBypass:          selfBypass,
-		processInfoCache:    newProcessInfoCache(),
+		localEnabled:   localEnabled,
+		localDataPlane: localDataPlane,
+		cgroupPath:     cgroupPath,
+		inboundResources: inboundResources{
+			selfBypass:       selfBypass,
+			processInfoCache: newProcessInfoCache(),
+		},
 		enableTCP:           enableTCP,
 		enableUDP:           enableUDP,
 		localDNSMode:        localDNSMode,
@@ -328,7 +352,10 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 		},
 		androidUIDOptions: newAndroidUIDOptions(options.Local),
 		fakeIPICMPReply:   fakeIPICMPReply,
-		tcAssignmentWake:  make(chan struct{}, 1),
+		inboundWorkers: inboundWorkers{
+			policyWake:       make(chan struct{}, 1),
+			tcAssignmentWake: make(chan struct{}, 1),
+		},
 	}
 	if inbound.tcPriority == 0 {
 		inbound.tcPriority = defaultTCPriority
@@ -385,7 +412,7 @@ func NewInbound(ctx context.Context, router adapter.Router, logger log.ContextLo
 	inbound.udpTimeout = udpTimeout
 	inbound.udpFragment = options.UDPFragment != nil && *options.UDPFragment
 	if inbound.enableUDP && (inbound.localEnabled || inbound.sharedSocketAssignEnabled()) {
-		inbound.udpNat = newUDPNATService(inbound, inbound.preparePacketConnection, udpTimeout)
+		inbound.udpNat = newIdleUDPNATService(inbound, inbound.preparePacketConnection, udpTimeout)
 	}
 	return inbound, nil
 }

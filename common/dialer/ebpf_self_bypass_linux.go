@@ -3,6 +3,7 @@
 package dialer
 
 import (
+	"context"
 	"net"
 	"runtime"
 	"sync"
@@ -30,14 +31,16 @@ func bindEBPFSelfBypassConnLifecycle(networkManager adapter.NetworkManager, conn
 		return conn
 	}
 	tracker := provider.EBPFSelfBypass()
-	if tracker.CleanupMode() != "lru_fallback" {
+	if !tracker.NeedsUserspaceUnregister() {
 		return conn
 	}
 	if lazyConn, loaded := conn.(*slowOpenConn); loaded {
 		lazyConn.setCloseHandler(func(tcpConn *net.TCPConn) {
 			rawConn, err := tcpConn.SyscallConn()
 			if err == nil {
-				_ = tracker.UnregisterSocket(rawConn)
+				if cookie, cookieErr := tracker.SocketCookie(rawConn); cookieErr == nil {
+					_ = tracker.UnregisterSocket(commonEBPF.SocketRegistration{Cookie: cookie})
+				}
 			}
 		})
 		return conn
@@ -61,7 +64,7 @@ func bindEBPFSelfBypassPacketConnLifecycle(networkManager adapter.NetworkManager
 		return conn
 	}
 	tracker := provider.EBPFSelfBypass()
-	if tracker.CleanupMode() != "lru_fallback" {
+	if !tracker.NeedsUserspaceUnregister() {
 		return conn
 	}
 	syscallConn, loaded := conn.(syscall.Conn)
@@ -73,6 +76,29 @@ func bindEBPFSelfBypassPacketConnLifecycle(networkManager adapter.NetworkManager
 		return conn
 	}
 	return &selfBypassPacketConn{PacketConn: conn, cleanup: EBPFSelfBypassCleanup(networkManager, rawConn), rawConn: rawConn}
+}
+
+// RegisterEBPFSelfBypassPacketConn records a successfully created packet
+// socket. Callers must invoke this after ListenPacket succeeds: a
+// net.ListenConfig control callback runs before bind and cannot unregister a
+// cookie when the bind fails.
+func RegisterEBPFSelfBypassPacketConn(networkManager adapter.NetworkManager, conn net.PacketConn) error {
+	provider, loaded := networkManager.(interface {
+		EBPFSelfBypass() *commonEBPF.SelfBypass
+	})
+	if !loaded || provider.EBPFSelfBypass() == nil {
+		return nil
+	}
+	syscallConn, loaded := conn.(syscall.Conn)
+	if !loaded {
+		return nil
+	}
+	rawConn, err := syscallConn.SyscallConn()
+	if err != nil {
+		return err
+	}
+	_, err = provider.EBPFSelfBypass().RegisterSocket(rawConn)
+	return err
 }
 
 type selfBypassConn struct {
@@ -137,13 +163,181 @@ func EBPFSelfBypassCleanup(networkManager adapter.NetworkManager, rawConn syscal
 		return nil
 	}
 	tracker := provider.EBPFSelfBypass()
-	if tracker == nil || tracker.CleanupMode() != "lru_fallback" {
+	if tracker == nil || !tracker.NeedsUserspaceUnregister() {
+		return nil
+	}
+	// Read the cookie before returning the callback. The socket may be closed
+	// through another reference before the owner invokes this callback.
+	cookie, err := tracker.SocketCookie(rawConn)
+	if err != nil {
 		return nil
 	}
 	var once sync.Once
 	return func() {
-		once.Do(func() { _ = tracker.UnregisterSocket(rawConn) })
+		once.Do(func() { _ = tracker.UnregisterSocket(commonEBPF.SocketRegistration{Cookie: cookie}) })
 	}
+}
+
+type selfBypassDialAttemptKey struct{}
+
+type selfBypassDialAttempt struct {
+	tracker *commonEBPF.SelfBypass
+	access  sync.Mutex
+	pending map[uint64]commonEBPF.SocketRegistration
+	done    bool
+}
+
+var errSelfBypassDialDone = E.New("eBPF self-bypass dial attempt already finished")
+
+func newSelfBypassDialAttempt(tracker *commonEBPF.SelfBypass) *selfBypassDialAttempt {
+	return &selfBypassDialAttempt{tracker: tracker, pending: make(map[uint64]commonEBPF.SocketRegistration)}
+}
+
+func (a *selfBypassDialAttempt) register(rawConn syscall.RawConn) error {
+	registration, err := a.tracker.RegisterSocket(rawConn)
+	if err != nil {
+		return err
+	}
+	if !registration.Active() {
+		return nil
+	}
+	a.access.Lock()
+	if a.done {
+		a.access.Unlock()
+		_ = a.tracker.UnregisterSocket(registration)
+		return errSelfBypassDialDone
+	}
+	a.pending[registration.Cookie] = registration
+	a.access.Unlock()
+	return nil
+}
+
+// commit keeps the returned connection registered. It reports false when the
+// winner cannot be identified, in which case cleanup must not run.
+func (a *selfBypassDialAttempt) commit(conn net.Conn) bool {
+	if conn == nil {
+		return false
+	}
+	syscallConn, loaded := conn.(syscall.Conn)
+	if !loaded {
+		return false
+	}
+	rawConn, err := syscallConn.SyscallConn()
+	if err != nil {
+		return false
+	}
+	cookie, err := a.tracker.SocketCookie(rawConn)
+	if err != nil {
+		return false
+	}
+	a.access.Lock()
+	delete(a.pending, cookie)
+	a.access.Unlock()
+	return true
+}
+
+func (a *selfBypassDialAttempt) cleanup() {
+	a.access.Lock()
+	a.done = true
+	pending := make([]commonEBPF.SocketRegistration, 0, len(a.pending))
+	for _, registration := range a.pending {
+		pending = append(pending, registration)
+	}
+	clear(a.pending)
+	a.access.Unlock()
+	for _, registration := range pending {
+		_ = a.tracker.UnregisterSocket(registration)
+	}
+}
+
+func selfBypassDialAttemptFromContext(ctx context.Context) *selfBypassDialAttempt {
+	if ctx == nil {
+		return nil
+	}
+	attempt, _ := ctx.Value(selfBypassDialAttemptKey{}).(*selfBypassDialAttempt)
+	return attempt
+}
+
+func appendEBPFSelfBypassDialer(networkManager adapter.NetworkManager, dialer *net.Dialer) {
+	provider, loaded := networkManager.(interface {
+		EBPFSelfBypass() *commonEBPF.SelfBypass
+	})
+	if !loaded || provider.EBPFSelfBypass() == nil {
+		return
+	}
+	tracker := provider.EBPFSelfBypass()
+	baseControl := dialer.Control
+	baseControlContext := dialer.ControlContext
+	dialer.ControlContext = func(ctx context.Context, network, address string, rawConn syscall.RawConn) error {
+		if baseControlContext != nil {
+			if err := baseControlContext(ctx, network, address, rawConn); err != nil {
+				return err
+			}
+		} else if baseControl != nil {
+			if err := baseControl(network, address, rawConn); err != nil {
+				return err
+			}
+		}
+		if attempt := selfBypassDialAttemptFromContext(ctx); attempt != nil {
+			return attempt.register(rawConn)
+		}
+		if !tracker.NeedsUserspaceRegistration() {
+			return nil
+		}
+		_, err := tracker.RegisterSocket(rawConn)
+		return err
+	}
+}
+
+func (d *DefaultDialer) selfBypassTracker() *commonEBPF.SelfBypass {
+	if d.networkManager == nil {
+		return nil
+	}
+	provider, loaded := d.networkManager.(interface {
+		EBPFSelfBypass() *commonEBPF.SelfBypass
+	})
+	if !loaded {
+		return nil
+	}
+	tracker := provider.EBPFSelfBypass()
+	if tracker == nil {
+		return nil
+	}
+	if !tracker.NeedsUserspaceRegistration() {
+		return nil
+	}
+	return tracker
+}
+
+func (d *DefaultDialer) dialWithSelfBypass(ctx context.Context, dialer net.Dialer, network, address string) (net.Conn, error) {
+	tracker := d.selfBypassTracker()
+	if tracker == nil {
+		return dialer.DialContext(ctx, network, address)
+	}
+	attempt := newSelfBypassDialAttempt(tracker)
+	dialContext := context.WithValue(ctx, selfBypassDialAttemptKey{}, attempt)
+	conn, err := dialer.DialContext(dialContext, network, address)
+	if err != nil {
+		attempt.cleanup()
+		return conn, err
+	}
+	if attempt.commit(conn) {
+		attempt.cleanup()
+	}
+	return conn, nil
+}
+
+// CloseUnclaimedEBPFSelfBypass releases a prepared self-bypass that no eBPF
+// inbound claimed during initialization. The box registers it at construction,
+// so it runs last when the box closes.
+func CloseUnclaimedEBPFSelfBypass(networkManager adapter.NetworkManager) error {
+	closer, loaded := networkManager.(interface {
+		CloseUnclaimedEBPFSelfBypass() error
+	})
+	if !loaded {
+		return nil
+	}
+	return closer.CloseUnclaimedEBPFSelfBypass()
 }
 
 func PrepareEBPFSelfBypass(networkManager adapter.NetworkManager, inbounds []option.Inbound) error {
@@ -253,7 +447,11 @@ func AppendEBPFSelfBypass(networkManager adapter.NetworkManager, controlFunc con
 	}
 	tracker := provider.EBPFSelfBypass()
 	selfBypassFunc := func(_ string, _ string, rawConn syscall.RawConn) error {
-		return tracker.RegisterSocket(rawConn)
+		if !tracker.NeedsUserspaceRegistration() {
+			return nil
+		}
+		_, err := tracker.RegisterSocket(rawConn)
+		return err
 	}
 	return control.Append(controlFunc, selfBypassFunc)
 }

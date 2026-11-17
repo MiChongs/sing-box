@@ -81,6 +81,15 @@ for compatibility; duration strings such as `30s` and `5m` are also accepted.
 The value must be at least `5s` and is rounded up to whole seconds for the
 kernel data plane.
 
+### udp_fragment
+
+Allow transparent UDP listeners to fragment oversized datagrams before they
+are returned through the eBPF inbound. The default is `false`. This applies to
+the generated proxy-side UDP reply path; it does not make fragmented packets
+arriving at an interception hook eligible for interception. IPv4 fragments and
+non-atomic IPv6 fragments still bypass when a complete transport tuple is not
+available.
+
 ### tc_priority
 
 TC filter priority from 1 through 65535. Default is `1`. Change it only when
@@ -211,7 +220,9 @@ IPv6 `fd7a:115c:a1e0::/48`) intercepted so tailnet traffic can reach a
 
 Rule sets whose destination IP CIDRs bypass the local data plane. Non-IP rules
 are ignored. This policy is independent from `shared.bypass_rule_set` and is
-updated transactionally across the active local backends.
+updated transactionally across the active local backends. Rule-set callbacks
+only queue a generation change; the policy worker coalesces rapid updates and
+performs the kernel map transaction outside the rule-set callback.
 
 ### local.include_uid
 
@@ -324,8 +335,9 @@ Bypasses private and special-use destinations. Default is `true`.
 ### shared.bypass_exclude
 
 Like `local.bypass_exclude`, but for the shared data plane: CIDR prefixes
-that are force-intercepted ahead of every shared bypass decision. Multiple
-IPv4 and IPv6 prefixes are supported, independently of `local.bypass_exclude`.
+that are force-intercepted ahead of every shared bypass decision. Multiple IPv4
+and IPv6 prefixes are accepted. The set is independent from the FakeIP
+prefixes; overlapping prefixes are resolved by the normal final-action policy.
 
 ### shared.bypass_rule_set
 
@@ -390,6 +402,25 @@ For local socket assignment and shared `socket_assign`, the response also report
 TCX/clsact attachment mode, SOCKMAP/direct listener lookup, delivery interface,
 policy-routing values, active/retired resource counts, health/reconcile times,
 and a network generation that increments at managed handover boundaries.
+
+The local self-bypass fields report decision, producer, visibility, cleanup,
+reclaim, and attachment independently. Local cgroup prefers
+`local_self_bypass_decision_backend=direct_tgid` with no per-socket producer or
+cleanup. If the direct object does not load, local cgroup uses the cookie
+fallback. Local socket assignment first tries `sk_storage` visibility with a
+cookie shadow; if its representative TC object does not load, visibility is
+`cookie_hash`. The producer is
+`cgroup_sock_create`, `cgroup_addr`, or `userspace_control`, while cleanup is
+`sk_storage`, `socket_release`, or `userspace_unregister`. Attachment is `bpf_link`,
+`legacy_attach`, `mixed`, or `none`. `local_self_bypass_fallback_reason`
+explains a capability or object-load fallback. `proc_fd_reclaim` is reported by
+`local_self_bypass_reclaim_backend` only as map-full recovery; its attempts,
+reclaimed sockets, failures, and last run have separate diagnostic fields.
+Userspace storage write failures and cookie fallbacks also have separate
+diagnostic counters.
+The implementation does not use `SO_MARK`; it avoids conflicts with Android
+`netd`, policy routing, and firewall marks. When cgroup hooks are unavailable,
+the userspace socket-cookie map is used as the compatibility fallback.
 
 The diagnostics response carries a response-level `schemaVersion`, including
 when no eBPF inbound is running. Clients should use that value to version the

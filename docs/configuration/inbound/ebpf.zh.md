@@ -75,6 +75,12 @@ UDP 会话超时，默认 `5m`。为兼容旧格式，JSON 数字按秒解释；
 `30s`、`5m` 等 duration 字符串。该值不能小于 `5s`，写入内核数据面时会向上
 取整到整秒。
 
+### udp_fragment
+
+允许透明 UDP listener 在返回超大数据报前进行分片，默认值为 `false`。该选项只作用于
+eBPF 入站生成的代理侧 UDP 回包路径；不会让进入接管 hook 时已经分片的报文重新参与接管。
+当 hook 无法取得完整传输层 tuple 时，IPv4 分片和非 atomic IPv6 分片仍会绕过。
+
 ### tc_priority
 
 TC filter 优先级，范围 1 至 65535，默认 `1`。仅在需要与其他 filter 协调顺序时
@@ -193,7 +199,8 @@ local 和 shared 的集合完全独立，本机强制接管前缀不会传播到
 ### local.bypass_rule_set
 
 目标 IP CIDR 命中这些规则集时绕过 local 数据面，非 IP 规则会被忽略。该策略与
-`shared.bypass_rule_set` 独立，并以事务方式更新所有启用的 local 后端。
+`shared.bypass_rule_set` 独立，并以事务方式更新所有启用的 local 后端。规则集回调只记录
+新的代数并唤醒策略 worker；快速连续更新会被合并，内核 map 事务在回调之外执行。
 
 ### local.include_uid
 
@@ -293,8 +300,8 @@ raw-IP、PPP/PPPoE 和受支持的隧道链路应使用 `socket_assign`。local 
 ### shared.bypass_exclude
 
 与 `local.bypass_exclude` 相同，但作用于 shared 数据面：这些 CIDR 前缀会在
-所有 shared bypass 决策之前被强制接管。支持多个 IPv4 和 IPv6 前缀，与
-`local.bypass_exclude` 相互独立。
+所有 shared bypass 决策之前被强制接管。支持配置多个 IPv4 和 IPv6 前缀；该集合
+与 FakeIP 前缀独立，重叠时按正常的最终动作策略处理。
 
 ### shared.bypass_rule_set
 
@@ -336,8 +343,8 @@ raw-IP、PPP/PPPoE 和受支持的隧道链路应使用 `socket_assign`。local 
 ## 策略顺序
 
 安全与服务流量绕过最先执行；随后 FakeIP 前缀强制接管；DNS 模式及 local UID/shared
-来源筛选早于端口、私网地址和各自数据面的规则集绕过。顶层兼容规则集会应用到所有
-已启用路径，路径级规则集策略仍彼此独立。shared 的 CIDR 与 MAC include 为或关系，
+来源筛选早于端口、私网地址和各自数据面的规则集绕过。路径级规则集策略彼此独立。
+shared 的 CIDR 与 MAC include 为或关系，
 任一 exclude 命中都优先绕过。
 
 ## 诊断
@@ -351,6 +358,21 @@ raw-IP、PPP/PPPoE 和受支持的隧道链路应使用 `socket_assign`。local 
 local socket assignment 和 shared `socket_assign` 还会报告实际的 TCX/clsact 挂载机制、SOCKMAP/direct
 listener 查找、delivery 接口、策略路由值、活动/待回收资源数量、health/reconcile 时间，
 以及在受管网络切换边界递增的网络代数。
+
+local 自绕过诊断分别报告 decision、producer、visibility、cleanup、reclaim 与 attachment。
+local cgroup 优先使用 `local_self_bypass_decision_backend=direct_tgid`，无需按 socket
+记录或清理；直接对象无法加载时，local cgroup 使用 cookie 回退。local socket assignment
+优先尝试 `sk_storage` visibility，并保留 cookie shadow；实际 TC storage 对象无法加载时，
+visibility 回退为 `cookie_hash`。producer 为 `cgroup_sock_create`、`cgroup_addr` 或
+`userspace_control`，cleanup 为 `sk_storage`、`socket_release` 或
+`userspace_unregister`。
+attachment 为 `bpf_link`、`legacy_attach`、`mixed` 或 `none`；
+`local_self_bypass_fallback_reason` 说明能力或对象加载回退原因。
+`local_self_bypass_reclaim_backend=proc_fd_reclaim` 仅表示 map 满时的有界恢复，尝试次数、
+回收 socket 数、失败数和最近执行时间由独立字段报告；用户空间 storage 写入失败和
+cookie 回退也有独立诊断计数。实现不使用 `SO_MARK`，避免与
+Android `netd`、策略路由和防火墙 mark
+冲突；当 cgroup hook 不可用时，会回退到用户空间 socket-cookie map。
 
 诊断响应在顶层携带 `schemaVersion`，即使当前没有运行中的 eBPF 入站也会返回。客户端
 应以该字段作为整份响应的版本。

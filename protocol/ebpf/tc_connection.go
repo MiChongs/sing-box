@@ -163,7 +163,7 @@ func (i *Inbound) prepareTCPacketConnection(
 	key udpSessionKey,
 ) (bool, context.Context, N.PacketWriter, N.CloseHandlerFunc) {
 	ctx := log.ContextWithNewID(i.ctx)
-	clientState := i.udpClientTable.loadOrCreate(key)
+	clientState := i.udpClientTable.claimNATState(key)
 	var writer N.PacketWriter
 	if key.Scope == udpSessionScopeLocalCgroup {
 		writer = &cgroupPacketWriter{inbound: i, key: key, clientState: clientState}
@@ -372,9 +372,6 @@ func (i *Inbound) newTCUDPReplySocket(source netip.AddrPort) (*net.UDPConn, func
 		if err != nil {
 			return err
 		}
-		if selfBypass != nil {
-			return selfBypass.RegisterSocket(rawConn)
-		}
 		return nil
 	})
 	i.tcNamespaceAccess.RLock()
@@ -395,11 +392,18 @@ func (i *Inbound) newTCUDPReplySocket(source netip.AddrPort) (*net.UDPConn, func
 	}
 	var cleanup func()
 	if selfBypass != nil {
+		rawConn, rawErr := udpConnection.SyscallConn()
+		if rawErr != nil {
+			_ = packetConnection.Close()
+			return nil, nil, rawErr
+		}
+		registration, registerErr := selfBypass.RegisterSocket(rawConn)
+		if registerErr != nil {
+			_ = packetConnection.Close()
+			return nil, nil, E.Cause(registerErr, "register TC eBPF UDP reply socket")
+		}
 		cleanup = func() {
-			rawConn, err := udpConnection.SyscallConn()
-			if err == nil {
-				_ = selfBypass.UnregisterSocket(rawConn)
-			}
+			_ = selfBypass.UnregisterSocket(registration)
 		}
 	}
 	return udpConnection, cleanup, nil
