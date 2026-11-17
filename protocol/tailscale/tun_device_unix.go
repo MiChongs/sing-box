@@ -4,12 +4,11 @@ package tailscale
 
 import (
 	"encoding/hex"
-	"errors"
-	"io"
 	"os"
 	"sync"
 	"sync/atomic"
 
+	"github.com/sagernet/sing-box/common/wgtun"
 	singTun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/logger"
 	wgTun "github.com/sagernet/wireguard-go/tun"
@@ -18,6 +17,7 @@ import (
 type tunDeviceAdapter struct {
 	tun        singTun.Tun
 	linuxTUN   singTun.LinuxTUN
+	reader     *wgtun.Reader
 	events     chan wgTun.Event
 	mtu        int
 	logger     logger.ContextLogger
@@ -44,6 +44,7 @@ func newTunDeviceAdapter(tun singTun.Tun, mtu int, logger logger.ContextLogger) 
 	if linuxTUN, ok := tun.(singTun.LinuxTUN); ok {
 		adapter.linuxTUN = linuxTUN
 	}
+	adapter.reader = wgtun.NewReader(tun, mtu)
 	adapter.events <- wgTun.EventUp
 	return adapter, nil
 }
@@ -52,34 +53,14 @@ func (a *tunDeviceAdapter) File() *os.File {
 	return nil
 }
 
-func (a *tunDeviceAdapter) Read(bufs [][]byte, sizes []int, offset int) (count int, err error) {
-	// Without GSO, Linux TUN packets lack the virtio header required by BatchRead.
-	if a.linuxTUN != nil && a.linuxTUN.BatchSize() > 1 {
-		n, err := a.linuxTUN.BatchRead(bufs, offset-singTun.PacketOffset, sizes)
-		if err == nil {
-			for i := range n {
-				a.debugPacket("read", bufs[i][offset:offset+sizes[i]])
-			}
-		}
-		return n, err
+func (a *tunDeviceAdapter) Read(slab []byte, packets []wgTun.ReadPacket) (int, error) {
+	n, err := a.reader.Read(slab, packets)
+	if a.debugTun {
+		wgtun.ReadPackets(slab, packets[:n], func(packet []byte) {
+			a.debugPacket("read", packet)
+		})
 	}
-	if offset < singTun.PacketOffset {
-		return 0, io.ErrShortBuffer
-	}
-	readBuf := bufs[0][offset-singTun.PacketOffset:]
-	n, err := a.tun.Read(readBuf)
-	if err == nil {
-		if n < singTun.PacketOffset {
-			return 0, io.ErrUnexpectedEOF
-		}
-		sizes[0] = n - singTun.PacketOffset
-		a.debugPacket("read", readBuf[singTun.PacketOffset:n])
-		return 1, nil
-	}
-	if errors.Is(err, singTun.ErrTooManySegments) {
-		err = wgTun.ErrTooManySegments
-	}
-	return 0, err
+	return n, err
 }
 
 func (a *tunDeviceAdapter) Write(bufs [][]byte, offset int) (count int, err error) {
@@ -126,10 +107,7 @@ func (a *tunDeviceAdapter) Close() error {
 }
 
 func (a *tunDeviceAdapter) BatchSize() int {
-	if a.linuxTUN != nil {
-		return a.linuxTUN.BatchSize()
-	}
-	return 1
+	return a.reader.BatchSize()
 }
 
 func (a *tunDeviceAdapter) debugPacket(direction string, packet []byte) {

@@ -29,7 +29,7 @@ func TestClientBindCloseUnblocksPausedReceive(t *testing.T) {
 
 	receiveDone := make(chan struct{})
 	go func() {
-		_, _ = bind.receive([][]byte{make([]byte, 2048)}, make([]int, 1), make([]conn.Endpoint, 1))
+		_, _ = bind.receive(make([]byte, 2048), make([]conn.ReceivedPacket, 1))
 		close(receiveDone)
 	}()
 
@@ -59,7 +59,7 @@ func TestClientBindCloseDoesNotWaitForDial(t *testing.T) {
 
 	receiveDone := make(chan struct{})
 	go func() {
-		_, _ = bind.receive([][]byte{make([]byte, 2048)}, make([]int, 1), make([]conn.Endpoint, 1))
+		_, _ = bind.receive(make([]byte, 2048), make([]conn.ReceivedPacket, 1))
 		close(receiveDone)
 	}()
 

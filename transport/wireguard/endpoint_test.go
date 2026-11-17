@@ -259,7 +259,7 @@ func (d *testEndpointDevice) BatchSize() int { return 1 }
 
 func (d *testEndpointDevice) Events() <-chan wgTun.Event { return d.events }
 
-func (d *testEndpointDevice) Read([][]byte, []int, int) (int, error) {
+func (d *testEndpointDevice) Read([]byte, []wgTun.ReadPacket) (int, error) {
 	<-d.done
 	return 0, net.ErrClosed
 }

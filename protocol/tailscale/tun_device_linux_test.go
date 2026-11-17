@@ -8,6 +8,7 @@ import (
 
 	singTun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common/logger"
+	wgTun "github.com/sagernet/wireguard-go/tun"
 
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sys/unix"
@@ -51,25 +52,23 @@ func TestTunDeviceAdapterReadBatch(t *testing.T) {
 	assertAdapterReadPackets(t, adapter, packets)
 }
 
-func assertAdapterReadPackets(t *testing.T, reader interface {
-	Read([][]byte, []int, int) (int, error)
-}, packets [][]byte,
-) {
+func assertAdapterReadPackets(t *testing.T, reader wgTun.Reader, packets [][]byte) {
 	t.Helper()
-	const offset = 32
-	buffers := make([][]byte, len(packets))
-	sizes := make([]int, len(packets))
-	for i := range buffers {
-		buffers[i] = bytes.Repeat([]byte{0xa5}, offset+1500)
-	}
-	n, err := reader.Read(buffers, sizes, offset)
+	const spacing = wgTun.ReadPacketSpacing
+	slab := bytes.Repeat([]byte{0xa5}, 2*(1<<16-1))
+	descriptors := make([]wgTun.ReadPacket, len(packets))
+	n, err := reader.Read(slab, descriptors)
 	require.NoError(t, err)
 	require.Equal(t, len(packets), n)
+	end := 0
 	for i, packet := range packets {
-		require.Equal(t, len(packet), sizes[i])
-		require.Equal(t, packet, buffers[i][offset:offset+sizes[i]])
-		require.Equal(t, bytes.Repeat([]byte{0xa5}, offset), buffers[i][:offset])
+		descriptor := descriptors[i]
+		require.Equal(t, len(packet), descriptor.Size)
+		require.GreaterOrEqual(t, descriptor.Offset, end+spacing, "spacing before packet %d", i)
+		require.Equal(t, packet, slab[descriptor.Offset:descriptor.Offset+descriptor.Size])
+		end = descriptor.Offset + descriptor.Size
 	}
+	require.LessOrEqual(t, end+spacing, len(slab), "spacing after the last packet")
 }
 
 type batchReadTestTUN struct {

@@ -4,6 +4,7 @@ package tailscale
 
 import (
 	"errors"
+	"io"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -66,13 +67,17 @@ func (a *tunDeviceAdapter) File() *os.File {
 	return nil
 }
 
-func (a *tunDeviceAdapter) Read(bufs [][]byte, sizes []int, offset int) (count int, err error) {
+func (a *tunDeviceAdapter) Read(slab []byte, packets []wgTun.ReadPacket) (int, error) {
+	const spacing = wgTun.ReadPacketSpacing
 	packet, release, err := a.tun.ReadPacket()
 	if err != nil {
 		return 0, err
 	}
 	defer release()
-	sizes[0] = copy(bufs[0][offset-singTun.PacketOffset:], packet)
+	if len(packet) > len(slab)-2*spacing {
+		return 0, io.ErrShortBuffer
+	}
+	packets[0] = wgTun.ReadPacket{Offset: spacing, Size: copy(slab[spacing:], packet)}
 	return 1, nil
 }
 

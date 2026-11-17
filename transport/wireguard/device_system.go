@@ -2,7 +2,6 @@ package wireguard
 
 import (
 	"context"
-	"errors"
 	"net"
 	"net/netip"
 	"os"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/kernelports"
+	"github.com/sagernet/sing-box/common/wgtun"
 	tun "github.com/sagernet/sing-tun"
 	"github.com/sagernet/sing/common"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -30,6 +30,7 @@ type systemDevice struct {
 	device       tun.Tun
 	ports        atomic.Pointer[kernelports.Pool]
 	batchDevice  tun.LinuxTUN
+	reader       *wgtun.Reader
 	events       chan wgTun.Event
 	closeOnce    sync.Once
 	inet4Address netip.Addr
@@ -120,9 +121,9 @@ func (w *systemDevice) Start() error {
 	}
 	w.options.Logger.Info("started at ", w.options.Name)
 	w.device = tunInterface
-	batchTUN, isBatchTUN := tunInterface.(tun.LinuxTUN)
-	if isBatchTUN && batchTUN.BatchSize() > 1 {
-		w.batchDevice = batchTUN
+	w.reader = wgtun.NewReader(tunInterface, int(w.options.MTU))
+	if w.reader.Batch() {
+		w.batchDevice = tunInterface.(tun.LinuxTUN)
 	}
 	w.events <- wgTun.EventUp
 	return nil
@@ -132,19 +133,8 @@ func (w *systemDevice) File() *os.File {
 	return nil
 }
 
-func (w *systemDevice) Read(bufs [][]byte, sizes []int, offset int) (count int, err error) {
-	if w.batchDevice != nil {
-		count, err = w.batchDevice.BatchRead(bufs, offset-tun.PacketOffset, sizes)
-	} else {
-		sizes[0], err = w.device.Read(bufs[0][offset-tun.PacketOffset:])
-		if err == nil {
-			sizes[0] -= tun.PacketOffset
-			count = 1
-		} else if errors.Is(err, tun.ErrTooManySegments) {
-			err = wgTun.ErrTooManySegments
-		}
-	}
-	return
+func (w *systemDevice) Read(slab []byte, packets []wgTun.ReadPacket) (int, error) {
+	return w.reader.Read(slab, packets)
 }
 
 func (w *systemDevice) Write(bufs [][]byte, offset int) (count int, err error) {

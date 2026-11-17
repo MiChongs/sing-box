@@ -121,7 +121,7 @@ func (c *ClientBind) Open(port uint16) (fns []conn.ReceiveFunc, actualPort uint1
 	return []conn.ReceiveFunc{c.receive}, 0, nil
 }
 
-func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint) (count int, err error) {
+func (c *ClientBind) receive(slab []byte, packets []conn.ReceivedPacket) (count int, err error) {
 	udpConn, err := c.connect()
 	if err != nil {
 		if isDone(c.done) {
@@ -134,7 +134,7 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 		}
 		return
 	}
-	n, addr, err := udpConn.ReadFrom(packets[0])
+	n, addr, err := udpConn.ReadFrom(slab)
 	if err != nil {
 		udpConn.Close()
 		if !isDone(c.done) {
@@ -143,12 +143,14 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
 		err = nil
 		return
 	}
-	sizes[0] = n
 	if n > 3 {
-		b := packets[0]
-		clear(b[1:4])
+		clear(slab[1:4])
 	}
-	eps[0] = remoteEndpoint(M.SocksaddrFromNet(addr).Unwrap().AddrPort())
+	packets[0] = conn.ReceivedPacket{
+		Offset:   0,
+		Size:     n,
+		Endpoint: remoteEndpoint(M.SocksaddrFromNet(addr).Unwrap().AddrPort()),
+	}
 	count = 1
 	return
 }
