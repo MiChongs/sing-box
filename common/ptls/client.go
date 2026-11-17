@@ -6,7 +6,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"math/rand"
 	"net"
 	"os"
 	"reflect"
@@ -14,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sagernet/sing-box/common/utlsid"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	E "github.com/sagernet/sing/common/exceptions"
@@ -491,39 +491,11 @@ func (c *utlsClientConn) HandshakeContext(ctx context.Context) error {
 }
 
 func parseUTLSFingerprint(name string) (utls.ClientHelloID, error) {
-	switch strings.ToLower(strings.TrimSpace(name)) {
-	case "chrome_psk", "chrome_psk_shuffle", "chrome_padding_psk_shuffle", "chrome_pq", "chrome_pq_psk":
-		fallthrough
-	case "chrome", "":
-		return utls.HelloChrome_Auto, nil
-	case "firefox":
-		return utls.HelloFirefox_Auto, nil
-	case "edge":
-		return utls.HelloEdge_Auto, nil
-	case "safari":
-		return utls.HelloSafari_Auto, nil
-	case "360":
-		return utls.Hello360_Auto, nil
-	case "qq":
-		return utls.HelloQQ_Auto, nil
-	case "ios":
-		return utls.HelloIOS_Auto, nil
-	case "android":
-		return utls.HelloAndroid_11_OkHttp, nil
-	case "random":
-		modern := []utls.ClientHelloID{
-			utls.HelloChrome_Auto,
-			utls.HelloFirefox_Auto,
-			utls.HelloEdge_Auto,
-			utls.HelloSafari_Auto,
-			utls.HelloIOS_Auto,
-		}
-		return modern[rand.Intn(len(modern))], nil
-	case "randomized":
-		return utls.HelloRandomized, nil
-	default:
-		return utls.ClientHelloID{}, E.New("ptls: unknown utls fingerprint: ", name)
+	id, err := utlsid.ClientHelloID(name)
+	if err != nil {
+		return utls.ClientHelloID{}, E.Cause(err, "ptls")
 	}
+	return id, nil
 }
 
 func parseTLSVersion(version string) (uint16, error) {

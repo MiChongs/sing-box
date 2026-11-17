@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"math/rand"
 	"net"
 	"slices"
 	"strings"
@@ -15,6 +14,7 @@ import (
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/common/tlsfragment"
 	"github.com/sagernet/sing-box/common/tlsspoof"
+	"github.com/sagernet/sing-box/common/utlsid"
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common"
@@ -382,7 +382,7 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 	if err != nil {
 		return nil, err
 	}
-	id, err := uTLSClientHelloID(options.UTLS.Fingerprint)
+	id, err := utlsid.ClientHelloID(options.UTLS.Fingerprint)
 	if err != nil {
 		return nil, err
 	}
@@ -424,56 +424,4 @@ func newUTLSClient(ctx context.Context, logger logger.ContextLogger, serverAddre
 		}
 	}
 	return config, nil
-}
-
-var (
-	randomFingerprint     utls.ClientHelloID
-	randomizedFingerprint utls.ClientHelloID
-)
-
-func init() {
-	modernFingerprints := []utls.ClientHelloID{
-		utls.HelloChrome_Auto,
-		utls.HelloFirefox_Auto,
-		utls.HelloEdge_Auto,
-		utls.HelloSafari_Auto,
-		utls.HelloIOS_Auto,
-	}
-	randomFingerprint = modernFingerprints[rand.Intn(len(modernFingerprints))]
-
-	weights := utls.DefaultWeights
-	weights.TLSVersMax_Set_VersionTLS13 = 1
-	weights.FirstKeyShare_Set_CurveP256 = 0
-	randomizedFingerprint = utls.HelloRandomized
-	randomizedFingerprint.Seed, _ = utls.NewPRNGSeed()
-	randomizedFingerprint.Weights = &weights
-}
-
-func uTLSClientHelloID(name string) (utls.ClientHelloID, error) {
-	switch name {
-	case "chrome_psk", "chrome_psk_shuffle", "chrome_padding_psk_shuffle", "chrome_pq", "chrome_pq_psk":
-		fallthrough
-	case "chrome", "":
-		return utls.HelloChrome_Auto, nil
-	case "firefox":
-		return utls.HelloFirefox_Auto, nil
-	case "edge":
-		return utls.HelloEdge_Auto, nil
-	case "safari":
-		return utls.HelloSafari_Auto, nil
-	case "360":
-		return utls.Hello360_Auto, nil
-	case "qq":
-		return utls.HelloQQ_Auto, nil
-	case "ios":
-		return utls.HelloIOS_Auto, nil
-	case "android":
-		return utls.HelloAndroid_11_OkHttp, nil
-	case "random":
-		return randomFingerprint, nil
-	case "randomized":
-		return randomizedFingerprint, nil
-	default:
-		return utls.ClientHelloID{}, E.New("unknown uTLS fingerprint: ", name)
-	}
 }

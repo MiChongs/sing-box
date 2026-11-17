@@ -17,6 +17,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
 	"strconv"
@@ -24,12 +25,11 @@ import (
 	"sync"
 	"testing"
 	"time"
-	"io"
 
+	"github.com/sagernet/quic-go"
 	"github.com/sagernet/sing-box/common/ptls"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
-	"github.com/sagernet/quic-go"
 )
 
 func parseHostPort(t *testing.T, addr string) (string, uint16) {
@@ -2687,20 +2687,21 @@ func TestPTLS_Padding_NonP256_Passthrough(t *testing.T) {
 		NotAfter:     time.Now().Add(24 * time.Hour),
 	}
 
-	start := time.Now()
-	// 执行填充签发，预期快速返回，不应被 64 次重试阻塞
+	// 非 P-256 私钥直接透传签名（透传逻辑由 TestWrapFixedLenSignerPassthrough 确定性校验），
+	// 这里校验填充签发的证书完整可用且确由 P-384 CA 签发
 	der, err := ptls.PadCertificateDER(leafTmpl, caCert, &leafPriv.PublicKey, p384Priv, 1800, 7.40)
-	elapsed := time.Since(start)
-
 	if err != nil {
 		t.Fatalf("非 P-256 CA 签发失败: %v", err)
 	}
 	if len(der) == 0 {
 		t.Fatal("生成的 DER 为空")
 	}
-	// 若未透传而进入 64 次 P-384 重试，耗时通常在数十至上百毫秒；透传后应在 5ms 内完成
-	if elapsed > 50*time.Millisecond {
-		t.Fatalf("非 P-256 私钥未正常透传，检测到异常耗时: %v", elapsed)
+	leafCert, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatalf("填充证书解析失败: %v", err)
+	}
+	if err := leafCert.CheckSignatureFrom(caCert); err != nil {
+		t.Fatalf("填充证书未由 P-384 CA 正确签发: %v", err)
 	}
 }
 
@@ -3144,8 +3145,9 @@ func TestPTLS_Client_UTLS_MultiFingerprint_Matrix(t *testing.T) {
 
 			state := cTLS.ConnectionState()
 			expectedVersion := uint16(tls.VersionTLS13)
-			if fp == "android" || fp == "randomized" {
-				// android (OkHttp 11) 与 randomized (古典随机扩展) 在 uTLS 规范中均基于 TLS 1.2 建模
+			if fp == "android" {
+				// android (OkHttp 11) 在 uTLS 规范中基于 TLS 1.2 建模；
+				// randomized 与主线 uTLS 一致，始终提供 TLS 1.3
 				expectedVersion = tls.VersionTLS12
 			}
 			if state.Version != expectedVersion {
@@ -3505,7 +3507,7 @@ func TestPTLS_Client_DisabledUTLS_PureStdlib_ZeroUTLS_Inspection(t *testing.T) {
 	// uTLS (Chrome/Firefox/Safari 等) 在构建 ClientHello 时会无条件注入 GREASE 保留字；
 	// Go 语言原生 crypto/tls 则完全不发送任何 GREASE 扩展或密码套件。
 	isGREASE := func(v uint16) bool {
-		return (v&0x0f0f == 0x0a0a) && ((v>>8) == (v&0xff))
+		return (v&0x0f0f == 0x0a0a) && ((v >> 8) == (v & 0xff))
 	}
 
 	curr := 76 // 跳过头部与 SessionID
@@ -3553,17 +3555,75 @@ func TestPTLS_Client_DisabledUTLS_PureStdlib_ZeroUTLS_Inspection(t *testing.T) {
 // 35. QUIC PTLS 专用辅助工具与模拟回落后端
 // -----------------------------------------------------------------------------
 
-func startDummyUDPFallbackServer(t *testing.T) (addr string, closeFn func(), receivedData *bytes.Buffer) {
+// udpFallbackRecorder collects the datagrams received by the dummy UDP
+// fallback server; the server goroutine writes while the test reads.
+type udpFallbackRecorder struct {
+	access  sync.Mutex
+	length  int
+	first   []byte
+	updated chan struct{}
+}
+
+func newUDPFallbackRecorder() *udpFallbackRecorder {
+	return &udpFallbackRecorder{updated: make(chan struct{}, 1)}
+}
+
+func (r *udpFallbackRecorder) record(packet []byte) {
+	r.access.Lock()
+	if r.first == nil {
+		r.first = append([]byte(nil), packet...)
+	}
+	r.length += len(packet)
+	r.access.Unlock()
+	select {
+	case r.updated <- struct{}{}:
+	default:
+	}
+}
+
+// Len returns the number of bytes received so far.
+func (r *udpFallbackRecorder) Len() int {
+	r.access.Lock()
+	defer r.access.Unlock()
+	return r.length
+}
+
+// FirstPacket returns a copy of the first datagram received, or nil.
+func (r *udpFallbackRecorder) FirstPacket() []byte {
+	r.access.Lock()
+	defer r.access.Unlock()
+	return append([]byte(nil), r.first...)
+}
+
+// WaitLen waits until at least length bytes arrived or timeout elapses, and
+// returns the number of bytes received.
+func (r *udpFallbackRecorder) WaitLen(length int, timeout time.Duration) int {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	for {
+		received := r.Len()
+		if received >= length {
+			return received
+		}
+		select {
+		case <-r.updated:
+		case <-timer.C:
+			return r.Len()
+		}
+	}
+}
+
+func startDummyUDPFallbackServer(t *testing.T) (addr string, closeFn func(), received *udpFallbackRecorder) {
 	t.Helper()
 	conn, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("启动 Dummy UDP Fallback 监听失败: %v", err)
 	}
 
-	buf := new(bytes.Buffer)
-	var mu sync.Mutex
-
+	recorder := newUDPFallbackRecorder()
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		tmp := make([]byte, 65536)
 		for {
 			n, rAddr, err := conn.ReadFrom(tmp)
@@ -3571,9 +3631,7 @@ func startDummyUDPFallbackServer(t *testing.T) (addr string, closeFn func(), rec
 				return
 			}
 			if n > 0 {
-				mu.Lock()
-				buf.Write(tmp[:n])
-				mu.Unlock()
+				recorder.record(tmp[:n])
 				_, _ = conn.WriteTo([]byte("UDP_FALLBACK_SUCCESS"), rAddr)
 			}
 		}
@@ -3581,8 +3639,9 @@ func startDummyUDPFallbackServer(t *testing.T) (addr string, closeFn func(), rec
 
 	closeFn = func() {
 		_ = conn.Close()
+		<-done
 	}
-	return conn.LocalAddr().String(), closeFn, buf
+	return conn.LocalAddr().String(), closeFn, recorder
 }
 
 // -----------------------------------------------------------------------------
@@ -4215,17 +4274,16 @@ func TestPTLS_QUIC_UDP_Fallback_Relay(t *testing.T) {
 	// 发起拨号：首包到达服务端，checkPTLS 验签失败触发 Fallback，将首包无损转发至 dummyUDPFallbackServer
 	_, _ = quic.DialAddr(ctx, listener.Addr().String(), clientTLSConf, &quic.Config{MaxIdleTimeout: 1 * time.Second})
 
-	time.Sleep(200 * time.Millisecond)
-
-	if receivedBuf.Len() < 1200 {
-		t.Fatalf("Fallback 目标未收到未授权客户端的原始 QUIC Initial 首包，实际收到 %d 字节", receivedBuf.Len())
+	if received := receivedBuf.WaitLen(1200, 3*time.Second); received < 1200 {
+		t.Fatalf("Fallback 目标未收到未授权客户端的原始 QUIC Initial 首包，实际收到 %d 字节", received)
 	}
 
-	recvBytes := receivedBuf.Bytes()
-	if (recvBytes[0] & 0x80) == 0 {
-		t.Fatalf("Fallback 目标收到的首包不是 Long Header 报文: 0x%02x", recvBytes[0])
+	firstPacket := receivedBuf.FirstPacket()
+	if (firstPacket[0] & 0x80) == 0 {
+		t.Fatalf("Fallback 目标收到的首包不是 Long Header 报文: 0x%02x", firstPacket[0])
 	}
 }
+
 // With reject_unknown_sni, a QUIC client presenting another SNI is dropped
 // silently: neither its Initial packets nor later ones reach the fallback.
 func TestPTLS_QUIC_RejectUnknownSNI_NoFallback(t *testing.T) {
