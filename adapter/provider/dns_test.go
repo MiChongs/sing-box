@@ -410,6 +410,13 @@ func TestProviderDomainResolverFallbackOption(t *testing.T) {
 	require.NoError(t, err)
 	require.JSONEq(t, `{"fallback": false}`, string(content))
 	require.True(t, (*option.ProviderDomainResolverOptions)(nil).FallbackEnabled())
+	require.True(t, (*option.ProviderDomainResolverOptions)(nil).NameserverEnabled())
+	require.NoError(t, options.UnmarshalJSON([]byte(`{"use_nameserver": false}`)))
+	require.False(t, options.NameserverEnabled())
+	require.True(t, options.FallbackEnabled())
+	content, err = options.MarshalJSON()
+	require.NoError(t, err)
+	require.JSONEq(t, `{"use_nameserver": false}`, string(content))
 	require.NoError(t, options.UnmarshalJSON([]byte(`true`)))
 	require.True(t, options.FallbackEnabled())
 }

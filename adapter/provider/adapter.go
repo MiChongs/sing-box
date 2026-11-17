@@ -50,7 +50,8 @@ type Adapter struct {
 	udp *udpHealthCheck
 
 	// dns answers for the nodes when provider_domain_resolver is enabled.
-	dns *providerDNS
+	dns              *providerDNS
+	dnsUseNameserver bool
 	// subscription is set for local / remote providers: their nodes come
 	// from subscription content or its cache, whose resolvers may name DNS
 	// servers this box does not have.
@@ -598,6 +599,7 @@ func (a *Adapter) EnableProviderDNS(overrideDialer *option.OverrideDialerOptions
 		return nil, E.Cause(err, "register provider DNS")
 	}
 	a.dns = transport
+	a.dnsUseNameserver = options.NameserverEnabled()
 	effective := *overrideDialer
 	var domainResolver option.DomainResolveOptions
 	if overrideDialer.DomainResolver != nil {
@@ -611,6 +613,12 @@ func (a *Adapter) EnableProviderDNS(overrideDialer *option.OverrideDialerOptions
 	effective.DomainResolver = &domainResolver
 	a.nodeResolver = &domainResolver
 	return &effective, nil
+}
+
+// ProviderDNSUseNameserver reports whether the subscription's general DNS
+// servers stand in when it names none for its nodes.
+func (a *Adapter) ProviderDNSUseNameserver() bool {
+	return a.dnsUseNameserver
 }
 
 // ProviderDNSEnabled reports whether the subscription DNS servers are used.

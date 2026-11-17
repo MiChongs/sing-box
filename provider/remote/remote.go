@@ -617,7 +617,7 @@ func (s *ProviderRemote) updateDNS(content string) {
 	if !s.ProviderDNSEnabled() {
 		return
 	}
-	servers := parser.ParseSubscriptionDNS(parser.ContextWithWarnHandler(s.ctx, s.logger.Warn), content)
+	servers := parser.ParseSubscriptionDNS(parser.ContextWithWarnHandler(s.ctx, s.logger.Warn), content, s.ProviderDNSUseNameserver())
 	s.UpdateDNSServers(servers)
 	s.infoMu.Lock()
 	s.lastDNSOpts = servers
@@ -649,6 +649,9 @@ func (s *ProviderRemote) cacheOptions() option.Options {
 			Options: &option.GroupDNSServerOptions{Servers: memberTags},
 		})
 		options.DNS = &option.DNSOptions{RawDNSOptions: option.RawDNSOptions{Servers: servers, Final: groupTag}}
+		// Named as the nodes' resolver too, so the cache reads back the same
+		// list with use_nameserver disabled.
+		options.Route = &option.RouteOptions{DefaultDomainResolver: &option.DomainResolveOptions{Server: groupTag}}
 	}
 	return options
 }

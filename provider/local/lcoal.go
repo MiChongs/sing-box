@@ -194,7 +194,7 @@ func (s *ProviderLocal) reloadFile(path string) error {
 		return err
 	}
 	if s.ProviderDNSEnabled() {
-		s.UpdateDNSServers(parser.ParseSubscriptionDNS(parser.ContextWithWarnHandler(s.ctx, s.logger.Warn), string(content)))
+		s.UpdateDNSServers(parser.ParseSubscriptionDNS(parser.ContextWithWarnHandler(s.ctx, s.logger.Warn), string(content), s.ProviderDNSUseNameserver()))
 	}
 	s.UpdateOutbounds(s.lastOutOpts, outboundOpts)
 	s.lastOutOpts = outboundOpts

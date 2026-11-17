@@ -20353,6 +20353,9 @@
                 },
                 "fallback": {
                   "type": "boolean"
+                },
+                "use_nameserver": {
+                  "type": "boolean"
                 }
               },
               "additionalProperties": false

@@ -17,22 +17,23 @@ import (
 )
 
 // ParseSubscriptionDNS extracts the DNS servers a subscription wants its own
-// server addresses resolved with: Clash dns.proxy-server-nameserver (else
-// dns.nameserver), or the sing-box server selected by
-// route.default_domain_resolver (else dns.final, else the first server), a
-// group expanding to its members. Only plain remote servers are kept
+// server addresses resolved with: Clash dns.proxy-server-nameserver, or the
+// sing-box server selected by route.default_domain_resolver, a group
+// expanding to its members. With useNameserver, a subscription naming no
+// such server falls back to its general DNS: Clash dns.nameserver, sing-box
+// dns.final, else the first server. Only plain remote servers are kept
 // (udp / tcp / tls / quic / https / h3); a broken DNS section never fails
 // the node import.
-func ParseSubscriptionDNS(ctx context.Context, content string) []option.DNSServerOptions {
+func ParseSubscriptionDNS(ctx context.Context, content string, useNameserver bool) []option.DNSServerOptions {
 	trimmed := strings.TrimSpace(content)
 	if trimmed == "" {
 		return nil
 	}
 	var servers []option.DNSServerOptions
 	if trimmed[0] == '{' {
-		servers = parseBoxDNS(ctx, trimmed)
+		servers = parseBoxDNS(ctx, trimmed, useNameserver)
 	} else {
-		servers = parseClashDNS(ctx, trimmed)
+		servers = parseClashDNS(ctx, trimmed, useNameserver)
 	}
 	return dedupDNSServers(servers)
 }
@@ -74,7 +75,7 @@ type boxDNSDocument struct {
 	} `json:"route"`
 }
 
-func parseBoxDNS(ctx context.Context, content string) []option.DNSServerOptions {
+func parseBoxDNS(ctx context.Context, content string, useNameserver bool) []option.DNSServerOptions {
 	document, err := json.UnmarshalExtendedContext[boxDNSDocument](ctx, []byte(content))
 	if err != nil || document.DNS == nil || len(document.DNS.Servers) == 0 {
 		return nil
@@ -106,6 +107,9 @@ func parseBoxDNS(ctx context.Context, content string) []option.DNSServerOptions 
 				target = index
 			}
 		}
+	}
+	if target < 0 && !useNameserver {
+		return nil
 	}
 	if target < 0 && document.DNS.Final != "" {
 		if index, loaded := byTag[document.DNS.Final]; loaded {
@@ -164,7 +168,7 @@ type clashDNSDocument struct {
 	} `yaml:"dns"`
 }
 
-func parseClashDNS(ctx context.Context, content string) []option.DNSServerOptions {
+func parseClashDNS(ctx context.Context, content string, useNameserver bool) []option.DNSServerOptions {
 	var document clashDNSDocument
 	if yaml.Unmarshal([]byte(content), &document) != nil {
 		return nil
@@ -173,7 +177,7 @@ func parseClashDNS(ctx context.Context, content string) []option.DNSServerOption
 		return nil
 	}
 	nameservers := document.DNS.ProxyServerNameserver
-	if len(nameservers) == 0 {
+	if len(nameservers) == 0 && useNameserver {
 		nameservers = document.DNS.Nameserver
 	}
 	var servers []option.DNSServerOptions

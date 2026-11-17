@@ -99,7 +99,7 @@ dns:
     - system
     - tls://1.1.1.1
 proxies: []
-`)
+`, true)
 	require.Len(t, servers, 2, "duplicates and system are dropped")
 	require.Equal(t, C.DNSTypeHTTPS, servers[0].Type)
 	require.Equal(t, C.DNSTypeTLS, servers[1].Type)
@@ -107,15 +107,15 @@ proxies: []
 	servers = ParseSubscriptionDNS(ctx, `
 dns:
   nameserver: 119.29.29.29
-`)
+`, true)
 	require.Len(t, servers, 1, "nameserver as a scalar, used without proxy-server-nameserver")
 
 	require.Empty(t, ParseSubscriptionDNS(ctx, `
 dns:
   enable: false
   proxy-server-nameserver: [223.5.5.5]
-`))
-	require.Empty(t, ParseSubscriptionDNS(ctx, "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388#node"))
+`, true))
+	require.Empty(t, ParseSubscriptionDNS(ctx, "ss://YWVzLTI1Ni1nY206cGFzcw@1.2.3.4:8388#node", true))
 }
 
 func TestParseSubscriptionDNSSingBox(t *testing.T) {
@@ -134,7 +134,7 @@ func TestParseSubscriptionDNSSingBox(t *testing.T) {
 		},
 		"route": {"default_domain_resolver": {"server": "bootstrap", "strategy": "ipv4_only"}},
 		"outbounds": [{"type": "socks", "tag": "a", "server": "1.2.3.4", "server_port": 1080}]
-	}`)
+	}`, true)
 	require.Len(t, servers, 2, "group members except local, broken server skipped")
 	require.Equal(t, C.DNSTypeHTTPS, servers[0].Type)
 	require.Equal(t, C.DNSTypeUDP, servers[1].Type)
@@ -142,11 +142,11 @@ func TestParseSubscriptionDNSSingBox(t *testing.T) {
 	servers = ParseSubscriptionDNS(ctx, `{
 		"dns": {"servers": [{"type": "udp", "tag": "a", "server": "1.1.1.1"}, {"type": "tls", "tag": "b", "server": "8.8.8.8"}], "final": "b"},
 		"route": {"default_domain_resolver": "missing"}
-	}`)
+	}`, true)
 	require.Len(t, servers, 1, "unknown default_domain_resolver falls through to final")
 	require.Equal(t, C.DNSTypeTLS, servers[0].Type)
 
-	servers = ParseSubscriptionDNS(ctx, `{"dns": {"servers": [{"type": "local"}]}}`)
+	servers = ParseSubscriptionDNS(ctx, `{"dns": {"servers": [{"type": "local"}]}}`, true)
 	require.Empty(t, servers, "local resolver has no subscription counterpart")
 }
 
@@ -158,7 +158,7 @@ func TestParseSubscriptionDNSCacheRoundTrip(t *testing.T) {
 	original := ParseSubscriptionDNS(ctx, `
 dns:
   proxy-server-nameserver: [https://doh.pub/dns-query, "tls://1.1.1.1#skip-cert-verify=true", 223.5.5.5, "tcp://[2400:3200::1]"]
-`)
+`, true)
 	require.Len(t, original, 4)
 	var servers []option.DNSServerOptions
 	var tags []string
@@ -168,8 +168,43 @@ dns:
 		servers = append(servers, server)
 	}
 	servers = append(servers, option.DNSServerOptions{Type: C.DNSTypeGroup, Tag: "provider", Options: &option.GroupDNSServerOptions{Servers: tags}})
-	content, err := json.Marshal(option.Options{DNS: &option.DNSOptions{RawDNSOptions: option.RawDNSOptions{Servers: servers, Final: "provider"}}})
+	content, err := json.Marshal(option.Options{
+		DNS:   &option.DNSOptions{RawDNSOptions: option.RawDNSOptions{Servers: servers, Final: "provider"}},
+		Route: &option.RouteOptions{DefaultDomainResolver: &option.DomainResolveOptions{Server: "provider"}},
+	})
 	require.NoError(t, err)
-	restored := ParseSubscriptionDNS(ctx, string(content))
-	require.Equal(t, original, restored)
+	require.Equal(t, original, ParseSubscriptionDNS(ctx, string(content), true))
+	require.Equal(t, original, ParseSubscriptionDNS(ctx, string(content), false), "the cache names the list as the nodes' resolver")
+}
+
+// Without use_nameserver only the DNS a subscription names for its nodes is
+// taken; its general DNS is left to the client.
+func TestParseSubscriptionDNSWithoutNameserver(t *testing.T) {
+	t.Parallel()
+	ctx := dnsTestContext()
+	require.Empty(t, ParseSubscriptionDNS(ctx, `
+dns:
+  nameserver: [223.5.5.5, https://doh.pub/dns-query]
+`, false))
+	servers := ParseSubscriptionDNS(ctx, `
+dns:
+  nameserver: [223.5.5.5]
+  proxy-server-nameserver: [tls://1.1.1.1]
+`, false)
+	require.Len(t, servers, 1)
+	require.Equal(t, C.DNSTypeTLS, servers[0].Type)
+
+	require.Empty(t, ParseSubscriptionDNS(ctx, `{
+		"dns": {"servers": [{"type": "udp", "tag": "a", "server": "1.1.1.1"}, {"type": "tls", "tag": "b", "server": "8.8.8.8"}], "final": "b"}
+	}`, false), "dns.final and the first server are general DNS")
+	require.Empty(t, ParseSubscriptionDNS(ctx, `{
+		"dns": {"servers": [{"type": "udp", "tag": "a", "server": "1.1.1.1"}], "final": "a"},
+		"route": {"default_domain_resolver": "missing"}
+	}`, false))
+	servers = ParseSubscriptionDNS(ctx, `{
+		"dns": {"servers": [{"type": "udp", "tag": "a", "server": "1.1.1.1"}, {"type": "tls", "tag": "b", "server": "8.8.8.8"}], "final": "a"},
+		"route": {"default_domain_resolver": {"server": "b"}}
+	}`, false)
+	require.Len(t, servers, 1)
+	require.Equal(t, C.DNSTypeTLS, servers[0].Type)
 }
