@@ -226,6 +226,10 @@ type _ProviderDomainResolverOptions struct {
 	Resolver         string         `json:"resolver,omitempty" reference:"dns_server"`
 	ResolverStrategy DomainStrategy `json:"resolver_strategy,omitempty"`
 	OutboundStrategy DomainStrategy `json:"outbound_strategy,omitempty"`
+	// Fallback lets Resolver answer for the nodes when the subscription DNS
+	// fails. A subscription whose private DNS returns addresses only the
+	// nodes' network can use disables it. Default true.
+	Fallback *bool `json:"fallback,omitempty"`
 }
 
 // ProviderDomainResolverOptions accepts `true` / `false` or the object form.
@@ -238,8 +242,14 @@ func (o *ProviderDomainResolverOptions) IsEnabled() bool {
 	return o.Enabled == nil || *o.Enabled
 }
 
+// FallbackEnabled reports whether the resolver answers when the subscription
+// DNS fails.
+func (o *ProviderDomainResolverOptions) FallbackEnabled() bool {
+	return o == nil || o.Fallback == nil || *o.Fallback
+}
+
 func (o ProviderDomainResolverOptions) MarshalJSON() ([]byte, error) {
-	if o.Resolver == "" && o.ResolverStrategy == DomainStrategy(C.DomainStrategyAsIS) && o.OutboundStrategy == DomainStrategy(C.DomainStrategyAsIS) {
+	if o.Resolver == "" && o.ResolverStrategy == DomainStrategy(C.DomainStrategyAsIS) && o.OutboundStrategy == DomainStrategy(C.DomainStrategyAsIS) && o.Fallback == nil {
 		return json.Marshal(o.IsEnabled())
 	}
 	return json.Marshal(_ProviderDomainResolverOptions(o))

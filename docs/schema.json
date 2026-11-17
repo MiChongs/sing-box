@@ -20350,6 +20350,9 @@
                 },
                 "outbound_strategy": {
                   "$ref": "#/$defs/DomainStrategy"
+                },
+                "fallback": {
+                  "type": "boolean"
                 }
               },
               "additionalProperties": false

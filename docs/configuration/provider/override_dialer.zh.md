@@ -45,7 +45,8 @@
   "enabled": true,
   "resolver": "",
   "resolver_strategy": "",
-  "outbound_strategy": ""
+  "outbound_strategy": "",
+  "fallback": true
 }
 ```
 
@@ -62,7 +63,7 @@
 
 订阅更新时只替换 DNS 服务器本身，节点不会因此重建；DNS 列表没有变化时，已有连接保持不变。远程订阅的 DNS 服务器会和节点一起写入缓存。
 
-当订阅中没有可用的 DNS 服务器，或所有服务器都失败时，查询回落到 `resolver`。多个订阅的 provider DNS 互相回落时，查询会直接报错而不会循环。
+当订阅中没有可用的 DNS 服务器，或所有服务器都失败时，查询回落到 `resolver`（参阅 [fallback](#fallback)）。多个订阅的 provider DNS 互相回落时，查询会直接报错而不会循环。
 
 关闭本选项后，缓存中指向 `<订阅 tag>-dns` 等已不存在服务器的节点会改用 `override_dialer.domain_resolver`（未设置时使用默认解析）。
 
@@ -87,3 +88,15 @@
 节点通过订阅 DNS 解析服务器地址时使用的域名策略，可选值同上。
 
 默认使用 `override_dialer.domain_resolver.strategy`。`domain_resolver` 中的 `timeout`、`disable_cache`、`client_subnet` 等其他字段同样生效。
+
+##### fallback
+
+订阅 DNS 失败时是否由 `resolver` 为节点应答，默认启用。
+
+当订阅 DNS 是私有 DNS、只有用它才能解析出可用的节点地址时（例如节点的内网或分区地址），请关闭此项：其他解析器的应答会让节点连到无法连接的地址。关闭后，只要订阅带有 DNS 服务器：
+
+* 订阅 DNS 使用一次查询的全部超时时间，失败后也不会暂停而改用 `resolver`；
+* 失败原样返回，包括 SERVFAIL / REFUSED 应答；
+* 如果订阅中的 DNS 服务器都无法创建，节点解析直接失败，而不是改用 `resolver`。
+
+`resolver` 仍用于解析订阅 DNS 服务器自身的域名；订阅完全没有带 DNS 服务器时，`resolver` 仍为节点解析，因为此时它是节点唯一的解析器，而不是回落。

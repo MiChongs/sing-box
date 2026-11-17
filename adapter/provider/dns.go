@@ -82,8 +82,15 @@ type providerDNS struct {
 	// memberDialer carries the override_dialer fields every member dials
 	// with (bind_interface, routing_mark, ...), without detour and resolver.
 	memberDialer option.DialerOptions
+	// fallback lets the resolver answer when the subscription DNS fails.
+	// Without it the resolver only serves a subscription that carries no
+	// DNS server at all.
+	fallback bool
 
 	members     atomic.Pointer[[]providerDNSMember]
+	// carriesServers is set while the subscription lists DNS servers, even
+	// if none of them could be created.
+	carriesServers atomic.Bool
 	generation  atomic.Uint64
 	membersDown atomic.Int64
 	keepIdle    atomic.Bool
@@ -125,6 +132,7 @@ func newProviderDNS(ctx context.Context, logFactory log.Factory, providerTag str
 		manager:          manager,
 		registry:         registry,
 		memberDialer:     memberDialer,
+		fallback:         options.FallbackEnabled(),
 	}
 	// kept until the reference manager decides otherwise, like configured
 	// HTTPS servers
@@ -231,13 +239,16 @@ func (t *providerDNS) applyLocked(servers []option.DNSServerOptions) {
 		names = append(names, name)
 	}
 	if len(servers) > 0 {
-		if len(members) == 0 {
+		if len(members) == 0 && !t.fallback {
+			t.logger.Error("no subscription DNS server is usable and fallback is disabled, nodes cannot be resolved")
+		} else if len(members) == 0 {
 			t.logger.Error("no subscription DNS server is usable, nodes resolve through ", t.fallbackName())
 		} else {
 			t.logger.Info("resolve nodes through subscription DNS: [", strings.Join(names, ", "), "]")
 		}
 	}
 	old := t.members.Swap(&members)
+	t.carriesServers.Store(len(servers) > 0)
 	t.applied = servers
 	t.generation.Add(1)
 	t.membersDown.Store(0)
@@ -309,6 +320,9 @@ func (t *providerDNS) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Ms
 	if !first {
 		return nil, E.New("provider DNS fallback loop through ", t.tag)
 	}
+	if !t.fallback && t.carriesServers.Load() {
+		return t.exchangeWithoutFallback(ctx, message)
+	}
 	var (
 		response *mDNS.Msg
 		err      error
@@ -347,6 +361,27 @@ func (t *providerDNS) Exchange(ctx context.Context, message *mDNS.Msg) (*mDNS.Ms
 		return nil, fallbackExchangeErr
 	}
 	return fallbackResponse, nil
+}
+
+// exchangeWithoutFallback answers only through the subscription DNS: its
+// private answers are the only ones the nodes can use, so the members get the
+// whole query time, are never rested, and an inconclusive answer (SERVFAIL,
+// REFUSED) is returned as is.
+func (t *providerDNS) exchangeWithoutFallback(ctx context.Context, message *mDNS.Msg) (*mDNS.Msg, error) {
+	members := t.loadMembers()
+	if len(members) == 0 {
+		return nil, E.New("no usable subscription DNS server in ", t.tag, " and fallback is disabled")
+	}
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, defaultMemberTimeout)
+		defer cancel()
+	}
+	response, err := t.exchangeMembers(ctx, members, message)
+	if response != nil {
+		return response, nil
+	}
+	return nil, err
 }
 
 // exchangeMembersWithBudget leaves the fallback at least half of the query

@@ -45,7 +45,8 @@ A boolean, or the object form:
   "enabled": true,
   "resolver": "",
   "resolver_strategy": "",
-  "outbound_strategy": ""
+  "outbound_strategy": "",
+  "fallback": true
 }
 ```
 
@@ -62,7 +63,7 @@ The subscription DNS uses at most half of a query's timeout, leaving the rest to
 
 Updating the subscription only swaps the DNS servers: nodes are not recreated for it, and an unchanged list keeps its connections. Remote providers cache the DNS servers together with the nodes.
 
-When the subscription carries no usable server, or all of them fail, queries fall back to `resolver`. Provider DNS servers of several providers falling back to each other fail the query instead of looping.
+When the subscription carries no usable server, or all of them fail, queries fall back to `resolver` (see [fallback](#fallback)). Provider DNS servers of several providers falling back to each other fail the query instead of looping.
 
 After disabling this option, cached nodes naming `<provider tag>-dns` or another DNS server that no longer exists use `override_dialer.domain_resolver` (or the default resolution when unset).
 
@@ -87,3 +88,15 @@ Follows the selected fallback server by default.
 Domain strategy the nodes resolve their server addresses with through the subscription DNS, same values.
 
 Defaults to `override_dialer.domain_resolver.strategy`. The other `domain_resolver` fields (`timeout`, `disable_cache`, `client_subnet`, ...) apply as well.
+
+##### fallback
+
+Whether `resolver` answers for the nodes when the subscription DNS fails. Enabled by default.
+
+Disable it when the subscription DNS is private and returns addresses only usable through it (for example internal or region-specific addresses of the nodes): an answer from another resolver would then point the nodes at addresses they cannot connect to. When disabled and the subscription carries DNS servers:
+
+* the subscription DNS gets the whole query timeout and is never rested in favor of `resolver`;
+* a failure is returned as is, including SERVFAIL / REFUSED answers;
+* if none of the subscription DNS servers can be created, node lookups fail instead of using `resolver`.
+
+`resolver` still resolves the subscription DNS server names, and still answers for the nodes of a subscription that carries no DNS server at all, since it is then their only resolver rather than a fallback.

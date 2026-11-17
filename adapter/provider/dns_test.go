@@ -74,7 +74,7 @@ func (m *fakeDNSManager) Default() adapter.DNSTransport {
 }
 
 // fakeDNSRegistry creates members from RemoteDNSServerOptions whose server
-// names the behavior: "ok", "fail" or "servfail".
+// names the behavior: "ok", "fail", "servfail", or "invalid" (not created).
 type fakeDNSRegistry struct {
 	adapter.DNSTransportRegistry
 	access  sync.Mutex
@@ -85,6 +85,9 @@ type fakeDNSRegistry struct {
 func (r *fakeDNSRegistry) CreateDNSTransport(_ context.Context, _ log.ContextLogger, tag string, transportType string, options any) (adapter.DNSTransport, error) {
 	r.access.Lock()
 	defer r.access.Unlock()
+	if options.(*option.RemoteDNSServerOptions).Server == "invalid.example" {
+		return nil, errors.New("invalid server")
+	}
 	transport := &fakeDNSTransport{tag: tag, dnsType: transportType}
 	switch options.(*option.RemoteDNSServerOptions).Server {
 	case "fail.example":
@@ -358,4 +361,55 @@ func TestProviderDNSEnvironmentAndDialer(t *testing.T) {
 	require.Equal(t, "wan0", created.BindInterface, "members dial with override_dialer, not the subscription")
 	require.Empty(t, created.Detour)
 	require.True(t, registry.created[0].keepIdle.Load(), "members keep idle connections by default")
+}
+
+// A subscription whose private DNS is the only source of usable node
+// addresses disables the fallback: its failures are reported instead of
+// answers from another resolver.
+func TestProviderDNSWithoutFallback(t *testing.T) {
+	t.Parallel()
+	fallback := &fakeDNSTransport{tag: "default", dnsType: C.DNSTypeUDP}
+	transport, _, _ := newTestProviderDNS(t, fallback)
+	disabled := false
+	transport.fallback = (&option.ProviderDomainResolverOptions{Fallback: &disabled}).FallbackEnabled()
+	require.False(t, transport.fallback)
+	message := new(mDNS.Msg)
+	message.SetQuestion("node.example.", mDNS.TypeA)
+
+	// No subscription DNS at all: the resolver is the nodes' only resolver.
+	require.Equal(t, mDNS.RcodeSuccess, query(t, transport).Rcode)
+	require.EqualValues(t, 1, fallback.queries.Load())
+
+	transport.Update([]option.DNSServerOptions{udpServer("fail.example"), udpServer("servfail.example")})
+	response, err := transport.Exchange(context.Background(), message)
+	require.NoError(t, err)
+	require.Equal(t, mDNS.RcodeServerFailure, response.Rcode, "the subscription answer is returned as is")
+	transport.Update([]option.DNSServerOptions{udpServer("fail.example")})
+	_, err = transport.Exchange(context.Background(), message)
+	require.Error(t, err)
+	_, err = transport.Exchange(context.Background(), message)
+	require.Error(t, err, "failed members are not rested in favor of the resolver")
+	require.False(t, transport.membersAreDown())
+
+	transport.Update([]option.DNSServerOptions{udpServer("invalid.example")})
+	_, err = transport.Exchange(context.Background(), message)
+	require.ErrorContains(t, err, "fallback is disabled")
+	require.EqualValues(t, 1, fallback.queries.Load(), "the resolver never answered for the subscription")
+
+	transport.Update([]option.DNSServerOptions{udpServer("ok.example")})
+	require.Equal(t, mDNS.RcodeSuccess, query(t, transport).Rcode)
+}
+
+func TestProviderDomainResolverFallbackOption(t *testing.T) {
+	t.Parallel()
+	var options option.ProviderDomainResolverOptions
+	require.NoError(t, options.UnmarshalJSON([]byte(`{"fallback": false}`)))
+	require.True(t, options.IsEnabled())
+	require.False(t, options.FallbackEnabled())
+	content, err := options.MarshalJSON()
+	require.NoError(t, err)
+	require.JSONEq(t, `{"fallback": false}`, string(content))
+	require.True(t, (*option.ProviderDomainResolverOptions)(nil).FallbackEnabled())
+	require.NoError(t, options.UnmarshalJSON([]byte(`true`)))
+	require.True(t, options.FallbackEnabled())
 }
