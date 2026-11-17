@@ -1,0 +1,12 @@
+# GitHub Pages build of the full documentation for this fork. It is served
+# below the Smart documentation site, at https://michongs.github.io/sing-box/docs/,
+# by .github/workflows/docs.yml. Local previews keep using mkdocs.yml.
+INHERIT: mkdocs.yml
+site_name: sing-box (xiaobaf14g)
+site_url: https://michongs.github.io/sing-box/docs/
+repo_url: https://github.com/MiChongs/sing-box
+repo_name: MiChongs/sing-box
+exclude_docs: |
+  CNAME
+hooks:
+  - docs-hooks/base_path.py

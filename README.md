@@ -782,6 +782,7 @@ go build -trimpath \
 
 - 上游文档：<https://sing-box.sagernet.org>
 - Smart 出站组文档站：<https://michongs.github.io/sing-box/>
+- 本分支完整文档站（含全部扩展功能）：<https://michongs.github.io/sing-box/docs/zh/>（[English](https://michongs.github.io/sing-box/docs/)）
 - 本仓库扩展功能文档：
   - [订阅 Provider](./docs/configuration/provider/index.zh.md)（[English](./docs/configuration/provider/index.md)）：[override_dialer](./docs/configuration/provider/override_dialer.zh.md)、[override_anytls](./docs/configuration/provider/override_anytls.zh.md)
   - [QUICX 入站](./docs/configuration/inbound/quicx.zh.md)（[English](./docs/configuration/inbound/quicx.md)）与[出站](./docs/configuration/outbound/quicx.zh.md)（[English](./docs/configuration/outbound/quicx.md)）

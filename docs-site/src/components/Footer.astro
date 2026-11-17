@@ -8,6 +8,7 @@ export interface Props {
 
 const { lang } = Astro.props;
 const t = ui[lang];
+const fullDocsHref = `${import.meta.env.BASE_URL}docs/${lang === 'zh' ? 'zh/' : ''}`;
 ---
 
 <footer class="mt-20 border-t border-line-soft">
@@ -17,6 +18,7 @@ const t = ui[lang];
       <p class="mt-1 text-subtle">{t.footerNote}</p>
     </div>
     <div class="flex flex-wrap gap-x-5 gap-y-2 text-muted">
+      <a class="text-muted hover:text-fg" href={fullDocsHref}>{t.nav.fullDocs}</a>
       <a class="text-muted hover:text-fg" href="https://github.com/MiChongs/sing-box" target="_blank" rel="noopener">GitHub</a>
       <a class="text-muted hover:text-fg" href="https://github.com/MiChongs/sing-box/releases" target="_blank" rel="noopener">Releases</a>
       <a class="text-muted hover:text-fg" href="https://github.com/reF1nd/sing-box" target="_blank" rel="noopener">reF1nd/sing-box</a>

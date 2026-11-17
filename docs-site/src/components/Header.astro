@@ -16,6 +16,8 @@ const links = [
   { label: t.nav.api, slug: 'clash-api', match: ['clash-api'] },
   { label: t.nav.examples, slug: 'examples', match: ['examples'] },
 ];
+// The full sing-box documentation (MkDocs) is deployed below this site.
+const fullDocsHref = `${import.meta.env.BASE_URL}docs/${lang === 'zh' ? 'zh/' : ''}`;
 const isActive = (match: string[]) => match.some((m) => path.includes(`/${lang}/${m}/`));
 
 // Same page in the other locale: swap the locale segment only.
@@ -54,6 +56,9 @@ const otherPath = path.replace(new RegExp(`/${lang}(/|$)`), `/${other}$1`);
           {l.label}
         </a>
       ))}
+      <a href={fullDocsHref} class="rounded-md px-3 py-1.5 text-[0.92rem] text-muted transition-colors hover:text-fg">
+        {t.nav.fullDocs}
+      </a>
     </nav>
 
     <div class="ml-auto flex items-center gap-1">

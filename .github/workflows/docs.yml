@@ -6,6 +6,10 @@ on:
       - xiaobaf14g-testing
     paths:
       - 'docs-site/**'
+      - 'docs/**'
+      - 'docs-hooks/**'
+      - 'mkdocs.yml'
+      - 'mkdocs-pages.yml'
       - '.github/workflows/docs.yml'
   workflow_dispatch:
 
@@ -24,7 +28,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build Astro site
+    name: Build documentation sites
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -51,8 +55,22 @@ jobs:
             npm install --no-audit --no-fund
           fi
 
-      - name: Build
+      - name: Build Smart site
         run: npm run build
+
+      # The full documentation (docs/, MkDocs Material) is served below the
+      # Smart site at /sing-box/docs/. Build it after Astro, which empties
+      # dist/ first.
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build full documentation
+        working-directory: .
+        run: |
+          pip install "mkdocs-material==9.7.2" "mkdocs-static-i18n==1.2.*"
+          mkdocs build --strict -f mkdocs-pages.yml -d docs-site/dist/docs
 
       - name: Configure Pages
         uses: actions/configure-pages@v5

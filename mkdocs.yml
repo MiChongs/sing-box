@@ -222,6 +222,7 @@ nav:
           - DNS: configuration/outbound/dns.md
           - Selector: configuration/outbound/selector.md
           - URLTest: configuration/outbound/urltest.md
+          - LoadBalance: configuration/outbound/loadbalance.md
           - Nested: configuration/outbound/nested.md
       - Provider:
           - configuration/provider/index.md
