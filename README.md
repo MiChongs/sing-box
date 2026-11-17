@@ -7,7 +7,7 @@
 [![Last Commit](https://img.shields.io/github/last-commit/MiChongs/sing-box/xiaobaf14g-testing)](https://github.com/MiChongs/sing-box/commits/xiaobaf14g-testing)
 [![Code Size](https://img.shields.io/github/languages/code-size/MiChongs/sing-box)](https://github.com/MiChongs/sing-box)
 
-本项目是 [sing-box](https://github.com/SagerNet/sing-box) 的衍生版本，基于 [reF1nd/sing-box](https://github.com/reF1nd/sing-box) 维护。在兼容上游配置格式的前提下，本分支新增 Smart 出站组、XHTTP 传输、VLESS Encryption、QUICX 与 Nowhere 协议以及 EasyTier 端点，扩展了 Clash API，并为 Windows、Linux、macOS、FreeBSD 与 Android 提供命令行程序的发布构建，SFA、SFW、SFL 图形客户端按需构建。
+本项目是 [sing-box](https://github.com/SagerNet/sing-box) 的衍生版本，基于 [reF1nd/sing-box](https://github.com/reF1nd/sing-box) 维护。在兼容上游配置格式的前提下，本分支新增 Smart 出站组、XHTTP 传输、VLESS Encryption、QUICX、Nowhere 与 AnyX 协议（含 PseudoVPN 三层透传）以及 EasyTier 端点，增强了订阅 Provider，扩展了 Clash API，并为 Windows、Linux、macOS、FreeBSD 与 Android 提供命令行程序的发布构建，SFA、SFW、SFL 图形客户端按需构建。
 
 ## 目录
 
@@ -17,9 +17,11 @@
 - [VLESS Encryption](#vless-encryption)
 - [QUICX 协议](#quicx-协议)
 - [Nowhere 协议](#nowhere-协议)
+- [AnyX 协议与 PseudoVPN](#anyx-协议与-pseudovpn)
 - [EasyTier 端点](#easytier-端点)
 - [eBPF 入站](#ebpf-入站)
 - [TCP 并发拨号](#tcp-并发拨号)
+- [订阅 Provider 扩展](#订阅-provider-扩展)
 - [Clash API 扩展](#clash-api-扩展)
 - [其他改进](#其他改进)
 - [继承自 reF1nd 的功能](#继承自-ref1nd-的功能)
@@ -40,10 +42,11 @@
 | VLESS Encryption（`mlkem768x25519plus`）及其上的 XTLS Vision | 本分支 | 无需 |
 | QUICX 入站与出站；QUIC 丢包检测自适应乱序 | [BanYeHanFeng/sing-box](https://github.com/BanYeHanFeng/sing-box)、[BanYeHanFeng/quic-go](https://github.com/BanYeHanFeng/quic-go) | `with_quic`（默认启用） |
 | Nowhere 2.1 入站与出站（含 Morph、Portal 链式转发） | [ohmycggk/sing-box](https://github.com/ohmycggk/sing-box) | 无需；QUIC carrier 需 `with_quic`（默认启用） |
+| AnyX 入站与出站、PseudoVPN 三层透传 | 本分支 | 无需 |
 | EasyTier 端点与 Magic DNS | 本分支 | `with_easytier`（实验性，默认不启用） |
 | Clash API 扩展：规则命中统计、Smart 管理接口 | 本分支 | `with_clash_api`（默认启用） |
 | eBPF 入站 | reF1nd；本分支改用 [MiChongs/sing-ebpf](https://github.com/MiChongs/sing-ebpf) | `with_ebpf`（默认不启用） |
-| 订阅 Provider | reF1nd | 无需 |
+| 订阅 Provider | reF1nd；`provider_domain_resolver`、全协议 `override_dialer`、`use_anyx` 由本分支新增 | 无需 |
 | URLTest 故障转移、`loadbalance` 出站组、`pass` 出站 | reF1nd | 无需 |
 | TLS `server_names` 与 `reject_unknown_sni`、TCP Keep-Alive 选项、DNS 缓存选项 | reF1nd | 无需 |
 
@@ -451,6 +454,55 @@ VLESS 入站的 `decryption` 与出站的 `encryption` 字段实现 Xray-core �
 
 完整字段说明参见 [Nowhere 入站](./docs/configuration/inbound/nowhere.zh.md)与 [Nowhere 出站](./docs/configuration/outbound/nowhere.zh.md)。
 
+## AnyX 协议与 PseudoVPN
+
+`anyx` 入站与出站实现 AnyX 协议。AnyX 由 AnyTLS 改造而来，仍是多路复用协议，但不再强制依赖 TLS，与 AnyTLS 不互通。
+
+- **承载方式**：可直接跑在明文 TCP 上，也可叠加 TLS（支持 REALITY 与幻影 TLS）或 V2Ray 传输层（ws / xhttp / grpc / http / quic）。
+- **会话加密**：`encryption` 可在会话内再套一层 Shadowsocks AEAD 或 2022 加密，两端配置须一致。
+- **填充**：`padding_scheme` 为 `auto` 时按 `padding_scheme_interval` 定期生成新方案，由服务端下发给客户端。认证前的填充量受 `padding_limit` 限制，用于防御慢速耗尽。
+- **回落**：首包认证失败的连接转交给 `fallback`；启用 TLS 时，也可以用 `fallback_for_alpn` 按协商出的 ALPN 选择回落目标。
+- **连接池**：出站可设置最小空闲会话数和空闲超时，也可以用 `disable_reuse` 完全关闭复用；`network` 声明是否支持 UDP。
+
+### PseudoVPN
+
+两端都开启 `pseudo_vpn` 后，AnyX 会话可以直接透传三层 IP 报文，工作方式类似 VPN。
+
+- **服务端**：创建一块 TUN 网卡，从 `address` 指定的虚拟子网（最多一个 IPv4 和一个 IPv6 前缀）中为每个客户端租出地址，再把报文交给主机转发。
+  - 地址是粘性的：客户端在租约有效期内重连拿回原地址；客户端重启后，服务端按认证用户把先前的地址还给它。
+  - 防护措施：单个地址池最多 65536 条租约，只转发源地址属于该客户端租约的报文（严格 RPF），租约失效通知会限速发送。
+  - 主机的转发与 NAT 规则需要自行配置，文档给出了 iptables 和 nftables 示例。
+- **客户端**：开启 `pseudo_vpn` 的出站成为[预匹配](./docs/configuration/shared/pre-match.zh.md) `route` 的三层目标。TUN 入站在三层转四层之前路由给它的 TCP 与 ICMP 连接，会以 IP 报文形式经 AnyX 会话转发。
+  - 地址转换：出站在本地端口地址与租到的虚拟地址之间做 1:1 NAT，并修正 TCP、UDP、ICMP 校验和以及 ICMP 差错报文的内嵌头。
+  - MSS 钳制：TCP MSS 按隧道 MTU 钳制。
+  - UDP：PseudoVPN 不承载 UDP，按 `udp` 选择丢弃、回复 ICMP 端口不可达，或交还常规四层路径。
+  - 会话与租约：会话断开后按需重建，失败时指数退避，不阻塞 TUN；重连和网络切换后保留原租约。
+
+```json
+{
+  "outbounds": [
+    {
+      "type": "anyx",
+      "tag": "anyx-vpn",
+      "server": "example.com",
+      "server_port": 443,
+      "password": "...",
+      "tls": { "enabled": true, "server_name": "example.com" },
+      "pseudo_vpn": { "enabled": true, "udp": "transparent" }
+    }
+  ],
+  "route": {
+    "rules": [
+      { "ip_cidr": ["10.0.0.0/8"], "action": "route", "outbound": "anyx-vpn" }
+    ]
+  }
+}
+```
+
+订阅中的 `anytls` 节点可以通过 `override_anytls.use_anyx` 转换为 AnyX 节点，并通过 `override_anytls.pseudo_vpn` 统一开启 PseudoVPN，参见 [override_anytls](./docs/configuration/provider/override_anytls.zh.md)。
+
+完整字段说明参见 [AnyX 入站](./docs/configuration/inbound/anyx.zh.md)与 [AnyX 出站](./docs/configuration/outbound/anyx.zh.md)。
+
 ## EasyTier 端点
 
 `easytier` 端点将 sing-box 接入 [EasyTier](https://github.com/EasyTier/EasyTier) 虚拟网络。EasyTier 内核以 WebAssembly 形式内嵌并由 wazero 执行，无需另行部署 `easytier-core`。该功能为实验性功能，需使用 `with_easytier` 构建标记，二进制文件体积约增加 11 MB。
@@ -559,6 +611,44 @@ wazero 仅在 amd64 与 arm64 架构上以编译方式执行，其他架构使�
 - **运行时开关与观测**：`GET` / `PATCH /configs` 的 `tcp-concurrent` 与 mihomo 面板兼容；`GET /dns/tcp-concurrent` 查看统计与连接历史，`DELETE /dns/tcp-concurrent` 清空历史；可观测性导出 `singbox_tcp_concurrent_*` 指标，Grafana 面板含对应图表。
 
 字段说明参见 [DNS](./docs/configuration/dns/index.zh.md#tcp_concurrent) 与 [拨号字段](./docs/configuration/shared/dial.zh.md#tcp_concurrent)。
+
+## 订阅 Provider 扩展
+
+### 订阅自带 DNS（`provider_domain_resolver`）
+
+在 `override_dialer` 中开启 `provider_domain_resolver` 后，节点的服务器地址改用订阅自带的 DNS 服务器解析：
+
+```json
+{
+  "type": "remote",
+  "tag": "airport",
+  "url": "https://example.com/sub",
+  "override_dialer": {
+    "provider_domain_resolver": {
+      "resolver": "local-dns",
+      "outbound_strategy": "prefer_ipv4"
+    }
+  }
+}
+```
+
+- **来源**：
+  - Clash 订阅：取 `dns.proxy-server-nameserver`，为空时取 `dns.nameserver`。支持 mihomo 的纯 IP、`udp://`、`tcp://`、`tls://`、`quic://`、`https://`、`h3://` 写法，以及 `#h3=true`、`#skip-cert-verify=true` 参数。
+  - sing-box 订阅：取 `route.default_domain_resolver` 指向的服务器，不存在时依次取 `dns.final` 和第一个服务器；指向 `group` 时展开为其成员。
+  - 只保留 udp / tcp / tls / quic / https / h3 服务器，重复项会合并。DNS 段有问题不影响节点导入。
+- **注册方式**：每个订阅注册一个固定的 `<订阅 tag>-dns` 服务器（类型 `provider`）。订阅更新时只热替换其中的成员，节点不会重建；DNS 列表没有变化时，已有连接保持不变。远程订阅的 DNS 服务器会和节点一起写入缓存。
+- **查询方式**：多个成员并发查询，采用最快的 NOERROR / NXDOMAIN 应答。
+  - 超时：订阅 DNS 最多使用一次查询一半的超时时间，剩余时间留给 `resolver` 回落；全部成员都无响应时，之后 30 秒内的查询直接走回落。
+  - 环路：多个订阅互相回落时直接报错，不会形成循环。
+  - 缓存：成员变化后，DNS 缓存随之失效。
+- **拨号**：订阅 DNS 不经过 `detour`，以免通过节点解析节点地址形成环路；`override_dialer` 的其余拨号字段（`bind_interface`、`routing_mark` 等）对它照常生效。订阅为 DNS 服务器指定的拨号字段和 TLS 文件路径会被忽略。
+- **复用连接**：只要还有被引用的节点，订阅 DNS 就会保持空闲连接，DoH 等协议不用每次查询都重新握手。
+
+### 覆写范围
+
+`override_dialer` 现在作用于订阅中所有会发起拨号的协议，包括 ssh、naive、mieru、EasyTier、OpenVPN 等此前会静默忽略覆写的协议，`direct` 除外。`override_anytls` 同时作用于 `anytls` 与 `anyx` 节点，并新增 `use_anyx`、`pseudo_vpn` 及 AnyX 会话相关字段。
+
+字段说明参见 [override_dialer](./docs/configuration/provider/override_dialer.zh.md)与 [override_anytls](./docs/configuration/provider/override_anytls.zh.md)。
 
 ## Clash API 扩展
 
@@ -693,9 +783,11 @@ go build -trimpath \
 - 上游文档：<https://sing-box.sagernet.org>
 - Smart 出站组文档站：<https://michongs.github.io/sing-box/>
 - 本仓库扩展功能文档：
-  - [订阅 Provider](./docs/configuration/provider/index.zh.md)（[English](./docs/configuration/provider/index.md)）
+  - [订阅 Provider](./docs/configuration/provider/index.zh.md)（[English](./docs/configuration/provider/index.md)）：[override_dialer](./docs/configuration/provider/override_dialer.zh.md)、[override_anytls](./docs/configuration/provider/override_anytls.zh.md)
   - [QUICX 入站](./docs/configuration/inbound/quicx.zh.md)（[English](./docs/configuration/inbound/quicx.md)）与[出站](./docs/configuration/outbound/quicx.zh.md)（[English](./docs/configuration/outbound/quicx.md)）
   - [Nowhere 入站](./docs/configuration/inbound/nowhere.zh.md)（[English](./docs/configuration/inbound/nowhere.md)）与[出站](./docs/configuration/outbound/nowhere.zh.md)（[English](./docs/configuration/outbound/nowhere.md)）
+  - [AnyX 入站](./docs/configuration/inbound/anyx.zh.md)（[English](./docs/configuration/inbound/anyx.md)）与[出站](./docs/configuration/outbound/anyx.zh.md)（[English](./docs/configuration/outbound/anyx.md)）
+  - [预匹配](./docs/configuration/shared/pre-match.zh.md)（[English](./docs/configuration/shared/pre-match.md)）
   - [EasyTier 端点](./docs/configuration/endpoint/easytier.zh.md)（[English](./docs/configuration/endpoint/easytier.md)）
   - [EasyTier DNS 服务器](./docs/configuration/dns/server/easytier.zh.md)（[English](./docs/configuration/dns/server/easytier.md)）
   - [eBPF 入站](./docs/configuration/inbound/ebpf.zh.md)（[English](./docs/configuration/inbound/ebpf.md)）
