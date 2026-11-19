@@ -439,6 +439,24 @@ func (g *Group) best(sc *scratch) (int, Reason) {
 				best = i
 			}
 		}
+		if best < 0 {
+			// The pool is empty: this candidate view shares no node with the
+			// committed pool (the pool is rebuilt every poolRefresh only, while the
+			// view narrows per target through filterCandidates), so every member
+			// was masked out. Returning the -1 sentinel here makes Select index
+			// sc.snapshots with it in trial and commit, which panics with
+			// "index out of range [-1]". Fall back to the most reliable candidate
+			// and put it back into the pool so the returned index is valid.
+			for i := range sc.snapshots {
+				if best < 0 || sc.snapshots[i].Reliability > sc.snapshots[best].Reliability {
+					best = i
+				}
+			}
+			if best >= 0 && !sc.mask[best] {
+				sc.mask[best] = true
+				sc.members = append(sc.members, best)
+			}
+		}
 		return best, ReasonReliabilityWinner
 	}
 	if eligibleCount > 1 {
